@@ -1,0 +1,20 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Python & PyO3 wheel build artifacts
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+.venv/
+.pytest_cache/
+
+# Ephemeral test databases, local agent memory, and benchmarks
+/.agents/
+*.tmp.ldb
+*.bench.ldb
+/tmp/

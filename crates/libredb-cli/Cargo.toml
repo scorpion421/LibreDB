@@ -1,0 +1,16 @@
+[package]
+name = "libredb-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Command-line utility and benchmark runner for the LibreDB cognitive storage engine"
+
+[[bin]]
+name = "libredb"
+path = "src/main.rs"
+
+[dependencies]
+libredb-core = { path = "../libredb-core" }
+serde_json.workspace = true
