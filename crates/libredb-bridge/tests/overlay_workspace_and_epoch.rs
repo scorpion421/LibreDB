@@ -74,10 +74,11 @@ fn overlay_brain_merges_global_and_project_memory_without_id_collisions() {
         .iter()
         .any(|c| c.key.as_deref() == Some("global::global-gitea-fmt")));
 
-    // Turn 2: Both global#1 and proj#1 are suppressed via Zero-Repeat Delta!
+    // Turn 2: Both global#1 and proj#1 are suppressed via Zero-Repeat Delta in RAM (`0` I/O reads)!
     let r2 = brain.pulse(&req).unwrap();
     assert!(r2.capsules.is_empty());
     assert_eq!(r2.already_in_context_stubs.len(), 2);
+    assert_eq!(r2.coalesced_io_reads, 0, "expected 0 payload disk reads on deduplicated Turn 2");
     assert!(r2.tokens_saved_by_delta > 20);
 }
 

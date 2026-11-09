@@ -1,11 +1,12 @@
 //! `OverlayBrain`: Unified dual-layer cognitive memory mounting a global base layer
 //! (`customizations.ldb`) underneath a writable project layer (`memory.ldb`).
 //!
-//! Queries both layers simultaneously in a single `< 5 ms` pass while maintaining isolated
-//! `SessionState` (`Zero-Repeat Delta`) namespaces so global and project `NodeId`s never collide.
+//! Scores `Inode` candidates across both layers **100% in RAM** and filters via `SessionState`
+//! (`Zero-Repeat Delta`) *before* touching disk extents - so already-seen items incur **zero I/O reads**!
 
 use crate::{
-    CognitiveEngine, DeliveredCapsule, FiredReflex, PulseRequest, PulseResponse, SessionState,
+    CognitiveEngine, DeliveredCapsule, FiredReflex, PulseRequest, PulseResponse,
+    ScoredInodeCandidate, SessionState,
 };
 use libredb_core::{LibreDb, Result};
 use std::sync::Arc;
@@ -40,6 +41,10 @@ impl OverlayBrain {
         })
     }
 
+    pub fn project_db(&self) -> &Arc<LibreDb> {
+        self.project.db()
+    }
+
     /// Refreshes indices only if `commit_seq` changed since last check (`< 1 microsecond` when clean!).
     pub fn refresh_if_needed(&mut self) -> Result<()> {
         if let Some(ref mut g) = self.global {
@@ -57,40 +62,45 @@ impl OverlayBrain {
         Ok(())
     }
 
-    /// Executes a federated, session-deduplicated `pulse` across both Project and Global layers,
-    /// persisting `SessionState` inside the writable `project` database.
+    /// Executes a federated, session-deduplicated `pulse` across both Project and Global layers.
+    ///
+    /// - Candidate scoring and `Zero-Repeat Delta` deduplication run **entirely in RAM (`0` disk reads)**,
+    /// - Only unseen/updated winning `NodeId`s are hydrated via coalesced extent reads,
+    /// - `SessionState` is persisted to disk **only if new nodes were actually delivered**!
     pub fn pulse(&self, req: &PulseRequest) -> Result<PulseResponse> {
         if self.global.is_none() {
             return self.project.pulse(req);
         }
         let global_eng = self.global.as_ref().unwrap();
 
-        // Run stateless candidate gathering on both layers (with `conversation_id = None`),
-        // then apply unified `SessionState` Zero-Repeat Delta filtering & budget packing across the union!
-        let mut raw_req = req.clone();
-        raw_req.conversation_id = None;
-        raw_req.token_budget = req.token_budget.saturating_mul(2).max(1200);
-
-        let proj_raw = self.project.pulse(&raw_req)?;
-        let glob_raw = global_eng.pulse(&raw_req)?;
-
         let mut session = if let Some(ref cid) = req.conversation_id {
             Some(SessionState::load_or_init(self.project.db(), cid, req.epoch)?)
         } else {
             None
         };
+        let mut session_dirty = false;
 
         let mut used_tokens = 0u32;
         let mut saved_by_delta = 0u32;
         let mut stubs = Vec::new();
         let mut fired_reflexes: Vec<FiredReflex> = Vec::new();
 
-        // 1. Merge project + global reflexes (project reflexes first).
-        for (is_global, rf) in proj_raw
-            .fired_reflexes
+        // 1. Evaluate reflexes across both layers in RAM (`0` disk reads).
+        let proj_rf = self.project.evaluate_reflexes(
+            req.workspace_dir.as_deref(),
+            &req.query,
+            req.error_context.as_deref(),
+        );
+        let glob_rf = global_eng.evaluate_reflexes(
+            req.workspace_dir.as_deref(),
+            &req.query,
+            req.error_context.as_deref(),
+        );
+
+        for (is_global, rf) in proj_rf
             .into_iter()
             .map(|r| (false, r))
-            .chain(glob_raw.fired_reflexes.into_iter().map(|r| (true, r)))
+            .chain(glob_rf.into_iter().map(|r| (true, r)))
         {
             let ns_id = if is_global {
                 GLOBAL_LAYER_TAG | rf.node_id
@@ -107,6 +117,7 @@ impl OverlayBrain {
                     continue;
                 }
                 sess.mark_delivered(ns_id, rf.generation);
+                session_dirty = true;
             }
             if used_tokens.saturating_add(rf.token_count) <= req.token_budget {
                 used_tokens += rf.token_count;
@@ -114,78 +125,137 @@ impl OverlayBrain {
             }
         }
 
-        // 2. Merge and rank capsules across both layers (boost local project context slightly by `1.15x`
-        //    so concrete project facts/decisions take priority over generic global docs at equal score).
-        let mut merged_caps: Vec<(bool, DeliveredCapsule)> = Vec::with_capacity(
-            proj_raw.capsules.len() + glob_raw.capsules.len(),
-        );
-        for mut c in proj_raw.capsules {
+        // 2. Score candidates across both layers 100% in RAM (`0` payload disk I/O!).
+        let proj_cands = self.project.score_candidates_in_ram(&req.query);
+        let glob_cands = global_eng.score_candidates_in_ram(&req.query);
+
+        let mut merged: Vec<(bool, ScoredInodeCandidate)> =
+            Vec::with_capacity(proj_cands.len() + glob_cands.len());
+        for mut c in proj_cands {
             c.score *= 1.15;
-            merged_caps.push((false, c));
+            merged.push((false, c));
         }
-        for c in glob_raw.capsules {
-            merged_caps.push((true, c));
+        for c in glob_cands {
+            merged.push((true, c));
         }
-        merged_caps.sort_by(|a, b| {
+        merged.sort_by(|a, b| {
             b.1.score
                 .partial_cmp(&a.1.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.node_id.cmp(&b.1.node_id))
         });
 
-        let peak = merged_caps.first().map_or(0.0, |x| x.1.score);
+        let peak = merged.first().map_or(0.0, |x| x.1.score);
         let floor = (peak * 0.35).max(0.80);
 
-        let mut selected: Vec<DeliveredCapsule> = Vec::new();
-        for (is_global, mut cap) in merged_caps {
-            if cap.score < floor {
+        // 3. Filter via `SessionState` BEFORE hydrating any extents from disk!
+        let mut to_fetch_proj: Vec<ScoredInodeCandidate> = Vec::new();
+        let mut to_fetch_glob: Vec<ScoredInodeCandidate> = Vec::new();
+        // Preserve display rank order `(is_global, local_idx)`
+        let mut order_plan: Vec<(bool, usize)> = Vec::new();
+
+        for (is_global, cand) in merged {
+            if cand.score < floor {
                 continue;
             }
             let ns_id = if is_global {
-                GLOBAL_LAYER_TAG | cap.node_id
+                GLOBAL_LAYER_TAG | cand.node_id
             } else {
-                cap.node_id
+                cand.node_id
             };
             let layer_prefix = if is_global { "global" } else { "proj" };
 
             if let Some(ref mut sess) = session {
-                if sess.is_already_in_context(ns_id, cap.generation) {
+                if sess.is_already_in_context(ns_id, cand.generation) {
                     let stub_tok = 6u32;
-                    if cap.token_count > stub_tok {
-                        sess.record_suppression(cap.token_count, stub_tok);
-                        saved_by_delta += cap.token_count - stub_tok;
+                    if cand.token_count > stub_tok {
+                        sess.record_suppression(cand.token_count, stub_tok);
+                        saved_by_delta += cand.token_count - stub_tok;
                     }
-                    let k_lbl = cap.key.as_deref().unwrap_or("-");
+                    let k_lbl = cand.key.as_deref().unwrap_or("-");
                     stubs.push(format!(
                         "{}#{} {}:{} gen={}",
                         layer_prefix,
-                        cap.node_id,
-                        cap.kind.as_str(),
+                        cand.node_id,
+                        cand.kind.as_str(),
                         k_lbl,
-                        cap.generation
+                        cand.generation
                     ));
                     used_tokens = used_tokens.saturating_add(stub_tok);
                     continue;
                 }
             }
 
-            let tok = cap.token_count.max(1);
+            let tok = cand.token_count.max(1);
             if used_tokens.saturating_add(tok) <= req.token_budget
-                || (selected.is_empty() && fired_reflexes.is_empty() && tok <= req.token_budget)
+                || (order_plan.is_empty() && fired_reflexes.is_empty() && tok <= req.token_budget)
             {
                 used_tokens += tok;
                 if let Some(ref mut sess) = session {
-                    sess.mark_delivered(ns_id, cap.generation);
+                    sess.mark_delivered(ns_id, cand.generation);
+                    session_dirty = true;
                 }
-                cap.key = Some(match cap.key {
-                    Some(k) => format!("{layer_prefix}::{k}"),
-                    None => layer_prefix.to_owned(),
-                });
-                selected.push(cap);
+                if is_global {
+                    let idx = to_fetch_glob.len();
+                    to_fetch_glob.push(cand);
+                    order_plan.push((true, idx));
+                } else {
+                    let idx = to_fetch_proj.len();
+                    to_fetch_proj.push(cand);
+                    order_plan.push((false, idx));
+                }
             }
         }
 
-        if let Some(ref sess) = session {
-            sess.save(self.project.db())?;
+        // 4. Hydrate ONLY unseen winning capsules via coalesced extent reads (`0` reads if all were in context!).
+        let proj_ids: Vec<u64> = to_fetch_proj.iter().map(|c| c.node_id).collect();
+        let glob_ids: Vec<u64> = to_fetch_glob.iter().map(|c| c.node_id).collect();
+
+        let (proj_recs, proj_io) = self.project.db().get_many_coalesced(&proj_ids)?;
+        let (glob_recs, glob_io) = global_eng.db().get_many_coalesced(&glob_ids)?;
+
+        let mut selected = Vec::with_capacity(order_plan.len());
+        for (is_global, idx) in order_plan {
+            if is_global {
+                let cand = &to_fetch_glob[idx];
+                let rec = &glob_recs[idx];
+                let key = Some(match &cand.key {
+                    Some(k) => format!("global::{k}"),
+                    None => "global".to_owned(),
+                });
+                selected.push(DeliveredCapsule {
+                    node_id: rec.node_id,
+                    kind: rec.kind,
+                    key,
+                    generation: rec.generation,
+                    token_count: rec.token_count,
+                    score: cand.score,
+                    content: String::from_utf8_lossy(&rec.payload).into_owned(),
+                });
+            } else {
+                let cand = &to_fetch_proj[idx];
+                let rec = &proj_recs[idx];
+                let key = Some(match &cand.key {
+                    Some(k) => format!("proj::{k}"),
+                    None => "proj".to_owned(),
+                });
+                selected.push(DeliveredCapsule {
+                    node_id: rec.node_id,
+                    kind: rec.kind,
+                    key,
+                    generation: rec.generation,
+                    token_count: rec.token_count,
+                    score: cand.score,
+                    content: String::from_utf8_lossy(&rec.payload).into_owned(),
+                });
+            }
+        }
+
+        // Only write `SessionState` to disk if `delivered_generations` actually gained a new item!
+        if session_dirty {
+            if let Some(ref sess) = session {
+                sess.save(self.project.db())?;
+            }
         }
 
         Ok(PulseResponse {
@@ -194,7 +264,7 @@ impl OverlayBrain {
             already_in_context_stubs: stubs,
             tokens_emitted: used_tokens,
             tokens_saved_by_delta: saved_by_delta,
-            coalesced_io_reads: proj_raw.coalesced_io_reads + glob_raw.coalesced_io_reads,
+            coalesced_io_reads: proj_io + glob_io,
         })
     }
 }

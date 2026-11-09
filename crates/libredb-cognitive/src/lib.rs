@@ -2,7 +2,7 @@
 //!
 //! Orchestrates:
 //! 1. `ReflexEngine` (proactive situational pitfall triggers),
-//! 2. `HybridIndex` (stemmed BM25 + 3-gram subwords + bilingual concept bridges),
+//! 2. `HybridIndex` (language-agnostic BM25 + IDF-weighted Unicode 3-grams + Hebbian concept bridges),
 //! 3. `Inode` Spreading Activation (associative 2-hop graph expansion in RAM),
 //! 4. `SessionState` (`Zero-Repeat Delta` per `(conversation_id, epoch)` eliminating duplicate output),
 //! 5. `FileSkeleton` (`95-99%` hash-cached code contract compression).
@@ -121,6 +121,17 @@ impl PulseResponse {
     }
 }
 
+/// Lightweight RAM-only scored candidate produced before touching any payload extents on disk.
+#[derive(Debug, Clone)]
+pub struct ScoredInodeCandidate {
+    pub node_id: u64,
+    pub kind: NodeKind,
+    pub key: Option<String>,
+    pub generation: u32,
+    pub token_count: u32,
+    pub score: f64,
+}
+
 /// High-level cognitive facade over `LibreDb`, `HybridIndex`, and `ReflexEngine`.
 pub struct CognitiveEngine {
     db: Arc<LibreDb>,
@@ -155,61 +166,20 @@ impl CognitiveEngine {
         self.index.save_snapshot(&self.db)
     }
 
-    /// Learns a persistent cross-lingual or conceptual Hebbian association between `cue_phrase`
-    /// (in any human language or domain vocabulary) and `target_node_ids`.
-    pub fn reinforce_association(
-        &mut self,
-        cue_phrase: &str,
-        target_node_ids: &[u64],
-    ) -> Result<usize> {
-        self.index
-            .reinforce_association(&self.db, cue_phrase, target_node_ids)
+    /// Evaluates learned situational reflexes in RAM (`0` disk I/O).
+    pub fn evaluate_reflexes(
+        &self,
+        workspace_dir: Option<&std::path::Path>,
+        query: &str,
+        error_context: Option<&str>,
+    ) -> Vec<FiredReflex> {
+        self.reflexes.evaluate(workspace_dir, query, error_context)
     }
 
-    /// Executes a one-shot associative `pulse`:
-    /// 1. Fires matching `ReflexEngine` pitfalls,
-    /// 2. Seeds initial candidates via `HybridIndex` (`BM25 + 3-grams + concept bridges`),
-    /// 3. Propagates 2-hop spreading activation across `Inode` synapses in RAM (`0` disk I/O),
-    /// 4. Applies `SessionState` Zero-Repeat Delta filtering (`conversation_id` + `epoch`),
-    /// 5. Packs unseen/updated winners strictly within `token_budget` and fetches via coalesced I/O.
-    pub fn pulse(&self, req: &PulseRequest) -> Result<PulseResponse> {
-        let mut used_tokens = 0u32;
-        let mut saved_by_delta = 0u32;
-        let mut stubs = Vec::new();
-
-        let mut session = if let Some(ref cid) = req.conversation_id {
-            Some(SessionState::load_or_init(&self.db, cid, req.epoch)?)
-        } else {
-            None
-        };
-
-        // 1. Evaluate situational Reflexes first (highest-ROI mistake prevention!).
-        let raw_reflexes = self.reflexes.evaluate(
-            req.workspace_dir.as_deref(),
-            &req.query,
-            req.error_context.as_deref(),
-        );
-        let mut fired_reflexes = Vec::new();
-        for rf in raw_reflexes {
-            let tracking_id = rf.node_id;
-            if let Some(ref mut sess) = session {
-                if sess.is_already_in_context(tracking_id, rf.generation) {
-                    let stub_tok = 5u32;
-                    sess.record_suppression(rf.token_count, stub_tok);
-                    saved_by_delta += rf.token_count.saturating_sub(stub_tok);
-                    used_tokens = used_tokens.saturating_add(stub_tok);
-                    stubs.push(format!("reflex:{} unchanged", rf.id));
-                    continue;
-                }
-                sess.mark_delivered(tracking_id, rf.generation);
-            }
-            if used_tokens.saturating_add(rf.token_count) <= req.token_budget {
-                used_tokens += rf.token_count;
-                fired_reflexes.push(rf);
-            }
-        }
-
-        // 2. Hybrid lexical + concept-bridge + trigram seed search (exclude internal cursors/quotas).
+    /// Computes ranked `Inode` candidates via `HybridIndex` + 2-hop synapse spreading activation
+    /// **100% in RAM (`0` payload disk reads!)** so `SessionState` (`Zero-Repeat Delta`) can filter
+    /// already-delivered items before touching a single payload byte on disk!
+    pub fn score_candidates_in_ram(&self, query: &str) -> Vec<ScoredInodeCandidate> {
         let searchable_kinds = [
             NodeKind::Rule,
             NodeKind::Skill,
@@ -222,15 +192,23 @@ impl CognitiveEngine {
             NodeKind::Snapshot,
             NodeKind::Handoff,
         ];
-        let lexical_hits = self.index.search(&req.query, Some(&searchable_kinds), 24);
+        let lexical_hits = self.index.search(query, Some(&searchable_kinds), 24);
+        if lexical_hits.is_empty() {
+            return Vec::new();
+        }
 
-        // 3. Spreading activation over in-memory Inode headers (`0` payload reads!).
         let inode_list = self.db.list_inodes(None, false);
-        let inode_map: HashMap<u64, (libredb_core::Inode, Option<String>, Vec<libredb_core::Synapse>)> =
-            inode_list
-                .into_iter()
-                .map(|(ino, k, syns)| (ino.node_id, (ino, k, syns)))
-                .collect();
+        let inode_map: HashMap<
+            u64,
+            (
+                libredb_core::Inode,
+                Option<String>,
+                Vec<libredb_core::Synapse>,
+            ),
+        > = inode_list
+            .into_iter()
+            .map(|(ino, k, syns)| (ino.node_id, (ino, k, syns)))
+            .collect();
 
         let mut energy_map: HashMap<u64, f64> = HashMap::new();
         let mut queue: VecDeque<(u64, usize, f64)> = VecDeque::new();
@@ -267,74 +245,154 @@ impl CognitiveEngine {
             }
         }
 
-        let mut ranked: Vec<(u64, f64)> = energy_map.into_iter().collect();
-        ranked.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
+        let mut out: Vec<ScoredInodeCandidate> = energy_map
+            .into_iter()
+            .filter_map(|(nid, score)| {
+                let (ino, key_opt, _) = inode_map.get(&nid)?;
+                if ino.flags.contains(NodeFlags::TOMBSTONE)
+                    || ino.flags.contains(NodeFlags::SUPERSEDED)
+                {
+                    return None;
+                }
+                Some(ScoredInodeCandidate {
+                    node_id: nid,
+                    kind: ino.kind,
+                    key: key_opt.clone(),
+                    generation: ino.generation,
+                    token_count: ino.token_count.max(1),
+                    score,
+                })
+            })
+            .collect();
+
+        out.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| a.node_id.cmp(&b.node_id))
         });
 
-        // Suppress low-relevance tail filler: only consider candidates scoring >= 35% of peak score!
-        let peak_score = ranked.first().map_or(0.0, |x| x.1);
+        let peak_score = out.first().map_or(0.0, |x| x.score);
         let relevance_floor = (peak_score * 0.35).max(0.80);
-        ranked.retain(|&(_, sc)| sc >= relevance_floor);
+        out.retain(|c| c.score >= relevance_floor);
+        out
+    }
 
-        // 4. Session Zero-Repeat Delta filtering + token-budget knapsack packing!
-        let mut to_hydrate: Vec<(u64, f64)> = Vec::new();
-        for (nid, score) in ranked {
-            let Some((ino, key_opt, _)) = inode_map.get(&nid) else {
-                continue;
-            };
-            if ino.flags.contains(NodeFlags::TOMBSTONE) || ino.flags.contains(NodeFlags::SUPERSEDED) {
-                continue;
-            }
+    /// Learns a persistent cross-lingual or conceptual Hebbian association between `cue_phrase`
+    /// (in any human language or domain vocabulary) and `target_node_ids`.
+    pub fn reinforce_association(
+        &mut self,
+        cue_phrase: &str,
+        target_node_ids: &[u64],
+    ) -> Result<usize> {
+        self.index
+            .reinforce_association(&self.db, cue_phrase, target_node_ids)
+    }
 
+    /// Executes a one-shot associative `pulse`:
+    /// 1. Fires matching `ReflexEngine` pitfalls,
+    /// 2. Scores `Inode` candidates via `HybridIndex` + 2-hop spreading activation in RAM (`0` disk I/O),
+    /// 3. Applies `SessionState` Zero-Repeat Delta filtering (`conversation_id` + `epoch`),
+    /// 4. Packs unseen/updated winners strictly within `token_budget` and fetches via coalesced I/O.
+    pub fn pulse(&self, req: &PulseRequest) -> Result<PulseResponse> {
+        let mut used_tokens = 0u32;
+        let mut saved_by_delta = 0u32;
+        let mut stubs = Vec::new();
+
+        let mut session = if let Some(ref cid) = req.conversation_id {
+            Some(SessionState::load_or_init(&self.db, cid, req.epoch)?)
+        } else {
+            None
+        };
+        let mut session_dirty = false;
+
+        // 1. Evaluate situational Reflexes first (highest-ROI mistake prevention!).
+        let raw_reflexes = self.reflexes.evaluate(
+            req.workspace_dir.as_deref(),
+            &req.query,
+            req.error_context.as_deref(),
+        );
+        let mut fired_reflexes = Vec::new();
+        for rf in raw_reflexes {
+            let tracking_id = rf.node_id;
             if let Some(ref mut sess) = session {
-                if sess.is_already_in_context(nid, ino.generation) {
+                if sess.is_already_in_context(tracking_id, rf.generation) {
+                    let stub_tok = 5u32;
+                    sess.record_suppression(rf.token_count, stub_tok);
+                    saved_by_delta += rf.token_count.saturating_sub(stub_tok);
+                    used_tokens = used_tokens.saturating_add(stub_tok);
+                    stubs.push(format!("reflex:{} unchanged", rf.id));
+                    continue;
+                }
+                sess.mark_delivered(tracking_id, rf.generation);
+                session_dirty = true;
+            }
+            if used_tokens.saturating_add(rf.token_count) <= req.token_budget {
+                used_tokens += rf.token_count;
+                fired_reflexes.push(rf);
+            }
+        }
+
+        // 2. Score candidates 100% in RAM (`0` payload disk reads!).
+        let ranked = self.score_candidates_in_ram(&req.query);
+
+        // 3. Session Zero-Repeat Delta filtering + token-budget knapsack packing!
+        let mut to_hydrate: Vec<ScoredInodeCandidate> = Vec::new();
+        for cand in ranked {
+            if let Some(ref mut sess) = session {
+                if sess.is_already_in_context(cand.node_id, cand.generation) {
                     let stub_tok = 6u32;
-                    if ino.token_count > stub_tok {
-                        sess.record_suppression(ino.token_count, stub_tok);
-                        saved_by_delta += ino.token_count - stub_tok;
+                    if cand.token_count > stub_tok {
+                        sess.record_suppression(cand.token_count, stub_tok);
+                        saved_by_delta += cand.token_count - stub_tok;
                     }
-                    let k_short = key_opt.as_deref().unwrap_or("-");
-                    stubs.push(format!("#{} {}:{} gen={}", nid, ino.kind.as_str(), k_short, ino.generation));
+                    let k_short = cand.key.as_deref().unwrap_or("-");
+                    stubs.push(format!(
+                        "#{} {}:{} gen={}",
+                        cand.node_id,
+                        cand.kind.as_str(),
+                        k_short,
+                        cand.generation
+                    ));
                     used_tokens = used_tokens.saturating_add(stub_tok);
                     continue;
                 }
             }
 
-            let tok = ino.token_count.max(1);
+            let tok = cand.token_count.max(1);
             if used_tokens.saturating_add(tok) <= req.token_budget
                 || (to_hydrate.is_empty() && fired_reflexes.is_empty() && tok <= req.token_budget)
             {
                 used_tokens += tok;
-                to_hydrate.push((nid, score));
                 if let Some(ref mut sess) = session {
-                    sess.mark_delivered(nid, ino.generation);
+                    sess.mark_delivered(cand.node_id, cand.generation);
+                    session_dirty = true;
                 }
+                to_hydrate.push(cand);
             }
         }
 
-        // 5. Hydrate ONLY the unseen/updated winning capsules in one coalesced extent read!
-        let hydrate_ids: Vec<u64> = to_hydrate.iter().map(|&(id, _)| id).collect();
+        // 4. Hydrate ONLY the unseen/updated winning capsules in one coalesced extent read!
+        let hydrate_ids: Vec<u64> = to_hydrate.iter().map(|c| c.node_id).collect();
         let (records, io_reads) = self.db.get_many_coalesced(&hydrate_ids)?;
 
         let mut capsules = Vec::with_capacity(records.len());
-        for (rec, (_, score)) in records.into_iter().zip(to_hydrate.into_iter()) {
-            let key = inode_map.get(&rec.node_id).and_then(|(_, k, _)| k.clone());
+        for (rec, cand) in records.into_iter().zip(to_hydrate.into_iter()) {
             capsules.push(DeliveredCapsule {
                 node_id: rec.node_id,
                 kind: rec.kind,
-                key,
+                key: cand.key,
                 generation: rec.generation,
                 token_count: rec.token_count,
-                score,
+                score: cand.score,
                 content: String::from_utf8_lossy(&rec.payload).into_owned(),
             });
         }
 
-        if let Some(ref sess) = session {
-            sess.save(&self.db)?;
+        if session_dirty {
+            if let Some(ref sess) = session {
+                sess.save(&self.db)?;
+            }
         }
 
         Ok(PulseResponse {

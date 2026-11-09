@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-11-09
+
+### Added
+
+- Multi-workspace dynamic `MCP` stdio server (`McpServerState` in `libredb-cli::mcp`) resolving `<workspace>/.agents/memory.ldb` automatically from `cwd` / `target` and caching hot `OverlayBrain` instances per workspace in RAM.
+- Consolidated 3-tool `MCP` surface (`libredb_pulse`, `libredb_code`, `libredb_memorize`) reducing per-turn system-prompt tool-schema token overhead by `78%` while retaining legacy tool-name dispatch compatibility.
+- Automatic Antigravity `transcript.jsonl` path resolution from `cid` inside `libredb_pulse` for hands-free `/compact` epoch synchronization.
+- Automated local deployment script (`scripts/deploy_plugin.ps1`) installing standalone `libredb.exe`, `libredb.pyd`, pre-indexed `customizations.ldb`, and the toggleable Antigravity plugin (`~/.gemini/config/plugins/libredb/`) without modifying `AntiGraviton`.
+
+### Changed
+
+- Refactored `OverlayBrain::pulse` and `CognitiveEngine::score_candidates_in_ram` to perform `BM25`, synapse spreading activation, and `SessionState` (`Zero-Repeat Delta`) deduplication `100%` in RAM before touching disk extents - reducing Turn 2+ deduplicated payload disk reads from `14` down to `0` (`sub-millisecond` warm latency).
+
 ## [0.3.0] - 2026-11-09
 
 ### Added

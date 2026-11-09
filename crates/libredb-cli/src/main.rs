@@ -32,7 +32,7 @@ Antigravity Cognitive & Code-Graph Commands:
   libredb handoff <db.ldb> <handoff_id> <task_key> <role> [--notes <text>]
   libredb learn-assoc <db.ldb> <cue_phrase> <target_id_1,target_id_2>
   libredb learn-reflex <db.ldb> <id> <directive> [--stack <s1,s2>] [--action <a1,a2>] [--env <e1,e2>]
-  libredb mcp-serve <project.ldb> [--global <customizations.ldb>]
+  libredb mcp-serve [<default_project.ldb>] [--global <customizations.ldb>]
 
 Lossless 1:1 SQLite Bridge Commands:
   libredb import-sqlite <db.ldb> <source.db> [--scope central|project]
@@ -72,14 +72,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     match args[0].as_str() {
         "mcp-serve" => {
-            if args.len() < 2 {
-                return Err("Usage: libredb mcp-serve <project.ldb> [--global <customizations.ldb>]".into());
-            }
+            let mut proj_path: Option<PathBuf> = None;
             let mut global_path: Option<PathBuf> = None;
-            if args.len() >= 4 && args[2] == "--global" {
-                global_path = Some(PathBuf::from(&args[3]));
+            let mut i = 1usize;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--global" if i + 1 < args.len() => {
+                        global_path = Some(PathBuf::from(&args[i + 1]));
+                        i += 2;
+                    }
+                    "--project" if i + 1 < args.len() => {
+                        proj_path = Some(PathBuf::from(&args[i + 1]));
+                        i += 2;
+                    }
+                    positional if !positional.starts_with("--") && proj_path.is_none() => {
+                        proj_path = Some(PathBuf::from(positional));
+                        i += 1;
+                    }
+                    other => return Err(format!("Unknown mcp-serve argument '{other}'").into()),
+                }
             }
-            mcp::run_mcp_stdio_server(Path::new(&args[1]), global_path.as_deref())?;
+            mcp::run_mcp_stdio_server(proj_path.as_deref(), global_path.as_deref())?;
         }
         "pulse" => {
             if args.len() < 3 {
