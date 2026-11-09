@@ -1,0 +1,20 @@
+[package]
+name = "libredb-py"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Native PyO3 abi3 Python bindings for LibreDB (Python 3.12 - 3.14+)"
+
+[lib]
+name = "libredb_py"
+crate-type = ["cdylib"]
+
+[dependencies]
+libredb-bridge = { path = "../libredb-bridge" }
+libredb-cognitive = { path = "../libredb-cognitive" }
+libredb-core = { path = "../libredb-core" }
+parking_lot.workspace = true
+pyo3 = { version = "0.24", features = ["extension-module", "abi3-py312"] }
+serde_json.workspace = true

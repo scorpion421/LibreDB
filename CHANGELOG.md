@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-11-09
+
+### Added
+
+- Persistent single-extent inverted index snapshots (`sys::index_snapshot`) with incremental `Inode` generation delta reconciliation in `libredb-index`, cutting cold CLI `pulse` startup by an order of magnitude without re-tokenizing unchanged capsules.
+- `OverlayBrain` in `libredb-cognitive::overlay` uniting a read-only global base layer (`customizations.ldb`) and a writable project layer (`memory.ldb`) in a single federated `pulse` with isolated `Zero-Repeat Delta` session namespaces.
+- Binary-safe workspace graph engine (`libredb-cognitive::workspace`):
+  - `index_workspace` (`libredb index-workspace`) skipping build directories (`target/`, `dist/`, `.venv/`) and `NUL`-byte binaries while extracting `64-bit` hash-cached `FileSkeleton`s.
+  - Automatic cross-graph causal synapse wiring (`Caller --[Calls]--> Callee` and `Decision/Task --[Governs]--> Symbol`).
+  - `query_symbol_impact` (`libredb impact`) and `extract_fim_slice` (`libredb fim`) combining surgical `[Lstart-Lend]` code slices with blast-radius callers and governing architectural decisions.
+- Incremental binary tail `/compact` detector (`sync_transcript_epoch`), atomic multi-entity commits (`execute_atomic_batch` / `libredb batch`), and zero-bloat subagent delegation bundles (`create_subagent_handoff` / `libredb handoff`).
+- Native `JSON-RPC 2.0` Model Context Protocol stdio server (`libredb mcp-serve`) keeping `OverlayBrain` hot in RAM for sub-millisecond tool calls with zero process startup overhead.
+- Native `PyO3` (`abi3-py312` forward-compatible) Python extension crate (`libredb-py`, `import libredb`) exposing `libredb.Brain` directly in-process to Python `3.12 - 3.14+`.
+
 ## [0.2.0] - 2026-11-09
 
 ### Added

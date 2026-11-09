@@ -1,11 +1,11 @@
 # LibreDB
 
-[![Version](https://img.shields.io/badge/version-0.2.0-blue.svg)](CHANGELOG.md)
-[![Tests](https://img.shields.io/badge/tests-passing%20(10k%20crash%20%2B%2019--table%20bijection)-brightgreen.svg)](crates/libredb-bridge/tests/)
-[![Tech Stack](https://img.shields.io/badge/rust-1.99%2B%20%7C%20LIBREDB1-orange.svg)](Cargo.toml)
+[![Version](https://img.shields.io/badge/version-0.3.0-blue.svg)](CHANGELOG.md)
+[![Tests](https://img.shields.io/badge/tests-passing%20(17%20suites%20%2B%2010k%20crash%20sims)-brightgreen.svg)](crates/libredb-bridge/tests/)
+[![Tech Stack](https://img.shields.io/badge/rust-1.99%2B%20%7C%20PyO3%20abi3%20%7C%20MCP-orange.svg)](Cargo.toml)
 [![License](https://img.shields.io/badge/license-AGPLv3%20%2B%20Commons%20Clause-purple.svg)](LICENSE)
 
-`LibreDB` is a local-first, zero-configuration, single-file cognitive memory and token-conservation engine (`*.ldb`) written in Rust for `LLMs`. It pairs a crash-proof single-file `Inode`-extent kernel with session-aware `Zero-Repeat Delta` deduplication, hash-cached code contract skeletons, data-learned situational `Reflex` triggers, language-agnostic Hebbian concept learning, and a 100% lossless bidirectional `SQLite` bridge.
+`LibreDB` is a local-first, zero-configuration, single-file cognitive database and workspace memory engine (`*.ldb`) built in Rust specifically for `Antigravity` and `LLMs`. It unifies dual-layer global/project overlay memory, session-aware `Zero-Repeat Delta` token conservation, language-agnostic Hebbian concept learning, causal code-graph impact & surgical `FIM` slicing, native `MCP` stdio serving, in-process `PyO3` Python bindings, and a 100% lossless bidirectional `SQLite` bridge.
 
 ## Table of contents
 
@@ -17,25 +17,26 @@
 
 ## Executive summary and impact
 
-Traditional `LLM` memory layers waste tens of thousands of prompt tokens per session by re-emitting identical context across turns, reading entire multi-thousand-line code files to inspect signatures, relying on hardcoded mono/bilingual synonym lists, and failing to surface situational tooling pitfalls before execution. `LibreDB v0.2.0` addresses every one of those token drains directly inside a single self-contained `.ldb` file.
-
-| Capability | Legacy `SQLite` + `FTS5` workflow | `LibreDB v0.2.0` cognitive engine |
+| Dimension | Legacy Python + `SQLite` (`SkillsDB`) | `LibreDB v0.3.0` (`Rust` + `PyO3` + `MCP`) |
 | :--- | :--- | :--- |
-| **Multi-turn context repetition** | Re-emits identical rules/skills/facts on repeated queries | **`Zero-Repeat Delta` (`SessionState`)** suppresses seen generations (`>80%` saved) |
-| **Large source file inspection** | Full/sliced `read_file` (`10,000-30,000` tokens) | **`FileSkeleton` (`64-bit` hash cache)** delivers `[Lstart-Lend]` contracts (`-95%+` tokens) |
-| **Multilingual & domain recall** | Hardcoded stopword & synonym tables | **Zero hardcoded languages:** `IDF` Unicode `n-grams` + persistent **Hebbian learning** |
-| **Operational mistake prevention** | Passive lookup only after hitting an error | **Data-learned `ReflexEngine`** fires `20-token` warnings proactively on context match |
-| **Migration & rollback safety** | Locked into `19` relational + `5` `FTS5` tables | **Lossless `SQLite <-> LibreDB` bijection** verified cell-for-cell |
+| **Invocation & index startup** | `300-1500 ms` shell/Python startup + SQLite queries | **`< 0.5 ms` via `mcp-serve` / `PyO3`** (`< 15 ms` cold CLI via `sys::index_snapshot`) |
+| **Multi-turn context bloat** | Re-emits identical rules, skills & facts on repeated calls | **`Zero-Repeat Delta` + auto `transcript.jsonl` `/compact` epoch sync** |
+| **Source inspection & edits** | Full `read_file` scans + separate `symbol_index` / `decisions` | **Unified `fim` & `impact`** joining `[Lstart-Lend]` code, callers & governing decisions |
+| **Language & concept recall** | Hardcoded stopword & bilingual synonym dictionaries | **100% language-agnostic `IDF` Unicode `n-grams` + persistent Hebbian learning** |
+| **Global + project memory** | Disconnected `customizations.db` and `.agents/memory.db` files | **`OverlayBrain`** federating global and project `.ldb` layers in one call |
+| **Migration & rollback safety** | Tied to `19` relational + `5` `FTS5` tables | **`223 ms` lossless cell-by-cell `SQLite <-> LibreDB` round-trip bijection** |
 
 ## Installation and quickstart
 
 ### Prerequisites
 
 - **Rust toolchain:** `1.85+` (`x86_64-pc-windows-msvc` or POSIX target)
+- **Optional Python integration:** `Python 3.12+` (tested on `Python 3.14.5` via Stable ABI `abi3`)
 
-### Build and test
+### Build and verify
 
 ```powershell
+$env:PYO3_USE_ABI3_FORWARD_COMPATIBILITY = "1"
 cargo test --release
 cargo build --release
 ```
@@ -43,49 +44,53 @@ cargo build --release
 ### Quickstart example
 
 ```powershell
-# 1. Verify 100% lossless round-trip on a read-only copy of an existing SQLite DB
-.\target\release\libredb.exe verify-roundtrip ~/.gemini/database/customizations.db --scope central
+# 1. Import global SQLite customizations into a pre-indexed global .ldb layer
+.\target\release\libredb.exe import-sqlite global.ldb ~/.gemini/database/customizations.db --scope central
 
-# 2. Import SQLite knowledge (read-only) into a single cognitive .ldb file
-.\target\release\libredb.exe import-sqlite brain.ldb ~/.gemini/database/customizations.db --scope central
+# 2. Index a code workspace and commit an architectural decision (auto-wires Governs -> Symbols!)
+.\target\release\libredb.exe batch project.ldb --decision "Superblock Safety::recover_existing verifies CRC32 on both slots"
+.\target\release\libredb.exe index-workspace project.ldb .
 
-# 3. Extract a 95%+ compressed, hash-cached code contract skeleton
-.\target\release\libredb.exe skeleton brain.ldb crates/libredb-core/src/engine.rs
+# 3. Inspect surgical FIM edit slice + blast-radius callers + governing decisions in one call
+.\target\release\libredb.exe fim project.ldb crates/libredb-core/src/engine.rs --symbol recover_existing
 
-# 4. Run a session-deduplicated, token-budgeted cognitive pulse (Turn 1 vs Turn 2 delta!)
-.\target\release\libredb.exe pulse brain.ldb "gitea release" --cid session-42 --epoch 1 --budget 600
-.\target\release\libredb.exe pulse brain.ldb "gitea release" --cid session-42 --epoch 1 --budget 600
+# 4. Run dual-layer OverlayBrain pulse (or launch persistent zero-latency MCP stdio server)
+.\target\release\libredb.exe pulse project.ldb "gitea release" --global global.ldb --cid conv-1 --budget 600
+.\target\release\libredb.exe mcp-serve project.ldb --global global.ldb
 ```
 
 ## Usage and commands
 
-| Command | Description |
+| Command / interface | Description |
 | :--- | :--- |
-| `libredb pulse <db.ldb> <query> [--cid <id>] [--epoch <n>] [--budget <t>]` | One-shot recall with `Reflex` triggers, spreading activation, and `Zero-Repeat Delta` |
-| `libredb skeleton <db.ldb> <source_file> [--filter <s>]` | Extracts/caches compressed `[Lstart-Lend]` symbol contracts and section spans |
-| `libredb learn-assoc <db.ldb> <cue_phrase> <id1,id2>` | Teaches a language-agnostic Hebbian concept bridge from any script/phrasing to target nodes |
-| `libredb learn-reflex <db.ldb> <id> <directive> [--stack <s>] [--action <a>]` | Persists a data-driven situational pitfall warning triggered by workspace/action context |
-| `libredb import-sqlite <db.ldb> <source.db> [--scope central\|project]` | Imports all `SkillsDB` SQLite tables read-only into cognitive capsules + lossless mirror |
-| `libredb export-sqlite <db.ldb> <out.db> [--scope central\|project]` | Reconstructs an exact SQLite database including indexes and rebuilt `FTS5` virtual tables |
-| `libredb verify-roundtrip <source.db> [--scope central\|project]` | Proves `100%` cell-by-cell `SQLite -> LibreDB -> SQLite` equivalence in `%TEMP%` |
-| `libredb put / get / get-key / link / deprecate / trace / recall` | Direct `O(1)` `Inode`, temporal `Supersedes`, and synapse graph operations |
-| `libredb compact / stats / verify / bench` | Crash-safe `64 KB` Gravity compaction, `CRC32` scrub, and `16`-thread benchmark |
+| `libredb pulse <proj.ldb> <q> [--global <g.ldb>] [--cid <c>] [--transcript <t>]` | Dual-layer associative recall with auto `/compact` epoch detection & `Zero-Repeat Delta` |
+| `libredb index-workspace <db.ldb> <dir> [--force]` | Binary-safe incremental workspace scanner wiring `Calls` and `Decision -> Symbol` synapses |
+| `libredb impact <db.ldb> <symbol>` | Returns symbol signature, blast-radius callers, callees, and governing `Decisions` |
+| `libredb fim <db.ldb> <file> [--symbol <s> \| --line <n>]` | Extracts minimal edit window enriched with blast-radius callers and governing invariants |
+| `libredb skeleton <db.ldb> <file> [--filter <s>]` | Extracts/serves `64-bit` hash-cached `[Lstart-Lend]` symbol contracts (`-92%+` tokens) |
+| `libredb batch <db.ldb> [--fact k=v] [--decision T::B] [--task k::t::s::p]` | Single-`fsync` atomic episodic commit with automatic `Decision -> Symbol` wiring |
+| `libredb handoff <db.ldb> <id> <task_key> <role> [--notes <n>]` | Generates deterministic, zero-bloat subagent delegation blocks |
+| `libredb learn-assoc` / `libredb learn-reflex` | Persists language-agnostic Hebbian concept bridges and situational pitfall reflexes |
+| `libredb mcp-serve <proj.ldb> [--global <g.ldb>]` | Runs a persistent `JSON-RPC 2.0` `MCP` server over `stdio` (`< 0.5 ms` per tool call) |
+| `import libredb` (`PyO3` `libredb.Brain`) | Native in-process Python `abi3` extension exposing all cognitive & bridge methods |
+| `libredb import-sqlite` / `export-sqlite` / `verify-roundtrip` | Lossless `19`-table + `5`-`FTS5` `SQLite <-> LibreDB` migration and parity verification |
 
 ## Architecture and project structure
 
 ```text
 LibreDB/
-|-- Cargo.toml                                     # Rust workspace (5 modular crates)
-|-- VERSION                                        # Semantic Version (0.2.0)
+|-- Cargo.toml                                     # Rust workspace (6 modular crates)
+|-- VERSION                                        # Semantic Version (0.3.0)
 |-- CHANGELOG.md                                   # Keep a Changelog 1.1.0 release history
 |-- LICENSE                                        # AGPLv3 + Commons Clause license
 |-- README.md                                      # 9-block standardized documentation
 |-- crates/
     |-- libredb-core/                              # Frozen single-file LIBREDB1 storage kernel (Inodes, Extents, MVCC)
-    |-- libredb-index/                             # Language-agnostic BM25, Unicode n-grams & Hebbian concept learner
-    |-- libredb-cognitive/                         # Session Zero-Repeat Delta, ReflexEngine, FileSkeleton & Pulse
+    |-- libredb-index/                             # Language-agnostic IDF n-grams, Hebbian learner & persistent index snapshot
+    |-- libredb-cognitive/                         # OverlayBrain, Session Delta, Reflexes, WorkspaceGraph, FIM & Transcript Epoch
     |-- libredb-bridge/                            # Lossless 19-table SQLite <-> LibreDB migrator & parity verifier
-    |-- libredb-cli/                               # Standalone CLI & benchmark runner (`libredb`)
+    |-- libredb-cli/                               # Standalone CLI & native JSON-RPC 2.0 MCP stdio server
+    |-- libredb-py/                                # Native PyO3 abi3 Python extension (`libredb.pyd` / `.so`)
 ```
 
 ## Versioning and license

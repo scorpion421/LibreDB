@@ -1,11 +1,14 @@
-//! Command-line interface for `LibreDB v0.2.0`: cognitive `pulse`, `skeleton`, `reflex`,
-//! lossless `SQLite` migration/verification, and storage diagnostics.
+//! Command-line interface and native MCP server for `LibreDB v0.3.0`.
+
+mod mcp;
 
 use libredb_bridge::{
     export_sqlite_database, import_sqlite_readonly, verify_sqlite_equivalence,
 };
 use libredb_cognitive::{
-    CognitiveEngine, FileSkeleton, PulseRequest, ReflexEngine, ReflexRule,
+    create_subagent_handoff, execute_atomic_batch, extract_fim_slice, index_workspace,
+    query_symbol_impact, sync_transcript_epoch, AtomicBatchSpec, CognitiveEngine, FileSkeleton,
+    OverlayBrain, PulseRequest, ReflexEngine, ReflexRule,
 };
 use libredb_core::{EdgeKind, LibreDb, NodeKind, WriteRequest};
 use std::env;
@@ -17,13 +20,19 @@ use std::time::Instant;
 
 fn print_usage() {
     println!(
-        "LibreDB v{} - Cognitive LLM memory & token-conservation engine
+        "LibreDB v{} - Tailored cognitive memory, workspace graph & MCP engine for Antigravity
 
-Cognitive & Token-Conservation Commands:
-  libredb pulse <db.ldb> <query> [--cid <conv_id>] [--epoch <n>] [--budget <tok>] [--cwd <dir>] [--err <msg>]
+Antigravity Cognitive & Code-Graph Commands:
+  libredb pulse <db.ldb> <query> [--global <g.ldb>] [--cid <id>] [--transcript <t.jsonl>] [--epoch <n>] [--budget <tok>] [--cwd <dir>] [--err <msg>]
+  libredb index-workspace <db.ldb> <workspace_dir> [--force]
   libredb skeleton <db.ldb> <source_file> [--filter <substr>]
+  libredb impact <db.ldb> <symbol_query>
+  libredb fim <db.ldb> <source_file> [--symbol <name> | --line <n>] [--pad <lines>]
+  libredb batch <db.ldb> [--fact k=v]... [--decision Title::Body]... [--task key::title::status::prio]... [--snapshot <summary>]
+  libredb handoff <db.ldb> <handoff_id> <task_key> <role> [--notes <text>]
   libredb learn-assoc <db.ldb> <cue_phrase> <target_id_1,target_id_2>
   libredb learn-reflex <db.ldb> <id> <directive> [--stack <s1,s2>] [--action <a1,a2>] [--env <e1,e2>]
+  libredb mcp-serve <project.ldb> [--global <customizations.ldb>]
 
 Lossless 1:1 SQLite Bridge Commands:
   libredb import-sqlite <db.ldb> <source.db> [--scope central|project]
@@ -62,18 +71,39 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     match args[0].as_str() {
+        "mcp-serve" => {
+            if args.len() < 2 {
+                return Err("Usage: libredb mcp-serve <project.ldb> [--global <customizations.ldb>]".into());
+            }
+            let mut global_path: Option<PathBuf> = None;
+            if args.len() >= 4 && args[2] == "--global" {
+                global_path = Some(PathBuf::from(&args[3]));
+            }
+            mcp::run_mcp_stdio_server(Path::new(&args[1]), global_path.as_deref())?;
+        }
         "pulse" => {
             if args.len() < 3 {
                 return Err(
-                    "Usage: libredb pulse <db.ldb> <query> [--cid <id>] [--epoch <n>] [--budget <tok>] [--cwd <dir>] [--err <msg>]".into(),
+                    "Usage: libredb pulse <db.ldb> <query> [--global <g.ldb>] [--cid <id>] [--transcript <t.jsonl>] [--epoch <n>] [--budget <tok>] [--cwd <dir>] [--err <msg>]".into(),
                 );
             }
             let mut req = PulseRequest::new(&args[2], 800);
+            let mut global_path: Option<PathBuf> = None;
+            let mut transcript_path: Option<PathBuf> = None;
+
             let mut i = 3usize;
             while i + 1 < args.len() {
                 match args[i].as_str() {
+                    "--global" => {
+                        global_path = Some(PathBuf::from(&args[i + 1]));
+                        i += 2;
+                    }
                     "--cid" => {
                         req.conversation_id = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    "--transcript" => {
+                        transcript_path = Some(PathBuf::from(&args[i + 1]));
                         i += 2;
                     }
                     "--epoch" => {
@@ -97,12 +127,42 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let t0 = Instant::now();
-            let db = Arc::new(LibreDb::open(&args[1])?);
-            let cog = CognitiveEngine::open_db(db)?;
-            let resp = cog.pulse(&req)?;
+            let proj_db = Arc::new(LibreDb::open(&args[1])?);
+            if let (Some(ref cid), Some(ref tp)) = (&req.conversation_id, &transcript_path) {
+                req.epoch = sync_transcript_epoch(&proj_db, cid, tp)?;
+            }
+            let glob_db = match global_path {
+                Some(gp) => Some(Arc::new(LibreDb::open(gp)?)),
+                None => None,
+            };
+            let brain = OverlayBrain::open(glob_db, proj_db)?;
+            let resp = brain.pulse(&req)?;
             let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
             println!("{}", resp.format_compact());
             println!("[Completed in {elapsed_ms:.2} ms]");
+        }
+        "index-workspace" => {
+            if args.len() < 3 {
+                return Err("Usage: libredb index-workspace <db.ldb> <workspace_dir> [--force]".into());
+            }
+            let force = args.get(3).map(String::as_str) == Some("--force");
+            let t0 = Instant::now();
+            let db = Arc::new(LibreDb::open(&args[1])?);
+            let rep = index_workspace(&db, Path::new(&args[2]), force)?;
+            let mut cog = CognitiveEngine::open_db(db)?;
+            cog.save_index_snapshot()?;
+            println!(
+                "[OK] Indexed workspace '{}' in {:.2} ms: {} files scanned ({} cached, {} reindexed, {} binaries skipped) -> {} symbols, {} call edges, {} governance edges",
+                args[2],
+                t0.elapsed().as_secs_f64() * 1000.0,
+                rep.files_scanned,
+                rep.files_unchanged_cached,
+                rep.files_reindexed,
+                rep.binary_files_skipped,
+                rep.symbols_indexed,
+                rep.call_synapses_wired,
+                rep.governance_synapses_wired
+            );
         }
         "skeleton" => {
             if args.len() < 3 {
@@ -120,9 +180,131 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             print!("{}", skel.render_compact(filter.as_deref(), filter.is_some()));
             println!(
                 "[Skeleton {} in {:.2} ms]",
-                if cache_hit { "served from hash-verified cache" } else { "extracted & cached" },
+                if cache_hit {
+                    "served from hash-verified cache"
+                } else {
+                    "extracted & cached"
+                },
                 elapsed_ms
             );
+        }
+        "impact" => {
+            if args.len() < 3 {
+                return Err("Usage: libredb impact <db.ldb> <symbol_query>".into());
+            }
+            let t0 = Instant::now();
+            let db = LibreDb::open(&args[1])?;
+            let reports = query_symbol_impact(&db, &args[2])?;
+            println!(
+                "=== BLAST-RADIUS & CAUSAL IMPACT: '{}' ({} matches in {:.2} ms) ===",
+                args[2],
+                reports.len(),
+                t0.elapsed().as_secs_f64() * 1000.0
+            );
+            for r in reports {
+                println!("\n* [#{}] {}", r.node_id, r.contract);
+                for g in &r.governing_decisions {
+                    println!("    [Governed by]: {g}");
+                }
+                for c in &r.callers {
+                    println!("    [Called by]  <- {c}");
+                }
+                for d in &r.callees {
+                    println!("    [Calls]      -> {d}");
+                }
+            }
+        }
+        "fim" => {
+            if args.len() < 3 {
+                return Err("Usage: libredb fim <db.ldb> <source_file> [--symbol <name> | --line <n>] [--pad <lines>]".into());
+            }
+            let mut symbol: Option<String> = None;
+            let mut line: Option<usize> = None;
+            let mut pad = 12usize;
+            let mut i = 3usize;
+            while i + 1 < args.len() {
+                match args[i].as_str() {
+                    "--symbol" => {
+                        symbol = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    "--line" => {
+                        line = Some(args[i + 1].parse()?);
+                        i += 2;
+                    }
+                    "--pad" => {
+                        pad = args[i + 1].parse()?;
+                        i += 2;
+                    }
+                    other => return Err(format!("Unknown flag '{other}'").into()),
+                }
+            }
+            let db = LibreDb::open(&args[1])?;
+            let bundle =
+                extract_fim_slice(&db, Path::new(&args[2]), symbol.as_deref(), line, pad)?;
+            print!("{}", bundle.format_compact());
+        }
+        "batch" => {
+            if args.len() < 3 {
+                return Err("Usage: libredb batch <db.ldb> [--fact k=v] [--decision Title::Body] [--task key::title::status::prio] [--snapshot <text>]".into());
+            }
+            let mut spec = AtomicBatchSpec::default();
+            let mut i = 2usize;
+            while i + 1 < args.len() {
+                match args[i].as_str() {
+                    "--fact" => {
+                        if let Some((k, v)) = args[i + 1].split_once('=') {
+                            spec.facts.push((k.trim().to_owned(), v.trim().to_owned()));
+                        }
+                        i += 2;
+                    }
+                    "--decision" => {
+                        if let Some((t, b)) = args[i + 1].split_once("::") {
+                            spec.decisions.push((t.trim().to_owned(), b.trim().to_owned()));
+                        }
+                        i += 2;
+                    }
+                    "--task" => {
+                        let parts: Vec<&str> = args[i + 1].splitn(4, "::").collect();
+                        if parts.len() == 4 {
+                            spec.tasks.push((
+                                parts[0].trim().to_owned(),
+                                parts[1].trim().to_owned(),
+                                parts[2].trim().to_owned(),
+                                parts[3].trim().to_owned(),
+                            ));
+                        }
+                        i += 2;
+                    }
+                    "--snapshot" => {
+                        spec.snapshot = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    other => return Err(format!("Unknown flag '{other}'").into()),
+                }
+            }
+            let t0 = Instant::now();
+            let db = LibreDb::open(&args[1])?;
+            let rep = execute_atomic_batch(&db, &spec)?;
+            println!(
+                "[OK] Committed {} capsules and wired {} governance synapses in {:.2} ms (IDs: {:?})",
+                rep.nodes_committed,
+                rep.governance_edges_wired,
+                t0.elapsed().as_secs_f64() * 1000.0,
+                rep.assigned_node_ids
+            );
+        }
+        "handoff" => {
+            if args.len() < 5 {
+                return Err("Usage: libredb handoff <db.ldb> <handoff_id> <task_key> <role> [--notes <text>]".into());
+            }
+            let mut notes = "";
+            if args.len() >= 7 && args[5] == "--notes" {
+                notes = &args[6];
+            }
+            let db = LibreDb::open(&args[1])?;
+            let (_, block) = create_subagent_handoff(&db, &args[2], &args[3], &args[4], notes)?;
+            print!("{block}");
         }
         "learn-assoc" => {
             if args.len() < 4 {
@@ -137,6 +319,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let db = Arc::new(LibreDb::open(&args[1])?);
             let mut cog = CognitiveEngine::open_db(db)?;
             let edges = cog.reinforce_association(&args[2], &target_ids)?;
+            cog.save_index_snapshot()?;
             println!(
                 "Reinforced {} Hebbian concept synapses from '{}' -> {:?}",
                 edges, args[2], target_ids
@@ -181,12 +364,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 scope = &args[4];
             }
             let t0 = Instant::now();
-            let db = LibreDb::open(&args[1])?;
+            let db = Arc::new(LibreDb::open(&args[1])?);
             let sum = import_sqlite_readonly(Path::new(&args[2]), &db, scope)?;
+            // Pre-build and persist the inverted index snapshot so cold CLI `pulse` runs in <10 ms!
+            let mut cog = CognitiveEngine::open_db(db)?;
+            cog.save_index_snapshot()?;
             println!(
-                "[OK] Imported SQLite '{}' (scope={}) in {:.2} ms: {} tables ({} rows) -> {} cognitive capsules + {} synapses",
+                "[OK] Imported SQLite '{}' + saved persistent index snapshot in {:.2} ms: {} tables ({} rows) -> {} cognitive capsules + {} synapses",
                 args[2],
-                sum.scope,
                 t0.elapsed().as_secs_f64() * 1000.0,
                 sum.tables_mirrored,
                 sum.total_sqlite_rows,
@@ -227,7 +412,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let _ = std::fs::remove_dir_all(&tmp_dir);
             std::fs::create_dir_all(&tmp_dir)?;
 
-            // Strictly copy source SQLite to temp first so original file is never locked or touched!
             let copy_src = tmp_dir.join("source_snapshot.db");
             let temp_ldb = tmp_dir.join("bridge.tmp.ldb");
             let recon_db = tmp_dir.join("reconstructed.db");
@@ -248,9 +432,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
             println!("=== LOSSLESS 1:1 SQLITE <-> LIBREDB BIJECTION VERIFIED ===");
             println!("  Source snapshot:       {}", src_path.display());
-            println!("  Tables verified:       {} (including {} FTS5 virtual tables)", rep.tables_verified, rep.fts5_tables_verified);
+            println!(
+                "  Tables verified:       {} (including {} FTS5 virtual tables)",
+                rep.tables_verified, rep.fts5_tables_verified
+            );
             println!("  Exact rows verified:   {} (0 discrepancies)", rep.rows_verified);
-            println!("  Cognitive graph built: {} capsules + {} synapses", imp_sum.cognitive_capsules_created, imp_sum.synapses_wired);
+            println!(
+                "  Cognitive graph built: {} capsules + {} synapses",
+                imp_sum.cognitive_capsules_created, imp_sum.synapses_wired
+            );
             println!("  Canonical digest:      {}", rep.canonical_digest_hex);
             println!("  Total round-trip time: {:.2} ms", elapsed_ms);
         }
@@ -370,7 +560,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             let db = LibreDb::open(&args[1])?;
             let chain = db.trace_lineage(root_id, depth)?;
-            println!("Causal & temporal lineage from node #{root_id} ({} steps):", chain.len());
+            println!(
+                "Causal & temporal lineage from node #{root_id} ({} steps):",
+                chain.len()
+            );
             for item in chain {
                 let edge_lbl = item.via_edge.map_or("root", |e| e.as_str());
                 let state_lbl = if item.is_active { "ACTIVE" } else { "SUPERSEDED" };
@@ -430,11 +623,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             if args.len() < 2 {
                 return Err("Usage: libredb compact <db.ldb>".into());
             }
-            let db = LibreDb::open(&args[1])?;
             let t0 = Instant::now();
+            let db = Arc::new(LibreDb::open(&args[1])?);
+            let mut cog = CognitiveEngine::open_db(Arc::clone(&db))?;
+            cog.save_index_snapshot()?;
             let rep = db.compact_with_gravity()?;
             println!(
-                "Gravity compaction finished in {:.2} ms: {} -> {} bytes ({} hot nodes in {} locality groups, {} cold nodes archived)",
+                "Gravity compaction + index snapshot finished in {:.2} ms: {} -> {} bytes ({} hot nodes in {} locality groups, {} cold nodes archived)",
                 t0.elapsed().as_secs_f64() * 1000.0,
                 rep.bytes_before,
                 rep.bytes_after,

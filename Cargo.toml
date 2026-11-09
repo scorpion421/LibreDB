@@ -6,10 +6,11 @@ members = [
     "crates/libredb-cognitive",
     "crates/libredb-bridge",
     "crates/libredb-cli",
+    "crates/libredb-py",
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["Antigravity <antigravity@local.dev>"]
 license = "AGPL-3.0-only"

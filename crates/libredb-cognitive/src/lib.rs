@@ -7,13 +7,25 @@
 //! 4. `SessionState` (`Zero-Repeat Delta` per `(conversation_id, epoch)` eliminating duplicate output),
 //! 5. `FileSkeleton` (`95-99%` hash-cached code contract compression).
 
+pub mod overlay;
 pub mod reflex;
 pub mod session;
 pub mod skeleton;
+pub mod transcript;
+pub mod workspace;
 
+pub use overlay::OverlayBrain;
 pub use reflex::{detect_workspace_markers, FiredReflex, ReflexEngine, ReflexRule};
 pub use session::SessionState;
 pub use skeleton::{FileSkeleton, SectionSpan, SymbolContract};
+pub use transcript::{
+    create_subagent_handoff, execute_atomic_batch, sync_transcript_epoch, AtomicBatchReport,
+    AtomicBatchSpec, TaskCapsule, TranscriptEpochState,
+};
+pub use workspace::{
+    extract_fim_slice, index_workspace, query_symbol_impact, FimSliceBundle, SymbolImpactReport,
+    WorkspaceIndexReport,
+};
 
 use libredb_core::{EdgeKind, LibreDb, NodeFlags, NodeKind, Result};
 use libredb_index::HybridIndex;
@@ -118,7 +130,7 @@ pub struct CognitiveEngine {
 
 impl CognitiveEngine {
     pub fn open_db(db: Arc<LibreDb>) -> Result<Self> {
-        let index = HybridIndex::build_from_db(&db)?;
+        let index = HybridIndex::load_or_build(&db)?;
         let reflexes = ReflexEngine::load(&db)?;
         Ok(Self {
             db,
@@ -131,11 +143,16 @@ impl CognitiveEngine {
         &self.db
     }
 
-    /// Re-synchronizes the in-memory `HybridIndex` and `ReflexEngine` after bulk writes/imports.
+    /// Re-synchronizes the in-memory `HybridIndex` and `ReflexEngine` incrementally after writes.
     pub fn refresh_indices(&mut self) -> Result<()> {
-        self.index = HybridIndex::build_from_db(&self.db)?;
+        self.index = HybridIndex::load_or_build(&self.db)?;
         self.reflexes = ReflexEngine::load(&self.db)?;
         Ok(())
+    }
+
+    /// Persists the compiled inverted index snapshot inside `.ldb` for sub-5ms cold CLI startup.
+    pub fn save_index_snapshot(&mut self) -> Result<u64> {
+        self.index.save_snapshot(&self.db)
     }
 
     /// Learns a persistent cross-lingual or conceptual Hebbian association between `cue_phrase`
