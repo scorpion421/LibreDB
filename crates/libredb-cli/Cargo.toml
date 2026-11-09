@@ -5,12 +5,15 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Command-line utility and benchmark runner for the LibreDB cognitive storage engine"
+description = "Command-line utility, cognitive pulse engine, and lossless SQLite bridge for LibreDB"
 
 [[bin]]
 name = "libredb"
 path = "src/main.rs"
 
 [dependencies]
+libredb-bridge = { path = "../libredb-bridge" }
+libredb-cognitive = { path = "../libredb-cognitive" }
 libredb-core = { path = "../libredb-core" }
+libredb-index = { path = "../libredb-index" }
 serde_json.workspace = true

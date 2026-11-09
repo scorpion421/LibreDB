@@ -1,0 +1,17 @@
+[package]
+name = "libredb-index"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Language-agnostic information-theoretic BM25, Unicode n-gram, and Hebbian concept-learning index for LibreDB"
+
+[dependencies]
+libredb-core = { path = "../libredb-core" }
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

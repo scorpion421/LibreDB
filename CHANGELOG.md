@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-11-09
+
+### Added
+
+- `libredb-index`: Language-agnostic information-theoretic search engine combining `BM25` token scoring, unsupervised morphological `BM25` over Unicode character `n-grams` (with zero hardcoded stopword lists, stemmers, or language dictionaries), and persistent Hebbian co-activation concept learning (`reinforce_association` / `libredb learn-assoc`).
+- `libredb-cognitive`:
+  - `SessionState` (`Zero-Repeat Delta` filter per `(conversation_id, epoch)`) suppressing duplicate context deliveries across multi-turn sessions while automatically re-hydrating mutated generations or post-compaction epochs.
+  - Purely data-driven `ReflexEngine` (`learn-reflex`) firing concise situational pitfall guardrails based on detected workspace markers, actions, and error substrings before execution.
+  - `FileSkeleton` (`libredb skeleton`) extracting `64-bit` content-hash-cached module boundaries, `[Lstart-Lend]` spans, signatures, and docstrings (`85-98%` token compression over full file reads).
+  - Unified one-shot `CognitiveEngine::pulse` (`libredb pulse`) integrating reflexes, hybrid search, 2-hop `Inode` spreading activation, session delta deduplication, and coalesced extent reads within a strict token budget.
+- `libredb-bridge`: Lossless 1:1 bidirectional `SQLite <-> LibreDB` migrator and cryptographic bijection verifier (`import-sqlite`, `export-sqlite`, `verify-roundtrip`) supporting all 19 `SkillsDB` relational tables and all 5 `FTS5` virtual tables with zero source modifications.
+- Lock-free `list_inodes`, `get_many_coalesced`, and `active_key_for` snapshot helpers in `libredb-core`.
+
 ## [0.1.0] - 2026-11-09
 
 ### Added

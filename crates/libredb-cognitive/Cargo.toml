@@ -1,0 +1,14 @@
+[package]
+name = "libredb-cognitive"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Session zero-repeat delta filter, situational reflex triggers, code contract skeletons, and one-shot cognitive pulse for Antigravity"
+
+[dependencies]
+libredb-core = { path = "../libredb-core" }
+libredb-index = { path = "../libredb-index" }
+serde.workspace = true
+serde_json.workspace = true

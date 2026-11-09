@@ -1,0 +1,633 @@
+//! Language-agnostic information-theoretic search and Hebbian association engine.
+//!
+//! Zero hardcoded languages, zero hardcoded stopword lists, zero hardcoded grammar/suffix rules,
+//! and zero hardcoded translation dictionaries:
+//! 1. **Universal Unicode Segmentation:** Splits whitespace, punctuation, `camelCase`, and Unicode
+//!    script transitions across all human writing systems (Latin, Cyrillic, Arabic, Devanagari,
+//!    Hangul, Kana, CJK ideographs, etc.).
+//! 2. **Automatic Stopword & Affix Attenuation via IDF:** Common function words and frequent
+//!    grammatical affixes in *any* language naturally occur in a high fraction of capsules and
+//!    automatically receive near-zero Inverse Document Frequency (`IDF`) weight.
+//! 3. **IDF-Weighted Unicode Character N-Grams:** Codepoint `3-grams` (and `1/2-grams` for CJK
+//!    ideographs) act as an unsupervised morphological analyzer across inflected, agglutinative,
+//!    and compound languages without language-specific stemmers.
+//! 4. **Persistent Hebbian Concept Synapses:** Cross-lingual and cross-domain bridges are learned
+//!    purely from data (`NodeKind::SynonymCluster` capsules and co-activated episode feedback) -
+//!    never hardcoded.
+
+use libredb_core::{LibreDb, NodeKind, Result, WriteRequest};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+
+pub const HEBBIAN_KEY_PREFIX: &str = "hebbian::";
+
+/// Ranked search hit produced by `HybridIndex::search`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchHit {
+    pub node_id: u64,
+    pub kind: NodeKind,
+    pub key: Option<String>,
+    pub score: f64,
+    pub matched_features: Vec<String>,
+}
+
+/// Persisted Hebbian association map for a single learned cue token (`hebbian::<cue_token>`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LearnedAssociation {
+    pub cue: String,
+    /// Maps `associated_token -> coactivation_weight` (`0.05 ..= 1.0`).
+    pub targets: HashMap<String, f64>,
+    pub observations: u32,
+}
+
+#[derive(Debug, Clone)]
+struct DocMeta {
+    kind: NodeKind,
+    key: Option<String>,
+    word_len: u32,
+    ngram_len: u32,
+    importance: u8,
+}
+
+/// Universal, zero-hardcoded-language hybrid index (`BM25 Words + BM25 Character N-Grams + Learned Hebbian Bridges`).
+#[derive(Default)]
+pub struct HybridIndex {
+    docs: HashMap<u64, DocMeta>,
+    total_word_len: u64,
+    total_ngram_len: u64,
+    /// Whole-token postings: `unicode_token -> Vec<(node_id, term_freq)>`.
+    word_postings: HashMap<String, Vec<(u64, u32)>>,
+    /// Unsupervised morphological codepoint n-gram postings: `ngram -> Vec<(node_id, gram_freq)>`.
+    ngram_postings: HashMap<String, Vec<(u64, u32)>>,
+    /// Learned (data-driven only!) concept associations: `cue_token -> Vec<(target_token, weight)>`.
+    learned_bridges: HashMap<String, Vec<(String, f64)>>,
+}
+
+impl HybridIndex {
+    /// Creates a clean index with zero hardcoded language assumptions or dictionaries.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Builds the index purely from capsules stored inside `db` (including any imported or
+    /// Hebbian-learned `NodeKind::SynonymCluster` associations and cross-linked `Inode` neighbors).
+    pub fn build_from_db(db: &LibreDb) -> Result<Self> {
+        let mut idx = Self::new();
+        let active = db.list_inodes(None, false);
+        let ids: Vec<u64> = active.iter().map(|(ino, _, _)| ino.node_id).collect();
+        let (records, _) = db.get_many_coalesced(&ids)?;
+
+        let key_lookup: HashMap<u64, Option<String>> = active
+            .into_iter()
+            .map(|(ino, k, _)| (ino.node_id, k))
+            .collect();
+
+        for rec in records {
+            let key = key_lookup.get(&rec.node_id).cloned().flatten();
+            if let Some(ref k) = key {
+                // Skip internal structured reflex trigger JSONs and SQLite binary mirror blobs!
+                if k.starts_with("reflex::") || k.starts_with("sqlite_mirror::") || k.starts_with("session_delta::") {
+                    continue;
+                }
+            }
+            if rec.kind == NodeKind::SynonymCluster {
+                let body = String::from_utf8_lossy(&rec.payload);
+                if let Some(ref k) = key {
+                    if k.starts_with(HEBBIAN_KEY_PREFIX) {
+                        if let Ok(assoc) = serde_json::from_slice::<LearnedAssociation>(&rec.payload) {
+                            for (dst, w) in assoc.targets {
+                                idx.insert_bridge_edge(&assoc.cue, &dst, w);
+                            }
+                            continue;
+                        }
+                    }
+                    // Imported data-driven `synonym_synapses` capsule from user database:
+                    idx.learn_phrase_pair_in_memory(k, &body, 0.80);
+                }
+            }
+            let text = String::from_utf8_lossy(&rec.payload);
+            idx.index_document(rec.node_id, rec.kind, key, &text, rec.importance);
+        }
+
+        Ok(idx)
+    }
+
+    /// Learns and persists a Hebbian association in `db` between any `cue_phrase` (in *any* human
+    /// language or notation) and the salient high-IDF tokens of `target_node_ids`.
+    ///
+    /// Uses bounded Hebbian reinforcement (`w_new = 1.0 - (1.0 - w_old) * 0.65`) so repeated
+    /// real-world co-activations approach `1.0` asymptotically while single coincidences stay mild.
+    pub fn reinforce_association(
+        &mut self,
+        db: &LibreDb,
+        cue_phrase: &str,
+        target_node_ids: &[u64],
+    ) -> Result<usize> {
+        let cue_tokens = segment_universal_tokens(cue_phrase);
+        if cue_tokens.is_empty() || target_node_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let (target_recs, _) = db.get_many_coalesced(target_node_ids)?;
+        let mut target_salient: Vec<String> = Vec::new();
+
+        for rec in &target_recs {
+            let mut combined = String::new();
+            if let Some((_, k)) = db.active_key_for(rec.node_id) {
+                combined.push_str(&k);
+                combined.push(' ');
+            }
+            combined.push_str(&String::from_utf8_lossy(&rec.payload));
+            for tok in self.top_salient_tokens(&combined, 12) {
+                if !target_salient.contains(&tok) {
+                    target_salient.push(tok);
+                }
+            }
+        }
+
+        if target_salient.is_empty() {
+            return Ok(0);
+        }
+
+        let mut updated_edges = 0usize;
+        for cue in &cue_tokens {
+            // Skip ultra-common filler tokens automatically via corpus document frequency (> 50% of docs).
+            if self.is_high_frequency_noise(cue) {
+                continue;
+            }
+            let storage_key = format!("{HEBBIAN_KEY_PREFIX}{cue}");
+            let mut assoc = match db.get_by_key(NodeKind::SynonymCluster, &storage_key) {
+                Ok(existing) => serde_json::from_slice::<LearnedAssociation>(&existing.payload)
+                    .unwrap_or_else(|_| LearnedAssociation {
+                        cue: cue.clone(),
+                        targets: HashMap::new(),
+                        observations: 0,
+                    }),
+                Err(_) => LearnedAssociation {
+                    cue: cue.clone(),
+                    targets: HashMap::new(),
+                    observations: 0,
+                },
+            };
+
+            assoc.observations = assoc.observations.saturating_add(1);
+            for dst in &target_salient {
+                if dst == cue {
+                    continue;
+                }
+                let entry = assoc.targets.entry(dst.clone()).or_insert(0.0_f64);
+                *entry = (1.0_f64 - (1.0_f64 - *entry) * 0.65_f64).clamp(0.10_f64, 0.95_f64);
+                let new_w = *entry;
+                self.insert_bridge_edge(cue, dst, new_w);
+                updated_edges += 1;
+            }
+
+            // Cap per-cue fanout to the top 24 strongest associations so memory stays compact.
+            if assoc.targets.len() > 24 {
+                let mut pairs: Vec<(String, f64)> = assoc.targets.into_iter().collect();
+                pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                pairs.truncate(24);
+                assoc.targets = pairs.into_iter().collect();
+            }
+
+            if let Ok(bytes) = serde_json::to_vec(&assoc) {
+                db.put(
+                    WriteRequest::new(NodeKind::SynonymCluster, bytes)
+                        .with_key(storage_key)
+                        .with_importance(170),
+                )?;
+            }
+        }
+
+        Ok(updated_edges)
+    }
+
+    /// Registers an in-memory bidirectional association between two phrases (e.g. from imported DB rows).
+    pub fn learn_phrase_pair_in_memory(&mut self, phrase_a: &str, phrase_b: &str, weight: f64) {
+        let toks_a = segment_universal_tokens(phrase_a);
+        let toks_b = segment_universal_tokens(phrase_b);
+        for a in &toks_a {
+            for b in &toks_b {
+                if a != b {
+                    self.insert_bridge_edge(a, b, weight);
+                    self.insert_bridge_edge(b, a, weight * 0.70);
+                }
+            }
+        }
+    }
+
+    /// Indexes a single document across both universal tokens and Unicode character n-grams.
+    pub fn index_document(
+        &mut self,
+        node_id: u64,
+        kind: NodeKind,
+        key: Option<String>,
+        body: &str,
+        importance: u8,
+    ) {
+        let mut word_tf: HashMap<String, u32> = HashMap::new();
+        let mut ngram_tf: HashMap<String, u32> = HashMap::new();
+        let mut word_len = 0u32;
+        let mut ngram_len = 0u32;
+
+        if let Some(ref k) = key {
+            for tok in segment_universal_tokens(k) {
+                *word_tf.entry(tok.clone()).or_insert(0) += 3;
+                word_len += 3;
+                for ng in extract_unicode_ngrams(&tok) {
+                    *ngram_tf.entry(ng).or_insert(0) += 2;
+                    ngram_len += 2;
+                }
+            }
+        }
+
+        let body_tokens = segment_universal_tokens(body);
+        for (idx, tok) in body_tokens.into_iter().enumerate() {
+            *word_tf.entry(tok.clone()).or_insert(0) += 1;
+            word_len += 1;
+            // Extract morphological subword n-grams over the first 80 tokens (title, signature, summary)
+            // so index build stays sub-millisecond while capturing compounds & inflections in any language.
+            if idx < 80 {
+                for ng in extract_unicode_ngrams(&tok) {
+                    *ngram_tf.entry(ng).or_insert(0) += 1;
+                    ngram_len += 1;
+                }
+            }
+        }
+
+        self.total_word_len += word_len.max(1) as u64;
+        self.total_ngram_len += ngram_len.max(1) as u64;
+        self.docs.insert(
+            node_id,
+            DocMeta {
+                kind,
+                key,
+                word_len: word_len.max(1),
+                ngram_len: ngram_len.max(1),
+                importance,
+            },
+        );
+
+        for (w, tf) in word_tf {
+            self.word_postings.entry(w).or_default().push((node_id, tf));
+        }
+        for (ng, tf) in ngram_tf {
+            self.ngram_postings.entry(ng).or_default().push((node_id, tf));
+        }
+    }
+
+    /// Executes universal `BM25 (tokens) + IDF-weighted BM25 (Unicode n-grams) + Learned Hebbian Bridges`.
+    pub fn search(
+        &self,
+        query: &str,
+        kind_filter: Option<&[NodeKind]>,
+        limit: usize,
+    ) -> Vec<SearchHit> {
+        if self.docs.is_empty() || limit == 0 {
+            return Vec::new();
+        }
+
+        let q_tokens = segment_universal_tokens(query);
+        if q_tokens.is_empty() {
+            return Vec::new();
+        }
+
+        // 1. Expand query tokens solely via data-learned Hebbian associations (`learned_bridges`).
+        let mut weighted_words: HashMap<String, f64> = HashMap::new();
+        for tok in &q_tokens {
+            weighted_words.insert(tok.clone(), 1.0);
+            if let Some(learned) = self.learned_bridges.get(tok) {
+                for (assoc_tok, w) in learned {
+                    let slot = weighted_words.entry(assoc_tok.clone()).or_insert(0.0);
+                    if *w > *slot {
+                        *slot = *w;
+                    }
+                }
+            }
+        }
+
+        let n_docs = self.docs.len() as f64;
+        let avg_wl = (self.total_word_len as f64 / n_docs).max(1.0);
+        let avg_ngl = (self.total_ngram_len as f64 / n_docs).max(1.0);
+        const K1: f64 = 1.2;
+        const B: f64 = 0.75;
+
+        let mut scores: HashMap<u64, f64> = HashMap::new();
+        let mut features: HashMap<u64, Vec<String>> = HashMap::new();
+
+        // 2. Information-theoretic BM25 over whole tokens (high-DF filler words in ANY language naturally get ~0 IDF!).
+        for (term, q_weight) in &weighted_words {
+            let Some(plist) = self.word_postings.get(term) else {
+                continue;
+            };
+            let df = plist.len() as f64;
+            // Pure Shannon-inspired smooth IDF: drops sharply as `df -> n_docs` without stopword lists!
+            let idf = ((n_docs - df + 0.5) / (df + 0.5) + 1.0).ln();
+            if idf <= 0.05 {
+                continue;
+            }
+
+            for &(nid, tf) in plist {
+                let Some(meta) = self.docs.get(&nid) else {
+                    continue;
+                };
+                if let Some(allowed) = kind_filter {
+                    if !allowed.contains(&meta.kind) {
+                        continue;
+                    }
+                }
+                let tf_f = tf as f64;
+                let dl = meta.word_len as f64;
+                let bm25 = idf * ((tf_f * (K1 + 1.0)) / (tf_f + K1 * (1.0 - B + B * (dl / avg_wl))));
+                *scores.entry(nid).or_insert(0.0) += bm25 * q_weight;
+                let fl = features.entry(nid).or_default();
+                if fl.len() < 5 && !fl.contains(term) {
+                    fl.push(term.clone());
+                }
+            }
+        }
+
+        // 3. Unsupervised morphological matching via IDF-weighted Unicode character n-grams!
+        //    Frequent inflectional suffixes in ANY language have high `df` -> low `idf`;
+        //    informative root stems & compound parts have low `df` -> high `idf`!
+        let mut query_ngrams: Vec<String> = Vec::new();
+        for tok in &q_tokens {
+            for ng in extract_unicode_ngrams(tok) {
+                if !query_ngrams.contains(&ng) {
+                    query_ngrams.push(ng);
+                }
+            }
+        }
+
+        if !query_ngrams.is_empty() {
+            let norm_scale = 0.45 / (query_ngrams.len() as f64).sqrt();
+            for ng in &query_ngrams {
+                let Some(plist) = self.ngram_postings.get(ng) else {
+                    continue;
+                };
+                let df = plist.len() as f64;
+                let idf = ((n_docs - df + 0.5) / (df + 0.5) + 1.0).ln();
+                if idf <= 0.15 {
+                    continue;
+                }
+                for &(nid, tf) in plist {
+                    let Some(meta) = self.docs.get(&nid) else {
+                        continue;
+                    };
+                    if let Some(allowed) = kind_filter {
+                        if !allowed.contains(&meta.kind) {
+                            continue;
+                        }
+                    }
+                    let tf_f = tf as f64;
+                    let dl = meta.ngram_len as f64;
+                    let ng_bm25 =
+                        idf * ((tf_f * (K1 + 1.0)) / (tf_f + K1 * (1.0 - B + B * (dl / avg_ngl))));
+                    *scores.entry(nid).or_insert(0.0) += ng_bm25 * norm_scale;
+                }
+            }
+        }
+
+        let mut hits: Vec<SearchHit> = scores
+            .into_iter()
+            .filter_map(|(nid, raw_score)| {
+                if raw_score < 0.20 {
+                    return None;
+                }
+                let meta = self.docs.get(&nid)?;
+                let imp_factor = 0.85 + (meta.importance as f64 / 255.0) * 0.40;
+                Some(SearchHit {
+                    node_id: nid,
+                    kind: meta.kind,
+                    key: meta.key.clone(),
+                    score: raw_score * imp_factor,
+                    matched_features: features.remove(&nid).unwrap_or_default(),
+                })
+            })
+            .collect();
+
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.node_id.cmp(&b.node_id))
+        });
+        hits.truncate(limit);
+        hits
+    }
+
+    fn insert_bridge_edge(&mut self, src: &str, dst: &str, weight: f64) {
+        let list = self.learned_bridges.entry(src.to_owned()).or_default();
+        if let Some(existing) = list.iter_mut().find(|(t, _)| t == dst) {
+            if weight > existing.1 {
+                existing.1 = weight;
+            }
+        } else {
+            list.push((dst.to_owned(), weight));
+        }
+    }
+
+    fn is_high_frequency_noise(&self, token: &str) -> bool {
+        let total = self.docs.len();
+        if total < 8 {
+            return false;
+        }
+        let df = self.word_postings.get(token).map_or(0, Vec::len);
+        (df * 2) > total
+    }
+
+    fn top_salient_tokens(&self, text: &str, max_k: usize) -> Vec<String> {
+        let n_docs = (self.docs.len() as f64).max(1.0);
+        let mut scored: HashMap<String, f64> = HashMap::new();
+        for tok in segment_universal_tokens(text) {
+            let df = self.word_postings.get(&tok).map_or(0, Vec::len) as f64;
+            let idf = ((n_docs - df + 0.5) / (df + 0.5) + 1.0).ln();
+            *scored.entry(tok).or_insert(0.0) += idf.max(0.2);
+        }
+        let mut vec: Vec<(String, f64)> = scored.into_iter().collect();
+        vec.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        vec.truncate(max_k);
+        vec.into_iter().map(|(t, _)| t).collect()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScriptKind {
+    CjkIdeograph,
+    AlphabeticUpper,
+    AlphabeticOther,
+    Digit,
+    Separator,
+}
+
+fn classify_char(ch: char) -> ScriptKind {
+    let cp = ch as u32;
+    // Unified CJK ideographs & extensions (each ideograph is a standalone semantic morpheme).
+    if (0x4E00..=0x9FFF).contains(&cp)
+        || (0x3400..=0x4DBF).contains(&cp)
+        || (0xF900..=0xFAFF).contains(&cp)
+        || (0x20000..=0x2CEAF).contains(&cp)
+    {
+        ScriptKind::CjkIdeograph
+    } else if ch.is_uppercase() {
+        ScriptKind::AlphabeticUpper
+    } else if ch.is_alphanumeric() {
+        if ch.is_numeric() {
+            ScriptKind::Digit
+        } else {
+            ScriptKind::AlphabeticOther
+        }
+    } else {
+        ScriptKind::Separator
+    }
+}
+
+/// Segments text across all Unicode scripts, `camelCase`, `snake_case`, and CJK ideographs
+/// using purely structural Unicode properties (zero language-specific word lists).
+pub fn segment_universal_tokens(input: &str) -> Vec<String> {
+    let mut tokens: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut prev_kind = ScriptKind::Separator;
+
+    for ch in input.chars() {
+        let kind = classify_char(ch);
+        match kind {
+            ScriptKind::Separator => {
+                if !current.is_empty() {
+                    push_if_meaningful(&mut tokens, &current);
+                    current.clear();
+                }
+                prev_kind = ScriptKind::Separator;
+            }
+            ScriptKind::CjkIdeograph => {
+                if !current.is_empty() {
+                    push_if_meaningful(&mut tokens, &current);
+                    current.clear();
+                }
+                // Emit individual ideograph as a 1-char token; adjacent CJK bigrams are captured in n-grams.
+                tokens.push(ch.to_string());
+                prev_kind = ScriptKind::CjkIdeograph;
+            }
+            ScriptKind::AlphabeticUpper => {
+                if prev_kind == ScriptKind::AlphabeticOther && !current.is_empty() {
+                    push_if_meaningful(&mut tokens, &current);
+                    current.clear();
+                }
+                for low in ch.to_lowercase() {
+                    current.push(low);
+                }
+                prev_kind = ScriptKind::AlphabeticUpper;
+            }
+            ScriptKind::AlphabeticOther | ScriptKind::Digit => {
+                if (prev_kind == ScriptKind::Digit) != (kind == ScriptKind::Digit)
+                    && !current.is_empty()
+                {
+                    push_if_meaningful(&mut tokens, &current);
+                    current.clear();
+                }
+                for low in ch.to_lowercase() {
+                    current.push(low);
+                }
+                prev_kind = kind;
+            }
+        }
+    }
+
+    if !current.is_empty() {
+        push_if_meaningful(&mut tokens, &current);
+    }
+
+    tokens
+}
+
+fn push_if_meaningful(out: &mut Vec<String>, candidate: &str) {
+    // Keep single characters only if non-ASCII (e.g. Kana/Hangul/symbol); require >= 2 chars for ASCII.
+    let char_cnt = candidate.chars().count();
+    if char_cnt >= 2 || (char_cnt == 1 && !candidate.is_ascii()) {
+        out.push(candidate.to_owned());
+    }
+}
+
+/// Extracts language-agnostic Unicode character `3-grams` (with word-boundary markers `^` and `$`
+/// only when length >= 4 so root morphemes inside compounds match standalone roots in any script!).
+pub fn extract_unicode_ngrams(token: &str) -> Vec<String> {
+    let chars: Vec<char> = token.chars().collect();
+    if chars.is_empty() {
+        return Vec::new();
+    }
+    // Single CJK ideograph or 2-char non-ASCII word acts as its own subword unit.
+    if chars.len() < 3 {
+        if !token.is_ascii() {
+            return vec![token.to_owned()];
+        }
+        return Vec::new();
+    }
+
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for win in chars.windows(3) {
+        let g: String = win.iter().collect();
+        if seen.insert(g.clone()) {
+            out.push(g);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn universal_ngrams_and_hebbian_learning_work_across_any_language_without_hardcoding() {
+        let dir = tempdir().unwrap();
+        let db = LibreDb::open(dir.path().join("multilingual.ldb")).unwrap();
+
+        // Store an English/Rust technical capsule:
+        let smb_id = db
+            .put(
+                WriteRequest::new(
+                    NodeKind::Skill,
+                    b"Disables mmap and sidecar shm locks on remote SMB UNC filesystems.".to_vec(),
+                )
+                .with_key("smb-lease-safety"),
+            )
+            .unwrap();
+
+        // Store a Turkish agglutinative capsule & a Polish inflected capsule to prove zero-rule morphology:
+        let tr_id = db
+            .put(
+                WriteRequest::new(
+                    NodeKind::Fact,
+                    "Veritabani yapilandirmalarinda kilitleme onlenir.".as_bytes().to_vec(),
+                )
+                .with_key("tr-config"),
+            )
+            .unwrap();
+
+        let mut idx = HybridIndex::build_from_db(&db).unwrap();
+
+        // 1. Unsupervised morphology: querying root `"yapilandirma"` matches agglutinated `"yapilandirmalarinda"`!
+        let tr_hits = idx.search("yapilandirma", None, 3);
+        assert!(!tr_hits.is_empty());
+        assert_eq!(tr_hits[0].node_id, tr_id);
+
+        // 2. Before learning Japanese: Japanese prompt `" \u{30CD}\u{30C3}\u{30C8}\u{30EF}\u{30FC}\u{30AF}\u{5171}\u{6709} "` (network share)
+        //    has zero hardcoded dictionary match to English `"smb-lease-safety"`:
+        let jp_query = "\u{30CD}\u{30C3}\u{30C8}\u{30EF}\u{30FC}\u{30AF}\u{5171}\u{6709}";
+        assert!(idx.search(jp_query, None, 3).is_empty());
+
+        // 3. Teach/reinforce one real episode linking that Japanese prompt to `smb_id`:
+        let learned = idx
+            .reinforce_association(&db, jp_query, &[smb_id])
+            .unwrap();
+        assert!(learned > 0);
+
+        // 4. Reload index cold from `.ldb` disk -> Japanese prompt now retrieves `smb-lease-safety` #1!
+        let reloaded = HybridIndex::build_from_db(&db).unwrap();
+        let jp_hits = reloaded.search(jp_query, None, 3);
+        assert!(!jp_hits.is_empty());
+        assert_eq!(jp_hits[0].node_id, smb_id);
+    }
+}

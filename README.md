@@ -1,11 +1,11 @@
 # LibreDB
 
-[![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)](CHANGELOG.md)
-[![Tests](https://img.shields.io/badge/tests-passing%20(10k%20crash%20sims)-brightgreen.svg)](crates/libredb-core/tests/)
+[![Version](https://img.shields.io/badge/version-0.2.0-blue.svg)](CHANGELOG.md)
+[![Tests](https://img.shields.io/badge/tests-passing%20(10k%20crash%20%2B%2019--table%20bijection)-brightgreen.svg)](crates/libredb-bridge/tests/)
 [![Tech Stack](https://img.shields.io/badge/rust-1.99%2B%20%7C%20LIBREDB1-orange.svg)](Cargo.toml)
 [![License](https://img.shields.io/badge/license-AGPLv3%20%2B%20Commons%20Clause-purple.svg)](LICENSE)
 
-`LibreDB` is a local-first, zero-configuration, single-file cognitive database engine (`*.ldb`) written in Rust for long-term `LLM` memory. It combines `SQLite`'s single-file portability, `PostgreSQL`'s concurrent `MVCC` and strict typing discipline, logistics chaos-warehouse write lanes, and `ext4`-inspired fixed `128-byte` `Inodes` with `64 KB` Gravity locality groups.
+`LibreDB` is a local-first, zero-configuration, single-file cognitive memory and token-conservation engine (`*.ldb`) written in Rust for `LLMs`. It pairs a crash-proof single-file `Inode`-extent kernel with session-aware `Zero-Repeat Delta` deduplication, hash-cached code contract skeletons, data-learned situational `Reflex` triggers, language-agnostic Hebbian concept learning, and a 100% lossless bidirectional `SQLite` bridge.
 
 ## Table of contents
 
@@ -17,15 +17,15 @@
 
 ## Executive summary and impact
 
-Conventional relational and vector databases force `LLM` memory systems to choose between single-writer bottlenecks (`SQLite_BUSY`), fragile multi-file network sidecars (`.db-wal` / `.db-shm`), or heavyweight server clusters lacking temporal truth and token awareness. `LibreDB` resolves these trade-offs directly inside a single self-healing binary file (`LIBREDB1`).
+Traditional `LLM` memory layers waste tens of thousands of prompt tokens per session by re-emitting identical context across turns, reading entire multi-thousand-line code files to inspect signatures, relying on hardcoded mono/bilingual synonym lists, and failing to surface situational tooling pitfalls before execution. `LibreDB v0.2.0` addresses every one of those token drains directly inside a single self-contained `.ldb` file.
 
-| Dimension | Traditional `SQLite` (`WAL` + `FTS5`) | `LibreDB` (`LIBREDB1` kernel) |
+| Capability | Legacy `SQLite` + `FTS5` workflow | `LibreDB v0.2.0` cognitive engine |
 | :--- | :--- | :--- |
-| **File footprint & `SMB` safety** | `3` files (`.db`, `.db-wal`, `.db-shm`); `.shm` breaks on `SMB` | **Single `.ldb` file** with ping-pong `CRC32C` superblocks |
-| **Concurrent subagent writes** | Single global writer lock (`SQLITE_BUSY` retry loops) | **`16` sharded chaos preparation lanes** + lock-free `MVCC` reads |
-| **Graph & impact traversal** | Multi-table `B-Tree` index joins across `19` isolated tables | **`O(1)` in-memory `128-byte` `Inode` array** with typed synapses |
-| **Connected family read I/O** | Scattered `4 KB` page reads across separate table trees | **`64 KB` Gravity block groups** coalescing families into `1` read |
-| **Temporal truth & `LLM` budget** | Manual history tables & heuristic `len / 4` token guesses | **Automatic `Supersedes` chains** + exact token-budgeted `recall` |
+| **Multi-turn context repetition** | Re-emits identical rules/skills/facts on repeated queries | **`Zero-Repeat Delta` (`SessionState`)** suppresses seen generations (`>80%` saved) |
+| **Large source file inspection** | Full/sliced `read_file` (`10,000-30,000` tokens) | **`FileSkeleton` (`64-bit` hash cache)** delivers `[Lstart-Lend]` contracts (`-95%+` tokens) |
+| **Multilingual & domain recall** | Hardcoded stopword & synonym tables | **Zero hardcoded languages:** `IDF` Unicode `n-grams` + persistent **Hebbian learning** |
+| **Operational mistake prevention** | Passive lookup only after hitting an error | **Data-learned `ReflexEngine`** fires `20-token` warnings proactively on context match |
+| **Migration & rollback safety** | Locked into `19` relational + `5` `FTS5` tables | **Lossless `SQLite <-> LibreDB` bijection** verified cell-for-cell |
 
 ## Installation and quickstart
 
@@ -33,79 +33,59 @@ Conventional relational and vector databases force `LLM` memory systems to choos
 
 - **Rust toolchain:** `1.85+` (`x86_64-pc-windows-msvc` or POSIX target)
 
-### Build and verify
+### Build and test
 
 ```powershell
-cargo build --release
 cargo test --release
+cargo build --release
 ```
 
 ### Quickstart example
 
 ```powershell
-# 1. Initialize a single-file cognitive database
-.\target\release\libredb.exe init memory.ldb
+# 1. Verify 100% lossless round-trip on a read-only copy of an existing SQLite DB
+.\target\release\libredb.exe verify-roundtrip ~/.gemini/database/customizations.db --scope central
 
-# 2. Store typed, keyed knowledge with automatic temporal superseding
-.\target\release\libredb.exe put memory.ldb decision "Use ping-pong superblocks for SMB safety" --key smb-safety --pin
-.\target\release\libredb.exe put memory.ldb symbol "fn recover_existing(backend: &dyn StorageBackend)" --key recover_existing
+# 2. Import SQLite knowledge (read-only) into a single cognitive .ldb file
+.\target\release\libredb.exe import-sqlite brain.ldb ~/.gemini/database/customizations.db --scope central
 
-# 3. Wire a cognitive synapse (`Decision #1 --[governs]--> Symbol #2`)
-.\target\release\libredb.exe link memory.ldb 1 governs 2 --weight 240
+# 3. Extract a 95%+ compressed, hash-cached code contract skeleton
+.\target\release\libredb.exe skeleton brain.ldb crates/libredb-core/src/engine.rs
 
-# 4. Recall connected context strictly within an LLM token budget
-.\target\release\libredb.exe recall memory.ldb 1 --hops 2 --budget 400
-
-# 5. Run "sleep phase" Gravity co-location and cryptographic scrub
-.\target\release\libredb.exe compact memory.ldb
-.\target\release\libredb.exe verify memory.ldb
+# 4. Run a session-deduplicated, token-budgeted cognitive pulse (Turn 1 vs Turn 2 delta!)
+.\target\release\libredb.exe pulse brain.ldb "gitea release" --cid session-42 --epoch 1 --budget 600
+.\target\release\libredb.exe pulse brain.ldb "gitea release" --cid session-42 --epoch 1 --budget 600
 ```
 
 ## Usage and commands
 
 | Command | Description |
 | :--- | :--- |
-| `libredb init <db.ldb>` | Initializes a fresh `LIBREDB1` database with dual `4 KB` superblocks |
-| `libredb put <db.ldb> <kind> <payload> [--key <k>] [--pin]` | Writes an inline or `LZ4`-compressed capsule (`Supersedes` prior key automatically) |
-| `libredb get <db.ldb> <node_id>` | Performs a lock-free `O(1)` `Inode` snapshot read by immutable `NodeId` |
-| `libredb get-key <db.ldb> <kind> <key>` | Resolves the active version of `(kind, key)` in `O(1)` |
-| `libredb link <db.ldb> <src> <edge_kind> <dst> [--weight <w>]` | Attaches a typed directed synapse (`governs`, `has_section`, `calls`, etc.) |
-| `libredb deprecate <db.ldb> <kind> <key>` | Tombstones a stale fact/key so it never pollutes active `LLM` context |
-| `libredb trace <db.ldb> <node_id> [--depth <n>]` | Walks `Supersedes`, `CausedBy`, and `Governs` edges to explain causal history |
-| `libredb recall <db.ldb> <seed_id> [--hops <n>] [--budget <t>]` | Executes spreading-activation recall within a strict token ceiling |
-| `libredb compact <db.ldb>` | Runs crash-proof two-phase disjoint-window Gravity compaction (`64 KB` locality groups) |
-| `libredb stats <db.ldb> [--json]` | Displays live storage, compression, token, and I/O telemetry |
-| `libredb verify <db.ldb>` | Verifies `CRC32C` checksums across all superblocks, `Inodes`, and extents |
-| `libredb bench [--nodes <n>] [--threads <t>]` | Benchmarks `16`-lane parallel preparation, batch commits, reads, and compaction |
+| `libredb pulse <db.ldb> <query> [--cid <id>] [--epoch <n>] [--budget <t>]` | One-shot recall with `Reflex` triggers, spreading activation, and `Zero-Repeat Delta` |
+| `libredb skeleton <db.ldb> <source_file> [--filter <s>]` | Extracts/caches compressed `[Lstart-Lend]` symbol contracts and section spans |
+| `libredb learn-assoc <db.ldb> <cue_phrase> <id1,id2>` | Teaches a language-agnostic Hebbian concept bridge from any script/phrasing to target nodes |
+| `libredb learn-reflex <db.ldb> <id> <directive> [--stack <s>] [--action <a>]` | Persists a data-driven situational pitfall warning triggered by workspace/action context |
+| `libredb import-sqlite <db.ldb> <source.db> [--scope central\|project]` | Imports all `SkillsDB` SQLite tables read-only into cognitive capsules + lossless mirror |
+| `libredb export-sqlite <db.ldb> <out.db> [--scope central\|project]` | Reconstructs an exact SQLite database including indexes and rebuilt `FTS5` virtual tables |
+| `libredb verify-roundtrip <source.db> [--scope central\|project]` | Proves `100%` cell-by-cell `SQLite -> LibreDB -> SQLite` equivalence in `%TEMP%` |
+| `libredb put / get / get-key / link / deprecate / trace / recall` | Direct `O(1)` `Inode`, temporal `Supersedes`, and synapse graph operations |
+| `libredb compact / stats / verify / bench` | Crash-safe `64 KB` Gravity compaction, `CRC32` scrub, and `16`-thread benchmark |
 
 ## Architecture and project structure
 
-Each `.ldb` file begins with two `4 KB` ping-pong superblocks (`Slot A` at `0..4096`, `Slot B` at `4096..8192`). Small capsules (`<= 43 bytes` with `<= 4` synapses) reside directly inside their `128-byte` `Inode` (`0` payload seeks). Larger capsules are `LZ4`-compressed into contiguous extents with `CRC32C` verification. During `compact`, active connected `Inode` families are packed together into `64 KB` Gravity locality groups using a two-phase disjoint staging window (`T_stage >= max(tail, 8192 + Lc)`), guaranteeing 100% power-loss immunity without external `.wal` or `.shm` files.
-
 ```text
 LibreDB/
-|-- Cargo.toml                                     # Rust workspace configuration
-|-- VERSION                                        # Semantic Version (0.1.0)
+|-- Cargo.toml                                     # Rust workspace (5 modular crates)
+|-- VERSION                                        # Semantic Version (0.2.0)
 |-- CHANGELOG.md                                   # Keep a Changelog 1.1.0 release history
 |-- LICENSE                                        # AGPLv3 + Commons Clause license
 |-- README.md                                      # 9-block standardized documentation
 |-- crates/
-    |-- libredb-core/                              # Core storage & cognitive kernel library
-    |   |-- Cargo.toml
-    |   |-- src/
-    |   |   |-- lib.rs                             # Public API surface
-    |   |   |-- error.rs                           # Typed error taxonomy
-    |   |   |-- crc.rs                             # SIMD CRC32, deterministic hash, BPE token counter
-    |   |   |-- format.rs                          # 128-byte Inode, Superblock, Synapse & frame codecs
-    |   |   |-- io.rs                              # Positional OS file I/O & fault-injecting crash simulator
-    |   |   |-- gravity.rs                         # 64 KB block-group BFS locality planner
-    |   |   |-- engine.rs                          # 16-lane chaos writes, MVCC snapshots, recall & compaction
-    |   |-- tests/
-    |       |-- integration_and_crash.rs           # Concurrency, gravity & 10,000-fault power-loss suite
-    |-- libredb-cli/                               # Standalone CLI & benchmark binary
-        |-- Cargo.toml
-        |-- src/
-            |-- main.rs                            # CLI entrypoint (`libredb`)
+    |-- libredb-core/                              # Frozen single-file LIBREDB1 storage kernel (Inodes, Extents, MVCC)
+    |-- libredb-index/                             # Language-agnostic BM25, Unicode n-grams & Hebbian concept learner
+    |-- libredb-cognitive/                         # Session Zero-Repeat Delta, ReflexEngine, FileSkeleton & Pulse
+    |-- libredb-bridge/                            # Lossless 19-table SQLite <-> LibreDB migrator & parity verifier
+    |-- libredb-cli/                               # Standalone CLI & benchmark runner (`libredb`)
 ```
 
 ## Versioning and license

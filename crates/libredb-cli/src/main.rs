@@ -1,8 +1,15 @@
-//! Command-line utility for inspecting, mutating, compacting, verifying, and benchmarking `.ldb` files.
+//! Command-line interface for `LibreDB v0.2.0`: cognitive `pulse`, `skeleton`, `reflex`,
+//! lossless `SQLite` migration/verification, and storage diagnostics.
 
+use libredb_bridge::{
+    export_sqlite_database, import_sqlite_readonly, verify_sqlite_equivalence,
+};
+use libredb_cognitive::{
+    CognitiveEngine, FileSkeleton, PulseRequest, ReflexEngine, ReflexRule,
+};
 use libredb_core::{EdgeKind, LibreDb, NodeKind, WriteRequest};
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
 use std::thread;
@@ -10,9 +17,20 @@ use std::time::Instant;
 
 fn print_usage() {
     println!(
-        "LibreDB v{} - Single-file cognitive chaos-extent-inode storage engine
+        "LibreDB v{} - Cognitive LLM memory & token-conservation engine
 
-Usage:
+Cognitive & Token-Conservation Commands:
+  libredb pulse <db.ldb> <query> [--cid <conv_id>] [--epoch <n>] [--budget <tok>] [--cwd <dir>] [--err <msg>]
+  libredb skeleton <db.ldb> <source_file> [--filter <substr>]
+  libredb learn-assoc <db.ldb> <cue_phrase> <target_id_1,target_id_2>
+  libredb learn-reflex <db.ldb> <id> <directive> [--stack <s1,s2>] [--action <a1,a2>] [--env <e1,e2>]
+
+Lossless 1:1 SQLite Bridge Commands:
+  libredb import-sqlite <db.ldb> <source.db> [--scope central|project]
+  libredb export-sqlite <db.ldb> <reconstructed.db> [--scope central|project]
+  libredb verify-roundtrip <source.db> [--scope central|project]
+
+Core Storage & Graph Commands:
   libredb init <db.ldb>
   libredb put <db.ldb> <kind> <payload> [--key <key>] [--importance <0..255>] [--pin]
   libredb get <db.ldb> <node_id>
@@ -44,6 +62,198 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     match args[0].as_str() {
+        "pulse" => {
+            if args.len() < 3 {
+                return Err(
+                    "Usage: libredb pulse <db.ldb> <query> [--cid <id>] [--epoch <n>] [--budget <tok>] [--cwd <dir>] [--err <msg>]".into(),
+                );
+            }
+            let mut req = PulseRequest::new(&args[2], 800);
+            let mut i = 3usize;
+            while i + 1 < args.len() {
+                match args[i].as_str() {
+                    "--cid" => {
+                        req.conversation_id = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    "--epoch" => {
+                        req.epoch = args[i + 1].parse()?;
+                        i += 2;
+                    }
+                    "--budget" => {
+                        req.token_budget = args[i + 1].parse()?;
+                        i += 2;
+                    }
+                    "--cwd" => {
+                        req.workspace_dir = Some(PathBuf::from(&args[i + 1]));
+                        i += 2;
+                    }
+                    "--err" => {
+                        req.error_context = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    other => return Err(format!("Unknown flag '{other}'").into()),
+                }
+            }
+
+            let t0 = Instant::now();
+            let db = Arc::new(LibreDb::open(&args[1])?);
+            let cog = CognitiveEngine::open_db(db)?;
+            let resp = cog.pulse(&req)?;
+            let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            println!("{}", resp.format_compact());
+            println!("[Completed in {elapsed_ms:.2} ms]");
+        }
+        "skeleton" => {
+            if args.len() < 3 {
+                return Err("Usage: libredb skeleton <db.ldb> <source_file> [--filter <substr>]".into());
+            }
+            let mut filter: Option<String> = None;
+            if args.len() >= 5 && args[3] == "--filter" {
+                filter = Some(args[4].clone());
+            }
+            let t0 = Instant::now();
+            let db = LibreDb::open(&args[1])?;
+            let src_path = Path::new(&args[2]);
+            let (skel, cache_hit) = FileSkeleton::index_or_get_cached(&db, src_path, None)?;
+            let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            print!("{}", skel.render_compact(filter.as_deref(), filter.is_some()));
+            println!(
+                "[Skeleton {} in {:.2} ms]",
+                if cache_hit { "served from hash-verified cache" } else { "extracted & cached" },
+                elapsed_ms
+            );
+        }
+        "learn-assoc" => {
+            if args.len() < 4 {
+                return Err("Usage: libredb learn-assoc <db.ldb> <cue_phrase> <id1,id2,...>".into());
+            }
+            let target_ids: Result<Vec<u64>, _> = args[3]
+                .split(',')
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.trim().parse::<u64>())
+                .collect();
+            let target_ids = target_ids?;
+            let db = Arc::new(LibreDb::open(&args[1])?);
+            let mut cog = CognitiveEngine::open_db(db)?;
+            let edges = cog.reinforce_association(&args[2], &target_ids)?;
+            println!(
+                "Reinforced {} Hebbian concept synapses from '{}' -> {:?}",
+                edges, args[2], target_ids
+            );
+        }
+        "learn-reflex" => {
+            if args.len() < 4 {
+                return Err("Usage: libredb learn-reflex <db.ldb> <id> <directive> [--stack s] [--action a] [--env e]".into());
+            }
+            let mut rule = ReflexRule {
+                id: args[2].clone(),
+                stack_any: Vec::new(),
+                action_any: Vec::new(),
+                env_or_error_any: Vec::new(),
+                directive: args[3].clone(),
+            };
+            let mut i = 4usize;
+            while i + 1 < args.len() {
+                let items: Vec<String> = args[i + 1]
+                    .split(',')
+                    .map(|s| s.trim().to_owned())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                match args[i].as_str() {
+                    "--stack" => rule.stack_any = items,
+                    "--action" => rule.action_any = items,
+                    "--env" => rule.env_or_error_any = items,
+                    other => return Err(format!("Unknown flag '{other}'").into()),
+                }
+                i += 2;
+            }
+            let db = LibreDb::open(&args[1])?;
+            let nid = ReflexEngine::learn_reflex(&db, &rule)?;
+            println!("Learned situational reflex '{}' as node #{nid}", rule.id);
+        }
+        "import-sqlite" => {
+            if args.len() < 3 {
+                return Err("Usage: libredb import-sqlite <db.ldb> <source.db> [--scope central|project]".into());
+            }
+            let mut scope = "central";
+            if args.len() >= 5 && args[3] == "--scope" {
+                scope = &args[4];
+            }
+            let t0 = Instant::now();
+            let db = LibreDb::open(&args[1])?;
+            let sum = import_sqlite_readonly(Path::new(&args[2]), &db, scope)?;
+            println!(
+                "[OK] Imported SQLite '{}' (scope={}) in {:.2} ms: {} tables ({} rows) -> {} cognitive capsules + {} synapses",
+                args[2],
+                sum.scope,
+                t0.elapsed().as_secs_f64() * 1000.0,
+                sum.tables_mirrored,
+                sum.total_sqlite_rows,
+                sum.cognitive_capsules_created,
+                sum.synapses_wired
+            );
+        }
+        "export-sqlite" => {
+            if args.len() < 3 {
+                return Err("Usage: libredb export-sqlite <db.ldb> <reconstructed.db> [--scope central|project]".into());
+            }
+            let mut scope = "central";
+            if args.len() >= 5 && args[3] == "--scope" {
+                scope = &args[4];
+            }
+            let t0 = Instant::now();
+            let db = LibreDb::open(&args[1])?;
+            let rows = export_sqlite_database(&db, scope, Path::new(&args[2]))?;
+            println!(
+                "[OK] Reconstructed SQLite '{}' (scope={}, {} rows + FTS5 indexes) in {:.2} ms",
+                args[2],
+                scope,
+                rows,
+                t0.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        "verify-roundtrip" => {
+            if args.len() < 2 {
+                return Err("Usage: libredb verify-roundtrip <source.db> [--scope central|project]".into());
+            }
+            let mut scope = "central";
+            if args.len() >= 4 && args[2] == "--scope" {
+                scope = &args[3];
+            }
+            let src_path = Path::new(&args[1]);
+            let pid = process::id();
+            let tmp_dir = env::temp_dir().join(format!("libredb_roundtrip_{pid}"));
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            std::fs::create_dir_all(&tmp_dir)?;
+
+            // Strictly copy source SQLite to temp first so original file is never locked or touched!
+            let copy_src = tmp_dir.join("source_snapshot.db");
+            let temp_ldb = tmp_dir.join("bridge.tmp.ldb");
+            let recon_db = tmp_dir.join("reconstructed.db");
+            std::fs::copy(src_path, &copy_src)?;
+
+            let t0 = Instant::now();
+            let imp_sum;
+            {
+                let ldb = LibreDb::open(&temp_ldb)?;
+                imp_sum = import_sqlite_readonly(&copy_src, &ldb, scope)?;
+                ldb.compact_with_gravity()?;
+                ldb.verify_integrity()?;
+                export_sqlite_database(&ldb, scope, &recon_db)?;
+            }
+            let rep = verify_sqlite_equivalence(&copy_src, &recon_db)?;
+            let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+
+            println!("=== LOSSLESS 1:1 SQLITE <-> LIBREDB BIJECTION VERIFIED ===");
+            println!("  Source snapshot:       {}", src_path.display());
+            println!("  Tables verified:       {} (including {} FTS5 virtual tables)", rep.tables_verified, rep.fts5_tables_verified);
+            println!("  Exact rows verified:   {} (0 discrepancies)", rep.rows_verified);
+            println!("  Cognitive graph built: {} capsules + {} synapses", imp_sum.cognitive_capsules_created, imp_sum.synapses_wired);
+            println!("  Canonical digest:      {}", rep.canonical_digest_hex);
+            println!("  Total round-trip time: {:.2} ms", elapsed_ms);
+        }
         "init" => {
             if args.len() < 2 {
                 return Err("Usage: libredb init <db.ldb>".into());
@@ -313,11 +523,16 @@ fn print_record(rec: &libredb_core::NodeRecord) {
             println!("  -> #{} ({}, weight={})", s.target_id, s.kind.as_str(), s.weight);
         }
     }
-    println!("Payload ({} bytes):\n{}", rec.payload.len(), String::from_utf8_lossy(&rec.payload));
+    println!(
+        "Payload ({} bytes):\n{}",
+        rec.payload.len(),
+        String::from_utf8_lossy(&rec.payload)
+    );
 }
 
 fn run_microbench(total_nodes: usize, threads: usize) -> Result<(), Box<dyn std::error::Error>> {
-    let tmp_path: PathBuf = env::temp_dir().join(format!("libredb_bench_{}.tmp.ldb", process::id()));
+    let tmp_path: PathBuf =
+        env::temp_dir().join(format!("libredb_bench_{}.tmp.ldb", process::id()));
     let _ = std::fs::remove_file(&tmp_path);
 
     let db = Arc::new(LibreDb::open(&tmp_path)?);
@@ -352,7 +567,6 @@ fn run_microbench(total_nodes: usize, threads: usize) -> Result<(), Box<dyn std:
     let ids = db.commit_batch(&all_prepared)?;
     let commit_ms = t_commit.elapsed().as_secs_f64() * 1000.0;
 
-    // Concurrent 16-thread random reads
     let ids_arc = Arc::new(ids);
     let t_read = Instant::now();
     let mut r_handles = Vec::with_capacity(threads);
@@ -381,9 +595,24 @@ fn run_microbench(total_nodes: usize, threads: usize) -> Result<(), Box<dyn std:
 
     let actual_n = ids_arc.len();
     println!("=== LibreDB Kernel Benchmark ({actual_n} nodes across {threads} threads) ===");
-    println!("  Parallel prepare ({threads} lanes): {:>8.2} ms ({:.0} nodes/sec)", prep_ms, (actual_n as f64) / (prep_ms / 1000.0));
-    println!("  Atomic batch commit + fsync:   {:>8.2} ms ({:.0} nodes/sec)", commit_ms, (actual_n as f64) / (commit_ms / 1000.0));
-    println!("  Concurrent {threads}-thread reads:  {:>8.2} ms ({:.0} reads/sec)", read_ms, (actual_n as f64) / (read_ms / 1000.0));
-    println!("  Gravity compaction + verify:   {:>8.2} ms ({} -> {} bytes)", comp_ms, comp.bytes_before, st.file_bytes);
+    println!(
+        "  Parallel prepare ({threads} lanes): {:>8.2} ms ({:.0} nodes/sec)",
+        prep_ms,
+        (actual_n as f64) / (prep_ms / 1000.0)
+    );
+    println!(
+        "  Atomic batch commit + fsync:   {:>8.2} ms ({:.0} nodes/sec)",
+        commit_ms,
+        (actual_n as f64) / (commit_ms / 1000.0)
+    );
+    println!(
+        "  Concurrent {threads}-thread reads:  {:>8.2} ms ({:.0} reads/sec)",
+        read_ms,
+        (actual_n as f64) / (read_ms / 1000.0)
+    );
+    println!(
+        "  Gravity compaction + verify:   {:>8.2} ms ({} -> {} bytes)",
+        comp_ms, comp.bytes_before, st.file_bytes
+    );
     Ok(())
 }
