@@ -18,6 +18,21 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+struct IpcWriteGuard<'a>(&'a dyn StorageBackend);
+
+impl<'a> IpcWriteGuard<'a> {
+    fn acquire(backend: &'a dyn StorageBackend) -> Result<Self> {
+        backend.lock_write_region()?;
+        Ok(Self(backend))
+    }
+}
+
+impl Drop for IpcWriteGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.unlock_write_region();
+    }
+}
+
 /// Number of independent lock-free preparation lanes for concurrent writers.
 pub const SHARD_WRITE_LANES: usize = 16;
 
@@ -385,6 +400,56 @@ impl LibreDb {
         })
     }
 
+    fn read_disk_superblock(backend: &dyn StorageBackend, file_len: u64) -> Result<Superblock> {
+        if file_len < DATA_REGION_START {
+            return Err(LibreDbError::NoValidSuperblock);
+        }
+        let mut buf_a = [0u8; SUPERBLOCK_SLOT_SIZE as usize];
+        let mut buf_b = [0u8; SUPERBLOCK_SLOT_SIZE as usize];
+        let res_a = backend
+            .read_at(0, &mut buf_a)
+            .and_then(|_| Superblock::decode(&buf_a));
+        let res_b = backend
+            .read_at(SUPERBLOCK_SLOT_SIZE, &mut buf_b)
+            .and_then(|_| Superblock::decode(&buf_b));
+        match (res_a, res_b) {
+            (Ok(a), Ok(b)) => {
+                let a_fits = a.data_tail_offset <= file_len;
+                let b_fits = b.data_tail_offset <= file_len;
+                match (a_fits, b_fits) {
+                    (true, true) => Ok(if b.commit_seq >= a.commit_seq { b } else { a }),
+                    (true, false) => Ok(a),
+                    (false, true) => Ok(b),
+                    (false, false) => Err(LibreDbError::NoValidSuperblock),
+                }
+            }
+            (Ok(a), Err(_)) if a.data_tail_offset <= file_len => Ok(a),
+            (Err(_), Ok(b)) if b.data_tail_offset <= file_len => Ok(b),
+            _ => Err(LibreDbError::NoValidSuperblock),
+        }
+    }
+
+    /// Checks whether another OS process (e.g. a lifecycle hook or CLI command) committed new
+    /// frames to the underlying `.ldb` file (`< 8 microseconds` 8 KB superblock read from OS page
+    /// cache), and transparently reloads `SnapshotState` if `commit_seq` or `compaction_count` advanced.
+    pub fn sync_from_disk_if_changed(&self) -> Result<bool> {
+        let file_len = self.backend.len()?;
+        if file_len < DATA_REGION_START {
+            return Ok(false);
+        }
+        let disk_sb = Self::read_disk_superblock(&*self.backend, file_len)?;
+        let mem_sb = self.state.read().superblock;
+        if disk_sb.commit_seq == mem_sb.commit_seq
+            && disk_sb.compaction_count == mem_sb.compaction_count
+            && disk_sb.data_tail_offset == mem_sb.data_tail_offset
+        {
+            return Ok(false);
+        }
+        let reloaded = Self::recover_existing(&*self.backend, file_len)?;
+        *self.state.write() = Arc::new(reloaded);
+        Ok(true)
+    }
+
     /// Prepares a `WriteRequest` on one of the 16 lock-free chaos lanes (compression, CRC32, token count).
     /// Multiple threads can invoke `prepare` in parallel with zero lock contention.
     pub fn prepare(&self, req: WriteRequest, worker_hint: usize) -> Result<PreparedWrite> {
@@ -477,6 +542,8 @@ impl LibreDb {
         }
 
         let _guard = self.commit_lock.lock();
+        let _ipc_guard = IpcWriteGuard::acquire(&*self.backend)?;
+        self.sync_from_disk_if_changed()?;
         let old_snap = Arc::clone(&self.state.read());
         let mut next_snap = SnapshotState {
             superblock: old_snap.superblock,
@@ -677,6 +744,8 @@ impl LibreDb {
         }
 
         let _guard = self.commit_lock.lock();
+        let _ipc_guard = IpcWriteGuard::acquire(&*self.backend)?;
+        self.sync_from_disk_if_changed()?;
         let old_snap = Arc::clone(&self.state.read());
 
         // Validate endpoints and group new synapses by `source_id`.
@@ -839,6 +908,8 @@ impl LibreDb {
     /// Tombstones an active keyed node so it no longer appears in active queries while keeping file integrity.
     pub fn deprecate_key(&self, kind: NodeKind, key: &str) -> Result<bool> {
         let _guard = self.commit_lock.lock();
+        let _ipc_guard = IpcWriteGuard::acquire(&*self.backend)?;
+        self.sync_from_disk_if_changed()?;
         let old_snap = Arc::clone(&self.state.read());
         let Some(&target_id) = old_snap.key_dir.get(&(kind, key.to_owned())) else {
             return Ok(false);
@@ -1248,6 +1319,8 @@ impl LibreDb {
     ///    flushes, flips `Superblock #2`, and shrinks the file via `set_len(8192 + Lc)`.
     pub fn compact_with_gravity(&self) -> Result<CompactionReport> {
         let _guard = self.commit_lock.lock();
+        let _ipc_guard = IpcWriteGuard::acquire(&*self.backend)?;
+        self.sync_from_disk_if_changed()?;
         let old_snap = Arc::clone(&self.state.read());
         let bytes_before = self.backend.len()?;
 

@@ -45,15 +45,17 @@ impl OverlayBrain {
         self.project.db()
     }
 
-    /// Refreshes indices only if `commit_seq` changed since last check (`< 1 microsecond` when clean!).
+    /// Refreshes indices across threads and OS processes if on-disk or in-memory `commit_seq` changed.
     pub fn refresh_if_needed(&mut self) -> Result<()> {
         if let Some(ref mut g) = self.global {
+            g.db().sync_from_disk_if_changed()?;
             let g_seq = g.db().stats()?.commit_seq;
             if g_seq != self.last_global_seq {
                 g.refresh_indices()?;
                 self.last_global_seq = g_seq;
             }
         }
+        self.project.db().sync_from_disk_if_changed()?;
         let p_seq = self.project.db().stats()?.commit_seq;
         if p_seq != self.last_project_seq {
             self.project.refresh_indices()?;

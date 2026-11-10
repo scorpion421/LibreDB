@@ -406,3 +406,58 @@ fn deterministic_10000_power_loss_and_torn_write_crash_simulation() {
 
     assert_eq!(simulated_crashes, 10_000);
 }
+
+#[test]
+fn multi_handle_interleaved_ipc_commits_preserve_every_update_and_lock_free_reads() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("ipc_concurrent.ldb");
+
+    // Simulate Process A (`libredb-mcp` long-lived daemon) and Process B (`hook-pre-tool` / `CLI`)
+    // holding independent `LibreDb` handles over the exact same OS file!
+    let handle_mcp = LibreDb::open(&db_path).unwrap();
+    let handle_hook = LibreDb::open(&db_path).unwrap();
+
+    handle_mcp
+        .put(WriteRequest::new(NodeKind::Fact, b"from_mcp_1".to_vec()).with_key("mcp_fact"))
+        .unwrap();
+
+    // Process B writes without Process A knowing in advance:
+    handle_hook
+        .put(
+            WriteRequest::new(NodeKind::WorkingSet, b"src/main.rs".to_vec())
+                .with_key("src/main.rs"),
+        )
+        .unwrap();
+
+    // Now Process A writes again: must NOT overwrite Process B's delta frame at the old tail!
+    handle_mcp
+        .put(
+            WriteRequest::new(NodeKind::Decision, b"ipc_safe_architecture".to_vec())
+                .with_key("ipc_dec"),
+        )
+        .unwrap();
+
+    // Both handles + a fresh verification handle must see ALL 3 capsules intact with valid CRCs!
+    handle_hook.sync_from_disk_if_changed().unwrap();
+    assert_eq!(
+        handle_hook.get_by_key(NodeKind::Fact, "mcp_fact").unwrap().payload,
+        b"from_mcp_1"
+    );
+    assert_eq!(
+        handle_mcp
+            .get_by_key(NodeKind::WorkingSet, "src/main.rs")
+            .unwrap()
+            .payload,
+        b"src/main.rs"
+    );
+    assert_eq!(
+        handle_hook
+            .get_by_key(NodeKind::Decision, "ipc_dec")
+            .unwrap()
+            .payload,
+        b"ipc_safe_architecture"
+    );
+
+    let verifier = LibreDb::open(&db_path).unwrap();
+    verifier.verify_integrity().unwrap();
+}

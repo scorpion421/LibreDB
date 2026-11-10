@@ -53,31 +53,40 @@ if ($SkillsDbCmd -and $SkillsDbCmd.Source) {
     }
 }
 
-# Seed read-only 1:1 import of central customizations.db into ~/.gemini/libredb/customizations.ldb (never modifies customizations.db!)
+# Seed read-only 1:1 import of central customizations.db into ~/.gemini/libredb/customizations.ldb
+# Uses staging + hot-safe rename swap so live MCP handles never enter Windows NTFS DELETE_PENDING!
 $CentralSqlite = Join-Path $GeminiDir "database\customizations.db"
 $GlobalLdb = Join-Path $LibreHome "customizations.ldb"
+$StagingLdb = "$GlobalLdb.staging"
+if (Test-Path $StagingLdb) { Remove-Item $StagingLdb -Force }
 if (Test-Path $CentralSqlite) {
-    if (Test-Path $GlobalLdb) { Remove-Item $GlobalLdb -Force }
-    & $TargetExe import-sqlite $GlobalLdb $CentralSqlite --scope central
+    & $TargetExe import-sqlite $StagingLdb $CentralSqlite --scope central
 }
 
-# Seed operational reflexes learned from real-world sessions into customizations.ldb
-& $TargetExe learn-reflex $GlobalLdb "rust-guardrail-staged" `
+& $TargetExe learn-reflex $StagingLdb "rust-guardrail-staged" `
     "[REFLEX rust-guardrail-staged]: Ensure /target/ and /dist/ are in .gitignore and run 'libredb guardrail check --path <dir> --staged --strict' before committing." `
     --stack "cargo.toml" --action "guardrail,release" | Out-Null
-& $TargetExe learn-reflex $GlobalLdb "rust-gitea-dist" `
+& $TargetExe learn-reflex $StagingLdb "rust-gitea-dist" `
     "[REFLEX rust-gitea-dist]: Copy compiled release deliverables into dist/ before running 'libredb gitea-release' so assets attach automatically." `
     --stack "cargo.toml" --action "gitea-release,gitea-sync" | Out-Null
-& $TargetExe learn-reflex $GlobalLdb "git-non-acl-safe-dir" `
+& $TargetExe learn-reflex $StagingLdb "git-non-acl-safe-dir" `
     "[REFLEX git-non-acl-safe-dir]: On non-ACL drives, run 'git config --global --add safe.directory <repo>' right after git init." `
     --action "git,gitea-init" --env "dubious ownership" | Out-Null
+& $TargetExe learn-reflex $StagingLdb "windows-hooks-cmd-quoting" `
+    "[REFLEX windows-hooks-cmd-quoting]: In Antigravity hooks.json on Windows, never wrap forward-slash paths in quotes because Go exec.Command('cmd','/C',cmd) escapes quotes as \\\"; use unquoted %USERPROFILE%\\... backslashes." `
+    --stack "hooks.json" --action "hooks.json,deploy_plugin" --env "falsch geschrieben,jsonhook__" | Out-Null
 
-& $TargetExe compact $GlobalLdb
+& $TargetExe compact $StagingLdb
+Install-BinaryHotSafe -Src $StagingLdb -Dst $GlobalLdb
+Remove-Item $StagingLdb -Force -ErrorAction SilentlyContinue
 
-# Ensure LibreDB's own workspace memory (.agents/memory.ldb) is auto-migrated from .agents/memory.db + workspace-indexed
+# Incrementally index LibreDB's own workspace into .agents/memory.ldb (auto-porting .agents/memory.db if .ldb is absent, never deleting live .ldb!)
 $SelfLdb = Join-Path $ProjectRoot ".agents\memory.ldb"
-if (Test-Path $SelfLdb) { Remove-Item $SelfLdb -Force }
-& $TargetExe index-workspace $SelfLdb $ProjectRoot
+try {
+    & $TargetExe index-workspace $SelfLdb $ProjectRoot
+} catch {
+    Write-Output "[INFO] Workspace index skipped while older handle drains: $_"
+}
 
 $ExeForward = $TargetExe.Replace('\', '/')
 $GlobalForward = $GlobalLdb.Replace('\', '/')
@@ -88,7 +97,7 @@ $PluginJson = @'
 {
   "name": "libredb",
   "displayName": "LibreDB Cognitive Memory",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Full Rust replacement for SQLite SkillsDB: single-file cognitive memory, silent SQLite auto-porter, sub-2ms hooks, guardrails, causal code graph, and local Gitea automation.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [

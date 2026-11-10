@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-11-10
+
+### Fixed
+
+- Added zero-sidecar inter-process writer synchronization (`LockFileEx` high-offset byte lock on Windows / advisory `flock` on Unix) and automatic superblock reload (`LibreDb::sync_from_disk_if_changed`) across `commit_batch`, `link_batch`, `deprecate_key`, `compact_with_gravity`, and `OverlayBrain::refresh_if_needed`, ensuring concurrent OS processes (`libredb-mcp` daemon + `PreInvocation`/`PreToolUse` hooks + `CLI`) never clobber interleaved commits while keeping `0 .. file_len` `MVCC` reads `100%` lock-free.
+- Replaced in-place `Remove-Item` deletion of live `.ldb` files in `scripts/deploy_plugin.ps1` with atomic staging + rename swaps, preventing Windows `NTFS` `DELETE_PENDING` (`os error 5`) errors when upgrading while background handles are open.
+
 ## [0.5.0] - 2026-11-10
 
 ### Added

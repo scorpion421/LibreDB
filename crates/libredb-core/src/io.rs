@@ -38,6 +38,99 @@ pub trait StorageBackend: Send + Sync {
     fn is_network_share(&self) -> bool {
         false
     }
+
+    /// Acquires an inter-process writer lock at a high virtual byte offset (`127 PB`) so
+    /// concurrent OS processes serialize writes without ever blocking `0 .. file_len` MVCC readers
+    /// and without creating sidecar lock files.
+    fn lock_write_region(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Releases the inter-process writer lock acquired via `lock_write_region`.
+    fn unlock_write_region(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+mod win_lock {
+    use std::fs::File;
+    use std::io;
+    use std::os::windows::io::AsRawHandle;
+
+    const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
+    const HIGH_LOCK_OFFSET_LOW: u32 = 0x0000_0000;
+    const HIGH_LOCK_OFFSET_HIGH: u32 = 0x7FFF_0000;
+
+    #[repr(C)]
+    struct Overlapped {
+        internal: usize,
+        internal_high: usize,
+        offset: u32,
+        offset_high: u32,
+        h_event: *mut core::ffi::c_void,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LockFileEx(
+            h_file: *mut core::ffi::c_void,
+            dw_flags: u32,
+            dw_reserved: u32,
+            n_bytes_low: u32,
+            n_bytes_high: u32,
+            lp_overlapped: *mut Overlapped,
+        ) -> i32;
+
+        fn UnlockFileEx(
+            h_file: *mut core::ffi::c_void,
+            dw_reserved: u32,
+            n_bytes_low: u32,
+            n_bytes_high: u32,
+            lp_overlapped: *mut Overlapped,
+        ) -> i32;
+    }
+
+    pub fn lock_high_byte(file: &File) -> io::Result<()> {
+        let mut ov = Overlapped {
+            internal: 0,
+            internal_high: 0,
+            offset: HIGH_LOCK_OFFSET_LOW,
+            offset_high: HIGH_LOCK_OFFSET_HIGH,
+            h_event: core::ptr::null_mut(),
+        };
+        let ok = unsafe {
+            LockFileEx(
+                file.as_raw_handle() as *mut _,
+                LOCKFILE_EXCLUSIVE_LOCK,
+                0,
+                1,
+                0,
+                &mut ov,
+            )
+        };
+        if ok != 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    pub fn unlock_high_byte(file: &File) -> io::Result<()> {
+        let mut ov = Overlapped {
+            internal: 0,
+            internal_high: 0,
+            offset: HIGH_LOCK_OFFSET_LOW,
+            offset_high: HIGH_LOCK_OFFSET_HIGH,
+            h_event: core::ptr::null_mut(),
+        };
+        let ok = unsafe { UnlockFileEx(file.as_raw_handle() as *mut _, 0, 1, 0, &mut ov) };
+        if ok != 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
 }
 
 /// Production OS file backend using overlap/positional reads (`seek_read` on Windows, `read_at` on Unix).
@@ -153,6 +246,30 @@ impl StorageBackend for OsFileBackend {
 
     fn is_network_share(&self) -> bool {
         self.is_network
+    }
+
+    fn lock_write_region(&self) -> Result<()> {
+        #[cfg(windows)]
+        {
+            win_lock::lock_high_byte(&self.file)?;
+        }
+        #[cfg(unix)]
+        {
+            self.file.lock()?;
+        }
+        Ok(())
+    }
+
+    fn unlock_write_region(&self) -> Result<()> {
+        #[cfg(windows)]
+        {
+            win_lock::unlock_high_byte(&self.file)?;
+        }
+        #[cfg(unix)]
+        {
+            self.file.unlock()?;
+        }
+        Ok(())
     }
 }
 
