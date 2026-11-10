@@ -20,3 +20,6 @@ libredb-core = { path = "../libredb-core" }
 libredb-index = { path = "../libredb-index" }
 serde_json.workspace = true
 sha2.workspace = true
+
+[dev-dependencies]
+rusqlite.workspace = true

@@ -520,6 +520,7 @@ pub fn index_workspace(db: &LibreDb, root: &Path, force: bool) -> Result<Workspa
     // 2. Wire `Decision / Task --[Governs]--> Symbol` & `Symbol --[CausedBy]--> Decision` automatically!
     let mut gov_edges = 0usize;
     let mut active_gov_ids: Vec<u64> = Vec::new();
+    let mut gov_out_edges: Vec<(u64, EdgeKind, u64, u8)> = Vec::new();
     for kind in [NodeKind::Decision, NodeKind::Task] {
         let gov_inodes = db.list_inodes(Some(kind), false);
         let gov_ids: Vec<u64> = gov_inodes.iter().map(|(i, _, _)| i.node_id).collect();
@@ -532,7 +533,7 @@ pub fn index_workspace(db: &LibreDb, root: &Path, force: bool) -> Result<Workspa
                 if let Some(targets) = by_qualified_name.get(&qcall) {
                     for &(sym_id, _) in targets {
                         if seen_gov_syms.insert(sym_id) {
-                            edges.push((rec.node_id, EdgeKind::Governs, sym_id, 245));
+                            gov_out_edges.push((rec.node_id, EdgeKind::Governs, sym_id, 245));
                             edges.push((sym_id, EdgeKind::CausedBy, rec.node_id, 235));
                             gov_edges += 2;
                         }
@@ -549,7 +550,7 @@ pub fn index_workspace(db: &LibreDb, root: &Path, force: bool) -> Result<Workspa
                     if targets.len() <= 3 && (targets.len() == 1 || is_salient) {
                         for &(sym_id, _) in targets {
                             if seen_gov_syms.insert(sym_id) {
-                                edges.push((rec.node_id, EdgeKind::Governs, sym_id, 240));
+                                gov_out_edges.push((rec.node_id, EdgeKind::Governs, sym_id, 240));
                                 edges.push((sym_id, EdgeKind::CausedBy, rec.node_id, 230));
                                 gov_edges += 2;
                             }
@@ -561,7 +562,7 @@ pub fn index_workspace(db: &LibreDb, root: &Path, force: bool) -> Result<Workspa
                         if mtargets.len() == 1 {
                             let (sym_id, _) = mtargets[0];
                             if seen_gov_syms.insert(sym_id) {
-                                edges.push((rec.node_id, EdgeKind::Governs, sym_id, 238));
+                                gov_out_edges.push((rec.node_id, EdgeKind::Governs, sym_id, 238));
                                 edges.push((sym_id, EdgeKind::CausedBy, rec.node_id, 228));
                                 gov_edges += 2;
                             }
@@ -572,26 +573,16 @@ pub fn index_workspace(db: &LibreDb, root: &Path, force: bool) -> Result<Workspa
         }
     }
 
-    let mut scoped_sources = active_sym_ids;
-    scoped_sources.extend_from_slice(&active_gov_ids);
     if need_call_pass {
         db.sync_edges_for_kinds(
-            &scoped_sources,
-            &[
-                EdgeKind::Calls,
-                EdgeKind::DependsOn,
-                EdgeKind::Governs,
-                EdgeKind::CausedBy,
-            ],
+            &active_sym_ids,
+            &[EdgeKind::Calls, EdgeKind::DependsOn, EdgeKind::CausedBy],
             &edges,
         )?;
     } else {
-        db.sync_edges_for_kinds(
-            &scoped_sources,
-            &[EdgeKind::Governs, EdgeKind::CausedBy],
-            &edges,
-        )?;
+        db.sync_edges_for_kinds(&active_sym_ids, &[EdgeKind::CausedBy], &edges)?;
     }
+    db.sync_edges_for_kinds(&active_gov_ids, &[EdgeKind::Governs], &gov_out_edges)?;
 
     Ok(WorkspaceIndexReport {
         files_scanned,

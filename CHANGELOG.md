@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.4] - 2026-11-10
+
+### Fixed
+
+- Normalized `McpServerState::brains` cache keys via `canonical_brain_cache_key` (`crates/libredb-cli/src/mcp.rs` and `canonicalize_with_missing_tail` in `crates/libredb-cli/src/security.rs`) so relative paths (`.agents/memory.ldb`), `..` segments, symlinks, and Windows casing variants always resolve to and evict the exact same cached `OverlayBrain` instance on seal failure or tamper quarantine.
+- Separated `Decision`/`Task` outgoing `EdgeKind::Governs` synchronization from `Symbol` `Calls`/`DependsOn`/`CausedBy` synchronization in `index_workspace` (`crates/libredb-cognitive/src/workspace.rs`) so reindexing source files preserves causal `Decision -> Decision` cognitive synapses untouched.
+
+### Security
+
+- Enforced strict fail-closed post-migration sealing in `evaluate_pre_invocation_payload` (`crates/libredb-cli/src/hooks.rs`), `McpServerState::resolve_brain_with_seal_target` (`crates/libredb-cli/src/mcp.rs`), and `record_working_set_edit` (`crates/libredb-cli/src/hooks.rs`), plus monotonic `trust:v3_upgraded::<ws>` `.ldb`-deletion downgrade rejection in `is_workspace_memory_trusted` (`crates/libredb-cli/src/security.rs`): if `seal_workspace_memory` fails after migrating a legacy `.agents/memory.db`, `PreInvocation` emits only the quarantine diagnostic and injects zero project capsules or headers, while `MCP` refuses to cache or serve the unsealed database.
+- Expanded `compute_cognitive_content_digest` (`CONTENT_DIGEST_DOMAIN = v4` in `crates/libredb-cli/src/security.rs`, with `PreMutationSealGuard` added to `learn-assoc` and `link` in `crates/libredb-cli/src/main.rs`) across all `13` persistent cognitive capsule kinds to cryptographically authenticate context-selecting metadata (`node_id`, `importance`, `PINNED` flag, `token_count`, `created_ns`, `updated_ns`, `generation`, and active cognitive graph synapses) alongside `kind`, `key`, and `payload`, catching identical-payload `Fact` re-writes and raw binary `.ldb` `updated_ns`/synapse tampering while keeping `WorkingSet`, `Symbol`, `index-workspace`, and `compact` (`--prune`) zero-friction.
+
 ## [0.9.3] - 2026-11-10
 
 ### Fixed

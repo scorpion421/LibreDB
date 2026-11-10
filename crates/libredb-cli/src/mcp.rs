@@ -30,7 +30,20 @@ pub struct McpServerState {
     default_project_path: PathBuf,
     global_path: Option<PathBuf>,
     global_db: Option<Arc<LibreDb>>,
-    brains: HashMap<PathBuf, OverlayBrain>,
+    /// Keyed by `canonical_brain_cache_key(db_path)` so relative paths, `..` segments, symlinks,
+    /// and Windows casing variants always address and evict the exact same cached `OverlayBrain`.
+    brains: HashMap<String, OverlayBrain>,
+}
+
+pub(crate) fn canonical_brain_cache_key(db_path: &Path) -> String {
+    let abs = if db_path.is_relative() {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(db_path))
+            .unwrap_or_else(|_| db_path.to_path_buf())
+    } else {
+        db_path.to_path_buf()
+    };
+    crate::security::normalize_workspace_key(&abs)
 }
 
 impl McpServerState {
@@ -73,8 +86,9 @@ impl McpServerState {
     ) -> Result<(), String> {
         if let (Some(ref gdb), Some(ws_root)) = (&self.global_db, ws_root_opt) {
             if let Err(err) = crate::security::seal_workspace_memory(gdb, proj_db, ws_root) {
-                let ldb_path = ws_root.join(".agents").join("memory.ldb");
-                self.brains.remove(&ldb_path);
+                let cache_key =
+                    canonical_brain_cache_key(&ws_root.join(".agents").join("memory.ldb"));
+                self.brains.remove(&cache_key);
                 return Err(format!(
                     "Workspace mutation succeeded, but updating hmac-sha256:v3 trust seal for '{}' failed: {err}",
                     ws_root.display()
@@ -99,38 +113,81 @@ impl McpServerState {
                 None => self.default_project_path.clone(),
             },
         };
+        let candidate_cache_key = canonical_brain_cache_key(&candidate_path);
 
         let mut ws_root_to_seal: Option<PathBuf> = None;
-        let db_path = if let Some(ws_root) = workspace_root_from_agents_ldb(&candidate_path) {
-            if crate::security::is_workspace_memory_trusted(self.global_db.as_deref(), &ws_root) {
-                if is_explicit_memorize {
-                    ws_root_to_seal = Some(ws_root);
+        let (mut db_path, mut cache_key) =
+            if let Some(ws_root) = workspace_root_from_agents_ldb(&candidate_path) {
+                if crate::security::is_workspace_memory_trusted(self.global_db.as_deref(), &ws_root)
+                {
+                    if is_explicit_memorize {
+                        ws_root_to_seal = Some(ws_root);
+                    }
+                    (candidate_path, candidate_cache_key)
+                } else {
+                    // Evict any cached OverlayBrain via canonical key so relative/symlink/casing variants are purged too.
+                    self.brains.remove(&candidate_cache_key);
+                    if is_explicit_memorize {
+                        return Err(format!(
+                            "Workspace memory at '{}' is quarantined because a pre-existing unsealed, tampered, or Git-tracked .agents database was detected. Run 'libredb trust \"{}\"' in a terminal if you trust this repository.",
+                            candidate_path.display(),
+                            ws_root.display()
+                        ));
+                    }
+                    let q_path = default_libredb_home().join("quarantined_workspace.ldb");
+                    let q_key = canonical_brain_cache_key(&q_path);
+                    (q_path, q_key)
                 }
-                candidate_path
             } else {
-                // Evict any cached OverlayBrain for this path so post-cache offline tampering is immediately quarantined.
-                self.brains.remove(&candidate_path);
-                if is_explicit_memorize {
-                    return Err(format!(
-                        "Workspace memory at '{}' is quarantined because a pre-existing unsealed, tampered, or Git-tracked .agents database was detected. Run 'libredb trust \"{}\"' in a terminal if you trust this repository.",
-                        candidate_path.display(),
-                        ws_root.display()
-                    ));
-                }
-                default_libredb_home().join("quarantined_workspace.ldb")
-            }
-        } else {
-            candidate_path
-        };
+                (candidate_path, candidate_cache_key)
+            };
 
-        if !self.brains.contains_key(&db_path) {
-            let (proj_db, _) = open_project_ldb_silent(&db_path)?;
-            let brain =
-                OverlayBrain::open(self.global_db.clone(), proj_db).map_err(|e| e.to_string())?;
-            self.brains.insert(db_path.clone(), brain);
+        if !self.brains.contains_key(&cache_key) {
+            let (proj_db, did_migrate) = open_project_ldb_silent(&db_path)?;
+            let mut ready_db = Some(proj_db);
+            if did_migrate {
+                if let Some(mig_ws) = workspace_root_from_agents_ldb(&db_path) {
+                    if !crate::security::is_private_brain_workspace(&mig_ws) {
+                        let seal_res = if is_protected_profile_dir(&mig_ws) {
+                            Err("workspace resolves to a protected profile directory".to_owned())
+                        } else if let Some(ref gdb) = self.global_db {
+                            crate::security::seal_workspace_memory(
+                                gdb,
+                                ready_db.as_ref().unwrap(),
+                                &mig_ws,
+                            )
+                        } else {
+                            Err("global customizations.ldb is unavailable".to_owned())
+                        };
+                        if let Err(err) = seal_res {
+                            ready_db = None;
+                            if is_explicit_memorize {
+                                return Err(format!(
+                                    "Post-migration hmac-sha256:v3 workspace seal failed for '{}': {err}",
+                                    mig_ws.display()
+                                ));
+                            }
+                            ws_root_to_seal = None;
+                            db_path = default_libredb_home().join("quarantined_workspace.ldb");
+                            cache_key = canonical_brain_cache_key(&db_path);
+                            if !self.brains.contains_key(&cache_key) {
+                                let (q_db, _) = open_project_ldb_silent(&db_path)?;
+                                let q_brain = OverlayBrain::open(self.global_db.clone(), q_db)
+                                    .map_err(|e| e.to_string())?;
+                                self.brains.insert(cache_key.clone(), q_brain);
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(valid_db) = ready_db {
+                let brain = OverlayBrain::open(self.global_db.clone(), valid_db)
+                    .map_err(|e| e.to_string())?;
+                self.brains.insert(cache_key.clone(), brain);
+            }
         }
 
-        let brain = self.brains.get_mut(&db_path).unwrap();
+        let brain = self.brains.get_mut(&cache_key).unwrap();
         brain.refresh_if_needed().map_err(|e| e.to_string())?;
         Ok((ws_root_to_seal, brain))
     }
@@ -776,13 +833,14 @@ fn default_libredb_home() -> PathBuf {
 }
 
 fn workspace_root_from_agents_ldb(db_path: &Path) -> Option<PathBuf> {
-    let resolved = if db_path.is_relative() {
+    let joined = if db_path.is_relative() {
         std::env::current_dir()
             .map(|cwd| cwd.join(db_path))
             .unwrap_or_else(|_| db_path.to_path_buf())
     } else {
         db_path.to_path_buf()
     };
+    let resolved = crate::security::canonicalize_with_missing_tail(&joined).unwrap_or(joined);
     let parent = resolved.parent()?;
     if parent.file_name().and_then(|n| n.to_str()) == Some(".agents") {
         parent.parent().filter(|p| !p.as_os_str().is_empty()).map(Path::to_path_buf)
@@ -837,5 +895,94 @@ fn resolve_workspace_ldb_path(probe: &Path, fallback: &Path) -> PathBuf {
         start_dir.join(".agents").join("memory.ldb")
     } else {
         fallback.to_path_buf()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{canonical_brain_cache_key, McpServerState};
+    use libredb_core::{LibreDb, NodeKind, WriteRequest};
+    use std::fs;
+
+    #[test]
+    fn relative_and_absolute_paths_share_canonical_cache_key_and_evict_on_seal_failure() {
+        let base_target = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join(format!(
+                "test_mcp_cache_key_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .subsec_nanos()
+            ));
+        let _ = fs::remove_dir_all(&base_target);
+        let ws_repo = base_target.join("mcp_repo");
+        fs::create_dir_all(ws_repo.join(".agents")).unwrap();
+        fs::create_dir_all(ws_repo.join("sub")).unwrap();
+
+        let global_path = base_target.join("customizations.ldb");
+        let abs_ldb = ws_repo.join(".agents").join("memory.ldb");
+        let dotdot_ldb = ws_repo.join("sub").join("..").join(".agents").join("memory.ldb");
+
+        {
+            let gdb = LibreDb::open(&global_path).unwrap();
+            let pdb = LibreDb::open(&abs_ldb).unwrap();
+            pdb.put(WriteRequest::new(NodeKind::Fact, b"k=1".to_vec()).with_key("k"))
+                .unwrap();
+            crate::security::seal_workspace_memory(&gdb, &pdb, &ws_repo).unwrap();
+        }
+
+        // Verify relative (from CWD), `sub/..`, and clean absolute paths produce the exact same cache key:
+        let cwd = std::env::current_dir().unwrap();
+        if let Some(rel_from_cwd) = abs_ldb.strip_prefix(&cwd).ok() {
+            assert_eq!(
+                canonical_brain_cache_key(rel_from_cwd),
+                canonical_brain_cache_key(&abs_ldb)
+            );
+        }
+        assert_eq!(
+            canonical_brain_cache_key(&dotdot_ldb),
+            canonical_brain_cache_key(&abs_ldb)
+        );
+
+        let mut state =
+            McpServerState::new(Some(&base_target.join("fallback.ldb")), Some(&global_path))
+                .unwrap();
+
+        // Populate cache via `sub/../.agents/memory.ldb` non-canonical path:
+        let hint_non_canon = dotdot_ldb.to_string_lossy().to_string();
+        let (ws_seal_opt, brain) = state
+            .resolve_brain_with_seal_target(Some(&hint_non_canon), None, true)
+            .unwrap();
+        assert!(ws_seal_opt.is_some());
+        let proj_arc = std::sync::Arc::clone(brain.project_db());
+        assert_eq!(state.brains.len(), 1);
+
+        // Corrupt the global trust secret so `seal_project_db_if_authorized` fails after mutation,
+        // and verify the entry cached under `sub/../.agents/memory.ldb` IS evicted via `ws_root`:
+        state
+            .global_db
+            .as_ref()
+            .unwrap()
+            .put(
+                WriteRequest::new(NodeKind::Config, b"corrupt-non-hex".to_vec())
+                    .with_key("sys::trust_anchor_secret"),
+            )
+            .unwrap();
+        let err = state
+            .seal_project_db_if_authorized(ws_seal_opt.as_deref(), &proj_arc)
+            .expect_err("Expected seal failure on corrupted secret");
+        assert!(err.contains("updating hmac-sha256:v3 trust seal"));
+        assert!(
+            state.brains.is_empty(),
+            "Cached OverlayBrain must be evicted even when opened via non-canonical/relative path"
+        );
+
+        drop(proj_arc);
+        drop(state);
+        let _ = fs::remove_dir_all(&base_target);
     }
 }

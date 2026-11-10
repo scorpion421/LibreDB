@@ -8,7 +8,7 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use hmac::{Hmac, Mac};
 use libredb_core::crc::hash_key;
-use libredb_core::{LibreDb, NodeKind, WriteRequest};
+use libredb_core::{EdgeKind, LibreDb, NodeFlags, NodeKind, WriteRequest};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -19,7 +19,7 @@ const DPAPI_PREFIX: &str = "dpapi:v1:";
 const VAULT_V1_PREFIX: &str = "vault:v1:";
 const VAULT_V2_PREFIX: &str = "vault:v2:";
 const VAULT_AEAD_AAD: &[u8] = b"LibreDB::CredentialVault::v2";
-const CONTENT_DIGEST_DOMAIN: &[u8] = b"LibreDB::CognitiveContent::v3\0";
+const CONTENT_DIGEST_DOMAIN: &[u8] = b"LibreDB::CognitiveContent::v4\0";
 const SEAL_V2_DOMAIN_SEP: &[u8] = b"LibreDB::WorkspaceTrustSeal::v2\0";
 const SEAL_V3_DOMAIN_SEP: &[u8] = b"LibreDB::WorkspaceTrustSeal::v3\0";
 const TRUST_SECRET_KEY: &str = "sys::trust_anchor_secret";
@@ -405,13 +405,41 @@ pub fn is_workspace_path_authorized(global_db: Option<&LibreDb>, ws_root: &Path)
     false
 }
 
-/// Computes a deterministic SHA-256 digest over all active prompt-relevant cognitive capsules in `proj_db`
-/// (`Rule`, `Skill`, `SkillSection`, `Decision`, `Fact`, `Task`, `Handoff`, `Snapshot`,
-/// `CompactionCheckpoint`, and `Config` excluding `sys::trust_seals`), ignoring ephemeral `WorkingSet`,
-/// `Symbol`, `TranscriptCursor`, and `QuotaEvent` cache updates.
+/// Returns true if `ws_root` resides inside an Antigravity per-conversation private brain folder
+/// (`~/.gemini/antigravity*/brain/<cid>`).
+pub fn is_private_brain_workspace(ws_root: &Path) -> bool {
+    let norm = normalize_workspace_key(ws_root);
+    let home_norm = normalize_workspace_key(&user_home_dir());
+    norm.starts_with(&format!("{home_norm}/.gemini/")) && norm.contains("/brain/")
+}
+
+/// Computes a deterministic SHA-256 digest over all active prompt- and context-relevant cognitive
+/// capsules in `proj_db` (`Rule`, `Skill`, `SkillSection`, `SynonymCluster`, `AgentTemplate`,
+/// `Decision`, `Fact`, `Task`, `TaskVerification`, `Handoff`, `Snapshot`, `CompactionCheckpoint`,
+/// and `Config` excluding `sys::trust_seals`), authenticating both content (`kind`, `key`, `payload`)
+/// and context-selecting persistent metadata (`node_id`, `importance`, `PINNED` flag, `token_count`,
+/// `created_ns`, `updated_ns`, `generation`, and active cognitive graph synapses) while ignoring
+/// ephemeral `WorkingSet`, `Symbol`, `Generic`, `TranscriptCursor`, `QuotaEvent`, `access_count`
+/// telemetry, and code-indexer `Decision`/`Task -> Symbol` governance link refreshes.
 pub fn compute_cognitive_content_digest(proj_db: &LibreDb) -> Result<([u8; 32], usize), String> {
-    let mut targets: Vec<(u8, String, u64)> = Vec::new();
-    for (ino, key_opt, _) in proj_db.list_inodes(None, false) {
+    struct DigestTarget {
+        kind_b: u8,
+        node_id: u64,
+        importance: u8,
+        pinned_flag: u8,
+        token_count: u32,
+        created_ns: u64,
+        eff_updated_ns: u64,
+        eff_generation: u32,
+        key: String,
+        raw_syns: Vec<libredb_core::Synapse>,
+    }
+
+    let all_inodes = proj_db.list_inodes(None, false);
+    let mut active_cognitive_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut targets: Vec<DigestTarget> = Vec::new();
+
+    for (ino, key_opt, syns) in all_inodes {
         if !ino.flags.is_live_active() {
             continue;
         }
@@ -419,24 +447,63 @@ pub fn compute_cognitive_content_digest(proj_db: &LibreDb) -> Result<([u8; 32], 
             NodeKind::Rule
             | NodeKind::Skill
             | NodeKind::SkillSection
+            | NodeKind::SynonymCluster
+            | NodeKind::AgentTemplate
             | NodeKind::Decision
             | NodeKind::Fact
             | NodeKind::Task
+            | NodeKind::TaskVerification
             | NodeKind::Handoff
             | NodeKind::Snapshot
             | NodeKind::CompactionCheckpoint => true,
             NodeKind::Config => key_opt.as_deref() != Some(TRUST_SEALS_KEY),
             _ => false,
         };
-        if include {
-            targets.push((ino.kind as u8, key_opt.unwrap_or_default(), ino.node_id));
+        if !include {
+            continue;
         }
+        active_cognitive_ids.insert(ino.node_id);
+        // Background `index_workspace` reconciles `Decision / Task --[Governs]--> Symbol` synapses via
+        // `sync_edges_for_kinds`, advancing `updated_ns` and `generation` on `Decision`/`Task` without
+        // changing their `node_id`-based `PreInvocation` selection order. All other cognitive kinds
+        // (including `Fact`, whose top-12 `PreInvocation` hydration sorts by `(updated_ns, node_id)`)
+        // bind `updated_ns` and `generation` directly.
+        let (eff_updated_ns, eff_generation) = match ino.kind {
+            NodeKind::Decision | NodeKind::Task => (0u64, 0u32),
+            _ => (ino.updated_ns, ino.generation),
+        };
+        targets.push(DigestTarget {
+            kind_b: ino.kind as u8,
+            node_id: ino.node_id,
+            importance: ino.importance,
+            pinned_flag: ino.flags.0 & NodeFlags::PINNED,
+            token_count: ino.token_count,
+            created_ns: ino.created_ns,
+            eff_updated_ns,
+            eff_generation,
+            key: key_opt.unwrap_or_default(),
+            raw_syns: syns,
+        });
     }
 
     let count = targets.len();
-    let mut entries: Vec<(u8, String, Vec<u8>)> = Vec::with_capacity(count);
+    struct HashedCapsule {
+        kind_b: u8,
+        key: String,
+        node_id: u64,
+        importance: u8,
+        pinned_flag: u8,
+        token_count: u32,
+        created_ns: u64,
+        eff_updated_ns: u64,
+        eff_generation: u32,
+        payload: Vec<u8>,
+        cog_syns: Vec<(u8, u8, u64)>,
+    }
+
+    let mut entries: Vec<HashedCapsule> = Vec::with_capacity(count);
     if !targets.is_empty() {
-        let ids: Vec<u64> = targets.iter().map(|(_, _, id)| *id).collect();
+        let ids: Vec<u64> = targets.iter().map(|t| t.node_id).collect();
         let (recs, _) = proj_db
             .get_many_coalesced(&ids)
             .map_err(|e| e.to_string())?;
@@ -445,22 +512,62 @@ pub fn compute_cognitive_content_digest(proj_db: &LibreDb) -> Result<([u8; 32], 
         for r in recs {
             by_id.insert(r.node_id, r.payload);
         }
-        for (kind_b, k, id) in targets {
-            let payload = by_id.remove(&id).unwrap_or_default();
-            entries.push((kind_b, k, payload));
+        for t in targets {
+            let payload = by_id.remove(&t.node_id).unwrap_or_default();
+            let mut cog_syns: Vec<(u8, u8, u64)> = t
+                .raw_syns
+                .into_iter()
+                .filter(|s| {
+                    s.kind != EdgeKind::Supersedes && active_cognitive_ids.contains(&s.target_id)
+                })
+                .map(|s| (s.kind as u8, s.weight, s.target_id))
+                .collect();
+            cog_syns.sort_unstable_by(|a, b| {
+                a.0.cmp(&b.0)
+                    .then_with(|| a.2.cmp(&b.2))
+                    .then_with(|| a.1.cmp(&b.1))
+            });
+            entries.push(HashedCapsule {
+                kind_b: t.kind_b,
+                key: t.key,
+                node_id: t.node_id,
+                importance: t.importance,
+                pinned_flag: t.pinned_flag,
+                token_count: t.token_count,
+                created_ns: t.created_ns,
+                eff_updated_ns: t.eff_updated_ns,
+                eff_generation: t.eff_generation,
+                payload,
+                cog_syns,
+            });
         }
-        entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)).then_with(|| a.2.cmp(&b.2)));
+        entries.sort_by(|a, b| {
+            a.kind_b
+                .cmp(&b.kind_b)
+                .then_with(|| a.key.cmp(&b.key))
+                .then_with(|| a.node_id.cmp(&b.node_id))
+        });
     }
 
     let mut hasher = Sha256::new();
     hasher.update(CONTENT_DIGEST_DOMAIN);
     hasher.update((entries.len() as u64).to_le_bytes());
-    for (kind_b, key_str, payload) in &entries {
-        hasher.update([*kind_b]);
-        hasher.update((key_str.len() as u32).to_le_bytes());
-        hasher.update(key_str.as_bytes());
-        hasher.update((payload.len() as u64).to_le_bytes());
-        hasher.update(payload);
+    for e in &entries {
+        hasher.update([e.kind_b, e.importance, e.pinned_flag]);
+        hasher.update(e.node_id.to_le_bytes());
+        hasher.update(e.token_count.to_le_bytes());
+        hasher.update(e.created_ns.to_le_bytes());
+        hasher.update(e.eff_updated_ns.to_le_bytes());
+        hasher.update(e.eff_generation.to_le_bytes());
+        hasher.update((e.key.len() as u32).to_le_bytes());
+        hasher.update(e.key.as_bytes());
+        hasher.update((e.payload.len() as u64).to_le_bytes());
+        hasher.update(&e.payload);
+        hasher.update((e.cog_syns.len() as u32).to_le_bytes());
+        for &(sk, sw, st) in &e.cog_syns {
+            hasher.update([sk, sw]);
+            hasher.update(st.to_le_bytes());
+        }
     }
     let out = hasher.finalize();
     let mut arr = [0u8; 32];
@@ -475,13 +582,12 @@ pub fn compute_cognitive_content_digest(proj_db: &LibreDb) -> Result<([u8; 32], 
 /// 4. Brand-new workspace where neither `.ldb` nor `.db` exists yet -> `true`.
 /// 5. Existing `.agents/memory.ldb` with cognitive capsules MUST carry a valid `hmac-sha256:v3:` seal
 ///    authenticating both `normalized_ws_key` AND `compute_cognitive_content_digest(&pdb)`. Any offline
-///    modification to Rules, Reflexes, Facts, Decisions, Tasks, or Config invalidates the HMAC immediately.
+///    modification to capsule content or context-selecting metadata invalidates the HMAC immediately.
 pub fn is_workspace_memory_trusted(global_db: Option<&LibreDb>, ws_root: &Path) -> bool {
-    let norm = normalize_workspace_key(ws_root);
-    let home_norm = normalize_workspace_key(&user_home_dir());
-    if norm.starts_with(&format!("{home_norm}/.gemini/")) && norm.contains("/brain/") {
+    if is_private_brain_workspace(ws_root) {
         return true;
     }
+    let norm = normalize_workspace_key(ws_root);
 
     let Some(gdb) = global_db else {
         let agents_dir = ws_root.join(".agents");
@@ -511,6 +617,14 @@ pub fn is_workspace_memory_trusted(global_db: Option<&LibreDb>, ws_root: &Path) 
 
     let path_authorized = explicitly_allowed || is_workspace_path_authorized(Some(gdb), ws_root);
     if !ldb_path.is_file() {
+        // Monotonic anti-downgrade guard: if this workspace was already upgraded to `v3` on this host,
+        // deleting `.agents/memory.ldb` and planting a legacy `.agents/memory.db` must NOT bypass `v3` checks.
+        if gdb
+            .get_by_key(NodeKind::Config, &format!("trust:v3_upgraded::{norm}"))
+            .is_ok()
+        {
+            return false;
+        }
         return path_authorized;
     }
 
@@ -648,13 +762,14 @@ impl PreMutationSealGuard {
                 authorized_ws: None,
             });
         };
-        let resolved_db = if db_path.is_relative() {
+        let joined_db = if db_path.is_relative() {
             std::env::current_dir()
                 .map(|cwd| cwd.join(db_path))
                 .unwrap_or_else(|_| db_path.to_path_buf())
         } else {
             db_path.to_path_buf()
         };
+        let resolved_db = canonicalize_with_missing_tail(&joined_db).unwrap_or(joined_db);
         let Some(parent) = resolved_db.parent() else {
             return Ok(Self {
                 authorized_ws: None,
@@ -1001,27 +1116,44 @@ fn lexical_normalize_lower(path: &Path) -> String {
 }
 
 /// Resolves symlinks along the deepest existing ancestor of `path` and appends any not-yet-created
-/// child segments so symlinked directories (`repo/link_dir/pre-commit`) and symlinked files
-/// (`repo/src/innocent.rs -> ~/.ssh/id_ed25519`) are both resolved accurately.
-fn canonicalize_with_missing_tail(path: &Path) -> Option<PathBuf> {
+/// child segments (collapsing `.` and `..` in the missing tail) so symlinked directories, relative
+/// `..` segments, and not-yet-created `.agents/memory.ldb` files all normalize to one canonical path.
+pub(crate) fn canonicalize_with_missing_tail(path: &Path) -> Option<PathBuf> {
     let abs_or_rel = if path.is_relative() {
-        std::env::current_dir().ok().map(|cwd| cwd.join(path)).unwrap_or_else(|| path.to_path_buf())
+        std::env::current_dir()
+            .ok()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|| path.to_path_buf())
     } else {
         path.to_path_buf()
     };
-    let mut curr: &Path = &abs_or_rel;
-    let mut tail: Vec<std::ffi::OsString> = Vec::new();
-    loop {
-        if let Ok(mut canon) = fs::canonicalize(curr) {
-            for seg in tail.into_iter().rev() {
-                canon.push(seg);
+    if let Ok(canon) = fs::canonicalize(&abs_or_rel) {
+        return Some(canon);
+    }
+
+    // Walk components forward so intermediate `..` after an existing symlinked or non-existent segment
+    // are collapsed deterministically once we hit the deepest existing prefix on disk.
+    let comps: Vec<Component<'_>> = abs_or_rel.components().collect();
+    for split in (1..=comps.len()).rev() {
+        let mut cand = PathBuf::new();
+        for c in &comps[..split] {
+            cand.push(c.as_os_str());
+        }
+        if let Ok(mut canon) = fs::canonicalize(&cand) {
+            for rem in &comps[split..] {
+                match rem {
+                    Component::CurDir => {}
+                    Component::ParentDir => {
+                        let _ = canon.pop();
+                    }
+                    Component::Normal(seg) => canon.push(seg),
+                    _ => {}
+                }
             }
             return Some(canon);
         }
-        let name = curr.file_name()?.to_os_string();
-        tail.push(name);
-        curr = curr.parent()?;
     }
+    None
 }
 
 fn check_credential_store_path(low_norm: &str, custom_protected: &[String]) -> Option<String> {
@@ -1973,5 +2105,165 @@ mod tests {
         assert_ne!(s1, s_diff_path);
         assert_ne!(s1, s_diff_content);
         assert_ne!(s1, s_diff_key);
+    }
+
+    #[test]
+    fn v3_seal_protects_fact_updated_ns_importance_and_cognitive_synapses_while_allowing_indexing() {
+        let tmp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join(format!(
+                "test_v3_meta_seal_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .subsec_nanos()
+            ));
+        let _ = fs::remove_dir_all(&tmp);
+        let repo = tmp.join("meta_repo");
+        fs::create_dir_all(repo.join(".agents")).unwrap();
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(
+            repo.join("src").join("lib.rs"),
+            b"pub fn compute_alpha_metric() -> u64 { 42 }\n",
+        )
+        .unwrap();
+
+        let gdb = LibreDb::open(tmp.join("customizations.ldb")).unwrap();
+        let pdb_path = repo.join(".agents").join("memory.ldb");
+        let pdb = LibreDb::open(&pdb_path).unwrap();
+
+        let dec_id = pdb
+            .put(
+                WriteRequest::new(
+                    NodeKind::Decision,
+                    b"[Decision: alpha_contract] Govern compute_alpha_metric invariants".to_vec(),
+                )
+                .with_key("alpha_contract"),
+            )
+            .unwrap();
+        let _fact_old = pdb
+            .put(
+                WriteRequest::new(NodeKind::Fact, b"fact_old = immutable_v1".to_vec())
+                    .with_key("fact_old")
+                    .with_importance(120),
+            )
+            .unwrap();
+        let _fact_new = pdb
+            .put(
+                WriteRequest::new(NodeKind::Fact, b"fact_new = latest_v1".to_vec())
+                    .with_key("fact_new")
+                    .with_importance(120),
+            )
+            .unwrap();
+
+        seal_workspace_memory(&gdb, &pdb, &repo).unwrap();
+        assert!(is_workspace_memory_trusted(Some(&gdb), &repo));
+
+        // 1. Ephemeral code-graph indexing (`Symbol`, `WorkingSet`, `Decision -> Symbol` Governs edges)
+        //    AND both compaction modes (`maybe_auto_compact` & `--prune`) MUST keep the v3 seal valid:
+        libredb_cognitive::index_workspace(&pdb, &repo, true).unwrap();
+        assert!(
+            is_workspace_memory_trusted(Some(&gdb), &repo),
+            "index_workspace must not invalidate v3 workspace seal"
+        );
+        pdb.compact_with_options(false).unwrap();
+        assert!(is_workspace_memory_trusted(Some(&gdb), &repo));
+        pdb.compact_with_options(true).unwrap();
+        assert!(is_workspace_memory_trusted(Some(&gdb), &repo));
+
+        // 2. Re-writing `fact_old` offline with the EXACT SAME key and EXACT SAME payload
+        //    (advancing `updated_ns` / `node_id` / `generation` to promote it in top-12 PreInvocation)
+        //    MUST invalidate `is_workspace_memory_trusted`:
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let rewritten_fact_id = pdb
+            .put(
+                WriteRequest::new(NodeKind::Fact, b"fact_old = immutable_v1".to_vec())
+                    .with_key("fact_old")
+                    .with_importance(120),
+            )
+            .unwrap();
+        assert!(
+            !is_workspace_memory_trusted(Some(&gdb), &repo),
+            "Identical key+payload Fact re-write advancing updated_ns/node_id must invalidate v3 seal"
+        );
+
+        // Re-seal legitimately, then verify cognitive synapse tampering (`Fact -> Decision`) invalidates seal:
+        seal_workspace_memory(&gdb, &pdb, &repo).unwrap();
+        assert!(is_workspace_memory_trusted(Some(&gdb), &repo));
+        pdb.link(rewritten_fact_id, EdgeKind::RelatedTo, dec_id, 210)
+            .unwrap();
+        assert!(
+            !is_workspace_memory_trusted(Some(&gdb), &repo),
+            "Unsealed cognitive synapse mutation must invalidate v3 seal"
+        );
+
+        // Re-seal and compact to a clean single `LDBS` base snapshot so we can perform a surgical
+        // raw binary `.ldb` attack mutating ONLY `updated_ns` (keeping `node_id`, `created_ns`,
+        // `generation`, `key`, `payload`, Inode CRC32, and Frame CRC32 100% valid!):
+        seal_workspace_memory(&gdb, &pdb, &repo).unwrap();
+        pdb.compact_with_options(true).unwrap();
+        assert!(is_workspace_memory_trusted(Some(&gdb), &repo));
+        drop(pdb);
+
+        let mut raw = fs::read(&pdb_path).unwrap();
+        let slot_a: &[u8; 4096] = raw[0..4096].try_into().unwrap();
+        let slot_b: &[u8; 4096] = raw[4096..8192].try_into().unwrap();
+        let sb = match (
+            libredb_core::format::Superblock::decode(slot_a),
+            libredb_core::format::Superblock::decode(slot_b),
+        ) {
+            (Ok(a), Ok(b)) => {
+                if b.commit_seq >= a.commit_seq {
+                    b
+                } else {
+                    a
+                }
+            }
+            (Ok(a), Err(_)) => a,
+            (Err(_), Ok(b)) => b,
+            _ => panic!("expected valid superblock"),
+        };
+        let base_off = sb.base_snapshot_offset as usize;
+        assert_eq!(&raw[base_off..base_off + 4], b"LDBS");
+        let frame_len = u32::from_le_bytes(raw[base_off + 4..base_off + 8].try_into().unwrap()) as usize;
+        let inode_count = u32::from_le_bytes(raw[base_off + 16..base_off + 20].try_into().unwrap()) as usize;
+        let mut patched = false;
+        for idx in 0..inode_count {
+            let off = base_off + 24 + idx * 128;
+            let nid = u64::from_le_bytes(raw[off..off + 8].try_into().unwrap());
+            if nid == rewritten_fact_id {
+                let old_upd = u64::from_le_bytes(raw[off + 24..off + 32].try_into().unwrap());
+                let forged_upd = old_upd.saturating_add(999_999_999);
+                raw[off + 24..off + 32].copy_from_slice(&forged_upd.to_le_bytes());
+                let ino_crc = libredb_core::crc::crc32(&raw[off..off + 124]);
+                raw[off + 124..off + 128].copy_from_slice(&ino_crc.to_le_bytes());
+                patched = true;
+                break;
+            }
+        }
+        assert!(patched, "Target Fact Inode must exist in LDBS snapshot");
+        let frame_crc_off = base_off + frame_len - 4;
+        let frame_crc = libredb_core::crc::crc32(&raw[base_off..frame_crc_off]);
+        raw[frame_crc_off..base_off + frame_len].copy_from_slice(&frame_crc.to_le_bytes());
+        fs::write(&pdb_path, &raw).unwrap();
+
+        // Storage CRC32 integrity is 100% valid and payload is untouched, yet v3 trust rejects it!
+        let forged_pdb = LibreDb::open(&pdb_path).unwrap();
+        forged_pdb.verify_integrity().unwrap();
+        assert_eq!(
+            forged_pdb.get(rewritten_fact_id).unwrap().payload,
+            b"fact_old = immutable_v1"
+        );
+        assert!(
+            !is_workspace_memory_trusted(Some(&gdb), &repo),
+            "Raw on-disk updated_ns mutation with unchanged payload and valid CRC32 must invalidate v3 seal"
+        );
+
+        drop(forged_pdb);
+        drop(gdb);
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

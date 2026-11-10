@@ -1168,10 +1168,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .map(|s| s.trim().parse::<u64>())
                 .collect();
             let target_ids = target_ids?;
-            let (db, _) = hooks::open_project_ldb_silent(Path::new(&args[1]))?;
-            let mut cog = CognitiveEngine::open_db(db)?;
+            let db_path = Path::new(&args[1]);
+            let gdb_opt = hooks::open_global_ldb_if_exists(None);
+            let seal_guard =
+                security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
+            let (db, _) = hooks::open_project_ldb_silent(db_path)?;
+            let mut cog = CognitiveEngine::open_db(Arc::clone(&db))?;
             let edges = cog.reinforce_association(&args[2], &target_ids)?;
             cog.save_index_snapshot()?;
+            seal_guard.reseal_after_write(gdb_opt.as_deref(), &db)?;
             println!(
                 "Reinforced {} Hebbian concept synapses from '{}' -> {:?}",
                 edges, args[2], target_ids
@@ -1392,8 +1397,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             if args.len() >= 7 && args[5] == "--weight" {
                 weight = args[6].parse()?;
             }
-            let db = LibreDb::open(&args[1])?;
+            let db_path = Path::new(&args[1]);
+            let gdb_opt = hooks::open_global_ldb_if_exists(None);
+            let seal_guard =
+                security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
+            let db = LibreDb::open(db_path)?;
             db.link(src_id, edge_kind, dst_id, weight)?;
+            seal_guard.reseal_after_write(gdb_opt.as_deref(), &db)?;
             println!(
                 "Linked node #{} --[{} (w={})]--> node #{}",
                 src_id,
