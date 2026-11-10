@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2] - 2026-11-10
+
+### Changed
+
+- Replaced full-table `list_inodes(None, false)` cloning inside `CognitiveEngine::score_candidates_in_ram` (`crates/libredb-cognitive/src/lib.rs`) with `O(1)` `LibreDb::get_inode_meta` (`crates/libredb-core/src/engine.rs`) hash lookups over the `<= 24` lexical seeds and their 2-hop neighbors, and replaced full disk snapshot reloads in `CognitiveEngine::refresh_indices` with in-RAM `HybridIndex::reconcile_in_ram` (`crates/libredb-index/src/lib.rs`) - cutting warm multi-turn `pulse` latency on `54,780`-node databases (`Nova-Launcher`) by `10x` (from `157 ms/turn` down to `5-16 ms/turn`).
+- Excluded internal cache and mirror prefixes (`skeleton::`, `session::`, `sqlite_row:`) in `is_internal_system_key` (`crates/libredb-index/src/lib.rs`) and tracked `SessionState::save` sequence increments in `OverlayBrain::pulse` (`crates/libredb-cognitive/src/overlay.rs`) so `FileSkeleton` caching and session state updates never trigger redundant index reconciliations.
+
 ## [0.7.1] - 2026-11-10
 
 ### Fixed

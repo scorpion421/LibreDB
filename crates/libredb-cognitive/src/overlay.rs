@@ -9,6 +9,7 @@ use crate::{
     ScoredInodeCandidate, SessionState,
 };
 use libredb_core::{LibreDb, Result};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 const GLOBAL_LAYER_TAG: u64 = 1u64 << 47;
@@ -17,8 +18,8 @@ const GLOBAL_LAYER_TAG: u64 = 1u64 << 47;
 pub struct OverlayBrain {
     global: Option<CognitiveEngine>,
     project: CognitiveEngine,
-    last_global_seq: u64,
-    last_project_seq: u64,
+    last_global_seq: AtomicU64,
+    last_project_seq: AtomicU64,
 }
 
 impl OverlayBrain {
@@ -40,8 +41,8 @@ impl OverlayBrain {
         Ok(Self {
             global,
             project,
-            last_global_seq,
-            last_project_seq,
+            last_global_seq: AtomicU64::new(last_global_seq),
+            last_project_seq: AtomicU64::new(last_project_seq),
         })
     }
 
@@ -54,16 +55,16 @@ impl OverlayBrain {
         if let Some(ref mut g) = self.global {
             g.db().sync_from_disk_if_changed()?;
             let g_seq = g.db().stats()?.commit_seq;
-            if g_seq != self.last_global_seq {
+            if g_seq != self.last_global_seq.load(Ordering::Relaxed) {
                 g.refresh_indices()?;
-                self.last_global_seq = g_seq;
+                self.last_global_seq.store(g_seq, Ordering::Relaxed);
             }
         }
         self.project.db().sync_from_disk_if_changed()?;
         let p_seq = self.project.db().stats()?.commit_seq;
-        if p_seq != self.last_project_seq {
+        if p_seq != self.last_project_seq.load(Ordering::Relaxed) {
             self.project.refresh_indices()?;
-            self.last_project_seq = p_seq;
+            self.last_project_seq.store(p_seq, Ordering::Relaxed);
         }
         Ok(())
     }
@@ -260,7 +261,12 @@ impl OverlayBrain {
         // Only write `SessionState` to disk if `delivered_generations` actually gained a new item!
         if session_dirty {
             if let Some(ref sess) = session {
+                let prev_seq = self.last_project_seq.load(Ordering::Relaxed);
                 sess.save(self.project.db())?;
+                let after_seq = self.project.db().stats()?.commit_seq;
+                if after_seq == prev_seq + 1 {
+                    self.last_project_seq.store(after_seq, Ordering::Relaxed);
+                }
             }
         }
 

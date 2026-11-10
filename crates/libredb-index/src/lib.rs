@@ -139,6 +139,16 @@ impl HybridIndex {
         Ok(idx)
     }
 
+    /// Incrementally reconciles any new, updated, or superseded `Inodes` directly into the
+    /// already-loaded in-RAM `HybridIndex` without re-reading `sys::index_snapshot` from disk.
+    pub fn reconcile_in_ram(&mut self, db: &LibreDb) -> Result<()> {
+        let current_seq = db.stats()?.commit_seq;
+        if self.indexed_commit_seq == current_seq {
+            return Ok(());
+        }
+        self.reconcile_delta(db, current_seq)
+    }
+
     fn reconcile_delta(&mut self, db: &LibreDb, current_seq: u64) -> Result<()> {
         let active = db.list_inodes(None, false);
         let mut live_ids: HashSet<u64> = HashSet::with_capacity(active.len());
@@ -592,7 +602,10 @@ impl HybridIndex {
 pub fn is_internal_system_key(k: &str) -> bool {
     k.starts_with("reflex::")
         || k.starts_with("sqlite_mirror::")
+        || k.starts_with("sqlite_row:")
         || k.starts_with("session_delta::")
+        || k.starts_with("session::")
+        || k.starts_with("skeleton::")
         || k.starts_with("sys::")
 }
 

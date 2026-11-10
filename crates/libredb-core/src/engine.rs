@@ -1145,6 +1145,15 @@ impl LibreDb {
         self.state.read().reverse_keys.get(&node_id).cloned()
     }
 
+    /// Returns `(Inode, key, synapses)` for a single `node_id` in `O(1)` directly from the in-RAM snapshot (`0` disk I/O).
+    pub fn get_inode_meta(&self, node_id: u64) -> Option<(Inode, Option<String>, Vec<Synapse>)> {
+        let snap = self.state.read();
+        let ino = snap.inodes.get(&node_id)?.clone();
+        let key = snap.reverse_keys.get(&node_id).map(|(_, k)| k.clone());
+        let syns = collect_node_synapses(&snap, &ino);
+        Some((ino, key, syns))
+    }
+
     /// Traces temporal and causal lineage (`Supersedes`, `CausedBy`, `Governs`) starting at `root_id`.
     pub fn trace_lineage(&self, root_id: u64, max_depth: usize) -> Result<Vec<NodeSummary>> {
         let snap = Arc::clone(&self.state.read());

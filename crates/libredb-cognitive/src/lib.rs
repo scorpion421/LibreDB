@@ -165,7 +165,7 @@ impl CognitiveEngine {
 
     /// Re-synchronizes the in-memory `HybridIndex` and `ReflexEngine` incrementally after writes.
     pub fn refresh_indices(&mut self) -> Result<()> {
-        self.index = HybridIndex::load_or_build(&self.db)?;
+        self.index.reconcile_in_ram(&self.db)?;
         self.reflexes = ReflexEngine::load(&self.db)?;
         Ok(())
     }
@@ -186,8 +186,8 @@ impl CognitiveEngine {
     }
 
     /// Computes ranked `Inode` candidates via `HybridIndex` + 2-hop synapse spreading activation
-    /// **100% in RAM (`0` payload disk reads!)** so `SessionState` (`Zero-Repeat Delta`) can filter
-    /// already-delivered items before touching a single payload byte on disk!
+    /// **100% in RAM (`0` payload disk reads, `O(K)` hash lookups!)** so `SessionState` (`Zero-Repeat Delta`)
+    /// can filter already-delivered items before touching a single payload byte on disk!
     pub fn score_candidates_in_ram(&self, query: &str) -> Vec<ScoredInodeCandidate> {
         let searchable_kinds = [
             NodeKind::Rule,
@@ -208,47 +208,52 @@ impl CognitiveEngine {
             return Vec::new();
         }
 
-        let inode_list = self.db.list_inodes(None, false);
-        let inode_map: HashMap<
+        let mut meta_cache: HashMap<
             u64,
             (
                 libredb_core::Inode,
                 Option<String>,
                 Vec<libredb_core::Synapse>,
             ),
-        > = inode_list
-            .into_iter()
-            .map(|(ino, k, syns)| (ino.node_id, (ino, k, syns)))
-            .collect();
-
-        let mut energy_map: HashMap<u64, f64> = HashMap::new();
-        let mut queue: VecDeque<(u64, usize, f64)> = VecDeque::new();
+        > = HashMap::with_capacity(64);
+        let mut energy_map: HashMap<u64, f64> = HashMap::with_capacity(64);
+        let mut queue: VecDeque<(u64, usize, f64)> = VecDeque::with_capacity(64);
 
         for hit in &lexical_hits {
-            energy_map.insert(hit.node_id, hit.score);
-            queue.push_back((hit.node_id, 0, hit.score));
+            if let Some(meta) = self.db.get_inode_meta(hit.node_id) {
+                meta_cache.insert(hit.node_id, meta);
+                energy_map.insert(hit.node_id, hit.score);
+                queue.push_back((hit.node_id, 0, hit.score));
+            }
         }
 
         while let Some((curr_id, hop, energy)) = queue.pop_front() {
             if hop >= 2 || energy < 0.25 {
                 continue;
             }
-            if let Some((_, _, syns)) = inode_map.get(&curr_id) {
-                for syn in syns {
-                    if syn.kind == EdgeKind::Supersedes {
-                        continue;
+            let syns = match meta_cache.get(&curr_id) {
+                Some((_, _, s)) => s.clone(),
+                None => continue,
+            };
+            for syn in syns {
+                if syn.kind == EdgeKind::Supersedes {
+                    continue;
+                }
+                let next_e = energy * (syn.weight as f64 / 255.0) * 0.55;
+                if next_e >= 0.25 {
+                    if !meta_cache.contains_key(&syn.target_id) {
+                        if let Some(m) = self.db.get_inode_meta(syn.target_id) {
+                            meta_cache.insert(syn.target_id, m);
+                        }
                     }
-                    let next_e = energy * (syn.weight as f64 / 255.0) * 0.55;
-                    if next_e >= 0.25 {
-                        if let Some((target_ino, _, _)) = inode_map.get(&syn.target_id) {
-                            if target_ino.flags.is_live_active()
-                                && searchable_kinds.contains(&target_ino.kind)
-                            {
-                                let slot = energy_map.entry(syn.target_id).or_insert(0.0);
-                                if next_e > *slot {
-                                    *slot = next_e;
-                                    queue.push_back((syn.target_id, hop + 1, next_e));
-                                }
+                    if let Some((target_ino, _, _)) = meta_cache.get(&syn.target_id) {
+                        if target_ino.flags.is_live_active()
+                            && searchable_kinds.contains(&target_ino.kind)
+                        {
+                            let slot = energy_map.entry(syn.target_id).or_insert(0.0);
+                            if next_e > *slot {
+                                *slot = next_e;
+                                queue.push_back((syn.target_id, hop + 1, next_e));
                             }
                         }
                     }
@@ -259,7 +264,7 @@ impl CognitiveEngine {
         let mut out: Vec<ScoredInodeCandidate> = energy_map
             .into_iter()
             .filter_map(|(nid, score)| {
-                let (ino, key_opt, _) = inode_map.get(&nid)?;
+                let (ino, key_opt, _) = meta_cache.get(&nid)?;
                 if ino.flags.contains(NodeFlags::TOMBSTONE)
                     || ino.flags.contains(NodeFlags::SUPERSEDED)
                 {

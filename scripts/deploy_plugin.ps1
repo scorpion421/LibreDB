@@ -69,7 +69,7 @@ $PluginJson = @'
 {
   "name": "libredb",
   "displayName": "LibreDB Cognitive Memory",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "description": "Full Rust replacement for SQLite SkillsDB: single-file cognitive memory, silent SQLite auto-porter, sub-2ms hooks, guardrails, 12-language causal code graph, and dynamic multi-remote Git/Gitea automation.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
