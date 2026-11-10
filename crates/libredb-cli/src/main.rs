@@ -393,7 +393,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             .with_importance(190),
                     )?;
                     if let Some(ref guard) = proj_seal_guard {
-                        guard.reseal_after_write(gdb_for_proj_seal.as_deref(), &db);
+                        guard.reseal_after_write(gdb_for_proj_seal.as_deref(), &db)?;
                     }
                     println!(
                         "[OK] Updated config '{}'{}",
@@ -423,7 +423,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         .ok_or("Usage: libredb config unset <key> [--project <dir>] [--global <g.ldb>]")?;
                     if db.deprecate_key(NodeKind::Config, key)? {
                         if let Some(ref guard) = proj_seal_guard {
-                            guard.reseal_after_write(gdb_for_proj_seal.as_deref(), &db);
+                            guard.reseal_after_write(gdb_for_proj_seal.as_deref(), &db)?;
                         }
                         println!("[OK] Removed config '{key}'");
                     } else {
@@ -1132,7 +1132,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
             let (db, _) = hooks::open_project_ldb_silent(db_path)?;
             let rep = execute_atomic_batch(&db, &spec)?;
-            seal_guard.reseal_after_write(gdb_opt.as_deref(), &db);
+            seal_guard.reseal_after_write(gdb_opt.as_deref(), &db)?;
             println!(
                 "[OK] Committed {} capsules and wired {} governance synapses in {:.2} ms (IDs: {:?})",
                 rep.nodes_committed,
@@ -1155,7 +1155,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
             let (db, _) = hooks::open_project_ldb_silent(db_path)?;
             let (_, block) = create_subagent_handoff(&db, &args[2], &args[3], &args[4], notes)?;
-            seal_guard.reseal_after_write(gdb_opt.as_deref(), &db);
+            seal_guard.reseal_after_write(gdb_opt.as_deref(), &db)?;
             print!("{block}");
         }
         "learn-assoc" => {
@@ -1209,7 +1209,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
             let (db, _) = hooks::open_project_ldb_silent(db_path)?;
             let nid = ReflexEngine::learn_reflex(&db, &rule)?;
-            seal_guard.reseal_after_write(gdb_opt.as_deref(), &db);
+            seal_guard.reseal_after_write(gdb_opt.as_deref(), &db)?;
             println!("Learned situational reflex '{}' as node #{nid}", rule.id);
         }
         "import-sqlite" => {
@@ -1227,7 +1227,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
             let db = Arc::new(LibreDb::open(db_path)?);
             let sum = import_sqlite_readonly(Path::new(&args[2]), &db, scope)?;
-            seal_guard.reseal_after_write(gdb_opt.as_deref(), &db);
+            seal_guard.reseal_after_write(gdb_opt.as_deref(), &db)?;
             // Pre-build and persist the inverted index snapshot so cold CLI `pulse` runs in <10 ms!
             let mut cog = CognitiveEngine::open_db(db)?;
             cog.save_index_snapshot()?;
@@ -1350,7 +1350,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
             let db = LibreDb::open(db_path)?;
             let id = db.put(req)?;
-            seal_guard.reseal_after_write(gdb_opt.as_deref(), &db);
+            seal_guard.reseal_after_write(gdb_opt.as_deref(), &db)?;
             let rec = db.get(id)?;
             println!(
                 "Stored node #{} (kind={}, gen={}, tokens={}, bytes={})",
@@ -1415,7 +1415,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let db = LibreDb::open(db_path)?;
             let removed = db.deprecate_key(kind, &args[3])?;
             if removed {
-                seal_guard.reseal_after_write(gdb_opt.as_deref(), &db);
+                seal_guard.reseal_after_write(gdb_opt.as_deref(), &db)?;
                 println!("Deprecated active key '{}' ({})", args[3], kind.as_str());
             } else {
                 println!("Key '{}' ({}) not found", args[3], kind.as_str());
@@ -1503,11 +1503,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
             let (db, _) = hooks::open_project_ldb_silent(db_path)?;
             let initial_bytes = db.stats()?.file_bytes;
-            seal_guard.reseal_after_write(gdb_opt.as_deref(), &db);
+            seal_guard.reseal_after_write(gdb_opt.as_deref(), &db)?;
             let mut cog = CognitiveEngine::open_db(Arc::clone(&db))?;
             cog.save_index_snapshot()?;
             let rep = db.compact_with_options(prune)?;
-            seal_guard.reseal_after_write(gdb_opt.as_deref(), &db);
+            seal_guard.reseal_after_write(gdb_opt.as_deref(), &db)?;
             println!(
                 "Gravity compaction{} + index snapshot finished in {:.2} ms: {} -> {} bytes ({} hot nodes in {} locality groups, {} cold nodes archived)",
                 if prune { " (--prune)" } else { "" },

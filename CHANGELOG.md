@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.3] - 2026-11-10
+
+### Fixed
+
+- Propagated explicit `Result<(), String>` errors from `PreMutationSealGuard::reseal_after_write` (`crates/libredb-cli/src/security.rs`) and `McpServerState::seal_project_db_if_authorized` (`crates/libredb-cli/src/mcp.rs`) across all project-mutating `CLI` commands (`crates/libredb-cli/src/main.rs`) and `MCP` write tools (`libredb_memorize`, `libredb_handoff`, evicting any stale RAM `OverlayBrain` on failure), and surfaced post-migration `seal_workspace_memory` errors explicitly in `run_pre_invocation_hook` (`crates/libredb-cli/src/hooks.rs`), ensuring a failed `hmac-sha256:v3:` seal refresh after a successful write is reported immediately to the caller rather than silently ignored.
+
 ## [0.9.2] - 2026-11-10
 
 ### Added

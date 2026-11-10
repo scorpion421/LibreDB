@@ -388,14 +388,25 @@ pub fn run_pre_invocation_hook(
     // Only touch global `customizations.ldb` on first workspace touch / legacy `.db` migration (or when
     // an explicit `--global` override is passed). Never re-seal an existing `.ldb` file automatically;
     // seal strictly when `did_migrate` just created `.ldb` from an already-authorized legacy `.db`.
+    let mut migration_seal_warning: Option<String> = None;
     if did_migrate || !had_prior_cursor || global_ldb_opt.is_some() {
         if let Some(ref root) = ws_root {
             if !is_protected_profile_dir(root) {
                 if let Some(name) = root.file_name().and_then(|n| n.to_str()) {
                     if let Some(global_db) = open_global_ldb_if_exists(global_ldb_opt) {
                         if did_migrate {
-                            let _ =
-                                crate::security::seal_workspace_memory(&global_db, &proj_db, root);
+                            if let Err(err) =
+                                crate::security::seal_workspace_memory(&global_db, &proj_db, root)
+                            {
+                                eprintln!(
+                                    "[WARN] LibreDB post-migration seal failed for '{}': {err}",
+                                    root.display()
+                                );
+                                migration_seal_warning = Some(format!(
+                                    "[WARN] Post-migration hmac-sha256:v3 workspace seal failed for '{}': {err}",
+                                    root.display()
+                                ));
+                            }
                         }
                         let ws_cfg_key = format!("workspace:{name}");
                         let root_str = root.to_string_lossy().into_owned();
@@ -416,7 +427,15 @@ pub fn run_pre_invocation_hook(
         }
     }
 
-    let context_block = build_project_memory_hydration(&proj_db, ws_root.as_deref());
+    let mut context_block = build_project_memory_hydration(&proj_db, ws_root.as_deref());
+    if let Some(warn_line) = migration_seal_warning {
+        if context_block.is_empty() {
+            context_block = warn_line;
+        } else {
+            context_block.push('\n');
+            context_block.push_str(&warn_line);
+        }
+    }
     if context_block.is_empty() {
         emit_json(&json!({ "injectSteps": [] }))?;
     } else {

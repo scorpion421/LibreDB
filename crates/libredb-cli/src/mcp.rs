@@ -66,10 +66,22 @@ impl McpServerState {
         )
     }
 
-    fn seal_project_db_if_authorized(&self, ws_root_opt: Option<&Path>, proj_db: &LibreDb) {
+    fn seal_project_db_if_authorized(
+        &mut self,
+        ws_root_opt: Option<&Path>,
+        proj_db: &LibreDb,
+    ) -> Result<(), String> {
         if let (Some(ref gdb), Some(ws_root)) = (&self.global_db, ws_root_opt) {
-            let _ = crate::security::seal_workspace_memory(gdb, proj_db, ws_root);
+            if let Err(err) = crate::security::seal_workspace_memory(gdb, proj_db, ws_root) {
+                let ldb_path = ws_root.join(".agents").join("memory.ldb");
+                self.brains.remove(&ldb_path);
+                return Err(format!(
+                    "Workspace mutation succeeded, but updating hmac-sha256:v3 trust seal for '{}' failed: {err}",
+                    ws_root.display()
+                ));
+            }
         }
+        Ok(())
     }
 
     fn resolve_brain_with_seal_target(
@@ -671,7 +683,7 @@ fn dispatch_tool(
                 }
             }
 
-            state.seal_project_db_if_authorized(ws_root_to_seal.as_deref(), &proj_db);
+            state.seal_project_db_if_authorized(ws_root_to_seal.as_deref(), &proj_db)?;
             let brain = state.resolve_brain_mut(cwd_hint, cid_arg, false)?;
             brain.refresh_if_needed()?;
             if outputs.is_empty() {
@@ -750,7 +762,7 @@ fn dispatch_tool(
                 (ws_opt, Arc::clone(brain.project_db()))
             };
             let (_, block) = create_subagent_handoff(&proj_db, hid, tkey, role, notes)?;
-            state.seal_project_db_if_authorized(ws_root_to_seal.as_deref(), &proj_db);
+            state.seal_project_db_if_authorized(ws_root_to_seal.as_deref(), &proj_db)?;
             let brain = state.resolve_brain_mut(cwd_hint, cid_arg, false)?;
             brain.refresh_if_needed()?;
             Ok(block)

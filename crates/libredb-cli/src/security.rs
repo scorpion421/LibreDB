@@ -689,10 +689,20 @@ impl PreMutationSealGuard {
         })
     }
 
-    pub fn reseal_after_write(&self, global_db: Option<&LibreDb>, proj_db: &LibreDb) {
+    pub fn reseal_after_write(
+        &self,
+        global_db: Option<&LibreDb>,
+        proj_db: &LibreDb,
+    ) -> Result<(), String> {
         if let (Some(gdb), Some(ref ws_root)) = (global_db, &self.authorized_ws) {
-            let _ = seal_workspace_memory(gdb, proj_db, ws_root);
+            seal_workspace_memory(gdb, proj_db, ws_root).map_err(|err| {
+                format!(
+                    "Workspace mutation succeeded, but updating hmac-sha256:v3 trust seal for '{}' failed: {err}",
+                    ws_root.display()
+                )
+            })?;
         }
+        Ok(())
     }
 }
 
@@ -1699,7 +1709,7 @@ mod tests {
                 .with_key("authorized_update"),
         )
         .unwrap();
-        guard.reseal_after_write(Some(&gdb), &pdb);
+        guard.reseal_after_write(Some(&gdb), &pdb).unwrap();
         assert!(is_workspace_memory_trusted(Some(&gdb), &repo));
 
         revoke_workspace_trust(&gdb, &repo).unwrap();
@@ -1783,6 +1793,60 @@ mod tests {
         .unwrap();
         assert!(!is_workspace_memory_trusted(Some(&gdb), &repo));
         assert!(migrate_workspace_seal_v2_to_v3(&gdb, &repo).is_err());
+
+        drop(pdb);
+        drop(gdb);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn reseal_after_write_updates_v3_seal_and_propagates_seal_errors() {
+        let tmp = std::env::temp_dir().join(format!(
+            "libredb_reseal_err_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        let repo = tmp.join("reseal_repo");
+        fs::create_dir_all(repo.join(".agents")).unwrap();
+
+        let gdb = LibreDb::open(tmp.join("customizations.ldb")).unwrap();
+        let pdb_path = repo.join(".agents").join("memory.ldb");
+        let pdb = LibreDb::open(&pdb_path).unwrap();
+        pdb.put(
+            WriteRequest::new(NodeKind::Fact, b"k=v1".to_vec()).with_key("fact:k"),
+        )
+        .unwrap();
+        seal_workspace_memory(&gdb, &pdb, &repo).unwrap();
+
+        // 1. Authorized happy-path write + reseal returns Ok(()) and keeps workspace v3-trusted:
+        let guard = PreMutationSealGuard::verify_before_write(Some(&gdb), &pdb_path).unwrap();
+        pdb.put(
+            WriteRequest::new(NodeKind::Fact, b"k=v2".to_vec()).with_key("fact:k"),
+        )
+        .unwrap();
+        guard.reseal_after_write(Some(&gdb), &pdb).unwrap();
+        assert!(is_workspace_memory_trusted(Some(&gdb), &repo));
+
+        // 2. If `seal_workspace_memory` fails after a write (e.g., broken/unreadable trust anchor secret),
+        //    `reseal_after_write` MUST propagate an explicit `Err` rather than ignoring it:
+        let guard_err = PreMutationSealGuard::verify_before_write(Some(&gdb), &pdb_path).unwrap();
+        pdb.put(
+            WriteRequest::new(NodeKind::Fact, b"k=v3".to_vec()).with_key("fact:k"),
+        )
+        .unwrap();
+        gdb.put(
+            WriteRequest::new(NodeKind::Config, b"corrupt-non-hex-secret".to_vec())
+                .with_key(TRUST_SECRET_KEY),
+        )
+        .unwrap();
+        let err_msg = guard_err
+            .reseal_after_write(Some(&gdb), &pdb)
+            .expect_err("reseal_after_write must propagate seal update failure");
+        assert!(err_msg.contains("updating hmac-sha256:v3 trust seal"));
 
         drop(pdb);
         drop(gdb);
