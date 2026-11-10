@@ -1493,6 +1493,36 @@ impl LibreDb {
         self.compact_with_options(false)
     }
 
+    /// Automatically runs a non-pruning Gravity Compaction if the uncompacted delta tail
+    /// exceeds `1 MiB` (or `512 KiB` with `>= 32` superseded/tombstoned Inodes).
+    pub fn maybe_auto_compact(&self) -> Result<bool> {
+        let should_compact = {
+            let snap = self.state.read();
+            let delta_bytes = snap
+                .superblock
+                .data_tail_offset
+                .saturating_sub(snap.superblock.delta_start_offset);
+            if delta_bytes >= 1_048_576 {
+                true
+            } else if delta_bytes >= 524_288 {
+                let stale = snap
+                    .inodes
+                    .values()
+                    .filter(|ino| !ino.flags.is_live_active())
+                    .count();
+                stale >= 32
+            } else {
+                false
+            }
+        };
+        if should_compact {
+            self.compact_with_options(false)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     /// Executes Gravity Compaction with optional full cold-archive pruning (`prune_all_cold = true`).
     pub fn compact_with_options(&self, prune_all_cold: bool) -> Result<CompactionReport> {
         let _guard = self.commit_lock.lock();
@@ -1504,11 +1534,61 @@ impl LibreDb {
         // Build full synapse map for gravity clustering.
         let mut full_synapses: HashMap<u64, Vec<Synapse>> =
             HashMap::with_capacity(old_snap.inodes.len());
+        let mut incoming_targets: HashSet<u64> = HashSet::new();
+        let mut active_symbol_count = 0usize;
         for (&nid, inode) in &old_snap.inodes {
-            full_synapses.insert(nid, collect_node_synapses(&old_snap, inode));
+            if inode.kind == NodeKind::Symbol && inode.flags.is_live_active() {
+                active_symbol_count += 1;
+            }
+            let syns = collect_node_synapses(&old_snap, inode);
+            if inode.flags.is_live_active() {
+                for s in &syns {
+                    incoming_targets.insert(s.target_id);
+                }
+            }
+            full_synapses.insert(nid, syns);
         }
 
-        let plan = compute_gravity_plan(&old_snap.inodes, &full_synapses, prune_all_cold);
+        let mut plan_inodes = old_snap.inodes.clone();
+        if prune_all_cold {
+            for (&nid, inode) in &mut plan_inodes {
+                if !inode.flags.is_live_active() {
+                    continue;
+                }
+                let key_opt = old_snap.reverse_keys.get(&nid).map(|(_, k)| k.as_str());
+                let should_prune = match inode.kind {
+                    NodeKind::QuotaEvent => true,
+                    NodeKind::Generic => key_opt.is_some_and(|k| {
+                        k.starts_with("sqlite_mirror::") || k.starts_with("sqlite_row:")
+                    }),
+                    NodeKind::Symbol => {
+                        let out_syns = full_synapses.get(&nid).map_or(0, Vec::len);
+                        let has_any_edge = out_syns > 0 || incoming_targets.contains(&nid);
+                        if has_any_edge {
+                            false
+                        } else if active_symbol_count > 500 {
+                            true
+                        } else if let Some(k) = key_opt {
+                            let has_line_suffix = k.rsplit_once("::").is_some_and(|(_, tail)| {
+                                !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit())
+                            });
+                            let short_name = k.rsplit("::").next().unwrap_or(k);
+                            let is_obfuscated = short_name.len() <= 2
+                                && short_name.split('.').all(|seg| seg.len() <= 2);
+                            has_line_suffix || is_obfuscated
+                        } else {
+                            false
+                        }
+                    }
+                    _ => false,
+                };
+                if should_prune {
+                    inode.flags.insert(NodeFlags::TOMBSTONE | NodeFlags::SUPERSEDED);
+                }
+            }
+        }
+
+        let plan = compute_gravity_plan(&plan_inodes, &full_synapses, prune_all_cold);
         let ordered_ids: Vec<u64> = plan
             .hot_node_ids
             .iter()
@@ -1610,7 +1690,9 @@ impl LibreDb {
         let mut key_ops: Vec<KeyMutation> = old_snap
             .key_dir
             .iter()
-            .filter(|(_, &nid)| !old_snap.inodes[&nid].flags.contains(NodeFlags::TOMBSTONE))
+            .filter(|(_, &nid)| {
+                kept_ids.contains(&nid) && !old_snap.inodes[&nid].flags.contains(NodeFlags::TOMBSTONE)
+            })
             .map(|((kind, key), &nid)| KeyMutation::Upsert {
                 kind: *kind,
                 key: key.clone(),

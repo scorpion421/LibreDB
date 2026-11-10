@@ -4,14 +4,13 @@
 use libredb_bridge::open_or_auto_migrate;
 use libredb_cognitive::{
     check_command_guardrails, check_text_guardrails, has_project_root_marker,
-    is_test_or_scratch_path, sync_transcript_epoch, CognitiveEngine,
+    is_compaction_checkpoint_line, is_test_or_scratch_path, sync_transcript_epoch, CognitiveEngine,
 };
 use libredb_core::{LibreDb, NodeKind, WriteRequest};
 use serde_json::{json, Value};
 use std::env;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 
 pub fn default_global_ldb_path() -> PathBuf {
@@ -243,11 +242,6 @@ pub fn run_pre_invocation_hook(
     let _ = io::stdin().read_to_string(&mut raw);
     let payload: Value = serde_json::from_str(raw.trim()).unwrap_or_else(|_| json!({}));
 
-    let Ok(global_db) = open_global_ldb(global_ldb_opt) else {
-        emit_json(&json!({ "injectSteps": [] }))?;
-        return Ok(());
-    };
-
     let (cid_opt, transcript_opt) = match resolve_cid_and_transcript(&payload) {
         Some((c, tp)) => (Some(c), Some(tp)),
         None => (None, None),
@@ -255,22 +249,6 @@ pub fn run_pre_invocation_hook(
 
     let ws_root = resolve_hook_workspace(&payload, transcript_opt.as_deref());
     let target_ldb: Option<PathBuf> = if let Some(ref root) = ws_root {
-        // Record learned workspace path into `customizations.ldb` (`workspace:<name>`)
-        if let Some(name) = root.file_name().and_then(|n| n.to_str()) {
-            let ws_key = format!("workspace:{name}");
-            let root_str = root.to_string_lossy().into_owned();
-            let already_same = global_db
-                .get_by_key(NodeKind::Config, &ws_key)
-                .map(|r| r.payload == root_str.as_bytes())
-                .unwrap_or(false);
-            if !already_same {
-                let _ = global_db.put(
-                    WriteRequest::new(NodeKind::Config, root_str.into_bytes())
-                        .with_key(ws_key)
-                        .with_importance(170),
-                );
-            }
-        }
         Some(root.join(".agents").join("memory.ldb"))
     } else if let Some(ref cid) = cid_opt {
         let brain_agents = user_home_dir()
@@ -296,8 +274,7 @@ pub fn run_pre_invocation_hook(
     };
 
     // If neither `.agents/memory.ldb` nor `.agents/memory.db` exists yet in this folder, wait until
-    // the agent or workspace actually creates project memory rather than polluting random folders,
-    // UNLESS it's an active Git/project workspace where auto-porting or existing memory applies!
+    // the agent or workspace actually creates project memory rather than polluting random folders.
     let mem_db_sibling = mem_ldb_path.with_extension("db");
     if !mem_ldb_path.exists() && !mem_db_sibling.exists() {
         emit_json(&json!({ "injectSteps": [] }))?;
@@ -318,12 +295,20 @@ pub fn run_pre_invocation_hook(
 
     let ws_key = ws_root
         .as_ref()
-        .map(|p| p.to_string_lossy().into_owned())
+        .map(|p| {
+            p.to_string_lossy()
+                .replace('\\', "/")
+                .trim_end_matches('/')
+                .to_ascii_lowercase()
+        })
         .unwrap_or_else(|| "__chat__".to_owned());
     let dedup_token = format!("{ws_key}@ep={epoch}");
 
+    let mut had_prior_cursor = false;
     if let Some(ref cid) = cid_opt {
-        if let Ok(cur_rec) = global_db.get_by_key(NodeKind::TranscriptCursor, cid) {
+        let proj_cur_key = format!("sys::pre_inv_dedup::{cid}");
+        if let Ok(cur_rec) = proj_db.get_by_key(NodeKind::TranscriptCursor, &proj_cur_key) {
+            had_prior_cursor = true;
             if let Ok(cur_json) = serde_json::from_slice::<Value>(&cur_rec.payload) {
                 if cur_json.get("dedup_token").and_then(Value::as_str) == Some(dedup_token.as_str())
                 {
@@ -339,11 +324,35 @@ pub fn run_pre_invocation_hook(
             "inferred_workspace": ws_key,
         });
         if let Ok(bytes) = serde_json::to_vec(&next_cur) {
-            let _ = global_db.put(
+            let _ = proj_db.put(
                 WriteRequest::new(NodeKind::TranscriptCursor, bytes)
-                    .with_key(cid)
-                    .with_importance(110),
+                    .with_key(proj_cur_key)
+                    .with_importance(64),
             );
+        }
+    }
+
+    // Only touch global `customizations.ldb` on the first turn in a workspace (or when an explicit
+    // `--db` override is passed) so routine turns never contend on or dirty `customizations.ldb`.
+    if !had_prior_cursor || global_ldb_opt.is_some() {
+        if let Some(ref root) = ws_root {
+            if let Some(name) = root.file_name().and_then(|n| n.to_str()) {
+                if let Ok(global_db) = open_global_ldb(global_ldb_opt) {
+                    let ws_cfg_key = format!("workspace:{name}");
+                    let root_str = root.to_string_lossy().into_owned();
+                    let already_same = global_db
+                        .get_by_key(NodeKind::Config, &ws_cfg_key)
+                        .map(|r| r.payload == root_str.as_bytes())
+                        .unwrap_or(false);
+                    if !already_same {
+                        let _ = global_db.put(
+                            WriteRequest::new(NodeKind::Config, root_str.into_bytes())
+                                .with_key(ws_cfg_key)
+                                .with_importance(170),
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -388,14 +397,21 @@ fn build_project_memory_hydration(proj_db: &LibreDb, ws_root: Option<&Path>) -> 
         }
     }
 
-    // Open tasks (skip completed)
+    // Open tasks (skip completed/done/closed/cancelled)
     if !task_ids.is_empty() {
         task_ids.sort_unstable();
         if let Ok((recs, _)) = proj_db.get_many_coalesced(&task_ids) {
             let open_tasks: Vec<String> = recs
                 .into_iter()
                 .map(|r| String::from_utf8_lossy(&r.payload).into_owned())
-                .filter(|t| !t.contains(" completed "))
+                .filter(|t| {
+                    let low = t.to_ascii_lowercase();
+                    !low.contains(" completed ")
+                        && !low.contains("| done |")
+                        && !low.contains("| completed |")
+                        && !low.contains("| closed |")
+                        && !low.contains("| cancelled |")
+                })
                 .take(5)
                 .collect();
             if !open_tasks.is_empty() {
@@ -500,50 +516,48 @@ fn build_project_memory_hydration(proj_db: &LibreDb, ws_root: Option<&Path>) -> 
 }
 
 fn collect_git_telemetry_line(root: &Path) -> Option<String> {
-    if !root.join(".git").exists() {
-        return None;
-    }
-    let st = Command::new("git")
-        .args(["status", "--porcelain", "--branch"])
-        .current_dir(root)
-        .output()
-        .ok()?;
-    if !st.status.success() {
-        return None;
-    }
-    let out_str = String::from_utf8_lossy(&st.stdout);
-    let mut branch = "main".to_owned();
-    let mut dirty = 0usize;
-    for l in out_str.lines() {
-        if let Some(hdr) = l.strip_prefix("## ") {
-            branch = hdr
-                .split("...")
-                .next()
-                .unwrap_or("main")
-                .split_whitespace()
-                .next()
-                .unwrap_or("main")
-                .to_owned();
-        } else if !l.trim().is_empty() {
-            dirty += 1;
+    let git_dir = root.join(".git");
+    let head_raw = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head_trimmed = head_raw.trim();
+    if let Some(ref_rel) = head_trimmed.strip_prefix("ref: ") {
+        let ref_rel = ref_rel.trim();
+        let branch = ref_rel
+            .strip_prefix("refs/heads/")
+            .unwrap_or(ref_rel)
+            .to_owned();
+        let ref_file = git_dir.join(ref_rel);
+        let short_hash = if let Ok(hash_raw) = std::fs::read_to_string(&ref_file) {
+            hash_raw.trim().chars().take(7).collect::<String>()
+        } else if let Ok(packed) = std::fs::read_to_string(git_dir.join("packed-refs")) {
+            packed
+                .lines()
+                .find_map(|l| {
+                    let l = l.trim();
+                    if l.starts_with('#') || l.starts_with('^') {
+                        return None;
+                    }
+                    let mut parts = l.split_whitespace();
+                    let h = parts.next()?;
+                    let r = parts.next()?;
+                    if r == ref_rel {
+                        Some(h.chars().take(7).collect::<String>())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| "unborn".to_owned())
+        } else {
+            "unborn".to_owned()
+        };
+        Some(format!("Git Telemetry: branch '{branch}' @ {short_hash}"))
+    } else {
+        let short_hash: String = head_trimmed.chars().take(7).collect();
+        if short_hash.is_empty() {
+            None
+        } else {
+            Some(format!("Git Telemetry: branch 'HEAD' @ {short_hash}"))
         }
     }
-    let rev = Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .current_dir(root)
-        .output()
-        .ok();
-    let short_hash = rev
-        .filter(|r| r.status.success())
-        .map(|r| String::from_utf8_lossy(&r.stdout).trim().to_owned())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unborn".to_owned());
-    let tree = if dirty == 0 {
-        "clean".to_owned()
-    } else {
-        format!("{dirty} modified")
-    };
-    Some(format!("Git Telemetry: branch '{branch}' @ {short_hash} ({tree})"))
 }
 
 fn record_working_set_edit(target_file: &Path) -> Result<(), String> {
@@ -741,6 +755,14 @@ fn resolve_cid_and_transcript(payload: &Value) -> Option<(String, PathBuf)> {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty() && !s.contains('/') && !s.contains('\\'))?;
+    if let Some(tp_str) = payload
+        .get("transcriptPath")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Some((cid.to_owned(), PathBuf::from(tp_str)));
+    }
     let brain_base = payload
         .get("brainDir")
         .and_then(Value::as_str)
@@ -795,7 +817,7 @@ fn count_recent_exploratory_streak(transcript_path: &Path) -> usize {
         if line.contains("\"USER_INPUT\"")
             || line.contains("\"USER_EXPLICIT\"")
             || line.contains("\"invoke_subagent\"")
-            || line.contains("<CONTEXT_SUMMARY>")
+            || is_compaction_checkpoint_line(line)
         {
             break;
         }

@@ -218,15 +218,35 @@ fn transcript_tail_detector_automatically_advances_epoch_on_compaction() {
     assert_eq!(brain.pulse(&req).unwrap().capsules.len(), 1);
     assert_eq!(brain.pulse(&req).unwrap().capsules.len(), 0);
 
-    // Append a simulated `/compact` CHECKPOINT line to `transcript.jsonl`!
+    // Append a simulated `PLANNER_RESPONSE` mentioning "CHECKPOINT" and the summary tag in thinking/tool output:
+    // this MUST NOT trigger a false `/compact` epoch increment!
     use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .unwrap();
+    let tag = concat!("<CONTEXT", "_SUMMARY>");
+    writeln!(
+        f,
+        "{{\"step_index\":20,\"type\":\"PLANNER_RESPONSE\",\"thinking\":\"Checking \\\"CHECKPOINT\\\" and {tag} in transcript.rs\",\"content\":\"ok\"}}"
+    )
+    .unwrap();
+    drop(f);
+
+    let ep_still_1 = sync_transcript_epoch(&db, "cid-live", &transcript).unwrap();
+    assert_eq!(
+        ep_still_1, 1,
+        "mentions of CHECKPOINT or summary tag inside PLANNER_RESPONSE must not bump epoch"
+    );
+
+    // Append a genuine `/compact` CHECKPOINT line to `transcript.jsonl`!
     let mut f = std::fs::OpenOptions::new()
         .append(true)
         .open(&transcript)
         .unwrap();
     writeln!(
         f,
-        "{{\"step_index\":40,\"type\":\"CHECKPOINT\",\"content\":\"<CONTEXT_SUMMARY>compacted</CONTEXT_SUMMARY>\"}}"
+        "{{\"step_index\":40,\"type\":\"CHECKPOINT\",\"content\":\"{tag}compacted\"}}"
     )
     .unwrap();
     drop(f);

@@ -17,8 +17,34 @@ pub struct TranscriptEpochState {
     pub active_epoch: u32,
 }
 
+/// Returns true if a single JSONL line from `transcript.jsonl` represents a genuine
+/// Antigravity context compaction checkpoint (`"type": "CHECKPOINT"` or a `USER_INPUT`
+/// step whose `content` begins with the context summary header), ignoring any mentions
+/// of those strings inside model thinking, tool call arguments, or `read_file` outputs.
+pub fn is_compaction_checkpoint_line(line: &str) -> bool {
+    let summary_tag = concat!("<CONTEXT", "_SUMMARY>");
+    if !line.contains("CHECKPOINT") && !line.contains(summary_tag) {
+        return false;
+    }
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+        let step_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if step_type == "CHECKPOINT" {
+            return true;
+        }
+        if step_type == "USER_INPUT" {
+            if let Some(content) = val.get("content").and_then(|v| v.as_str()) {
+                if content.trim_start().starts_with(summary_tag) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    false
+}
+
 /// Inspects an Antigravity `transcript.jsonl` incrementally from `last_byte_offset` (`O(delta_bytes)`!)
-/// to detect `/compact` checkpoints (`"CHECKPOINT"` or `"<CONTEXT_SUMMARY>"`) automatically.
+/// to detect `/compact` checkpoints automatically without false positives from tool outputs or thinking.
 pub fn sync_transcript_epoch(
     db: &LibreDb,
     conversation_id: &str,
@@ -65,8 +91,7 @@ pub fn sync_transcript_epoch(
 
     let mut added_checkpoints = 0u32;
     for line in delta_str.lines() {
-        let head = &line[..line.len().min(360)];
-        if head.contains("\"CHECKPOINT\"") || line.contains("<CONTEXT_SUMMARY>") {
+        if is_compaction_checkpoint_line(line) {
             added_checkpoints += 1;
         }
     }
@@ -202,6 +227,7 @@ pub fn execute_atomic_batch(db: &LibreDb, spec: &AtomicBatchSpec) -> Result<Atom
     } else {
         db.link_batch(&edges)?
     };
+    let _ = db.maybe_auto_compact();
 
     Ok(AtomicBatchReport {
         nodes_committed: ids.len(),

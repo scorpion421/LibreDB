@@ -24,8 +24,8 @@ pub use reflex::{detect_workspace_markers, FiredReflex, ReflexEngine, ReflexRule
 pub use session::SessionState;
 pub use skeleton::{FileSkeleton, SectionSpan, SymbolContract};
 pub use transcript::{
-    create_subagent_handoff, execute_atomic_batch, sync_transcript_epoch, AtomicBatchReport,
-    AtomicBatchSpec, TaskCapsule, TranscriptEpochState,
+    create_subagent_handoff, execute_atomic_batch, is_compaction_checkpoint_line,
+    sync_transcript_epoch, AtomicBatchReport, AtomicBatchSpec, TaskCapsule, TranscriptEpochState,
 };
 pub use workspace::{
     extract_fim_slice, has_project_root_marker, index_workspace, query_symbol_impact,

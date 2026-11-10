@@ -261,12 +261,9 @@ impl OverlayBrain {
         // Only write `SessionState` to disk if `delivered_generations` actually gained a new item!
         if session_dirty {
             if let Some(ref sess) = session {
-                let prev_seq = self.last_project_seq.load(Ordering::Relaxed);
                 sess.save(self.project.db())?;
                 let after_seq = self.project.db().stats()?.commit_seq;
-                if after_seq == prev_seq + 1 {
-                    self.last_project_seq.store(after_seq, Ordering::Relaxed);
-                }
+                self.last_project_seq.store(after_seq, Ordering::Relaxed);
             }
         }
 

@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.1] - 2026-11-10
+
+### Added
+
+- Added `LibreDb::maybe_auto_compact` in `crates/libredb-core/src/engine.rs` (invoked automatically after `SessionState::save` and `execute_atomic_batch`) so uncompacted delta tails exceeding `1 MiB` (or `512 KiB` with `>= 32` superseded Inodes) self-compact in the background without manual CLI intervention.
+- Added `is_compaction_checkpoint_line` in `crates/libredb-cognitive/src/transcript.rs` to parse candidate `transcript.jsonl` JSON lines and verify `"type" == "CHECKPOINT"` (or a `USER_INPUT` summary step) rather than matching raw substrings inside model thinking or `read_file` tool outputs.
+
+### Changed
+
+- Upgraded `compact_with_options(true)` (`libredb compact <db.ldb> --prune`) in `crates/libredb-core/src/engine.rs` and `populate_cognitive_graph` in `crates/libredb-bridge/src/lib.rs` to normalize symbol file paths (`\` -> `/`), use canonical 2-part symbol keys (`{file_path}::{qualified_name}`), and filter out unreferenced R8/ProGuard obfuscated or legacy 3-part line-numbered `NodeKind::Symbol` bloat on `> 500`-symbol tables while keeping `sqlite_mirror::*` 100% lossless prior to `--prune`.
+- Upgraded `HybridIndex` (`INDEX_FORMAT_VERSION = 3`) in `crates/libredb-index/src/lib.rs` to retain 100% of `word_postings` across full document bodies while capping body character `3-gram` extraction to the first `16` unique tokens (`len >= 4`, max `12` 3-grams/token), shrinking `sys::index_snapshot` in `customizations.ldb` by over `60%`.
+- Decoupled `run_pre_invocation_hook` (`crates/libredb-cli/src/hooks.rs`) from global `customizations.ldb` on routine turns by storing the per-conversation `PreInvocation` deduplication cursor (`sys::pre_inv_dedup::{cid}`) inside `.agents/memory.ldb`, replacing the two `git.exe` subprocesses in `collect_git_telemetry_line` with a pure-Rust `.git/HEAD` and `.git/refs` reader (`< 0.1 ms`), supporting `transcriptPath` in hook payloads, and filtering `| done |`, `| completed |`, `| closed |`, and `| cancelled |` tasks from the `Active Task Board`.
+
+### Fixed
+
+- Fixed `OverlayBrain::pulse` (`crates/libredb-cognitive/src/overlay.rs`) to unconditionally synchronize `last_project_seq` after `SessionState::save` (including when `maybe_auto_compact` advances `commit_seq` by `2`).
+
 ## [0.8.0] - 2026-11-10
 
 ### Added

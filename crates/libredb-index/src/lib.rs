@@ -22,7 +22,7 @@ pub const HEBBIAN_KEY_PREFIX: &str = "hebbian::";
 pub const INDEX_SNAPSHOT_KEY: &str = "sys::index_snapshot";
 /// Binary schema/filtering version for `sys::index_snapshot`. Bumping this automatically
 /// rebuilds any older bloated snapshot (e.g. v1 with `Symbol`/`QuotaEvent` postings) on open.
-pub const INDEX_FORMAT_VERSION: u32 = 2;
+pub const INDEX_FORMAT_VERSION: u32 = 3;
 
 /// Ranked search hit produced by `HybridIndex::search`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -370,13 +370,17 @@ impl HybridIndex {
             }
         }
 
-        let ngram_cap = if kind == NodeKind::Symbol { 8 } else { 80 };
+        let ngram_cap = if kind == NodeKind::Symbol { 6 } else { 16 };
         let body_tokens = segment_universal_tokens(body);
-        for (idx, tok) in body_tokens.into_iter().enumerate() {
-            if idx < ngram_cap {
-                for ng in extract_unicode_ngrams(&tok) {
-                    *ngram_tf.entry(ng).or_insert(0) += 1;
-                    ngram_len += 1;
+        let mut seen_ngram_tokens = 0usize;
+        for tok in body_tokens {
+            if seen_ngram_tokens < ngram_cap && !word_tf.contains_key(&tok) {
+                if tok.chars().count() >= 4 || !tok.is_ascii() {
+                    seen_ngram_tokens += 1;
+                    for ng in extract_unicode_ngrams(&tok).into_iter().take(12) {
+                        *ngram_tf.entry(ng).or_insert(0) += 1;
+                        ngram_len += 1;
+                    }
                 }
             }
             *word_tf.entry(tok).or_insert(0) += 1;

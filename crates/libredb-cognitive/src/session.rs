@@ -99,10 +99,12 @@ impl SessionState {
         let storage_key = format!("session_delta::{}", self.conversation_id);
         let bytes = serde_json::to_vec(self)
             .map_err(|e| LibreDbError::CorruptFormat(if e.is_io() { "session io" } else { "session json" }))?;
-        db.put(
+        let nid = db.put(
             WriteRequest::new(NodeKind::TranscriptCursor, bytes)
                 .with_key(storage_key)
                 .with_importance(64),
-        )
+        )?;
+        let _ = db.maybe_auto_compact();
+        Ok(nid)
     }
 }

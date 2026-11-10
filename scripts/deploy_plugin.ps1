@@ -69,7 +69,7 @@ $PluginJson = @'
 {
   "name": "libredb",
   "displayName": "LibreDB Cognitive Memory",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "description": "Full Rust replacement for SQLite SkillsDB: single-file cognitive memory, silent SQLite auto-porter, sub-2ms hooks, guardrails, 14-language causal code graph, and dynamic multi-remote Git/Gitea automation.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
@@ -248,11 +248,11 @@ $LogoSvg = @'
 
 # 7. Write user-facing README.md inside plugin bundle
 $PluginReadme = @'
-# LibreDB cognitive memory plugin (v0.8.0)
+# LibreDB cognitive memory plugin (v0.8.1)
 
 Complete standalone Rust replacement for `AntiGraviton SkillsDB` (`customizations-db`):
 - `libredb-mcp`: 3-tool multi-workspace cognitive memory & 14-language causal code-graph server with zero-I/O RAM session delta, `[Zero-Repeat Skeleton]` deduplication, and automatic incremental workspace refresh.
-- Compaction garbage collection (`compact_with_options`) and `INDEX_FORMAT_VERSION = 2` selective cognitive `HybridIndex`.
+- Compaction garbage collection (`compact_with_options`, `maybe_auto_compact`) and `INDEX_FORMAT_VERSION = 3` selective cognitive `HybridIndex`.
 - Silent background 1:1 auto-migration for any pre-existing `.agents/memory.db` in older projects or chats; pure `.ldb` operation for all new projects and chats.
 - Native compiled `< 2 ms` `PreInvocation` and `PreToolUse` guardrail hooks (`hooks.json`) with post-compaction epoch hydration, live `transcript.jsonl` workspace inference, `research -> flash` subagent routing, and `CRLF`/BOM normalization.
 - Global system directives (`rules/AGENTS.md`) and dynamic multi-remote Git/Gitea release automation (`libredb git-sync` / `git-release` & `gitea-sync` / `gitea-release`).
@@ -261,6 +261,6 @@ To switch cleanly to pure single-engine operation, disable `AntiGraviton SkillsD
 '@
 [System.IO.File]::WriteAllText((Join-Path $PluginDir "README.md"), $PluginReadme, $Utf8NoBom)
 
-Write-Output "[OK] Deployed LibreDB v0.8.0 standalone binaries to: $BinDir"
+Write-Output "[OK] Deployed LibreDB v0.8.1 standalone binaries to: $BinDir"
 Write-Output "[OK] Hydrated and modernized global 19-table store at: $GlobalLdb"
 Write-Output "[OK] Installed complete Antigravity replacement plugin at: $PluginDir"

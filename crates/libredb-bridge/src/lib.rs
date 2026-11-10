@@ -1111,6 +1111,47 @@ fn populate_cognitive_graph(conn: &Connection, ldb: &LibreDb) -> Result<(usize, 
     }
 
     if existing_tables.contains("symbol_index") {
+        let sym_total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbol_index;", [], |r| r.get(0))
+            .unwrap_or(0);
+        let filter_unreferenced = sym_total > 500;
+        let mut referenced_syms: HashSet<String> = HashSet::new();
+        let mut referenced_files: HashSet<String> = HashSet::new();
+
+        if filter_unreferenced {
+            for (_, dec_body) in &active_decisions_text {
+                for token in dec_body
+                    .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':'))
+                    .filter(|t| t.len() >= 4)
+                {
+                    referenced_syms.insert(token.to_owned());
+                }
+            }
+            if existing_tables.contains("dependency_edges") {
+                if let Ok(mut estmt) =
+                    conn.prepare("SELECT source_symbol, target_symbol FROM dependency_edges;")
+                {
+                    if let Ok(erows) = estmt.query_map([], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                    }) {
+                        for erow in erows.flatten() {
+                            referenced_syms.insert(erow.0);
+                            referenced_syms.insert(erow.1);
+                        }
+                    }
+                }
+            }
+            if existing_tables.contains("active_working_set") {
+                if let Ok(mut wstmt) = conn.prepare("SELECT file_path FROM active_working_set;") {
+                    if let Ok(wrows) = wstmt.query_map([], |r| r.get::<_, String>(0)) {
+                        for wf in wrows.flatten() {
+                            referenced_files.insert(wf.replace('\\', "/"));
+                        }
+                    }
+                }
+            }
+        }
+
         let mut stmt = conn.prepare(
             "SELECT file_path, symbol_name, qualified_name, kind, start_line, end_line, signature FROM symbol_index;",
         )?;
@@ -1126,12 +1167,28 @@ fn populate_cognitive_graph(conn: &Connection, ldb: &LibreDb) -> Result<(usize, 
             ))
         })?;
         for row in rows {
-            let (fpath, sname, qname, kind, s_line, e_line, sig) = row?;
+            let (raw_fpath, sname, qname, kind, s_line, e_line, sig) = row?;
+            let fpath = raw_fpath.replace('\\', "/");
+            if filter_unreferenced {
+                let is_obfuscated =
+                    sname.len() <= 2 && qname.split('.').all(|seg| seg.len() <= 2);
+                if is_obfuscated {
+                    continue;
+                }
+                let file_cap_ok = referenced_files.contains(&fpath)
+                    && file_symbols_idx.get(&fpath).map_or(0, Vec::len) < 16;
+                let is_ref = referenced_syms.contains(&sname)
+                    || referenced_syms.contains(&qname)
+                    || file_cap_ok;
+                if !is_ref {
+                    continue;
+                }
+            }
             let body = format!("{fpath} [L{s_line}-L{e_line}] ({kind}) {qname}: {sig}");
             let b_idx = prepared.len();
             prepared.push(ldb.prepare(
                 WriteRequest::new(NodeKind::Symbol, body.into_bytes())
-                    .with_key(format!("{fpath}::{qname}::{s_line}"))
+                    .with_key(format!("{fpath}::{qname}"))
                     .with_importance(175),
                 b_idx,
             )?);
@@ -1187,7 +1244,8 @@ fn populate_cognitive_graph(conn: &Connection, ldb: &LibreDb) -> Result<(usize, 
             ))
         })?;
         for row in rows {
-            let (fpath, syms, ranges, edits, upd) = row?;
+            let (raw_fpath, syms, ranges, edits, upd) = row?;
+            let fpath = raw_fpath.replace('\\', "/");
             let body = format!(
                 "[WorkingSet edits={edits} {upd}] {fpath} | ranges={ranges} | symbols={syms}"
             );

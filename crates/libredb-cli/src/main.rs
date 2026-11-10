@@ -1135,6 +1135,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let prune = args.iter().skip(2).any(|a| a == "--prune");
             let t0 = Instant::now();
             let db = Arc::new(LibreDb::open(&args[1])?);
+            let initial_bytes = db.stats()?.file_bytes;
             let mut cog = CognitiveEngine::open_db(Arc::clone(&db))?;
             cog.save_index_snapshot()?;
             let rep = db.compact_with_options(prune)?;
@@ -1142,7 +1143,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 "Gravity compaction{} + index snapshot finished in {:.2} ms: {} -> {} bytes ({} hot nodes in {} locality groups, {} cold nodes archived)",
                 if prune { " (--prune)" } else { "" },
                 t0.elapsed().as_secs_f64() * 1000.0,
-                rep.bytes_before,
+                initial_bytes,
                 rep.bytes_after,
                 rep.hot_nodes_packed,
                 rep.locality_groups,
