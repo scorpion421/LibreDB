@@ -1,0 +1,769 @@
+//! Native sub-millisecond Antigravity lifecycle hooks (`PreInvocation` and `PreToolUse`)
+//! with silent background `SQLite -> LibreDB` auto-migration on first workspace/chat touch.
+
+use libredb_bridge::open_or_auto_migrate;
+use libredb_cognitive::{
+    check_command_guardrails, check_text_guardrails, is_test_or_scratch_path,
+    sync_transcript_epoch, CognitiveEngine,
+};
+use libredb_core::{LibreDb, NodeKind, WriteRequest};
+use serde_json::{json, Value};
+use std::env;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Arc;
+
+pub fn default_global_ldb_path() -> PathBuf {
+    user_home_dir()
+        .join(".gemini")
+        .join("libredb")
+        .join("customizations.ldb")
+}
+
+pub fn default_central_sqlite_path() -> PathBuf {
+    user_home_dir()
+        .join(".gemini")
+        .join("database")
+        .join("customizations.db")
+}
+
+pub fn open_global_ldb(override_path: Option<&Path>) -> Result<Arc<LibreDb>, String> {
+    let target = override_path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_global_ldb_path);
+    let central_sql = default_central_sqlite_path();
+    let (db, migrated) = open_or_auto_migrate(&target, Some(&central_sql), "central")
+        .map_err(|e| e.to_string())?;
+    if migrated.is_some() {
+        if let Ok(mut cog) = CognitiveEngine::open_db(Arc::clone(&db)) {
+            let _ = cog.save_index_snapshot();
+        }
+    }
+    Ok(db)
+}
+
+pub fn open_project_ldb_silent(ldb_path: &Path) -> Result<(Arc<LibreDb>, bool), String> {
+    let (db, migrated) =
+        open_or_auto_migrate(ldb_path, None, "project").map_err(|e| e.to_string())?;
+    let did_migrate = migrated.is_some();
+    if did_migrate {
+        if let Ok(mut cog) = CognitiveEngine::open_db(Arc::clone(&db)) {
+            let _ = cog.save_index_snapshot();
+        }
+    }
+    Ok((db, did_migrate))
+}
+
+/// Handles Antigravity `PreToolUse` JSON hook from `stdin` (`< 1.5 ms`).
+pub fn run_pre_tool_hook(_global_ldb_opt: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
+    let mut raw = String::new();
+    let _ = io::stdin().read_to_string(&mut raw);
+    let payload: Value = serde_json::from_str(raw.trim()).unwrap_or_else(|_| json!({}));
+
+    let tool_name = payload
+        .get("toolName")
+        .or_else(|| payload.get("tool"))
+        .or_else(|| payload.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+
+    let args = payload
+        .get("toolInput")
+        .or_else(|| payload.get("parameters"))
+        .or_else(|| payload.get("arguments"))
+        .or_else(|| payload.get("args"))
+        .unwrap_or(&payload);
+
+    // 1. Shell command guardrails + automatic WaitMsBeforeAsync upgrade to 10000ms
+    let cmd_opt = args
+        .get("CommandLine")
+        .or_else(|| args.get("command"))
+        .and_then(Value::as_str);
+
+    if let Some(cmd_line) = cmd_opt {
+        if let Some(v) = check_command_guardrails(cmd_line) {
+            emit_json(&json!({
+                "decision": "deny",
+                "reason": format!("LibreDB Guardrail Blocked Command ({}): {}", v.rule, v.message)
+            }))?;
+            return Ok(());
+        }
+
+        // Subagent Firewall: block >= 4 consecutive exploratory shell searches in main context
+        if is_exploratory_search_cmd(cmd_line) {
+            if let Some((cid, t_path)) = resolve_cid_and_transcript(&payload) {
+                if !cid.is_empty() && t_path.is_file() && count_recent_exploratory_streak(&t_path) >= 4 {
+                    emit_json(&json!({
+                        "decision": "deny",
+                        "reason": "LibreDB Subagent Firewall (Rule 5): 4+ consecutive exploratory shell search commands executed in main context. Delegate open multi-file searching to invoke_subagent(TypeName='research', Model='flash') or use libredb_code(action='skeleton'|'fim'|'impact')."
+                    }))?;
+                    return Ok(());
+                }
+            }
+        }
+
+        let is_daemon = args.get("IsDaemon").and_then(Value::as_bool).unwrap_or(false);
+        if !is_daemon {
+            if let Some(wait_val) = args.get("WaitMsBeforeAsync") {
+                if let Some(w_i64) = wait_val.as_i64() {
+                    if w_i64 > 0 && w_i64 < 10_000 {
+                        emit_json(&json!({
+                            "decision": "allow",
+                            "overwrite": { "WaitMsBeforeAsync": 10000 }
+                        }))?;
+                        return Ok(());
+                    }
+                } else if let Some(w_str) = wait_val.as_str() {
+                    if let Ok(w_i64) = w_str.parse::<i64>() {
+                        if w_i64 > 0 && w_i64 < 10_000 {
+                            emit_json(&json!({
+                                "decision": "allow",
+                                "overwrite": { "WaitMsBeforeAsync": "10000" }
+                            }))?;
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. File write/edit guardrails + silent WorkingSet tracking in .agents/memory.ldb
+    let target_file = args
+        .get("Path")
+        .or_else(|| args.get("TargetFile"))
+        .or_else(|| args.get("file_path"))
+        .or_else(|| args.get("path"))
+        .and_then(Value::as_str)
+        .unwrap_or("<tool_input>");
+
+    let is_write_or_edit = matches!(
+        tool_name,
+        "write_file"
+            | "edit_file"
+            | "write_to_file"
+            | "replace_file_content"
+            | "multi_replace_file_content"
+    ) || args.get("Content").is_some()
+        || args.get("Replacement").is_some()
+        || args.get("ReplacementChunks").is_some();
+
+    if is_write_or_edit {
+        if !is_test_or_scratch_path(target_file) {
+            let mut texts_to_check: Vec<&str> = Vec::new();
+            for k in [
+                "Content",
+                "Replacement",
+                "CodeContent",
+                "ReplacementContent",
+                "content",
+                "replacement",
+                "new_string",
+            ] {
+                if let Some(s) = args.get(k).and_then(Value::as_str) {
+                    texts_to_check.push(s);
+                }
+            }
+            if let Some(chunks) = args.get("ReplacementChunks").and_then(Value::as_array) {
+                for ch in chunks {
+                    if let Some(s) = ch
+                        .get("ReplacementContent")
+                        .or_else(|| ch.get("Replacement"))
+                        .and_then(Value::as_str)
+                    {
+                        texts_to_check.push(s);
+                    }
+                }
+            }
+
+            for txt in texts_to_check {
+                let violations = check_text_guardrails(txt, target_file);
+                if let Some(first_crit) = violations.into_iter().find(|v| v.severity == "CRITICAL")
+                {
+                    emit_json(&json!({
+                        "decision": "deny",
+                        "reason": format!(
+                            "LibreDB Guardrail Blocked Code Modification ({}): {} In snippet: '{}'",
+                            first_crit.rule, first_crit.message, first_crit.snippet
+                        )
+                    }))?;
+                    return Ok(());
+                }
+            }
+        }
+
+        if target_file != "<tool_input>" && !is_test_or_scratch_path(target_file) {
+            let _ = record_working_set_edit(Path::new(target_file));
+        }
+    }
+
+    emit_json(&json!({ "decision": "allow" }))?;
+    Ok(())
+}
+
+/// Handles Antigravity `PreInvocation` JSON hook from `stdin` (`< 2.5 ms` warm, `< 30 ms` on first-time SQLite auto-port).
+pub fn run_pre_invocation_hook(
+    global_ldb_opt: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut raw = String::new();
+    let _ = io::stdin().read_to_string(&mut raw);
+    let payload: Value = serde_json::from_str(raw.trim()).unwrap_or_else(|_| json!({}));
+
+    let invocation_num = payload
+        .get("invocationNum")
+        .and_then(Value::as_u64)
+        .unwrap_or(1);
+    if invocation_num > 1 {
+        emit_json(&json!({ "injectSteps": [] }))?;
+        return Ok(());
+    }
+
+    let Ok(global_db) = open_global_ldb(global_ldb_opt) else {
+        emit_json(&json!({ "injectSteps": [] }))?;
+        return Ok(());
+    };
+
+    let (cid_opt, transcript_opt) = match resolve_cid_and_transcript(&payload) {
+        Some((c, tp)) => (Some(c), Some(tp)),
+        None => (None, None),
+    };
+
+    let ws_root = resolve_hook_workspace(&payload);
+    let target_ldb: Option<PathBuf> = if let Some(ref root) = ws_root {
+        // Record learned workspace path into `customizations.ldb` (`workspace:<name>`)
+        if let Some(name) = root.file_name().and_then(|n| n.to_str()) {
+            let ws_key = format!("workspace:{name}");
+            let root_str = root.to_string_lossy().into_owned();
+            let already_same = global_db
+                .get_by_key(NodeKind::Config, &ws_key)
+                .map(|r| r.payload == root_str.as_bytes())
+                .unwrap_or(false);
+            if !already_same {
+                let _ = global_db.put(
+                    WriteRequest::new(NodeKind::Config, root_str.into_bytes())
+                        .with_key(ws_key)
+                        .with_importance(170),
+                );
+            }
+        }
+        Some(root.join(".agents").join("memory.ldb"))
+    } else if let Some(ref cid) = cid_opt {
+        let brain_agents = user_home_dir()
+            .join(".gemini")
+            .join("antigravity")
+            .join("brain")
+            .join(cid)
+            .join(".agents");
+        let cand_ldb = brain_agents.join("memory.ldb");
+        let cand_db = brain_agents.join("memory.db");
+        if cand_ldb.exists() || cand_db.exists() {
+            Some(cand_ldb)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let Some(mem_ldb_path) = target_ldb else {
+        emit_json(&json!({ "injectSteps": [] }))?;
+        return Ok(());
+    };
+
+    // If neither `.agents/memory.ldb` nor `.agents/memory.db` exists yet in this folder, wait until
+    // the agent or workspace actually creates project memory rather than polluting random folders,
+    // UNLESS it's an active Git/project workspace where auto-porting or existing memory applies!
+    let mem_db_sibling = mem_ldb_path.with_extension("db");
+    if !mem_ldb_path.exists() && !mem_db_sibling.exists() {
+        emit_json(&json!({ "injectSteps": [] }))?;
+        return Ok(());
+    }
+
+    let Ok((proj_db, _did_migrate)) = open_project_ldb_silent(&mem_ldb_path) else {
+        emit_json(&json!({ "injectSteps": [] }))?;
+        return Ok(());
+    };
+
+    let mut epoch = 1u32;
+    if let (Some(ref cid), Some(ref tp)) = (&cid_opt, &transcript_opt) {
+        if tp.is_file() {
+            epoch = sync_transcript_epoch(&proj_db, cid, tp).unwrap_or(1);
+        }
+    }
+
+    let ws_key = ws_root
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "__chat__".to_owned());
+    let dedup_token = format!("{ws_key}@ep={epoch}");
+
+    if let Some(ref cid) = cid_opt {
+        if let Ok(cur_rec) = global_db.get_by_key(NodeKind::TranscriptCursor, cid) {
+            if let Ok(cur_json) = serde_json::from_slice::<Value>(&cur_rec.payload) {
+                if cur_json.get("dedup_token").and_then(Value::as_str) == Some(dedup_token.as_str())
+                {
+                    emit_json(&json!({ "injectSteps": [] }))?;
+                    return Ok(());
+                }
+            }
+        }
+        let next_cur = json!({
+            "conversation_id": cid,
+            "epoch_count": epoch,
+            "dedup_token": dedup_token,
+            "inferred_workspace": ws_key,
+        });
+        if let Ok(bytes) = serde_json::to_vec(&next_cur) {
+            let _ = global_db.put(
+                WriteRequest::new(NodeKind::TranscriptCursor, bytes)
+                    .with_key(cid)
+                    .with_importance(110),
+            );
+        }
+    }
+
+    let context_block = build_project_memory_hydration(&proj_db, ws_root.as_deref());
+    if context_block.is_empty() {
+        emit_json(&json!({ "injectSteps": [] }))?;
+    } else {
+        emit_json(&json!({
+            "injectSteps": [{
+                "ephemeralMessage": context_block
+            }]
+        }))?;
+    }
+    Ok(())
+}
+
+fn build_project_memory_hydration(proj_db: &LibreDb, ws_root: Option<&Path>) -> String {
+    let mut lines: Vec<String> = Vec::new();
+
+    if let Some(root) = ws_root {
+        if let Some(git_line) = collect_git_telemetry_line(root) {
+            lines.push(git_line);
+        }
+    }
+
+    let inodes = proj_db.list_inodes(None, false);
+    let mut task_ids: Vec<u64> = Vec::new();
+    let mut handoff_ids: Vec<u64> = Vec::new();
+    let mut decision_ids: Vec<u64> = Vec::new();
+    let mut fact_ids: Vec<(u64, u64)> = Vec::new();
+
+    for (ino, _, _) in &inodes {
+        if !ino.flags.is_live_active() {
+            continue;
+        }
+        match ino.kind {
+            NodeKind::Task => task_ids.push(ino.node_id),
+            NodeKind::Handoff => handoff_ids.push(ino.node_id),
+            NodeKind::Decision => decision_ids.push(ino.node_id),
+            NodeKind::Fact => fact_ids.push((ino.updated_ns, ino.node_id)),
+            _ => {}
+        }
+    }
+
+    // Open tasks (skip completed)
+    if !task_ids.is_empty() {
+        task_ids.sort_unstable();
+        if let Ok((recs, _)) = proj_db.get_many_coalesced(&task_ids) {
+            let open_tasks: Vec<String> = recs
+                .into_iter()
+                .map(|r| String::from_utf8_lossy(&r.payload).into_owned())
+                .filter(|t| !t.contains(" completed "))
+                .take(5)
+                .collect();
+            if !open_tasks.is_empty() {
+                if !lines.is_empty() {
+                    lines.push(String::new());
+                }
+                lines.push("Active Task Board:".to_owned());
+                for t in open_tasks {
+                    let first = t.lines().next().unwrap_or(&t);
+                    lines.push(format!("  * {first}"));
+                }
+            }
+        }
+    }
+
+    // Pending handoffs
+    if !handoff_ids.is_empty() {
+        if let Ok((recs, _)) = proj_db.get_many_coalesced(&handoff_ids) {
+            let pending: Vec<String> = recs
+                .into_iter()
+                .map(|r| String::from_utf8_lossy(&r.payload).into_owned())
+                .filter(|h| h.contains("(pending)"))
+                .take(3)
+                .collect();
+            if !pending.is_empty() {
+                if !lines.is_empty() {
+                    lines.push(String::new());
+                }
+                lines.push("Pending Subagent Handoffs:".to_owned());
+                for h in pending {
+                    let first = h.lines().next().unwrap_or(&h);
+                    lines.push(format!("  * {first}"));
+                }
+            }
+        }
+    }
+
+    // Most recent 12 active facts
+    if !fact_ids.is_empty() {
+        fact_ids.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+        let top_fids: Vec<u64> = fact_ids.into_iter().take(12).map(|(_, id)| id).collect();
+        if let Ok((recs, _)) = proj_db.get_many_coalesced(&top_fids) {
+            if !recs.is_empty() {
+                if !lines.is_empty() {
+                    lines.push(String::new());
+                }
+                lines.push("Project Facts (.agents/memory.ldb):".to_owned());
+                for r in recs {
+                    let txt = String::from_utf8_lossy(&r.payload);
+                    lines.push(format!("  * {}", txt.trim()));
+                }
+            }
+        }
+    }
+
+    // Active architectural decisions (up to 5)
+    if !decision_ids.is_empty() {
+        decision_ids.sort_by(|a, b| b.cmp(a));
+        decision_ids.truncate(5);
+        if let Ok((recs, _)) = proj_db.get_many_coalesced(&decision_ids) {
+            if !recs.is_empty() {
+                if !lines.is_empty() {
+                    lines.push(String::new());
+                }
+                lines.push("Active Architectural Decisions:".to_owned());
+                for r in recs {
+                    let txt = String::from_utf8_lossy(&r.payload);
+                    let flat = txt.lines().collect::<Vec<_>>().join(" ");
+                    lines.push(format!("  * {}", flat.trim()));
+                }
+            }
+        }
+    }
+
+    // Latest snapshot or compaction checkpoint
+    if let Ok(snap) = proj_db.get_by_key(NodeKind::Snapshot, "latest_snapshot") {
+        if !lines.is_empty() {
+            lines.push(String::new());
+        }
+        lines.push("Latest Milestone Snapshot:".to_owned());
+        for sl in String::from_utf8_lossy(&snap.payload).lines().take(5) {
+            lines.push(format!("  {sl}"));
+        }
+    } else if let Ok(cp) = proj_db.get_by_key(NodeKind::CompactionCheckpoint, "latest_compaction") {
+        if !lines.is_empty() {
+            lines.push(String::new());
+        }
+        lines.push("Latest Compaction Checkpoint:".to_owned());
+        for cl in String::from_utf8_lossy(&cp.payload).lines().take(3) {
+            lines.push(format!("  {cl}"));
+        }
+    }
+
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "=== PROJECT MEMORY CONTEXT (LibreDB .agents/memory.ldb) ===\n{}",
+            lines.join("\n")
+        )
+    }
+}
+
+fn collect_git_telemetry_line(root: &Path) -> Option<String> {
+    if !root.join(".git").exists() {
+        return None;
+    }
+    let st = Command::new("git")
+        .args(["status", "--porcelain", "--branch"])
+        .current_dir(root)
+        .output()
+        .ok()?;
+    if !st.status.success() {
+        return None;
+    }
+    let out_str = String::from_utf8_lossy(&st.stdout);
+    let mut branch = "main".to_owned();
+    let mut dirty = 0usize;
+    for l in out_str.lines() {
+        if let Some(hdr) = l.strip_prefix("## ") {
+            branch = hdr
+                .split("...")
+                .next()
+                .unwrap_or("main")
+                .split_whitespace()
+                .next()
+                .unwrap_or("main")
+                .to_owned();
+        } else if !l.trim().is_empty() {
+            dirty += 1;
+        }
+    }
+    let rev = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(root)
+        .output()
+        .ok();
+    let short_hash = rev
+        .filter(|r| r.status.success())
+        .map(|r| String::from_utf8_lossy(&r.stdout).trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unborn".to_owned());
+    let tree = if dirty == 0 {
+        "clean".to_owned()
+    } else {
+        format!("{dirty} modified")
+    };
+    Some(format!("Git Telemetry: branch '{branch}' @ {short_hash} ({tree})"))
+}
+
+fn record_working_set_edit(target_file: &Path) -> Result<(), String> {
+    let Some(root) = find_workspace_root(target_file) else {
+        return Ok(());
+    };
+    let ldb_path = root.join(".agents").join("memory.ldb");
+    let db_sibling = ldb_path.with_extension("db");
+    if !ldb_path.exists() && !db_sibling.exists() {
+        return Ok(());
+    }
+    let (proj_db, _) = open_project_ldb_silent(&ldb_path)?;
+    let rel_key = target_file
+        .strip_prefix(&root)
+        .unwrap_or(target_file)
+        .to_string_lossy()
+        .replace('\\', "/");
+
+    let prev_edits = proj_db
+        .get_by_key(NodeKind::WorkingSet, &rel_key)
+        .ok()
+        .and_then(|r| {
+            let s = String::from_utf8_lossy(&r.payload);
+            s.split("edits=")
+                .nth(1)
+                .and_then(|tail| tail.split_whitespace().next())
+                .and_then(|n| n.parse::<u64>().ok())
+        })
+        .unwrap_or(0);
+    let next_edits = prev_edits + 1;
+    let body = format!("[WorkingSet edits={next_edits}] {rel_key}");
+    proj_db
+        .put(
+            WriteRequest::new(NodeKind::WorkingSet, body.into_bytes())
+                .with_key(rel_key)
+                .with_importance(180),
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn resolve_hook_workspace(payload: &Value) -> Option<PathBuf> {
+    if let Some(arr) = payload.get("workspacePaths").and_then(Value::as_array) {
+        for item in arr {
+            if let Some(s) = item.as_str() {
+                let p = PathBuf::from(s);
+                if p.is_dir() && !is_protected_profile_dir(&p) {
+                    if let Some(root) = find_workspace_root(&p) {
+                        if !is_protected_profile_dir(&root) {
+                            return Some(root);
+                        }
+                    }
+                    return Some(p);
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn find_workspace_root(start: &Path) -> Option<PathBuf> {
+    let dir = if start.is_file() {
+        start.parent()?
+    } else {
+        start
+    };
+    if is_protected_profile_dir(dir) {
+        return None;
+    }
+    let markers = [
+        ".agents",
+        ".git",
+        "Cargo.toml",
+        "pyproject.toml",
+        "package.json",
+        "pubspec.yaml",
+        "go.mod",
+        "pom.xml",
+    ];
+    let mut curr = Some(dir);
+    while let Some(c) = curr {
+        if c.parent().is_none() || is_protected_profile_dir(c) {
+            break;
+        }
+        if markers.iter().any(|m| c.join(m).exists()) {
+            return Some(c.to_path_buf());
+        }
+        curr = c.parent();
+    }
+    None
+}
+
+pub fn is_protected_profile_dir(p: &Path) -> bool {
+    let low = p.to_string_lossy().to_ascii_lowercase().replace('/', "\\");
+    let trimmed = low.trim_end_matches('\\');
+
+    let home_trim = user_home_dir()
+        .to_string_lossy()
+        .to_ascii_lowercase()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_owned();
+    let temp_trim = env::temp_dir()
+        .to_string_lossy()
+        .to_ascii_lowercase()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_owned();
+
+    if trimmed == home_trim || trimmed == temp_trim {
+        return true;
+    }
+
+    // Allow dedicated Antigravity scratch workspaces (`~/.gemini/antigravity/scratch/<project>`)
+    let scratch_prefix = format!("{home_trim}\\.gemini\\antigravity\\scratch\\");
+    if low.starts_with(&scratch_prefix) && trimmed.len() > scratch_prefix.trim_end_matches('\\').len() {
+        return false;
+    }
+
+    trimmed == format!("{home_trim}\\appdata")
+        || trimmed == format!("{home_trim}\\appdata\\local")
+        || trimmed == format!("{home_trim}\\appdata\\roaming")
+        || low.contains("\\.gemini\\")
+        || trimmed.ends_with("\\.gemini")
+        || low.contains("\\appdata\\local\\programs")
+        || low.contains("\\appdata\\local\\antigravity")
+        || low.contains("\\appdata\\roaming\\antigravity")
+        || low.contains("\\windows\\")
+        || trimmed.ends_with("\\windows")
+        || low.contains("\\program files")
+}
+
+fn resolve_cid_and_transcript(payload: &Value) -> Option<(String, PathBuf)> {
+    let cid = payload
+        .get("conversationId")
+        .or_else(|| payload.get("cid"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.contains('/') && !s.contains('\\'))?;
+    let brain_base = payload
+        .get("brainDir")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| user_home_dir().join(".gemini").join("antigravity").join("brain"));
+    let t_path = brain_base
+        .join(cid)
+        .join(".system_generated")
+        .join("logs")
+        .join("transcript.jsonl");
+    Some((cid.to_owned(), t_path))
+}
+
+fn is_exploratory_search_cmd(cmd: &str) -> bool {
+    let low = cmd.trim().to_ascii_lowercase();
+    low.starts_with("select-string ")
+        || low.starts_with("grep ")
+        || low.starts_with("rg ")
+        || low.starts_with("findstr ")
+        || low.contains("| select-string ")
+        || (low.starts_with("get-childitem ") && low.contains("-recurse"))
+}
+
+fn count_recent_exploratory_streak(transcript_path: &Path) -> usize {
+    use std::io::{Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(transcript_path) else {
+        return 0;
+    };
+    let Ok(meta) = f.metadata() else {
+        return 0;
+    };
+    let fsize = meta.len();
+    if fsize == 0 {
+        return 0;
+    }
+    let read_len = fsize.min(131_072);
+    let offset = fsize - read_len;
+    if f.seek(SeekFrom::Start(offset)).is_err() {
+        return 0;
+    }
+    let mut buf = vec![0u8; read_len as usize];
+    if f.read_exact(&mut buf).is_err() {
+        return 0;
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let mut lines: Vec<&str> = text.lines().collect();
+    if offset > 0 && !lines.is_empty() {
+        lines.remove(0);
+    }
+    let mut streak = 0usize;
+    for line in lines.into_iter().rev().take(30) {
+        if line.contains("\"USER_INPUT\"")
+            || line.contains("\"USER_EXPLICIT\"")
+            || line.contains("\"invoke_subagent\"")
+            || line.contains("<CONTEXT_SUMMARY>")
+        {
+            break;
+        }
+        if line.contains("\"PLANNER_RESPONSE\"") && line.contains("\"run_command\"") {
+            if let Ok(obj) = serde_json::from_str::<Value>(line) {
+                let mut had_run = false;
+                let mut had_exp = false;
+                if let Some(tcs) = obj.get("tool_calls").and_then(Value::as_array) {
+                    for tc in tcs {
+                        let nm = tc
+                            .get("name")
+                            .or_else(|| tc.get("function").and_then(|f| f.get("name")))
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        if nm == "run_command" {
+                            had_run = true;
+                            let prev_cmd = tc
+                                .get("args")
+                                .or_else(|| tc.get("arguments"))
+                                .and_then(|a| a.get("CommandLine"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
+                            if is_exploratory_search_cmd(prev_cmd) {
+                                had_exp = true;
+                            }
+                        }
+                    }
+                }
+                if had_run {
+                    if had_exp {
+                        streak += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    streak
+}
+
+fn emit_json(val: &Value) -> io::Result<()> {
+    let mut out = io::stdout().lock();
+    writeln!(out, "{val}")?;
+    out.flush()
+}
+
+pub fn user_home_dir() -> PathBuf {
+    env::var_os("USERPROFILE")
+        .or_else(|| env::var_os("HOME"))
+        .map(PathBuf::from)
+        .unwrap_or_else(env::temp_dir)
+}

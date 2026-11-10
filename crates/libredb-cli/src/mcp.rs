@@ -9,6 +9,7 @@
 //! 3. **Hands-Free `/compact` Detection:** Automatically locates Antigravity's `transcript.jsonl`
 //!    from `cid` (`~/.gemini/antigravity/brain/<cid>/.system_generated/logs/transcript.jsonl`).
 
+use crate::hooks::{is_protected_profile_dir, open_global_ldb, open_project_ldb_silent};
 use libredb_bridge::import_sqlite_readonly;
 use libredb_cognitive::{
     create_subagent_handoff, execute_atomic_batch, extract_fim_slice, index_workspace,
@@ -38,8 +39,7 @@ impl McpServerState {
         };
         let global_path_buf = global_path.map(Path::to_path_buf);
         let global_db = match global_path {
-            Some(gp) if gp.exists() => Some(Arc::new(LibreDb::open(gp).map_err(|e| e.to_string())?)),
-            Some(gp) => Some(Arc::new(LibreDb::open(gp).map_err(|e| e.to_string())?)),
+            Some(gp) => Some(open_global_ldb(Some(gp))?),
             None => None,
         };
 
@@ -51,17 +51,25 @@ impl McpServerState {
         })
     }
 
-    fn resolve_brain_mut(&mut self, hint_path: Option<&str>) -> Result<&mut OverlayBrain, String> {
+    fn resolve_brain_mut(
+        &mut self,
+        hint_path: Option<&str>,
+        cid_opt: Option<&str>,
+    ) -> Result<&mut OverlayBrain, String> {
         let db_path = match hint_path {
             Some(raw) if !raw.trim().is_empty() => {
                 resolve_workspace_ldb_path(Path::new(raw.trim()), &self.default_project_path)
             }
-            _ => self.default_project_path.clone(),
+            _ => match cid_opt.and_then(infer_chat_memory_ldb_path) {
+                Some(chat_ldb) => chat_ldb,
+                None => self.default_project_path.clone(),
+            },
         };
 
         if !self.brains.contains_key(&db_path) {
-            let proj_db = Arc::new(LibreDb::open(&db_path).map_err(|e| e.to_string())?);
-            let brain = OverlayBrain::open(self.global_db.clone(), proj_db).map_err(|e| e.to_string())?;
+            let (proj_db, _) = open_project_ldb_silent(&db_path)?;
+            let brain =
+                OverlayBrain::open(self.global_db.clone(), proj_db).map_err(|e| e.to_string())?;
             self.brains.insert(db_path.clone(), brain);
         }
 
@@ -194,8 +202,22 @@ pub fn handle_rpc_method(
                         "type": "object",
                         "properties": {
                             "cwd": { "type": "string" },
+                            "cid": { "type": "string" },
                             "facts": { "type": "object" },
                             "decisions": { "type": "object" },
+                            "tasks": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "key": { "type": "string" },
+                                        "title": { "type": "string" },
+                                        "status": { "type": "string" },
+                                        "priority": { "type": "string" }
+                                    },
+                                    "required": ["key", "title"]
+                                }
+                            },
                             "snapshot": { "type": "string" },
                             "learn_assoc": {
                                 "type": "object",
@@ -245,6 +267,7 @@ fn dispatch_tool(
         .and_then(Value::as_str)
         .or_else(|| args.get("file_path").and_then(Value::as_str))
         .or_else(|| args.get("target").and_then(Value::as_str));
+    let cid_arg = args.get("cid").and_then(Value::as_str);
 
     match name {
         "libredb_pulse" => {
@@ -258,8 +281,8 @@ fn dispatch_tool(
                 req.error_context = Some(err.to_owned());
             }
 
-            let brain = state.resolve_brain_mut(cwd_hint)?;
-            if let Some(cid) = args.get("cid").and_then(Value::as_str) {
+            let brain = state.resolve_brain_mut(cwd_hint, cid_arg)?;
+            if let Some(cid) = cid_arg {
                 req.conversation_id = Some(cid.to_owned());
                 let tp_opt = args
                     .get("transcript_path")
@@ -283,7 +306,7 @@ fn dispatch_tool(
             let line = args.get("line").and_then(Value::as_u64).map(|n| n as usize);
             let pad = args.get("pad").and_then(Value::as_u64).unwrap_or(12) as usize;
 
-            let brain = state.resolve_brain_mut(cwd_hint.or(Some(target)))?;
+            let brain = state.resolve_brain_mut(cwd_hint.or(Some(target)), cid_arg)?;
             let proj_db = Arc::clone(brain.project_db());
 
             match action {
@@ -329,7 +352,7 @@ fn dispatch_tool(
                 }
             }
 
-            let brain = state.resolve_brain_mut(cwd_hint)?;
+            let brain = state.resolve_brain_mut(cwd_hint, cid_arg)?;
             let proj_db = Arc::clone(brain.project_db());
 
             let mut spec = AtomicBatchSpec::default();
@@ -349,10 +372,31 @@ fn dispatch_tool(
                     ));
                 }
             }
+            if let Some(tarr) = args.get("tasks").and_then(Value::as_array) {
+                for t in tarr {
+                    if let (Some(k), Some(title)) = (
+                        t.get("key").and_then(Value::as_str),
+                        t.get("title").and_then(Value::as_str),
+                    ) {
+                        let st = t.get("status").and_then(Value::as_str).unwrap_or("pending");
+                        let pr = t.get("priority").and_then(Value::as_str).unwrap_or("med");
+                        spec.tasks.push((
+                            k.to_owned(),
+                            title.to_owned(),
+                            st.to_owned(),
+                            pr.to_owned(),
+                        ));
+                    }
+                }
+            }
             if let Some(snap) = args.get("snapshot").and_then(Value::as_str) {
                 spec.snapshot = Some(snap.to_owned());
             }
-            if !spec.facts.is_empty() || !spec.decisions.is_empty() || spec.snapshot.is_some() {
+            if !spec.facts.is_empty()
+                || !spec.decisions.is_empty()
+                || !spec.tasks.is_empty()
+                || spec.snapshot.is_some()
+            {
                 let rep = execute_atomic_batch(&proj_db, &spec)?;
                 outputs.push(format!(
                     "Committed {} capsules ({} governance edges)",
@@ -408,13 +452,13 @@ fn dispatch_tool(
         "libredb_skeleton" => {
             let fp = args.get("file_path").and_then(Value::as_str).ok_or("Missing file_path")?;
             let flt = args.get("filter").and_then(Value::as_str);
-            let brain = state.resolve_brain_mut(Some(fp))?;
+            let brain = state.resolve_brain_mut(Some(fp), cid_arg)?;
             let (skel, _) = FileSkeleton::index_or_get_cached(brain.project_db(), Path::new(fp), None)?;
             Ok(skel.render_compact(flt, flt.is_some()))
         }
         "libredb_impact" => {
             let sym = args.get("symbol").and_then(Value::as_str).ok_or("Missing symbol")?;
-            let brain = state.resolve_brain_mut(cwd_hint)?;
+            let brain = state.resolve_brain_mut(cwd_hint, cid_arg)?;
             let reports = query_symbol_impact(brain.project_db(), sym)?;
             Ok(serde_json::to_string_pretty(&reports)?)
         }
@@ -423,7 +467,7 @@ fn dispatch_tool(
             let sym = args.get("symbol").and_then(Value::as_str);
             let line = args.get("line").and_then(Value::as_u64).map(|n| n as usize);
             let pad = args.get("pad").and_then(Value::as_u64).unwrap_or(12) as usize;
-            let brain = state.resolve_brain_mut(Some(fp))?;
+            let brain = state.resolve_brain_mut(Some(fp), cid_arg)?;
             let bundle = extract_fim_slice(brain.project_db(), Path::new(fp), sym, line, pad)?;
             Ok(bundle.format_compact())
         }
@@ -432,7 +476,7 @@ fn dispatch_tool(
             let tkey = args.get("task_key").and_then(Value::as_str).ok_or("Missing task_key")?;
             let role = args.get("role").and_then(Value::as_str).ok_or("Missing role")?;
             let notes = args.get("instructions").and_then(Value::as_str).unwrap_or("");
-            let brain = state.resolve_brain_mut(cwd_hint)?;
+            let brain = state.resolve_brain_mut(cwd_hint, cid_arg)?;
             let (_, block) = create_subagent_handoff(brain.project_db(), hid, tkey, role, notes)?;
             Ok(block)
         }
@@ -449,6 +493,22 @@ fn user_home_dir() -> PathBuf {
 
 fn default_libredb_home() -> PathBuf {
     user_home_dir().join(".gemini").join("libredb")
+}
+
+fn infer_chat_memory_ldb_path(cid: &str) -> Option<PathBuf> {
+    if cid.trim().is_empty() || cid.contains('/') || cid.contains('\\') {
+        return None;
+    }
+    let brain_dir = user_home_dir()
+        .join(".gemini")
+        .join("antigravity")
+        .join("brain")
+        .join(cid.trim());
+    if brain_dir.is_dir() {
+        Some(brain_dir.join(".agents").join("memory.ldb"))
+    } else {
+        None
+    }
 }
 
 fn infer_antigravity_transcript_path(cid: &str) -> Option<PathBuf> {
@@ -477,8 +537,7 @@ fn resolve_workspace_ldb_path(probe: &Path, fallback: &Path) -> PathBuf {
         probe
     };
 
-    let low = start_dir.to_string_lossy().to_lowercase();
-    if low.contains("\\.gemini") || low.contains("/.gemini") || low.contains("\\windows") {
+    if is_protected_profile_dir(start_dir) {
         return fallback.to_path_buf();
     }
 
@@ -495,7 +554,7 @@ fn resolve_workspace_ldb_path(probe: &Path, fallback: &Path) -> PathBuf {
 
     let mut curr_opt = Some(start_dir);
     while let Some(curr) = curr_opt {
-        if curr.parent().is_none() {
+        if curr.parent().is_none() || is_protected_profile_dir(curr) {
             break;
         }
         if markers.iter().any(|m| curr.join(m).exists()) {

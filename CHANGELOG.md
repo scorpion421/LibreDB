@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-11-10
+
+### Added
+
+- Silent, crash-safe background `SQLite -> LibreDB` auto-porter (`open_or_auto_migrate` in `libredb-bridge`) wired across `MCP` (`libredb-mcp`), lifecycle hooks, `CLI`, and `PyO3`: whenever an existing workspace (`<root>/.agents/memory.db`), chat (`<brain>/<cid>/.agents/memory.db`), or central store (`customizations.db`) is touched for the first time, `LibreDB` imports `100%` of its contents read-only into `.ldb` in the background (`0` bytes altered in `.db`), while brand-new chats and projects operate purely on `.ldb`.
+- Complete `19`-table zero-amnesia cognitive hydration in `populate_cognitive_graph`:
+  - Preserves `100%` verbatim `SKILL.md` bodies (`skill_full::<name>` + `libredb get-skill`), `runtime_config` (`NodeKind::Config`), `transcript_cursors`, and `quota_ledger` alongside active/historical `rules` and `skill_sections`.
+  - Hydrates all `11` project memory tables including `session_snapshots` (chronological `Supersedes` milestone lineage), `fact_history` + `deprecated_at` / `superseded_by` temporal chains, `task_verifications` (`Verifies` synapses), `task_handoffs.context_variables`, `compaction_archive`, `active_working_set` (`Touches` synapses), automatic `Decision -> Governs -> Symbol` synapses, and unlimited `dependency_edges`.
+- Pure-Rust binary-safe guardrail engine (`libredb-cognitive::guardrail` / `libredb guardrail check`) enforcing formatting invariants (`no-em-en-dash`, `no-emojis`, `no-vbscript`), SemVer tag immutability, zero-polling, and SOC-compliant remote execution rules in `< 0.5 ms` per file without scanning build binaries.
+- Native compiled Rust Antigravity lifecycle hooks (`libredb hook-pre-invocation` and `libredb hook-pre-tool` in `< 2 ms`), replacing `400 ms` Python hook cold-starts while preserving epoch deduplication, `WaitMsBeforeAsync` auto-upgrades, Subagent Firewall checks, and `WorkingSet` tracking.
+- Dependency-free native Rust Gitea workflow suite (`gitea-status`, `gitea-config`, `gitea-init`, `gitea-sync`, `gitea-release`, `gitea-credential-helper`) over `std::net::TcpStream` HTTP/1.1 with `[GITEA REPOSITORY COLLISION]` protection, transient Basic auth headers, Keep a Changelog 1.1.0 release syncing, and `multipart/form-data` binary asset uploads.
+- Complete standalone Antigravity replacement bundle in `scripts/deploy_plugin.ps1` (`plugin.json`, `mcp_config.json`, `hooks.json`, `rules/AGENTS.md`, `skills/libredb/SKILL.md`, and `PATH` shim) allowing `customizations-db` to be cleanly toggled off for pure single-engine operation.
+
+### Fixed
+
+- Eliminated `O(N^2)` posting-list duplicate scans during bulk `HybridIndex` ingestion in `libredb-index`, accelerating initial index builds on `55,000+`-symbol repositories (`Android`, `Nova-Launcher`) by over an order of magnitude so first-touch hook auto-migration stays well inside the `5 s` hook budget.
+
 ## [0.4.0] - 2026-11-09
 
 ### Added

@@ -7,6 +7,7 @@
 //! 4. `SessionState` (`Zero-Repeat Delta` per `(conversation_id, epoch)` eliminating duplicate output),
 //! 5. `FileSkeleton` (`95-99%` hash-cached code contract compression).
 
+pub mod guardrail;
 pub mod overlay;
 pub mod reflex;
 pub mod session;
@@ -14,6 +15,10 @@ pub mod skeleton;
 pub mod transcript;
 pub mod workspace;
 
+pub use guardrail::{
+    audit_workspace_guardrails, check_command_guardrails, check_text_guardrails,
+    is_test_or_scratch_path, GuardrailAuditReport, GuardrailViolation,
+};
 pub use overlay::OverlayBrain;
 pub use reflex::{detect_workspace_markers, FiredReflex, ReflexEngine, ReflexRule};
 pub use session::SessionState;
@@ -187,9 +192,11 @@ impl CognitiveEngine {
             NodeKind::Decision,
             NodeKind::Fact,
             NodeKind::Task,
+            NodeKind::TaskVerification,
             NodeKind::Symbol,
             NodeKind::WorkingSet,
             NodeKind::Snapshot,
+            NodeKind::CompactionCheckpoint,
             NodeKind::Handoff,
         ];
         let lexical_hits = self.index.search(query, Some(&searchable_kinds), 24);

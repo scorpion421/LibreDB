@@ -1,6 +1,8 @@
 //! Native `PyO3` (`abi3-py312` stable ABI) Python extension (`import libredb`) for Python 3.12+.
 
-use libredb_bridge::{export_sqlite_database, import_sqlite_readonly, verify_sqlite_equivalence};
+use libredb_bridge::{
+    export_sqlite_database, import_sqlite_readonly, open_or_auto_migrate, verify_sqlite_equivalence,
+};
 use libredb_cognitive::{
     create_subagent_handoff, execute_atomic_batch, extract_fim_slice, index_workspace,
     query_symbol_impact, sync_transcript_epoch, AtomicBatchSpec, CognitiveEngine, FileSkeleton,
@@ -30,9 +32,24 @@ impl PyBrain {
     #[new]
     #[pyo3(signature = (path, global_path=None))]
     pub fn new(path: &str, global_path: Option<&str>) -> PyResult<Self> {
-        let project_db = Arc::new(LibreDb::open(path).map_err(to_py_err)?);
+        let (project_db, mig_proj) =
+            open_or_auto_migrate(Path::new(path), None, "project").map_err(to_py_err)?;
+        if mig_proj.is_some() {
+            if let Ok(mut cog) = CognitiveEngine::open_db(Arc::clone(&project_db)) {
+                let _ = cog.save_index_snapshot();
+            }
+        }
         let global_db = match global_path {
-            Some(gp) => Some(Arc::new(LibreDb::open(gp).map_err(to_py_err)?)),
+            Some(gp) => {
+                let (gdb, mig_glob) =
+                    open_or_auto_migrate(Path::new(gp), None, "central").map_err(to_py_err)?;
+                if mig_glob.is_some() {
+                    if let Ok(mut cog) = CognitiveEngine::open_db(Arc::clone(&gdb)) {
+                        let _ = cog.save_index_snapshot();
+                    }
+                }
+                Some(gdb)
+            }
             None => None,
         };
         Ok(Self {

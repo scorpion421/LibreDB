@@ -12,8 +12,9 @@ use libredb_core::crc::{crc32, hash_key};
 use libredb_core::{EdgeKind, LibreDb, NodeFlags, NodeKind, WriteRequest};
 use rusqlite::{types::ValueRef, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -116,6 +117,84 @@ pub fn import_sqlite_readonly(
         cognitive_capsules_created: capsules,
         synapses_wired: synapses,
     })
+}
+
+/// Opens `ldb_path` directly if it already exists; otherwise, if a legacy SQLite database
+/// (`sqlite_override` or sibling `<stem>.db`) exists, silently imports 100% of its contents
+/// into a crash-safe temporary `.ldb` and atomically publishes it at `ldb_path` without
+/// modifying the source `.db` file. Brand-new workspaces/chats without `.db` open a fresh `.ldb`.
+pub fn open_or_auto_migrate(
+    ldb_path: &Path,
+    sqlite_override: Option<&Path>,
+    scope: &str,
+) -> Result<(Arc<LibreDb>, Option<ImportSummary>)> {
+    let already_initialized = ldb_path
+        .metadata()
+        .map(|m| m.is_file() && m.len() >= 8192)
+        .unwrap_or(false);
+    if already_initialized {
+        let db = LibreDb::open(ldb_path)?;
+        return Ok((Arc::new(db), None));
+    }
+
+    let default_sibling = ldb_path.with_extension("db");
+    let sqlite_candidate = sqlite_override.unwrap_or(&default_sibling);
+    let has_legacy_sqlite = sqlite_candidate
+        .metadata()
+        .map(|m| m.is_file() && m.len() > 0)
+        .unwrap_or(false);
+
+    if !has_legacy_sqlite {
+        let db = LibreDb::open(ldb_path)?;
+        return Ok((Arc::new(db), None));
+    }
+
+    if let Some(parent) = ldb_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let tmp_ldb = ldb_path.with_extension(format!("ldb.migrating.{pid}.{nanos}"));
+    let _ = std::fs::remove_file(&tmp_ldb);
+
+    let migrate_res = (|| -> Result<ImportSummary> {
+        let staging_db = LibreDb::open(&tmp_ldb)?;
+        let summary = import_sqlite_readonly(sqlite_candidate, &staging_db, scope)?;
+        drop(staging_db);
+        Ok(summary)
+    })();
+
+    match migrate_res {
+        Ok(summary) => {
+            if ldb_path.exists() {
+                let _ = std::fs::remove_file(&tmp_ldb);
+                let db = LibreDb::open(ldb_path)?;
+                Ok((Arc::new(db), None))
+            } else {
+                match std::fs::rename(&tmp_ldb, ldb_path) {
+                    Ok(()) => {
+                        let db = LibreDb::open(ldb_path)?;
+                        Ok((Arc::new(db), Some(summary)))
+                    }
+                    Err(_) => {
+                        let _ = std::fs::remove_file(&tmp_ldb);
+                        let db = LibreDb::open(ldb_path)?;
+                        Ok((Arc::new(db), None))
+                    }
+                }
+            }
+        }
+        Err(err) => {
+            let _ = std::fs::remove_file(&tmp_ldb);
+            Err(err)
+        }
+    }
 }
 
 /// Exports the lossless SQLite mirror for `scope` from `ldb` into a brand-new SQLite database at `out_sqlite_path`,
@@ -451,26 +530,41 @@ fn cell_to_rusqlite(c: &SqlCell) -> rusqlite::types::Value {
     }
 }
 
-/// Converts active `SkillsDB` tables into native `LibreDB` cognitive capsules and wires Inode synapses
-/// using batched single-`fsync` commits (`commit_batch` + `link_batch`) for sub-50ms bulk imports!
+/// Converts all 19 `SkillsDB` tables (`8` central + `11` project) into native `LibreDB` cognitive
+/// capsules and wires temporal `Supersedes` + structural `Inode` synapses in one batched commit!
 fn populate_cognitive_graph(conn: &Connection, ldb: &LibreDb) -> Result<(usize, usize)> {
     let existing_tables = list_table_names(conn)?;
     let mut prepared: Vec<libredb_core::PreparedWrite> = Vec::new();
 
-    // Deferred symbolic link specifications resolved once `commit_batch` assigns `NodeId`s:
-    // `(batch_idx_of_child, parent_skill_name)`
     let mut pending_sections: Vec<(usize, String)> = Vec::new();
     let mut skill_batch_idx: HashMap<String, usize> = HashMap::new();
+    let mut pending_skill_full: Vec<(usize, usize)> = Vec::new();
     let mut pending_template_skills: Vec<(usize, Vec<String>)> = Vec::new();
     let mut task_batch_idx: HashMap<i64, usize> = HashMap::new();
     let mut pending_handoff_tasks: Vec<(usize, i64)> = Vec::new();
+    let mut pending_verify_tasks: Vec<(usize, i64)> = Vec::new();
     let mut symbol_batch_idx: HashMap<String, usize> = HashMap::new();
+    let mut file_symbols_idx: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut pending_working_files: Vec<(usize, String)> = Vec::new();
+    let mut active_decisions_text: Vec<(usize, String)> = Vec::new();
+    let mut fact_last_idx: HashMap<String, usize> = HashMap::new();
+    let mut pending_fact_supersedes: Vec<(String, String)> = Vec::new();
 
-    // --- Central DB tables ---
+    let mut inactive_rules: HashSet<String> = HashSet::new();
+    let mut inactive_skills: HashSet<String> = HashSet::new();
+    let mut inactive_decisions: HashSet<String> = HashSet::new();
+    let mut deprecated_facts: HashSet<String> = HashSet::new();
+
+    // ==================== CENTRAL DB TABLES (8) ====================
     if existing_tables.contains("rules") {
-        let mut stmt = conn.prepare(
-            "SELECT key, name, category, summary, content, is_active FROM rules ORDER BY id ASC;",
-        )?;
+        let cols = query_table_columns(conn, "rules")?;
+        let has_scope = cols.iter().any(|c| c == "scope");
+        let sql = if has_scope {
+            "SELECT key, name, category, summary, content, is_active, scope FROM rules ORDER BY id ASC;"
+        } else {
+            "SELECT key, name, category, summary, content, is_active, 'global' FROM rules ORDER BY id ASC;"
+        };
+        let mut stmt = conn.prepare(sql)?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -479,20 +573,24 @@ fn populate_cognitive_graph(conn: &Connection, ldb: &LibreDb) -> Result<(usize, 
                 r.get::<_, Option<String>>(3)?.unwrap_or_default(),
                 r.get::<_, String>(4)?,
                 r.get::<_, i64>(5).unwrap_or(1),
+                r.get::<_, Option<String>>(6)?.unwrap_or_else(|| "global".to_owned()),
             ))
         })?;
         for row in rows {
-            let (key, name, cat, summary, content, is_active) = row?;
-            if is_active != 0 {
-                let body = format!("[Rule: {name} | {cat}]\nSummary: {summary}\n{content}");
-                let idx = prepared.len();
-                prepared.push(ldb.prepare(
-                    WriteRequest::new(NodeKind::Rule, body.into_bytes())
-                        .with_key(key)
-                        .with_importance(230)
-                        .with_pinned(true),
-                    idx,
-                )?);
+            let (key, name, cat, summary, content, is_active, scope) = row?;
+            let body = format!("[Rule: {name} | {cat} | scope={scope}]\nSummary: {summary}\n{content}");
+            let idx = prepared.len();
+            prepared.push(ldb.prepare(
+                WriteRequest::new(NodeKind::Rule, body.into_bytes())
+                    .with_key(&key)
+                    .with_importance(230)
+                    .with_pinned(is_active != 0),
+                idx,
+            )?);
+            if is_active == 0 {
+                inactive_rules.insert(key);
+            } else {
+                inactive_rules.remove(&key);
             }
         }
     }
@@ -513,19 +611,33 @@ fn populate_cognitive_graph(conn: &Connection, ldb: &LibreDb) -> Result<(usize, 
         })?;
         for row in rows {
             let (name, plugin, cat, desc, content, is_active) = row?;
-            if is_active != 0 {
-                let summary_card = format!(
-                    "[Skill: {name} | plugin={plugin} | category={cat}]\n{desc}\n(Full length: {} chars)",
-                    content.len()
-                );
-                let b_idx = prepared.len();
-                prepared.push(ldb.prepare(
-                    WriteRequest::new(NodeKind::Skill, summary_card.into_bytes())
-                        .with_key(&name)
-                        .with_importance(200),
-                    b_idx,
-                )?);
-                skill_batch_idx.insert(name, b_idx);
+            let summary_card = format!(
+                "[Skill: {name} | plugin={plugin} | category={cat}]\n{desc}\n(Full length: {} chars)",
+                content.len()
+            );
+            let s_idx = prepared.len();
+            prepared.push(ldb.prepare(
+                WriteRequest::new(NodeKind::Skill, summary_card.into_bytes())
+                    .with_key(&name)
+                    .with_importance(200),
+                s_idx,
+            )?);
+
+            // Also preserve 100% verbatim SKILL.md body in a dedicated non-polluting full-skill capsule!
+            let full_idx = prepared.len();
+            prepared.push(ldb.prepare(
+                WriteRequest::new(NodeKind::Generic, content.into_bytes())
+                    .with_key(format!("skill_full::{name}"))
+                    .with_importance(120),
+                full_idx,
+            )?);
+            pending_skill_full.push((s_idx, full_idx));
+
+            if is_active == 0 {
+                inactive_skills.insert(name);
+            } else {
+                inactive_skills.remove(&name);
+                skill_batch_idx.insert(name, s_idx);
             }
         }
     }
@@ -553,6 +665,33 @@ fn populate_cognitive_graph(conn: &Connection, ldb: &LibreDb) -> Result<(usize, 
                 b_idx,
             )?);
             pending_sections.push((b_idx, sname));
+        }
+    }
+
+    if existing_tables.contains("runtime_config") {
+        let cols = query_table_columns(conn, "runtime_config")?;
+        let sql = if cols.iter().any(|c| c == "updated_at") {
+            "SELECT key, value, updated_at FROM runtime_config ORDER BY key ASC;"
+        } else {
+            "SELECT key, value, '' FROM runtime_config ORDER BY key ASC;"
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            ))
+        })?;
+        for row in rows {
+            let (key, val, _upd) = row?;
+            let b_idx = prepared.len();
+            prepared.push(ldb.prepare(
+                WriteRequest::new(NodeKind::Config, val.into_bytes())
+                    .with_key(key)
+                    .with_importance(180),
+                b_idx,
+            )?);
         }
     }
 
@@ -605,65 +744,278 @@ fn populate_cognitive_graph(conn: &Connection, ldb: &LibreDb) -> Result<(usize, 
         }
     }
 
-    // --- Project Memory DB tables ---
-    if existing_tables.contains("project_decisions") {
+    if existing_tables.contains("transcript_cursors") {
+        let cols = query_table_columns(conn, "transcript_cursors")?;
+        let has_epoch = cols.iter().any(|c| c == "epoch_count");
+        let has_dedup = cols.iter().any(|c| c == "dedup_token");
+        let has_ws = cols.iter().any(|c| c == "inferred_workspace");
+        let sql = format!(
+            "SELECT conversation_id, checkpoint_count, {}, {}, {}, updated_at FROM transcript_cursors;",
+            if has_epoch { "epoch_count" } else { "1" },
+            if has_dedup { "dedup_token" } else { "''" },
+            if has_ws { "inferred_workspace" } else { "''" }
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1).unwrap_or(0),
+                r.get::<_, i64>(2).unwrap_or(1),
+                r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+            ))
+        })?;
+        for row in rows {
+            let (cid, ckpt, ep, dedup, ws, upd) = row?;
+            let payload = serde_json::json!({
+                "conversation_id": cid,
+                "checkpoint_count": ckpt,
+                "epoch_count": ep,
+                "dedup_token": dedup,
+                "inferred_workspace": ws,
+                "updated_at": upd,
+            });
+            let b_idx = prepared.len();
+            prepared.push(ldb.prepare(
+                WriteRequest::new(NodeKind::TranscriptCursor, serde_json::to_vec(&payload)?)
+                    .with_key(cid)
+                    .with_importance(110),
+                b_idx,
+            )?);
+        }
+    }
+
+    if existing_tables.contains("quota_ledger") {
         let mut stmt = conn.prepare(
-            "SELECT title, content, category, is_active FROM project_decisions ORDER BY id ASC;",
+            "SELECT id, pool, execution_tier, model_used, input_tokens, output_tokens, saved_agy_tokens, created_at FROM quota_ledger ORDER BY id ASC;",
         )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                r.get::<_, i64>(4).unwrap_or(0),
+                r.get::<_, i64>(5).unwrap_or(0),
+                r.get::<_, i64>(6).unwrap_or(0),
+                r.get::<_, String>(7)?,
+            ))
+        })?;
+        for row in rows {
+            let (qid, pool, tier, model, in_tok, out_tok, saved_tok, created_at) = row?;
+            let payload = serde_json::json!({
+                "id": qid,
+                "pool": pool,
+                "tier": tier,
+                "model": model,
+                "input_tokens": in_tok,
+                "output_tokens": out_tok,
+                "saved_agy_tokens": saved_tok,
+                "created_at": created_at,
+            });
+            let b_idx = prepared.len();
+            prepared.push(ldb.prepare(
+                WriteRequest::new(NodeKind::QuotaEvent, serde_json::to_vec(&payload)?)
+                    .with_key(format!("quota::{qid}"))
+                    .with_importance(90),
+                b_idx,
+            )?);
+        }
+    }
+
+    // ==================== PROJECT MEMORY DB TABLES (11) ====================
+    if existing_tables.contains("project_decisions") {
+        let cols = query_table_columns(conn, "project_decisions")?;
+        let has_upd = cols.iter().any(|c| c == "updated_at");
+        let sql = if has_upd {
+            "SELECT title, content, category, is_active, updated_at FROM project_decisions ORDER BY id ASC;"
+        } else {
+            "SELECT title, content, category, is_active, '' FROM project_decisions ORDER BY id ASC;"
+        };
+        let mut stmt = conn.prepare(sql)?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, Option<String>>(2)?.unwrap_or_default(),
                 r.get::<_, i64>(3).unwrap_or(1),
+                r.get::<_, Option<String>>(4)?.unwrap_or_default(),
             ))
         })?;
+        let mut latest_dec_idx: HashMap<String, (usize, String, bool)> = HashMap::new();
         for row in rows {
-            let (title, content, cat, is_active) = row?;
-            if is_active != 0 {
-                let body = format!("[Decision: {title} ({cat})]\n{content}");
-                let b_idx = prepared.len();
-                prepared.push(ldb.prepare(
-                    WriteRequest::new(NodeKind::Decision, body.into_bytes())
-                        .with_key(title)
-                        .with_importance(225)
-                        .with_pinned(true),
-                    b_idx,
-                )?);
+            let (title, content, cat, is_active, upd) = row?;
+            let dt_tag = if upd.len() >= 10 {
+                format!(" [{}]", &upd[..10])
+            } else {
+                String::new()
+            };
+            let body = format!("[Decision: {title} ({cat}){dt_tag}]\n{content}");
+            let b_idx = prepared.len();
+            prepared.push(ldb.prepare(
+                WriteRequest::new(NodeKind::Decision, body.clone().into_bytes())
+                    .with_key(&title)
+                    .with_importance(225)
+                    .with_pinned(is_active != 0),
+                b_idx,
+            )?);
+            if is_active == 0 {
+                inactive_decisions.insert(title.clone());
+                latest_dec_idx.insert(title, (b_idx, body, false));
+            } else {
+                inactive_decisions.remove(&title);
+                latest_dec_idx.insert(title, (b_idx, body, true));
+            }
+        }
+        for (_, (idx, body, active)) in latest_dec_idx {
+            if active {
+                active_decisions_text.push((idx, body));
             }
         }
     }
 
-    if existing_tables.contains("project_facts") {
+    if existing_tables.contains("session_snapshots") {
+        let cols = query_table_columns(conn, "session_snapshots")?;
+        let has_commit = cols.iter().any(|c| c == "commit_hash");
+        let sql = format!(
+            "SELECT id, conversation_id, summary, next_steps, files_touched, {}, created_at FROM session_snapshots ORDER BY id ASC;",
+            if has_commit { "commit_hash" } else { "NULL" }
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                r.get::<_, Option<String>>(6)?.unwrap_or_default(),
+            ))
+        })?;
+        for row in rows {
+            let (sid, cid, summary, next_steps, files_touched, commit_hash, created_at) = row?;
+            let dt = if created_at.len() >= 10 { &created_at[..10] } else { &created_at };
+            let mut lines = vec![format!("[Snapshot #{sid} {dt}] {summary}")];
+            if !commit_hash.is_empty() {
+                lines.push(format!("Commit: {}", &commit_hash[..commit_hash.len().min(12)]));
+            }
+            if !files_touched.is_empty() {
+                lines.push(format!("Files: {files_touched}"));
+            }
+            if !next_steps.is_empty() {
+                lines.push(format!("Next: {next_steps}"));
+            }
+            if !cid.is_empty() {
+                lines.push(format!("Conversation: {cid}"));
+            }
+            let body = lines.join("\n");
+            let b_idx = prepared.len();
+            // Keyed on `latest_snapshot` in chronological order so every milestone builds a clean `Supersedes` chain!
+            prepared.push(ldb.prepare(
+                WriteRequest::new(NodeKind::Snapshot, body.into_bytes())
+                    .with_key("latest_snapshot")
+                    .with_importance(205),
+                b_idx,
+            )?);
+        }
+    }
+
+    // Replay `fact_history` first so historical mutations automatically form temporal `Supersedes` chains!
+    if existing_tables.contains("fact_history") {
         let mut stmt = conn.prepare(
-            "SELECT key, value, deprecated_at FROM project_facts ORDER BY id ASC;",
+            "SELECT key, old_value, new_value FROM fact_history ORDER BY id ASC;",
         )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut seeded_initial: HashSet<String> = HashSet::new();
+        for row in rows {
+            let (key, old_opt, new_val) = row?;
+            if !seeded_initial.contains(&key) {
+                seeded_initial.insert(key.clone());
+                if let Some(old_v) = old_opt.filter(|s| !s.is_empty()) {
+                    let b_old = prepared.len();
+                    prepared.push(ldb.prepare(
+                        WriteRequest::new(NodeKind::Fact, format!("{key} = {old_v}").into_bytes())
+                            .with_key(&key)
+                            .with_importance(150),
+                        b_old,
+                    )?);
+                    fact_last_idx.insert(key.clone(), b_old);
+                }
+            }
+            let b_new = prepared.len();
+            prepared.push(ldb.prepare(
+                WriteRequest::new(NodeKind::Fact, format!("{key} = {new_val}").into_bytes())
+                    .with_key(&key)
+                    .with_importance(180),
+                b_new,
+            )?);
+            fact_last_idx.insert(key, b_new);
+        }
+    }
+
+    if existing_tables.contains("project_facts") {
+        let cols = query_table_columns(conn, "project_facts")?;
+        let has_dep = cols.iter().any(|c| c == "deprecated_at");
+        let has_sup = cols.iter().any(|c| c == "superseded_by");
+        let has_upd = cols.iter().any(|c| c == "updated_at");
+        let sql = format!(
+            "SELECT key, value, {}, {}, {} FROM project_facts ORDER BY id ASC;",
+            if has_dep { "deprecated_at" } else { "NULL" },
+            if has_sup { "superseded_by" } else { "NULL" },
+            if has_upd { "updated_at" } else { "''" }
+        );
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<String>>(4)?.unwrap_or_default(),
             ))
         })?;
         for row in rows {
-            let (key, val, dep) = row?;
-            if dep.is_none() {
-                let body = format!("{key} = {val}");
-                let b_idx = prepared.len();
-                prepared.push(ldb.prepare(
-                    WriteRequest::new(NodeKind::Fact, body.into_bytes())
-                        .with_key(key)
-                        .with_importance(195),
-                    b_idx,
-                )?);
+            let (key, val, dep_opt, sup_opt, upd) = row?;
+            let body = if upd.len() >= 10 {
+                format!("{key} = {val} [{}]", &upd[..10])
+            } else {
+                format!("{key} = {val}")
+            };
+            let b_idx = prepared.len();
+            prepared.push(ldb.prepare(
+                WriteRequest::new(NodeKind::Fact, body.into_bytes())
+                    .with_key(&key)
+                    .with_importance(195),
+                b_idx,
+            )?);
+            fact_last_idx.insert(key.clone(), b_idx);
+            if dep_opt.as_ref().is_some_and(|s| !s.is_empty()) {
+                deprecated_facts.insert(key.clone());
+                if let Some(sup_key) = sup_opt.filter(|s| !s.is_empty() && s != &key) {
+                    pending_fact_supersedes.push((sup_key, key));
+                }
+            } else {
+                deprecated_facts.remove(&key);
             }
         }
     }
 
     if existing_tables.contains("project_tasks") {
-        let mut stmt = conn.prepare(
-            "SELECT id, title, description, status, priority FROM project_tasks ORDER BY id ASC;",
-        )?;
+        let cols = query_table_columns(conn, "project_tasks")?;
+        let has_upd = cols.iter().any(|c| c == "updated_at");
+        let sql = format!(
+            "SELECT id, title, description, status, priority, {} FROM project_tasks ORDER BY id ASC;",
+            if has_upd { "updated_at" } else { "''" }
+        );
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
@@ -671,26 +1023,62 @@ fn populate_cognitive_graph(conn: &Connection, ldb: &LibreDb) -> Result<(usize, 
                 r.get::<_, Option<String>>(2)?.unwrap_or_default(),
                 r.get::<_, String>(3)?,
                 r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?.unwrap_or_default(),
             ))
         })?;
         for row in rows {
-            let (tid, title, desc, status, prio) = row?;
-            let body = format!("[Task #{tid} {status} ({prio})]: {title}\n{desc}");
+            let (tid, title, desc, status, prio, upd) = row?;
+            let dt = if upd.len() >= 10 { format!(" [{}]", &upd[..10]) } else { String::new() };
+            let body = format!("[Task #{tid} {status} ({prio}){dt}]: {title}\n{desc}");
+            let imp = if status == "completed" { 130 } else { 195 };
             let b_idx = prepared.len();
             prepared.push(ldb.prepare(
                 WriteRequest::new(NodeKind::Task, body.into_bytes())
                     .with_key(format!("task::{tid}"))
-                    .with_importance(185),
+                    .with_importance(imp),
                 b_idx,
             )?);
             task_batch_idx.insert(tid, b_idx);
         }
     }
 
-    if existing_tables.contains("task_handoffs") {
+    if existing_tables.contains("task_verifications") {
         let mut stmt = conn.prepare(
-            "SELECT id, task_id, source_role, target_role, notes, status FROM task_handoffs ORDER BY created_at ASC;",
+            "SELECT id, task_id, verifier_type, passed, details, created_at FROM task_verifications ORDER BY id ASC;",
         )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3).unwrap_or(0),
+                r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+            ))
+        })?;
+        for row in rows {
+            let (vid, tid, vtype, passed, details, created_at) = row?;
+            let status_lbl = if passed != 0 { "PASSED" } else { "FAILED" };
+            let body = format!("[Verification #{vid} task=#{tid} {vtype} {status_lbl} {created_at}]: {details}");
+            let b_idx = prepared.len();
+            prepared.push(ldb.prepare(
+                WriteRequest::new(NodeKind::TaskVerification, body.into_bytes())
+                    .with_key(format!("verify::{vid}"))
+                    .with_importance(175),
+                b_idx,
+            )?);
+            pending_verify_tasks.push((b_idx, tid));
+        }
+    }
+
+    if existing_tables.contains("task_handoffs") {
+        let cols = query_table_columns(conn, "task_handoffs")?;
+        let has_vars = cols.iter().any(|c| c == "context_variables");
+        let sql = format!(
+            "SELECT id, task_id, source_role, target_role, notes, status, {} FROM task_handoffs ORDER BY created_at ASC;",
+            if has_vars { "context_variables" } else { "NULL" }
+        );
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -699,11 +1087,16 @@ fn populate_cognitive_graph(conn: &Connection, ldb: &LibreDb) -> Result<(usize, 
                 r.get::<_, String>(3)?,
                 r.get::<_, Option<String>>(4)?.unwrap_or_default(),
                 r.get::<_, String>(5)?,
+                r.get::<_, Option<String>>(6)?.unwrap_or_default(),
             ))
         })?;
         for row in rows {
-            let (hid, tid_opt, src, dst, notes, status) = row?;
-            let body = format!("[Handoff {hid} {src}->{dst} ({status})]: {notes}");
+            let (hid, tid_opt, src, dst, notes, status, ctx_vars) = row?;
+            let body = if ctx_vars.is_empty() {
+                format!("[Handoff {hid} {src}->{dst} ({status})]: {notes}")
+            } else {
+                format!("[Handoff {hid} {src}->{dst} ({status})]: {notes}\nContext: {ctx_vars}")
+            };
             let b_idx = prepared.len();
             prepared.push(ldb.prepare(
                 WriteRequest::new(NodeKind::Handoff, body.into_bytes())
@@ -742,8 +1135,70 @@ fn populate_cognitive_graph(conn: &Connection, ldb: &LibreDb) -> Result<(usize, 
                     .with_importance(175),
                 b_idx,
             )?);
+            file_symbols_idx.entry(fpath).or_default().push(b_idx);
             symbol_batch_idx.entry(sname).or_insert(b_idx);
             symbol_batch_idx.entry(qname).or_insert(b_idx);
+        }
+    }
+
+    if existing_tables.contains("compaction_archive") {
+        let mut stmt = conn.prepare(
+            "SELECT conversation_id, checkpoint_num, step_index, summary, extracted_refs, created_at FROM compaction_archive ORDER BY checkpoint_num ASC, id ASC;",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+            ))
+        })?;
+        for row in rows {
+            let (cid, ckpt_num, step_idx, summary, refs, created_at) = row?;
+            let dt = if created_at.len() >= 10 { &created_at[..10] } else { &created_at };
+            let body = if refs.is_empty() {
+                format!("[Compaction #{ckpt_num} step={step_idx} {dt} cid={cid}]: {summary}")
+            } else {
+                format!("[Compaction #{ckpt_num} step={step_idx} {dt} cid={cid}]: {summary}\nRefs: {refs}")
+            };
+            let b_idx = prepared.len();
+            prepared.push(ldb.prepare(
+                WriteRequest::new(NodeKind::CompactionCheckpoint, body.into_bytes())
+                    .with_key("latest_compaction")
+                    .with_importance(170),
+                b_idx,
+            )?);
+        }
+    }
+
+    if existing_tables.contains("active_working_set") {
+        let mut stmt = conn.prepare(
+            "SELECT file_path, symbols_touched, line_ranges, edit_count, updated_at FROM active_working_set ORDER BY updated_at ASC;",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                r.get::<_, i64>(3).unwrap_or(1),
+                r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+            ))
+        })?;
+        for row in rows {
+            let (fpath, syms, ranges, edits, upd) = row?;
+            let body = format!(
+                "[WorkingSet edits={edits} {upd}] {fpath} | ranges={ranges} | symbols={syms}"
+            );
+            let b_idx = prepared.len();
+            prepared.push(ldb.prepare(
+                WriteRequest::new(NodeKind::WorkingSet, body.into_bytes())
+                    .with_key(&fpath)
+                    .with_importance(180),
+                b_idx,
+            )?);
+            pending_working_files.push((b_idx, fpath));
         }
     }
 
@@ -753,6 +1208,15 @@ fn populate_cognitive_graph(conn: &Connection, ldb: &LibreDb) -> Result<(usize, 
 
     // Collect all synapses and commit them in ONE single atomic `link_batch` fsync!
     let mut edges: Vec<(u64, EdgeKind, u64, u8)> = Vec::new();
+
+    for (s_idx, full_idx) in pending_skill_full {
+        edges.push((
+            assigned_ids[s_idx],
+            EdgeKind::RelatedTo,
+            assigned_ids[full_idx],
+            200,
+        ));
+    }
 
     for (sec_idx, sname) in pending_sections {
         if let Some(&p_idx) = skill_batch_idx.get(&sname) {
@@ -774,13 +1238,77 @@ fn populate_cognitive_graph(conn: &Connection, ldb: &LibreDb) -> Result<(usize, 
 
     for (h_idx, tid) in pending_handoff_tasks {
         if let Some(&t_idx) = task_batch_idx.get(&tid) {
-            edges.push((assigned_ids[h_idx], EdgeKind::Delegates, assigned_ids[t_idx], 230));
+            edges.push((
+                assigned_ids[h_idx],
+                EdgeKind::Delegates,
+                assigned_ids[t_idx],
+                230,
+            ));
         }
     }
 
+    for (v_idx, tid) in pending_verify_tasks {
+        if let Some(&t_idx) = task_batch_idx.get(&tid) {
+            edges.push((
+                assigned_ids[v_idx],
+                EdgeKind::Verifies,
+                assigned_ids[t_idx],
+                225,
+            ));
+        }
+    }
+
+    for (sup_key, old_key) in pending_fact_supersedes {
+        if let (Some(&new_i), Some(&old_i)) =
+            (fact_last_idx.get(&sup_key), fact_last_idx.get(&old_key))
+        {
+            if assigned_ids[new_i] != assigned_ids[old_i] {
+                edges.push((
+                    assigned_ids[new_i],
+                    EdgeKind::Supersedes,
+                    assigned_ids[old_i],
+                    245,
+                ));
+            }
+        }
+    }
+
+    for (ws_idx, fpath) in pending_working_files {
+        if let Some(sym_indices) = file_symbols_idx.get(&fpath) {
+            for &sym_i in sym_indices.iter().take(16) {
+                edges.push((
+                    assigned_ids[ws_idx],
+                    EdgeKind::Touches,
+                    assigned_ids[sym_i],
+                    195,
+                ));
+            }
+        }
+    }
+
+    // Wire `Decision --[Governs]--> Symbol` automatically for imported architectural decisions!
+    if !active_decisions_text.is_empty() && !symbol_batch_idx.is_empty() {
+        for (dec_idx, dec_body) in &active_decisions_text {
+            let dec_nid = assigned_ids[*dec_idx];
+            let mut matched_syms = HashSet::new();
+            for token in dec_body
+                .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':'))
+                .filter(|t| t.len() >= 4)
+            {
+                if let Some(&sym_i) = symbol_batch_idx.get(token) {
+                    let sym_nid = assigned_ids[sym_i];
+                    if matched_syms.insert(sym_nid) {
+                        edges.push((dec_nid, EdgeKind::Governs, sym_nid, 225));
+                    }
+                }
+            }
+        }
+    }
+
+    // Import 100% of `dependency_edges` with zero truncation limit!
     if existing_tables.contains("dependency_edges") && !symbol_batch_idx.is_empty() {
         let mut stmt = conn.prepare(
-            "SELECT source_symbol, target_symbol, edge_kind FROM dependency_edges LIMIT 10000;",
+            "SELECT source_symbol, target_symbol, edge_kind FROM dependency_edges;",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok((
@@ -809,6 +1337,22 @@ fn populate_cognitive_graph(conn: &Connection, ldb: &LibreDb) -> Result<(usize, 
     }
 
     let synapses = ldb.link_batch(&edges)?;
+
+    // Deprecate inactive/archived keys after wiring synapses so historical capsules stay preserved
+    // with `SUPERSEDED | TOMBSTONE` flags without appearing in active `get_by_key` or `pulse` queries.
+    for rkey in inactive_rules {
+        let _ = ldb.deprecate_key(NodeKind::Rule, &rkey)?;
+    }
+    for skey in inactive_skills {
+        let _ = ldb.deprecate_key(NodeKind::Skill, &skey)?;
+    }
+    for dkey in inactive_decisions {
+        let _ = ldb.deprecate_key(NodeKind::Decision, &dkey)?;
+    }
+    for fkey in deprecated_facts {
+        let _ = ldb.deprecate_key(NodeKind::Fact, &fkey)?;
+    }
+
     let _ = NodeFlags::COLD_ARCHIVE;
 
     Ok((capsules, synapses))

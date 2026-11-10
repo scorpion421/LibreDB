@@ -339,9 +339,16 @@ impl HybridIndex {
         let mut ngram_len = 0u32;
 
         if let Some(ref k) = key {
+            let ngram_source = if kind == NodeKind::Symbol {
+                k.split("::").nth(1).unwrap_or(k.as_str())
+            } else {
+                k.as_str()
+            };
             for tok in segment_universal_tokens(k) {
-                *word_tf.entry(tok.clone()).or_insert(0) += 3;
+                *word_tf.entry(tok).or_insert(0) += 3;
                 word_len += 3;
+            }
+            for tok in segment_universal_tokens(ngram_source) {
                 for ng in extract_unicode_ngrams(&tok) {
                     *ngram_tf.entry(ng).or_insert(0) += 2;
                     ngram_len += 2;
@@ -349,22 +356,26 @@ impl HybridIndex {
             }
         }
 
+        let ngram_cap = if kind == NodeKind::Symbol { 8 } else { 80 };
         let body_tokens = segment_universal_tokens(body);
         for (idx, tok) in body_tokens.into_iter().enumerate() {
-            *word_tf.entry(tok.clone()).or_insert(0) += 1;
-            word_len += 1;
-            if idx < 80 {
+            if idx < ngram_cap {
                 for ng in extract_unicode_ngrams(&tok) {
                     *ngram_tf.entry(ng).or_insert(0) += 1;
                     ngram_len += 1;
                 }
             }
+            *word_tf.entry(tok).or_insert(0) += 1;
+            word_len += 1;
         }
 
-        if let Some(prev) = self.docs.remove(&node_id) {
+        let had_prev = if let Some(prev) = self.docs.remove(&node_id) {
             self.total_word_len = self.total_word_len.saturating_sub(prev.word_len as u64);
             self.total_ngram_len = self.total_ngram_len.saturating_sub(prev.ngram_len as u64);
-        }
+            true
+        } else {
+            false
+        };
 
         self.total_word_len += word_len.max(1) as u64;
         self.total_ngram_len += ngram_len.max(1) as u64;
@@ -382,12 +393,16 @@ impl HybridIndex {
 
         for (w, tf) in word_tf {
             let list = self.word_postings.entry(w).or_default();
-            list.retain(|&(id, _)| id != node_id);
+            if had_prev {
+                list.retain(|&(id, _)| id != node_id);
+            }
             list.push((node_id, tf));
         }
         for (ng, tf) in ngram_tf {
             let list = self.ngram_postings.entry(ng).or_default();
-            list.retain(|&(id, _)| id != node_id);
+            if had_prev {
+                list.retain(|&(id, _)| id != node_id);
+            }
             list.push((node_id, tf));
         }
     }

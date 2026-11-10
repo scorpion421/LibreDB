@@ -1,14 +1,16 @@
-//! Command-line interface and native MCP server for `LibreDB v0.3.0`.
+//! Command-line interface, lifecycle hooks, Gitea automation, and native MCP server for `LibreDB`.
 
+mod gitea;
+mod hooks;
 mod mcp;
 
 use libredb_bridge::{
-    export_sqlite_database, import_sqlite_readonly, verify_sqlite_equivalence,
+    export_sqlite_database, import_sqlite_readonly, open_or_auto_migrate, verify_sqlite_equivalence,
 };
 use libredb_cognitive::{
-    create_subagent_handoff, execute_atomic_batch, extract_fim_slice, index_workspace,
-    query_symbol_impact, sync_transcript_epoch, AtomicBatchSpec, CognitiveEngine, FileSkeleton,
-    OverlayBrain, PulseRequest, ReflexEngine, ReflexRule,
+    audit_workspace_guardrails, create_subagent_handoff, execute_atomic_batch, extract_fim_slice,
+    index_workspace, query_symbol_impact, sync_transcript_epoch, AtomicBatchSpec, CognitiveEngine,
+    FileSkeleton, OverlayBrain, PulseRequest, ReflexEngine, ReflexRule,
 };
 use libredb_core::{EdgeKind, LibreDb, NodeKind, WriteRequest};
 use std::env;
@@ -32,7 +34,19 @@ Antigravity Cognitive & Code-Graph Commands:
   libredb handoff <db.ldb> <handoff_id> <task_key> <role> [--notes <text>]
   libredb learn-assoc <db.ldb> <cue_phrase> <target_id_1,target_id_2>
   libredb learn-reflex <db.ldb> <id> <directive> [--stack <s1,s2>] [--action <a1,a2>] [--env <e1,e2>]
+  libredb get-skill <skill_name> [--section <title>] [--global <customizations.ldb>]
   libredb mcp-serve [<default_project.ldb>] [--global <customizations.ldb>]
+
+Native Antigravity Hooks, Guardrails & Gitea Automation:
+  libredb guardrail check [--path <dir>] [--staged] [--strict]
+  libredb hook-pre-tool [--global <customizations.ldb>]
+  libredb hook-pre-invocation [--global <customizations.ldb>]
+  libredb gitea-status [--global <customizations.ldb>]
+  libredb gitea-config [--url <u>] [--user <usr>] [--token <tok>] [--register-helper]
+  libredb gitea-credential-helper [get]
+  libredb gitea-init [<dir>] [--name <repo>] [--use-existing] [--overwrite]
+  libredb gitea-sync [-m <msg>] [--project <dir>] [--releases] [--allow-unversioned]
+  libredb gitea-release [vX.Y.Z] [--project <dir>]
 
 Lossless 1:1 SQLite Bridge Commands:
   libredb import-sqlite <db.ldb> <source.db> [--scope central|project]
@@ -94,6 +108,276 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             mcp::run_mcp_stdio_server(proj_path.as_deref(), global_path.as_deref())?;
         }
+        "hook-pre-tool" => {
+            let mut global_path: Option<PathBuf> = None;
+            let mut i = 1usize;
+            while i + 1 < args.len() {
+                if args[i] == "--global" {
+                    global_path = Some(PathBuf::from(&args[i + 1]));
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            hooks::run_pre_tool_hook(global_path.as_deref())?;
+        }
+        "hook-pre-invocation" => {
+            let mut global_path: Option<PathBuf> = None;
+            let mut i = 1usize;
+            while i + 1 < args.len() {
+                if args[i] == "--global" {
+                    global_path = Some(PathBuf::from(&args[i + 1]));
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            hooks::run_pre_invocation_hook(global_path.as_deref())?;
+        }
+        "guardrail" => {
+            let sub = args.get(1).map(String::as_str).unwrap_or("check");
+            if sub != "check" {
+                return Err("Usage: libredb guardrail check [--path <dir>] [--staged] [--strict]".into());
+            }
+            let mut dir = env::current_dir()?;
+            let mut staged = false;
+            let mut strict = false;
+            let mut i = 2usize;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--path" if i + 1 < args.len() => {
+                        dir = PathBuf::from(&args[i + 1]);
+                        i += 2;
+                    }
+                    "--staged" => {
+                        staged = true;
+                        i += 1;
+                    }
+                    "--strict" => {
+                        strict = true;
+                        i += 1;
+                    }
+                    other => return Err(format!("Unknown guardrail flag '{other}'").into()),
+                }
+            }
+            let rep = audit_workspace_guardrails(&dir, staged)?;
+            if rep.passed(strict) {
+                println!("=== LIBREDB GUARDRAIL AUDIT REPORT: [PASSED] ===");
+                println!("  Files Checked:      {}", rep.files_checked);
+                println!("  Violations Found:   0");
+                println!("================================================");
+            } else {
+                println!("=== LIBREDB GUARDRAIL AUDIT REPORT: [FAILED] ===");
+                println!("  Files Checked:      {}", rep.files_checked);
+                println!("  Violations Found:   {}", rep.violations.len());
+                for v in &rep.violations {
+                    println!(
+                        "  * [{}] {} ({}:L{}): {} -> '{}'",
+                        v.severity, v.rule, v.file, v.line, v.message, v.snippet
+                    );
+                }
+                println!("================================================");
+                process::exit(1);
+            }
+        }
+        "get-skill" => {
+            if args.len() < 2 {
+                return Err("Usage: libredb get-skill <skill_name> [--section <title>] [--global <customizations.ldb>]".into());
+            }
+            let skill_name = &args[1];
+            let mut section: Option<String> = None;
+            let mut global_path: Option<PathBuf> = None;
+            let mut i = 2usize;
+            while i + 1 < args.len() {
+                match args[i].as_str() {
+                    "--section" => {
+                        section = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    "--global" => {
+                        global_path = Some(PathBuf::from(&args[i + 1]));
+                        i += 2;
+                    }
+                    other => return Err(format!("Unknown flag '{other}'").into()),
+                }
+            }
+            let gdb = hooks::open_global_ldb(global_path.as_deref())?;
+            if let Some(sec_title) = section {
+                let exact_key = format!("{skill_name}::{sec_title}");
+                if let Ok(rec) = gdb.get_by_key(NodeKind::SkillSection, &exact_key) {
+                    println!("{}", String::from_utf8_lossy(&rec.payload));
+                } else {
+                    let prefix = format!("{skill_name}::").to_ascii_lowercase();
+                    let sub_low = sec_title.to_ascii_lowercase();
+                    let mut matched_id = None;
+                    for (ino, k_opt, _) in gdb.list_inodes(Some(NodeKind::SkillSection), false) {
+                        if let Some(k) = k_opt {
+                            let kl = k.to_ascii_lowercase();
+                            if kl.starts_with(&prefix) && kl.contains(&sub_low) {
+                                matched_id = Some(ino.node_id);
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(nid) = matched_id {
+                        let rec = gdb.get(nid)?;
+                        println!("{}", String::from_utf8_lossy(&rec.payload));
+                    } else {
+                        return Err(format!("Section '{sec_title}' not found in skill '{skill_name}'").into());
+                    }
+                }
+            } else if let Ok(full_rec) =
+                gdb.get_by_key(NodeKind::Generic, &format!("skill_full::{skill_name}"))
+            {
+                println!("{}", String::from_utf8_lossy(&full_rec.payload));
+            } else {
+                let rec = gdb.get_by_key(NodeKind::Skill, skill_name)?;
+                println!("{}", String::from_utf8_lossy(&rec.payload));
+            }
+        }
+        "gitea-credential-helper" => {
+            let action = args.get(1).map(String::as_str).unwrap_or("get");
+            gitea::cmd_gitea_credential_helper(action, None)?;
+        }
+        "gitea-status" => {
+            let mut global_path: Option<PathBuf> = None;
+            if args.len() >= 3 && args[1] == "--global" {
+                global_path = Some(PathBuf::from(&args[2]));
+            }
+            gitea::cmd_gitea_status(global_path.as_deref())?;
+        }
+        "gitea-config" => {
+            let mut url: Option<String> = None;
+            let mut user: Option<String> = None;
+            let mut token: Option<String> = None;
+            let mut global_path: Option<PathBuf> = None;
+            let mut reg_helper = false;
+            let mut i = 1usize;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--url" if i + 1 < args.len() => {
+                        url = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    "--user" if i + 1 < args.len() => {
+                        user = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    "--token" if i + 1 < args.len() => {
+                        token = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    "--global" if i + 1 < args.len() => {
+                        global_path = Some(PathBuf::from(&args[i + 1]));
+                        i += 2;
+                    }
+                    "--register-helper" => {
+                        reg_helper = true;
+                        i += 1;
+                    }
+                    other => return Err(format!("Unknown gitea-config flag '{other}'").into()),
+                }
+            }
+            gitea::cmd_gitea_config(
+                global_path.as_deref(),
+                url.as_deref(),
+                user.as_deref(),
+                token.as_deref(),
+                reg_helper,
+            )?;
+        }
+        "gitea-init" => {
+            let mut dir = env::current_dir()?;
+            let mut name: Option<String> = None;
+            let mut use_existing = false;
+            let mut overwrite = false;
+            let mut global_path: Option<PathBuf> = None;
+            let mut i = 1usize;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--name" if i + 1 < args.len() => {
+                        name = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    "--global" if i + 1 < args.len() => {
+                        global_path = Some(PathBuf::from(&args[i + 1]));
+                        i += 2;
+                    }
+                    "--use-existing" => {
+                        use_existing = true;
+                        i += 1;
+                    }
+                    "--overwrite" => {
+                        overwrite = true;
+                        i += 1;
+                    }
+                    pos if !pos.starts_with("--") => {
+                        dir = PathBuf::from(pos);
+                        i += 1;
+                    }
+                    other => return Err(format!("Unknown gitea-init flag '{other}'").into()),
+                }
+            }
+            gitea::cmd_gitea_init(&dir, name.as_deref(), use_existing, overwrite, global_path.as_deref())?;
+        }
+        "gitea-sync" => {
+            let mut dir = env::current_dir()?;
+            let mut msg = "Synchronize workspace".to_owned();
+            let mut releases = false;
+            let mut allow_unversioned = false;
+            let mut global_path: Option<PathBuf> = None;
+            let mut i = 1usize;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "-m" | "--message" if i + 1 < args.len() => {
+                        msg = args[i + 1].clone();
+                        i += 2;
+                    }
+                    "--project" if i + 1 < args.len() => {
+                        dir = PathBuf::from(&args[i + 1]);
+                        i += 2;
+                    }
+                    "--global" if i + 1 < args.len() => {
+                        global_path = Some(PathBuf::from(&args[i + 1]));
+                        i += 2;
+                    }
+                    "--releases" => {
+                        releases = true;
+                        i += 1;
+                    }
+                    "--allow-unversioned" => {
+                        allow_unversioned = true;
+                        i += 1;
+                    }
+                    other => return Err(format!("Unknown gitea-sync flag '{other}'").into()),
+                }
+            }
+            gitea::cmd_gitea_sync(&dir, &msg, releases, allow_unversioned, global_path.as_deref())?;
+        }
+        "gitea-release" => {
+            let mut dir = env::current_dir()?;
+            let mut tag: Option<String> = None;
+            let mut global_path: Option<PathBuf> = None;
+            let mut i = 1usize;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--project" if i + 1 < args.len() => {
+                        dir = PathBuf::from(&args[i + 1]);
+                        i += 2;
+                    }
+                    "--global" if i + 1 < args.len() => {
+                        global_path = Some(PathBuf::from(&args[i + 1]));
+                        i += 2;
+                    }
+                    pos if !pos.starts_with("--") && tag.is_none() => {
+                        tag = Some(pos.to_owned());
+                        i += 1;
+                    }
+                    other => return Err(format!("Unknown gitea-release flag '{other}'").into()),
+                }
+            }
+            gitea::cmd_gitea_release(&dir, tag.as_deref(), global_path.as_deref())?;
+        }
         "pulse" => {
             if args.len() < 3 {
                 return Err(
@@ -140,12 +424,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let t0 = Instant::now();
-            let proj_db = Arc::new(LibreDb::open(&args[1])?);
+            let (proj_db, _) = open_or_auto_migrate(Path::new(&args[1]), None, "project")?;
             if let (Some(ref cid), Some(ref tp)) = (&req.conversation_id, &transcript_path) {
                 req.epoch = sync_transcript_epoch(&proj_db, cid, tp)?;
             }
             let glob_db = match global_path {
-                Some(gp) => Some(Arc::new(LibreDb::open(gp)?)),
+                Some(gp) => Some(open_or_auto_migrate(&gp, None, "central")?.0),
                 None => None,
             };
             let brain = OverlayBrain::open(glob_db, proj_db)?;
