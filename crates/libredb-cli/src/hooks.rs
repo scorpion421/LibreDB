@@ -336,20 +336,22 @@ pub fn run_pre_invocation_hook(
     // `--db` override is passed) so routine turns never contend on or dirty `customizations.ldb`.
     if !had_prior_cursor || global_ldb_opt.is_some() {
         if let Some(ref root) = ws_root {
-            if let Some(name) = root.file_name().and_then(|n| n.to_str()) {
-                if let Ok(global_db) = open_global_ldb(global_ldb_opt) {
-                    let ws_cfg_key = format!("workspace:{name}");
-                    let root_str = root.to_string_lossy().into_owned();
-                    let already_same = global_db
-                        .get_by_key(NodeKind::Config, &ws_cfg_key)
-                        .map(|r| r.payload == root_str.as_bytes())
-                        .unwrap_or(false);
-                    if !already_same {
-                        let _ = global_db.put(
-                            WriteRequest::new(NodeKind::Config, root_str.into_bytes())
-                                .with_key(ws_cfg_key)
-                                .with_importance(170),
-                        );
+            if !is_protected_profile_dir(root) {
+                if let Some(name) = root.file_name().and_then(|n| n.to_str()) {
+                    if let Ok(global_db) = open_global_ldb(global_ldb_opt) {
+                        let ws_cfg_key = format!("workspace:{name}");
+                        let root_str = root.to_string_lossy().into_owned();
+                        let already_same = global_db
+                            .get_by_key(NodeKind::Config, &ws_cfg_key)
+                            .map(|r| r.payload == root_str.as_bytes())
+                            .unwrap_or(false);
+                        if !already_same {
+                            let _ = global_db.put(
+                                WriteRequest::new(NodeKind::Config, root_str.into_bytes())
+                                    .with_key(ws_cfg_key)
+                                    .with_importance(170),
+                            );
+                        }
                     }
                 }
             }
@@ -576,17 +578,24 @@ fn record_working_set_edit(target_file: &Path) -> Result<(), String> {
         .to_string_lossy()
         .replace('\\', "/");
 
-    let prev_edits = proj_db
-        .get_by_key(NodeKind::WorkingSet, &rel_key)
-        .ok()
-        .and_then(|r| {
-            let s = String::from_utf8_lossy(&r.payload);
-            s.split("edits=")
-                .nth(1)
-                .and_then(|tail| tail.split_whitespace().next())
-                .and_then(|n| n.parse::<u64>().ok())
-        })
-        .unwrap_or(0);
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+
+    let mut prev_edits = 0u64;
+    if let Ok(r) = proj_db.get_by_key(NodeKind::WorkingSet, &rel_key) {
+        // Coalesce rapid consecutive edits to the same file within 60 seconds to avoid delta-log spam.
+        if now_ns.saturating_sub(r.updated_ns) < 60_000_000_000 {
+            return Ok(());
+        }
+        let s = String::from_utf8_lossy(&r.payload);
+        prev_edits = s
+            .split("edits=")
+            .nth(1)
+            .and_then(|tail| tail.split_whitespace().next())
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(0);
+    }
     let next_edits = prev_edits + 1;
     let body = format!("[WorkingSet edits={next_edits}] {rel_key}");
     proj_db
@@ -596,6 +605,7 @@ fn record_working_set_edit(target_file: &Path) -> Result<(), String> {
                 .with_importance(180),
         )
         .map_err(|e| e.to_string())?;
+    let _ = proj_db.maybe_auto_compact();
     Ok(())
 }
 
@@ -725,7 +735,8 @@ pub fn is_protected_profile_dir(p: &Path) -> bool {
         .trim_end_matches('\\')
         .to_owned();
 
-    if trimmed == home_trim || trimmed == temp_trim {
+    let temp_prefix = format!("{temp_trim}\\");
+    if trimmed == home_trim || trimmed == temp_trim || low.starts_with(&temp_prefix) {
         return true;
     }
 
@@ -738,6 +749,8 @@ pub fn is_protected_profile_dir(p: &Path) -> bool {
     trimmed == format!("{home_trim}\\appdata")
         || trimmed == format!("{home_trim}\\appdata\\local")
         || trimmed == format!("{home_trim}\\appdata\\roaming")
+        || low.contains("\\appdata\\local\\temp\\")
+        || trimmed.ends_with("\\appdata\\local\\temp")
         || low.contains("\\.gemini\\")
         || trimmed.ends_with("\\.gemini")
         || low.contains("\\appdata\\local\\programs")

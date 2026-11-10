@@ -128,21 +128,25 @@ pub fn open_or_auto_migrate(
     sqlite_override: Option<&Path>,
     scope: &str,
 ) -> Result<(Arc<LibreDb>, Option<ImportSummary>)> {
-    let already_initialized = ldb_path
-        .metadata()
-        .map(|m| m.is_file() && m.len() >= 8192)
-        .unwrap_or(false);
-    if already_initialized {
-        let db = LibreDb::open(ldb_path)?;
-        return Ok((Arc::new(db), None));
-    }
-
     let default_sibling = ldb_path.with_extension("db");
     let sqlite_candidate = sqlite_override.unwrap_or(&default_sibling);
     let has_legacy_sqlite = sqlite_candidate
         .metadata()
         .map(|m| m.is_file() && m.len() > 0)
         .unwrap_or(false);
+
+    let already_initialized = ldb_path
+        .metadata()
+        .map(|m| m.is_file() && m.len() >= 8192)
+        .unwrap_or(false);
+    if already_initialized {
+        let db = LibreDb::open(ldb_path)?;
+        if has_legacy_sqlite && db.stats().map(|s| s.total_inodes == 0).unwrap_or(false) {
+            let summary = import_sqlite_readonly(sqlite_candidate, &db, scope)?;
+            return Ok((Arc::new(db), Some(summary)));
+        }
+        return Ok((Arc::new(db), None));
+    }
 
     if !has_legacy_sqlite {
         let db = LibreDb::open(ldb_path)?;

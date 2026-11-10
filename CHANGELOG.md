@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.2] - 2026-11-10
+
+### Changed
+
+- Routed all project-scoped CLI subcommands (`index-workspace`, `skeleton`, `impact`, `fim`, `batch`, `handoff`, `learn-assoc`, `learn-reflex`, and `compact`) in `crates/libredb-cli/src/main.rs` through `open_project_ldb_silent` (`open_or_auto_migrate`), and upgraded `open_or_auto_migrate` in `crates/libredb-bridge/src/lib.rs` to automatically import a sibling `.db` file even if an empty (`total_inodes == 0`) `.ldb` file was previously initialized.
+- Added a `60`-second per-file coalescing window and `maybe_auto_compact` call in `record_working_set_edit` (`crates/libredb-cli/src/hooks.rs`) so consecutive `PreToolUse` `edit_file` operations on the same file do not append redundant `WorkingSet` delta commits.
+
+### Fixed
+
+- Tightened `is_protected_profile_dir` and `run_pre_invocation_hook` in `crates/libredb-cli/src/hooks.rs` to block all subdirectories inside `$TEMP` (`low.starts_with(&format!("{temp_trim}\\"))` and `\appdata\local\temp\`) from registering `workspace:<name>` entries in global `customizations.ldb`.
+
 ## [0.8.1] - 2026-11-10
 
 ### Added

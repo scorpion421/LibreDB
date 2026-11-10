@@ -69,7 +69,7 @@ $PluginJson = @'
 {
   "name": "libredb",
   "displayName": "LibreDB Cognitive Memory",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "description": "Full Rust replacement for SQLite SkillsDB: single-file cognitive memory, silent SQLite auto-porter, sub-2ms hooks, guardrails, 14-language causal code graph, and dynamic multi-remote Git/Gitea automation.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
@@ -248,7 +248,7 @@ $LogoSvg = @'
 
 # 7. Write user-facing README.md inside plugin bundle
 $PluginReadme = @'
-# LibreDB cognitive memory plugin (v0.8.1)
+# LibreDB cognitive memory plugin (v0.8.2)
 
 Complete standalone Rust replacement for `AntiGraviton SkillsDB` (`customizations-db`):
 - `libredb-mcp`: 3-tool multi-workspace cognitive memory & 14-language causal code-graph server with zero-I/O RAM session delta, `[Zero-Repeat Skeleton]` deduplication, and automatic incremental workspace refresh.
@@ -261,6 +261,25 @@ To switch cleanly to pure single-engine operation, disable `AntiGraviton SkillsD
 '@
 [System.IO.File]::WriteAllText((Join-Path $PluginDir "README.md"), $PluginReadme, $Utf8NoBom)
 
-Write-Output "[OK] Deployed LibreDB v0.8.1 standalone binaries to: $BinDir"
+# 8. Ensure "libredb": { "enabled": true } in ~/.gemini/config/config.json if present
+$AgyConfigPath = Join-Path $GeminiDir "config\config.json"
+if (Test-Path $AgyConfigPath) {
+    try {
+        $CfgObj = Get-Content $AgyConfigPath -Raw | ConvertFrom-Json
+        if ($null -ne $CfgObj.plugins) {
+            if ($null -eq $CfgObj.plugins.PSObject.Properties["libredb"]) {
+                $CfgObj.plugins | Add-Member -NotePropertyName "libredb" -NotePropertyValue ([PSCustomObject]@{ enabled = $true })
+            } else {
+                $CfgObj.plugins.libredb.enabled = $true
+            }
+            $CfgJson = $CfgObj | ConvertTo-Json -Depth 20
+            [System.IO.File]::WriteAllText($AgyConfigPath, $CfgJson, $Utf8NoBom)
+        }
+    } catch {
+        Write-Output "[WARN] Could not auto-update config.json plugin state: $_"
+    }
+}
+
+Write-Output "[OK] Deployed LibreDB v0.8.2 standalone binaries to: $BinDir"
 Write-Output "[OK] Hydrated and modernized global 19-table store at: $GlobalLdb"
 Write-Output "[OK] Installed complete Antigravity replacement plugin at: $PluginDir"

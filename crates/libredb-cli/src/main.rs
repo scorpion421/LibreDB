@@ -656,7 +656,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             let force = args.get(3).map(String::as_str) == Some("--force");
             let t0 = Instant::now();
-            let db = Arc::new(LibreDb::open(&args[1])?);
+            let (db, _) = hooks::open_project_ldb_silent(Path::new(&args[1]))?;
             let rep = index_workspace(&db, Path::new(&args[2]), force)?;
             let mut cog = CognitiveEngine::open_db(db)?;
             cog.save_index_snapshot()?;
@@ -682,7 +682,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 filter = Some(args[4].clone());
             }
             let t0 = Instant::now();
-            let db = LibreDb::open(&args[1])?;
+            let (db, _) = hooks::open_project_ldb_silent(Path::new(&args[1]))?;
             let src_path = Path::new(&args[2]);
             let (skel, cache_hit) = FileSkeleton::index_or_get_cached(&db, src_path, None)?;
             let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -702,7 +702,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 return Err("Usage: libredb impact <db.ldb> <symbol_query>".into());
             }
             let t0 = Instant::now();
-            let db = LibreDb::open(&args[1])?;
+            let (db, _) = hooks::open_project_ldb_silent(Path::new(&args[1]))?;
             let reports = query_symbol_impact(&db, &args[2])?;
             println!(
                 "=== BLAST-RADIUS & CAUSAL IMPACT: '{}' ({} matches in {:.2} ms) ===",
@@ -748,7 +748,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     other => return Err(format!("Unknown flag '{other}'").into()),
                 }
             }
-            let db = LibreDb::open(&args[1])?;
+            let (db, _) = hooks::open_project_ldb_silent(Path::new(&args[1]))?;
             let bundle =
                 extract_fim_slice(&db, Path::new(&args[2]), symbol.as_deref(), line, pad)?;
             print!("{}", bundle.format_compact());
@@ -793,7 +793,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             let t0 = Instant::now();
-            let db = LibreDb::open(&args[1])?;
+            let (db, _) = hooks::open_project_ldb_silent(Path::new(&args[1]))?;
             let rep = execute_atomic_batch(&db, &spec)?;
             println!(
                 "[OK] Committed {} capsules and wired {} governance synapses in {:.2} ms (IDs: {:?})",
@@ -811,7 +811,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             if args.len() >= 7 && args[5] == "--notes" {
                 notes = &args[6];
             }
-            let db = LibreDb::open(&args[1])?;
+            let (db, _) = hooks::open_project_ldb_silent(Path::new(&args[1]))?;
             let (_, block) = create_subagent_handoff(&db, &args[2], &args[3], &args[4], notes)?;
             print!("{block}");
         }
@@ -825,7 +825,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .map(|s| s.trim().parse::<u64>())
                 .collect();
             let target_ids = target_ids?;
-            let db = Arc::new(LibreDb::open(&args[1])?);
+            let (db, _) = hooks::open_project_ldb_silent(Path::new(&args[1]))?;
             let mut cog = CognitiveEngine::open_db(db)?;
             let edges = cog.reinforce_association(&args[2], &target_ids)?;
             cog.save_index_snapshot()?;
@@ -860,7 +860,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 i += 2;
             }
-            let db = LibreDb::open(&args[1])?;
+            let (db, _) = hooks::open_project_ldb_silent(Path::new(&args[1]))?;
             let nid = ReflexEngine::learn_reflex(&db, &rule)?;
             println!("Learned situational reflex '{}' as node #{nid}", rule.id);
         }
@@ -1134,7 +1134,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             let prune = args.iter().skip(2).any(|a| a == "--prune");
             let t0 = Instant::now();
-            let db = Arc::new(LibreDb::open(&args[1])?);
+            let (db, _) = hooks::open_project_ldb_silent(Path::new(&args[1]))?;
             let initial_bytes = db.stats()?.file_bytes;
             let mut cog = CognitiveEngine::open_db(Arc::clone(&db))?;
             cog.save_index_snapshot()?;
