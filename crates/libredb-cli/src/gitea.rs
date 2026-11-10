@@ -6,7 +6,7 @@
 //! and strict SemVer 2.0.0 + Keep a Changelog 1.1.0 + `[GITEA REPOSITORY COLLISION]` guardrails.
 
 use crate::hooks::open_global_ldb;
-use libredb_cognitive::audit_workspace_guardrails;
+use libredb_cognitive::{audit_workspace_guardrails, index_workspace, CognitiveEngine};
 use libredb_core::{LibreDb, NodeKind, WriteRequest};
 use serde_json::{json, Value};
 use std::env;
@@ -15,6 +15,7 @@ use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
@@ -297,6 +298,20 @@ pub fn cmd_gitea_sync(
 
     ensure_local_git_initialized(&clean_root)?;
     record_learned_workspace(&ldb, &clean_root);
+
+    let proj_ldb_path = clean_root.join(".agents").join("memory.ldb");
+    if proj_ldb_path.is_file() {
+        if let Ok(pdb) = LibreDb::open(&proj_ldb_path) {
+            let pdb = Arc::new(pdb);
+            if let Ok(rep) = index_workspace(&pdb, &clean_root, false) {
+                if rep.files_reindexed > 0 {
+                    if let Ok(mut cog) = CognitiveEngine::open_db(pdb) {
+                        let _ = cog.save_index_snapshot();
+                    }
+                }
+            }
+        }
+    }
 
     let _ = Command::new("git")
         .args(["add", "-A"])

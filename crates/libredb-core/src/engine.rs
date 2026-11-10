@@ -781,16 +781,25 @@ impl LibreDb {
             let incoming = &grouped[&source_id];
             let existing_inode = next_snap.inodes[&source_id].clone();
             let mut syns = collect_node_synapses(&next_snap, &existing_inode);
+            let mut node_changed = false;
 
             for &new_syn in incoming {
                 if let Some(slot) = syns
                     .iter_mut()
                     .find(|s| s.kind == new_syn.kind && s.target_id == new_syn.target_id)
                 {
-                    slot.weight = new_syn.weight;
+                    if slot.weight != new_syn.weight {
+                        slot.weight = new_syn.weight;
+                        node_changed = true;
+                    }
                 } else {
                     syns.push(new_syn);
+                    node_changed = true;
                 }
+            }
+
+            if !node_changed {
+                continue;
             }
 
             let mut inline_synapses = [None; INLINE_SYNAPSE_CAP];
@@ -880,6 +889,10 @@ impl LibreDb {
 
             next_snap.inodes.insert(source_id, updated_inode.clone());
             modified_inodes.push(updated_inode);
+        }
+
+        if modified_inodes.is_empty() {
+            return Ok(edges.len());
         }
 
         let new_seq = next_snap.superblock.commit_seq + 1;

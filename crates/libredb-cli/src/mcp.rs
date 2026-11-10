@@ -326,16 +326,42 @@ fn dispatch_tool(
                 }
             };
 
+            let ws_root: Option<PathBuf> = args
+                .get("cwd")
+                .and_then(Value::as_str)
+                .map(PathBuf::from)
+                .filter(|p| p.is_dir());
+
             match action {
                 "skeleton" => {
                     let (skel, _) = FileSkeleton::index_or_get_cached(&proj_db, &resolved_target, None)?;
                     Ok(skel.render_compact(sym, sym.is_some()))
                 }
                 "impact" => {
+                    if let Some(ref root) = ws_root {
+                        if let Ok(rep) = index_workspace(&proj_db, root, false) {
+                            if rep.files_reindexed > 0 {
+                                if let Ok(mut cog) = CognitiveEngine::open_db(Arc::clone(&proj_db)) {
+                                    let _ = cog.save_index_snapshot();
+                                }
+                                let _ = brain.refresh_if_needed();
+                            }
+                        }
+                    }
                     let reports = query_symbol_impact(&proj_db, target)?;
                     Ok(serde_json::to_string_pretty(&reports)?)
                 }
                 "fim" => {
+                    if let Some(ref root) = ws_root {
+                        if let Ok(rep) = index_workspace(&proj_db, root, false) {
+                            if rep.files_reindexed > 0 {
+                                if let Ok(mut cog) = CognitiveEngine::open_db(Arc::clone(&proj_db)) {
+                                    let _ = cog.save_index_snapshot();
+                                }
+                                let _ = brain.refresh_if_needed();
+                            }
+                        }
+                    }
                     let bundle = extract_fim_slice(&proj_db, &resolved_target, sym, line, pad)?;
                     Ok(bundle.format_compact())
                 }

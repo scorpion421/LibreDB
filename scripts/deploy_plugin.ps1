@@ -55,39 +55,15 @@ if ($SkillsDbCmd -and $SkillsDbCmd.Source) {
     }
 }
 
-# Seed read-only 1:1 import of central customizations.db into ~/.gemini/libredb/customizations.ldb
-# Uses staging + hot-safe rename swap so live MCP handles never enter Windows NTFS DELETE_PENDING!
+# Seed or update ~/.gemini/libredb/customizations.ldb without ever overwriting live additions from old SQLite
 $CentralSqlite = Join-Path $GeminiDir "database\customizations.db"
 $GlobalLdb = Join-Path $LibreHome "customizations.ldb"
 $StagingLdb = "$GlobalLdb.staging"
 if (Test-Path $StagingLdb) { Remove-Item $StagingLdb -Force }
-if (Test-Path $CentralSqlite) {
+if (Test-Path $GlobalLdb) {
+    Copy-Item $GlobalLdb $StagingLdb -Force
+} elseif (Test-Path $CentralSqlite) {
     & $TargetExe import-sqlite $StagingLdb $CentralSqlite --scope central
-}
-
-& $TargetExe learn-reflex $StagingLdb "rust-guardrail-staged" `
-    "[REFLEX rust-guardrail-staged]: Ensure /target/ and /dist/ are in .gitignore and run 'libredb guardrail check --path <dir> --staged --strict' before committing." `
-    --stack "cargo.toml" --action "guardrail,release" | Out-Null
-& $TargetExe learn-reflex $StagingLdb "rust-gitea-dist" `
-    "[REFLEX rust-gitea-dist]: Copy compiled release deliverables into dist/ before running 'libredb gitea-release' so assets attach automatically." `
-    --stack "cargo.toml" --action "gitea-release,gitea-sync" | Out-Null
-& $TargetExe learn-reflex $StagingLdb "git-non-acl-safe-dir" `
-    "[REFLEX git-non-acl-safe-dir]: On non-ACL drives, run 'git config --global --add safe.directory <repo>' right after git init." `
-    --action "git,gitea-init" --env "dubious ownership" | Out-Null
-& $TargetExe learn-reflex $StagingLdb "windows-hooks-cmd-quoting" `
-    '[REFLEX windows-hooks-cmd-quoting]: In Antigravity hooks.json on Windows, never wrap forward-slash paths in quotes because Go exec.Command(cmd, /C) escapes quotes with backslashes; use unquoted %USERPROFILE%\... paths.' `
-    --stack "hooks.json" --action "hooks.json,deploy_plugin" --env "falsch geschrieben,jsonhook__" | Out-Null
-
-& $TargetExe compact $StagingLdb
-Install-BinaryHotSafe -Src $StagingLdb -Dst $GlobalLdb
-Remove-Item $StagingLdb -Force -ErrorAction SilentlyContinue
-
-# Incrementally index LibreDB's own workspace into .agents/memory.ldb (auto-porting .agents/memory.db if .ldb is absent, never deleting live .ldb!)
-$SelfLdb = Join-Path $ProjectRoot ".agents\memory.ldb"
-try {
-    & $TargetExe index-workspace $SelfLdb $ProjectRoot
-} catch {
-    Write-Output "[INFO] Workspace index skipped while older handle drains: $_"
 }
 
 $ExeForward = $TargetExe.Replace('\', '/')
@@ -99,7 +75,7 @@ $PluginJson = @'
 {
   "name": "libredb",
   "displayName": "LibreDB Cognitive Memory",
-  "version": "0.5.3",
+  "version": "0.6.0",
   "description": "Full Rust replacement for SQLite SkillsDB: single-file cognitive memory, silent SQLite auto-porter, sub-2ms hooks, guardrails, causal code graph, and local Gitea automation.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
@@ -234,7 +210,11 @@ description: >-
 ## CLI commands (`libredb`)
 
 - **Guardrails:** `libredb guardrail check --path "<dir>" [--staged] [--strict]`
-- **Skills lookup:** `libredb get-skill <skill_name> [--section "<Section Title>"]`
+- **Rules, skills & reflexes:**
+  - `libredb get-skill <skill_name> [--section "<Section Title>"]`
+  - `libredb sync-skill <SKILL.md> [--name <skill_name>]`
+  - `libredb list-rules`, `libredb list-skills`, `libredb list-reflexes`
+  - `libredb modernize-global`
 - **Gitea workflow:**
   - `libredb gitea-status`
   - `libredb gitea-init "<dir>" [--name <repo>] [--use-existing] [--overwrite]`
@@ -242,7 +222,21 @@ description: >-
   - `libredb gitea-release [vX.Y.Z] --project "<dir>"`
   - `libredb gitea-config [--url <u>] [--user <usr>] [--token <tok>] [--register-helper]`
 '@
-[System.IO.File]::WriteAllText((Join-Path $SkillDir "SKILL.md"), $SkillMd, $Utf8NoBom)
+$SkillMdPath = Join-Path $SkillDir "SKILL.md"
+[System.IO.File]::WriteAllText($SkillMdPath, $SkillMd, $Utf8NoBom)
+
+# Modernize staging DB (deprecate legacy customizations-db skill, update rule texts to libredb, sync SKILL.md, seed 9 core reflexes, compact)
+& $TargetExe modernize-global --global $StagingLdb --skill-md $SkillMdPath
+Install-BinaryHotSafe -Src $StagingLdb -Dst $GlobalLdb
+Remove-Item $StagingLdb -Force -ErrorAction SilentlyContinue
+
+# Incrementally index LibreDB's own workspace into .agents/memory.ldb
+$SelfLdb = Join-Path $ProjectRoot ".agents\memory.ldb"
+try {
+    & $TargetExe index-workspace $SelfLdb $ProjectRoot
+} catch {
+    Write-Output "[INFO] Workspace index skipped while older handle drains: $_"
+}
 
 # 6. Write square transparent SVG logo with >=10% margin and high contrast on dark & light themes
 $LogoSvg = @'
@@ -260,10 +254,10 @@ $LogoSvg = @'
 
 # 7. Write user-facing README.md inside plugin bundle
 $PluginReadme = @'
-# LibreDB cognitive memory plugin (v0.5.0)
+# LibreDB cognitive memory plugin (v0.6.0)
 
 Complete standalone Rust replacement for `AntiGraviton SkillsDB` (`customizations-db`):
-- `libredb-mcp`: 3-tool multi-workspace cognitive memory & causal code-graph server with zero-I/O RAM session delta.
+- `libredb-mcp`: 3-tool multi-workspace cognitive memory & causal code-graph server with zero-I/O RAM session delta and automatic incremental workspace refresh.
 - Silent background 1:1 auto-migration for any pre-existing `.agents/memory.db` in older projects or chats; pure `.ldb` operation for all new projects and chats.
 - Native compiled `< 2 ms` `PreInvocation` and `PreToolUse` guardrail hooks (`hooks.json`).
 - Global system directives (`rules/AGENTS.md`) and native local Gitea release automation (`libredb gitea-sync` / `gitea-release`).
@@ -272,6 +266,6 @@ To switch cleanly to pure single-engine operation, disable `AntiGraviton SkillsD
 '@
 [System.IO.File]::WriteAllText((Join-Path $PluginDir "README.md"), $PluginReadme, $Utf8NoBom)
 
-Write-Output "[OK] Deployed LibreDB v0.5.3 standalone binaries to: $BinDir"
-Write-Output "[OK] Hydrated global 19-table store at: $GlobalLdb"
+Write-Output "[OK] Deployed LibreDB v0.6.0 standalone binaries to: $BinDir"
+Write-Output "[OK] Hydrated and modernized global 19-table store at: $GlobalLdb"
 Write-Output "[OK] Installed complete Antigravity replacement plugin at: $PluginDir"

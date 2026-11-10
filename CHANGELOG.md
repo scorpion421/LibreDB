@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-11-10
+
+### Added
+
+- Added CLI rule, skill, and reflex inspection and synchronization subcommands (`libredb list-rules`, `libredb list-skills`, `libredb list-reflexes`, `libredb sync-skill <SKILL.md>`, and `libredb modernize-global`) in `crates/libredb-cli/src/main.rs`.
+- Added `libredb modernize-global` to cleanly deprecate legacy `customizations-db` skill capsules in `~/.gemini/libredb/customizations.ldb`, update active `NodeKind::Rule` directives from `skillsdb` to `libredb` (while preserving all `sqlite_row:*` 1:1 audit backups untouched), sync `SKILL.md` (`skill:libredb`), and seed `9` core procedural reflexes (`rust-guardrail-staged`, `windows-hooks-cmd-quoting`, `gitea-collision-and-github-guard`, `semver-changelog-discipline`, `anti-salami-code-slicing`, `windows-soc-admin-audit`, `formatting-and-language-boundary`, `rust-gitea-dist`, and `git-non-acl-safe-dir`).
+- Added automatic incremental workspace code-graph refresh before `libredb_code` (`action="impact"` and `action="fim"`) and `libredb gitea-sync` so newly edited files and symbols are immediately reflected in blast-radius callers and governance edges without manual `index-workspace` invocations.
+
+### Changed
+
+- Made `LibreDb::link_batch` in `crates/libredb-core/src/engine.rs` zero-I/O idempotent when all target synapses on a node already exist with identical weights, eliminating redundant delta-envelope commits and `fsync` calls on unchanged graph edges.
+- Optimized `index_workspace` in `crates/libredb-cognitive/src/workspace.rs` to skip full source-file identifier re-scanning when `files_reindexed == 0` and call edges are already wired, reducing warm incremental workspace checks to `< 2 ms` with `0` disk writes.
+- Updated `scripts/deploy_plugin.ps1` to preserve live additions in `~/.gemini/libredb/customizations.ldb` across redeployments instead of re-importing from frozen `customizations.db` when `customizations.ldb` already exists.
+
 ## [0.5.3] - 2026-11-10
 
 ### Fixed

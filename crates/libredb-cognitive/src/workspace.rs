@@ -198,39 +198,48 @@ pub fn index_workspace(db: &LibreDb, root: &Path, force: bool) -> Result<Workspa
     }
 
     let mut edges: Vec<(u64, EdgeKind, u64, u8)> = Vec::new();
+    let existing_call_edges: usize = sym_inodes
+        .iter()
+        .map(|(_, _, syns)| syns.iter().filter(|s| s.kind == EdgeKind::Calls).count())
+        .sum();
+    let need_call_pass = force || !changed_files.is_empty() || existing_call_edges == 0;
     let mut call_edges = 0usize;
 
     // 1. Wire `CallerSymbol --[Calls]--> CalleeSymbol` across workspace files!
-    for (rel_path, skel, text_opt) in &all_skeletons {
-        let Some(ref text) = text_opt else { continue };
-        let lines: Vec<&str> = text.lines().collect();
-        for sym in &skel.symbols {
-            let src_key = format!("{rel_path}::{}", sym.name);
-            let Some(&src_id) = by_full_key.get(&src_key) else {
-                continue;
-            };
-            let start_i = sym.start_line.saturating_sub(1);
-            let end_i = sym.end_line.min(lines.len());
-            if start_i >= end_i {
-                continue;
-            }
-            let body_slice = lines[start_i..end_i].join("\n");
-            let mut seen_targets: HashSet<u64> = HashSet::new();
-
-            for ident in extract_code_identifiers(&body_slice) {
-                if ident == sym.name {
+    if need_call_pass {
+        for (rel_path, skel, text_opt) in &all_skeletons {
+            let Some(ref text) = text_opt else { continue };
+            let lines: Vec<&str> = text.lines().collect();
+            for sym in &skel.symbols {
+                let src_key = format!("{rel_path}::{}", sym.name);
+                let Some(&src_id) = by_full_key.get(&src_key) else {
+                    continue;
+                };
+                let start_i = sym.start_line.saturating_sub(1);
+                let end_i = sym.end_line.min(lines.len());
+                if start_i >= end_i {
                     continue;
                 }
-                if let Some(targets) = by_short_name.get(&ident) {
-                    for &(dst_id, _) in targets {
-                        if dst_id != src_id && seen_targets.insert(dst_id) {
-                            edges.push((src_id, EdgeKind::Calls, dst_id, 200));
-                            call_edges += 1;
+                let body_slice = lines[start_i..end_i].join("\n");
+                let mut seen_targets: HashSet<u64> = HashSet::new();
+
+                for ident in extract_code_identifiers(&body_slice) {
+                    if ident == sym.name {
+                        continue;
+                    }
+                    if let Some(targets) = by_short_name.get(&ident) {
+                        for &(dst_id, _) in targets {
+                            if dst_id != src_id && seen_targets.insert(dst_id) {
+                                edges.push((src_id, EdgeKind::Calls, dst_id, 200));
+                                call_edges += 1;
+                            }
                         }
                     }
                 }
             }
         }
+    } else {
+        call_edges = existing_call_edges;
     }
 
     // 2. Wire `Decision / Task --[Governs]--> Symbol` & `Symbol --[CausedBy]--> Decision` automatically!

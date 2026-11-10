@@ -35,6 +35,11 @@ Antigravity Cognitive & Code-Graph Commands:
   libredb learn-assoc <db.ldb> <cue_phrase> <target_id_1,target_id_2>
   libredb learn-reflex <db.ldb> <id> <directive> [--stack <s1,s2>] [--action <a1,a2>] [--env <e1,e2>]
   libredb get-skill <skill_name> [--section <title>] [--global <customizations.ldb>]
+  libredb sync-skill <SKILL.md> [--name <skill_name>] [--global <customizations.ldb>]
+  libredb list-rules [--global <customizations.ldb>]
+  libredb list-skills [--global <customizations.ldb>]
+  libredb list-reflexes [--global <customizations.ldb>]
+  libredb modernize-global [--global <customizations.ldb>] [--skill-md <SKILL.md>]
   libredb mcp-serve [<default_project.ldb>] [--global <customizations.ldb>]
 
 Native Antigravity Hooks, Guardrails & Gitea Automation:
@@ -238,6 +243,163 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let rec = gdb.get_by_key(NodeKind::Skill, skill_name)?;
                 println!("{}", String::from_utf8_lossy(&rec.payload));
             }
+        }
+        "list-rules" => {
+            let mut global_path: Option<PathBuf> = None;
+            let mut i = 1usize;
+            while i < args.len() {
+                if (args[i] == "--global" || args[i] == "--db") && i + 1 < args.len() {
+                    global_path = Some(PathBuf::from(&args[i + 1]));
+                    i += 2;
+                } else if !args[i].starts_with('-') && global_path.is_none() {
+                    global_path = Some(PathBuf::from(&args[i]));
+                    i += 1;
+                } else {
+                    return Err(format!("Unknown list-rules flag '{}'", args[i]).into());
+                }
+            }
+            let gdb = hooks::open_global_ldb(global_path.as_deref())?;
+            let mut inodes: Vec<_> = gdb
+                .list_inodes(Some(NodeKind::Rule), false)
+                .into_iter()
+                .filter(|(_, k_opt, _)| !k_opt.as_deref().is_some_and(|k| k.starts_with("reflex::")))
+                .collect();
+            inodes.sort_by(|a, b| a.1.cmp(&b.1));
+            println!("=== Active Rules ({}) ===", inodes.len());
+            for (ino, k_opt, _) in inodes {
+                let k = k_opt.unwrap_or_else(|| format!("node_{}", ino.node_id));
+                let rec = gdb.get(ino.node_id)?;
+                let txt = String::from_utf8_lossy(&rec.payload);
+                let summary = txt
+                    .lines()
+                    .find(|l| l.starts_with("Summary:"))
+                    .or_else(|| txt.lines().next())
+                    .unwrap_or("");
+                println!("  * [#{} {:<42} {:>4} tok] {}", ino.node_id, k, ino.token_count, summary);
+            }
+        }
+        "list-skills" => {
+            let mut global_path: Option<PathBuf> = None;
+            let mut i = 1usize;
+            while i < args.len() {
+                if (args[i] == "--global" || args[i] == "--db") && i + 1 < args.len() {
+                    global_path = Some(PathBuf::from(&args[i + 1]));
+                    i += 2;
+                } else if !args[i].starts_with('-') && global_path.is_none() {
+                    global_path = Some(PathBuf::from(&args[i]));
+                    i += 1;
+                } else {
+                    return Err(format!("Unknown list-skills flag '{}'", args[i]).into());
+                }
+            }
+            let gdb = hooks::open_global_ldb(global_path.as_deref())?;
+            let sec_inodes = gdb.list_inodes(Some(NodeKind::SkillSection), false);
+            let mut skill_inodes = gdb.list_inodes(Some(NodeKind::Skill), false);
+            skill_inodes.sort_by(|a, b| a.1.cmp(&b.1));
+            println!(
+                "=== Active Skills ({} skills, {} sections) ===",
+                skill_inodes.len(),
+                sec_inodes.len()
+            );
+            for (ino, k_opt, _) in skill_inodes {
+                let sname = k_opt.unwrap_or_else(|| format!("node_{}", ino.node_id));
+                let prefix = format!("{sname}::");
+                let sec_cnt = sec_inodes
+                    .iter()
+                    .filter(|(_, sk_opt, _)| sk_opt.as_deref().is_some_and(|sk| sk.starts_with(&prefix)))
+                    .count();
+                let rec = gdb.get(ino.node_id)?;
+                let txt = String::from_utf8_lossy(&rec.payload);
+                let desc = txt.lines().nth(1).or_else(|| txt.lines().next()).unwrap_or("");
+                println!(
+                    "  * [#{} {:<28} {:>2} secs, {:>3} tok] {}",
+                    ino.node_id, sname, sec_cnt, ino.token_count, desc
+                );
+            }
+        }
+        "list-reflexes" => {
+            let mut global_path: Option<PathBuf> = None;
+            let mut i = 1usize;
+            while i < args.len() {
+                if (args[i] == "--global" || args[i] == "--db") && i + 1 < args.len() {
+                    global_path = Some(PathBuf::from(&args[i + 1]));
+                    i += 2;
+                } else if !args[i].starts_with('-') && global_path.is_none() {
+                    global_path = Some(PathBuf::from(&args[i]));
+                    i += 1;
+                } else {
+                    return Err(format!("Unknown list-reflexes flag '{}'", args[i]).into());
+                }
+            }
+            let gdb = hooks::open_global_ldb(global_path.as_deref())?;
+            let mut inodes: Vec<_> = gdb
+                .list_inodes(Some(NodeKind::Rule), false)
+                .into_iter()
+                .filter(|(_, k_opt, _)| k_opt.as_deref().is_some_and(|k| k.starts_with("reflex::")))
+                .collect();
+            inodes.sort_by(|a, b| a.1.cmp(&b.1));
+            println!("=== Active Situational Reflexes ({}) ===", inodes.len());
+            for (ino, k_opt, _) in inodes {
+                let k = k_opt.unwrap_or_else(|| format!("node_{}", ino.node_id));
+                let rec = gdb.get(ino.node_id)?;
+                if let Ok(r) = serde_json::from_slice::<ReflexRule>(&rec.payload) {
+                    println!(
+                        "  * [#{} {:<32}] stack={:?} action={:?} -> {}",
+                        ino.node_id, r.id, r.stack_any, r.action_any, r.directive
+                    );
+                } else {
+                    println!("  * [#{} {}] {}", ino.node_id, k, String::from_utf8_lossy(&rec.payload));
+                }
+            }
+        }
+        "sync-skill" => {
+            if args.len() < 2 {
+                return Err("Usage: libredb sync-skill <SKILL.md> [--name <skill_name>] [--global <customizations.ldb>]".into());
+            }
+            let md_path = PathBuf::from(&args[1]);
+            let mut explicit_name: Option<String> = None;
+            let mut global_path: Option<PathBuf> = None;
+            let mut i = 2usize;
+            while i + 1 < args.len() {
+                match args[i].as_str() {
+                    "--name" => {
+                        explicit_name = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    "--global" => {
+                        global_path = Some(PathBuf::from(&args[i + 1]));
+                        i += 2;
+                    }
+                    other => return Err(format!("Unknown sync-skill flag '{other}'").into()),
+                }
+            }
+            let gdb = hooks::open_global_ldb(global_path.as_deref())?;
+            let (sname, sec_cnt) = sync_skill_markdown(&gdb, &md_path, explicit_name.as_deref())?;
+            let mut cog = CognitiveEngine::open_db(gdb)?;
+            cog.save_index_snapshot()?;
+            println!(
+                "[OK] Synced skill '{sname}' ({sec_cnt} sections + full body) and updated index snapshot"
+            );
+        }
+        "modernize-global" => {
+            let mut global_path: Option<PathBuf> = None;
+            let mut skill_md: Option<PathBuf> = None;
+            let mut i = 1usize;
+            while i + 1 < args.len() {
+                match args[i].as_str() {
+                    "--global" => {
+                        global_path = Some(PathBuf::from(&args[i + 1]));
+                        i += 2;
+                    }
+                    "--skill-md" => {
+                        skill_md = Some(PathBuf::from(&args[i + 1]));
+                        i += 2;
+                    }
+                    other => return Err(format!("Unknown modernize-global flag '{other}'").into()),
+                }
+            }
+            let gdb = hooks::open_global_ldb(global_path.as_deref())?;
+            modernize_global_db(&gdb, skill_md.as_deref())?;
         }
         "gitea-credential-helper" => {
             let action = args.get(1).map(String::as_str).unwrap_or("get");
@@ -1130,6 +1292,297 @@ fn run_microbench(total_nodes: usize, threads: usize) -> Result<(), Box<dyn std:
     println!(
         "  Gravity compaction + verify:   {:>8.2} ms ({} -> {} bytes)",
         comp_ms, comp.bytes_before, st.file_bytes
+    );
+    Ok(())
+}
+
+fn sync_skill_markdown(
+    gdb: &Arc<LibreDb>,
+    md_path: &Path,
+    explicit_name: Option<&str>,
+) -> Result<(String, usize), Box<dyn std::error::Error>> {
+    let raw = std::fs::read_to_string(md_path)?;
+    let normalized = raw.replace("\r\n", "\n");
+    let mut name_opt: Option<String> = explicit_name.map(ToOwned::to_owned);
+    let mut desc = String::new();
+    let mut body_start = 0usize;
+
+    if let Some(after_open) = normalized.strip_prefix("---\n") {
+        if let Some(end_idx) = after_open.find("\n---\n") {
+            let fm = &after_open[..end_idx];
+            body_start = 4 + end_idx + 5;
+            for line in fm.lines() {
+                if let Some((k, v)) = line.split_once(':') {
+                    let key = k.trim();
+                    let val = v.trim().trim_matches('"').trim_matches('\'');
+                    if key == "name" && name_opt.is_none() && !val.is_empty() {
+                        name_opt = Some(val.to_owned());
+                    } else if key == "description" && !val.is_empty() {
+                        desc = val.to_owned();
+                    }
+                }
+            }
+        }
+    }
+
+    let skill_name = name_opt.unwrap_or_else(|| {
+        md_path
+            .parent()
+            .and_then(|p| p.file_name())
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned()
+    });
+    if desc.is_empty() {
+        desc = format!("Specialized Antigravity skill '{skill_name}'");
+    }
+
+    let body = &normalized[body_start..];
+    let mut sections: Vec<(String, String)> = Vec::new();
+    let mut cur_title: Option<String> = None;
+    let mut cur_buf = String::new();
+
+    for line in body.lines() {
+        if let Some(h2) = line.strip_prefix("## ").or_else(|| line.strip_prefix("### ")) {
+            if let Some(prev_t) = cur_title.take() {
+                let trimmed = cur_buf.trim().to_owned();
+                if !trimmed.is_empty() {
+                    sections.push((prev_t, trimmed));
+                }
+                cur_buf.clear();
+            }
+            cur_title = Some(h2.trim().to_owned());
+            cur_buf.push_str(line);
+            cur_buf.push('\n');
+        } else if cur_title.is_some() {
+            cur_buf.push_str(line);
+            cur_buf.push('\n');
+        }
+    }
+    if let Some(last_t) = cur_title.take() {
+        let trimmed = cur_buf.trim().to_owned();
+        if !trimmed.is_empty() {
+            sections.push((last_t, trimmed));
+        }
+    }
+
+    let sec_prefix = format!("{skill_name}::");
+    let new_keys: std::collections::HashSet<String> = sections
+        .iter()
+        .map(|(t, _)| format!("{skill_name}::{t}"))
+        .collect();
+    for (_, k_opt, _) in gdb.list_inodes(Some(NodeKind::SkillSection), false) {
+        if let Some(k) = k_opt {
+            if k.starts_with(&sec_prefix) && !new_keys.contains(&k) {
+                let _ = gdb.deprecate_key(NodeKind::SkillSection, &k);
+            }
+        }
+    }
+
+    let mut prepared = Vec::new();
+    let summary_card = format!(
+        "[Skill: {skill_name} | plugin={skill_name} | category={skill_name}]\n{desc}\n(Full length: {} chars)",
+        normalized.len()
+    );
+    prepared.push(gdb.prepare(
+        WriteRequest::new(NodeKind::Skill, summary_card.into_bytes())
+            .with_key(&skill_name)
+            .with_importance(210),
+        0,
+    )?);
+    prepared.push(gdb.prepare(
+        WriteRequest::new(NodeKind::Generic, normalized.clone().into_bytes())
+            .with_key(format!("skill_full::{skill_name}"))
+            .with_importance(120),
+        1,
+    )?);
+
+    for (idx, (stitle, scontent)) in sections.iter().enumerate() {
+        let sec_key = format!("{skill_name}::{stitle}");
+        let sec_body = format!("[{skill_name} > {stitle}]\n{scontent}");
+        prepared.push(gdb.prepare(
+            WriteRequest::new(NodeKind::SkillSection, sec_body.into_bytes())
+                .with_key(sec_key)
+                .with_importance(195),
+            idx + 2,
+        )?);
+    }
+
+    let ids = gdb.commit_batch(&prepared)?;
+    let skill_id = ids[0];
+    let full_id = ids[1];
+    let mut edges = vec![(skill_id, EdgeKind::HasSection, full_id, 250)];
+    for &sec_id in &ids[2..] {
+        edges.push((skill_id, EdgeKind::HasSection, sec_id, 240));
+        edges.push((sec_id, EdgeKind::RelatedTo, skill_id, 240));
+    }
+    gdb.link_batch(&edges)?;
+
+    Ok((skill_name, sections.len()))
+}
+
+fn modernize_global_db(
+    gdb: &Arc<LibreDb>,
+    skill_md_opt: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let t0 = Instant::now();
+    let mut deprecated_legacy = 0usize;
+
+    if gdb.deprecate_key(NodeKind::Skill, "customizations-db")? {
+        deprecated_legacy += 1;
+    }
+    if gdb.deprecate_key(NodeKind::Generic, "skill_full::customizations-db")? {
+        deprecated_legacy += 1;
+    }
+    for (_, k_opt, _) in gdb.list_inodes(Some(NodeKind::SkillSection), false) {
+        if let Some(k) = k_opt {
+            if k.starts_with("customizations-db::")
+                && gdb.deprecate_key(NodeKind::SkillSection, &k)?
+            {
+                deprecated_legacy += 1;
+            }
+        }
+    }
+
+    let mut rules_updated = 0usize;
+    let mut rule_writes = Vec::new();
+    for (idx, (ino, k_opt, _)) in gdb
+        .list_inodes(Some(NodeKind::Rule), false)
+        .into_iter()
+        .enumerate()
+    {
+        let Some(key) = k_opt else { continue };
+        if key.starts_with("reflex::") {
+            continue;
+        }
+        let rec = gdb.get(ino.node_id)?;
+        let orig = String::from_utf8_lossy(&rec.payload).into_owned();
+        let updated = orig
+            .replace("skillsdb ", "libredb ")
+            .replace("(skillsdb ", "(libredb ")
+            .replace("`skillsdb`", "`libredb`")
+            .replace("customizations-db", "libredb")
+            .replace("customizations.db", "customizations.ldb")
+            .replace("memory.db", "memory.ldb")
+            .replace("SkillsDB", "LibreDB");
+        if updated != orig {
+            rule_writes.push(gdb.prepare(
+                WriteRequest::new(NodeKind::Rule, updated.into_bytes())
+                    .with_key(key)
+                    .with_importance(230)
+                    .with_pinned(true),
+                idx,
+            )?);
+            rules_updated += 1;
+        }
+    }
+    if !rule_writes.is_empty() {
+        gdb.commit_batch(&rule_writes)?;
+    }
+
+    let default_skill_md = env::var_os("USERPROFILE")
+        .or_else(|| env::var_os("HOME"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".gemini")
+        .join("config")
+        .join("plugins")
+        .join("libredb")
+        .join("skills")
+        .join("libredb")
+        .join("SKILL.md");
+    let skill_path = skill_md_opt
+        .map(Path::to_path_buf)
+        .unwrap_or(default_skill_md);
+    let mut synced_sections = 0usize;
+    if skill_path.is_file() {
+        let (_, cnt) = sync_skill_markdown(gdb, &skill_path, Some("libredb"))?;
+        synced_sections = cnt;
+    }
+
+    let core_reflexes = [
+        ReflexRule {
+            id: "rust-guardrail-staged".to_owned(),
+            stack_any: vec!["rust".to_owned(), "cargo".to_owned()],
+            action_any: vec!["commit".to_owned(), "gitea".to_owned(), "release".to_owned(), "sync".to_owned()],
+            env_or_error_any: Vec::new(),
+            directive: "Ensure /target/ and /dist/ are in .gitignore and run 'libredb guardrail check --path <dir> --staged --strict' before committing.".to_owned(),
+        },
+        ReflexRule {
+            id: "windows-hooks-cmd-quoting".to_owned(),
+            stack_any: vec!["windows".to_owned(), "hooks".to_owned(), "json".to_owned()],
+            action_any: vec!["hook".to_owned(), "plugin".to_owned(), "deploy".to_owned()],
+            env_or_error_any: Vec::new(),
+            directive: "On Windows, hooks.json commands run via cmd.exe /C: use unquoted %USERPROFILE%\\.gemini\\libredb\\bin\\libredb.exe <subcmd> with backslashes.".to_owned(),
+        },
+        ReflexRule {
+            id: "gitea-collision-and-github-guard".to_owned(),
+            stack_any: vec!["git".to_owned(), "gitea".to_owned()],
+            action_any: vec!["gitea-init".to_owned(), "gitea-sync".to_owned(), "gitea-release".to_owned(), "push".to_owned()],
+            env_or_error_any: vec!["GITEA REPOSITORY COLLISION".to_owned(), "UNVERSIONED WORKSPACE".to_owned()],
+            directive: "Auto-sync only to local Gitea (never push to GitHub unless explicitly requested). Pause and ask user on [GITEA REPOSITORY COLLISION] or before --allow-unversioned.".to_owned(),
+        },
+        ReflexRule {
+            id: "semver-changelog-discipline".to_owned(),
+            stack_any: vec!["semver".to_owned(), "changelog".to_owned(), "release".to_owned()],
+            action_any: vec!["release".to_owned(), "tag".to_owned(), "version".to_owned(), "gitea-release".to_owned()],
+            env_or_error_any: Vec::new(),
+            directive: "Never overwrite an existing release tag in place; increment SemVer X.Y.Z, document under Keep a Changelog 1.1.0 in CHANGELOG.md, and attach deliverables from dist/ or releases/.".to_owned(),
+        },
+        ReflexRule {
+            id: "anti-salami-code-slicing".to_owned(),
+            stack_any: vec!["rust".to_owned(), "python".to_owned(), "typescript".to_owned(), "code".to_owned()],
+            action_any: vec!["read".to_owned(), "inspect".to_owned(), "skeleton".to_owned(), "fim".to_owned(), "impact".to_owned(), "refactor".to_owned()],
+            env_or_error_any: Vec::new(),
+            directive: "Read files <=800 lines in one read_file call; for files >800 lines use libredb_code (action=skeleton, fim, or impact) before editing.".to_owned(),
+        },
+        ReflexRule {
+            id: "windows-soc-admin-audit".to_owned(),
+            stack_any: vec!["windows".to_owned(), "powershell".to_owned(), "admin".to_owned(), "wmi".to_owned(), "cim".to_owned()],
+            action_any: vec!["elevate".to_owned(), "admin".to_owned(), "service".to_owned(), "schtasks".to_owned(), "firewall".to_owned()],
+            env_or_error_any: vec!["Access is denied".to_owned(), "RunAs".to_owned()],
+            directive: "Follow SOC transparent IT admin standard: log all 4 phases ([1/4 PRE-CHECK]..[4/4 POST-CHECK]) under C:\\IT_ADMIN_LOGS\\<USER>\\<TASK>\\<TARGET>\\<Date>\\<hh_mm_ss>\\ and never use C:\\Windows\\Temp or cmd.exe /c wrappers.".to_owned(),
+        },
+        ReflexRule {
+            id: "formatting-and-language-boundary".to_owned(),
+            stack_any: vec!["markdown".to_owned(), "docs".to_owned(), "commit".to_owned(), "ui".to_owned()],
+            action_any: vec!["write".to_owned(), "edit".to_owned(), "commit".to_owned(), "readme".to_owned()],
+            env_or_error_any: Vec::new(),
+            directive: "Enforce strict output invariants: zero em-dashes/en-dashes, zero emojis, sentence case headings, informal German ('Du') in chat without Deppenbindestriche, and 100% ASCII English in code/comments/commits.".to_owned(),
+        },
+        ReflexRule {
+            id: "rust-gitea-dist".to_owned(),
+            stack_any: vec!["cargo.toml".to_owned(), "rust".to_owned()],
+            action_any: vec!["gitea-release".to_owned(), "gitea-sync".to_owned()],
+            env_or_error_any: Vec::new(),
+            directive: "Copy compiled release deliverables into dist/ before running 'libredb gitea-release' so assets attach automatically.".to_owned(),
+        },
+        ReflexRule {
+            id: "git-non-acl-safe-dir".to_owned(),
+            stack_any: vec!["git".to_owned()],
+            action_any: vec!["git".to_owned(), "gitea-init".to_owned()],
+            env_or_error_any: vec!["dubious ownership".to_owned()],
+            directive: "On non-ACL drives, run 'git config --global --add safe.directory <repo>' right after git init.".to_owned(),
+        },
+    ];
+
+    for r in &core_reflexes {
+        ReflexEngine::learn_reflex(gdb, r)?;
+    }
+
+    let mut cog = CognitiveEngine::open_db(Arc::clone(gdb))?;
+    cog.save_index_snapshot()?;
+    let comp = gdb.compact_with_gravity()?;
+
+    println!(
+        "[OK] Modernized global LibreDB in {:.2} ms: {} legacy customizations-db capsules deprecated, {} rules updated to libredb, {} libredb skill sections synced, {} reflexes active ({} -> {} bytes)",
+        t0.elapsed().as_secs_f64() * 1000.0,
+        deprecated_legacy,
+        rules_updated,
+        synced_sections,
+        core_reflexes.len(),
+        comp.bytes_before,
+        comp.bytes_after
     );
     Ok(())
 }
