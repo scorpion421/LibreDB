@@ -69,7 +69,7 @@ $PluginJson = @'
 {
   "name": "libredb",
   "displayName": "LibreDB Cognitive Memory",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Full Rust replacement for SQLite SkillsDB: single-file cognitive memory, silent SQLite auto-porter, sub-2ms hooks, guardrails, 12-language causal code graph, and dynamic multi-remote Git/Gitea automation.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
@@ -247,7 +247,7 @@ $LogoSvg = @'
 
 # 7. Write user-facing README.md inside plugin bundle
 $PluginReadme = @'
-# LibreDB cognitive memory plugin (v0.7.0)
+# LibreDB cognitive memory plugin (v0.7.1)
 
 Complete standalone Rust replacement for `AntiGraviton SkillsDB` (`customizations-db`):
 - `libredb-mcp`: 3-tool multi-workspace cognitive memory & 12-language causal code-graph server with zero-I/O RAM session delta and automatic incremental workspace refresh.
@@ -259,6 +259,6 @@ To switch cleanly to pure single-engine operation, disable `AntiGraviton SkillsD
 '@
 [System.IO.File]::WriteAllText((Join-Path $PluginDir "README.md"), $PluginReadme, $Utf8NoBom)
 
-Write-Output "[OK] Deployed LibreDB v0.7.0 standalone binaries to: $BinDir"
+Write-Output "[OK] Deployed LibreDB v0.7.1 standalone binaries to: $BinDir"
 Write-Output "[OK] Hydrated and modernized global 19-table store at: $GlobalLdb"
 Write-Output "[OK] Installed complete Antigravity replacement plugin at: $PluginDir"

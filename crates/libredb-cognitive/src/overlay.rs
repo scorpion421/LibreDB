@@ -23,6 +23,10 @@ pub struct OverlayBrain {
 
 impl OverlayBrain {
     pub fn open(global_db: Option<Arc<LibreDb>>, project_db: Arc<LibreDb>) -> Result<Self> {
+        if let Some(ref gdb) = global_db {
+            gdb.sync_from_disk_if_changed()?;
+        }
+        project_db.sync_from_disk_if_changed()?;
         let last_global_seq = match &global_db {
             Some(gdb) => gdb.stats()?.commit_seq,
             None => 0,

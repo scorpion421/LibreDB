@@ -996,7 +996,20 @@ impl LibreDb {
         // Snapshot read lock is already dropped before performing any disk I/O or decompression!
         drop(snap);
 
-        let payload = self.read_inode_payload(&inode)?;
+        let payload = match self.read_inode_payload(&inode) {
+            Ok(p) => p,
+            Err(LibreDbError::ChecksumMismatch { .. }) if self.sync_from_disk_if_changed()? => {
+                let fresh_snap = Arc::clone(&self.state.read());
+                let fresh_ino = fresh_snap
+                    .inodes
+                    .get(&node_id)
+                    .ok_or(LibreDbError::NodeNotFound(node_id))?
+                    .clone();
+                drop(fresh_snap);
+                self.read_inode_payload(&fresh_ino)?
+            }
+            Err(e) => return Err(e),
+        };
         self.telemetry.record_hit(node_id);
         let access_count = inode
             .access_count
@@ -1084,7 +1097,7 @@ impl LibreDb {
         if node_ids.is_empty() {
             return Ok((Vec::new(), 0));
         }
-        let snap = Arc::clone(&self.state.read());
+        let mut snap = Arc::clone(&self.state.read());
         let mut valid_ids = Vec::with_capacity(node_ids.len());
         for &nid in node_ids {
             if snap.inodes.contains_key(&nid) {
@@ -1093,7 +1106,14 @@ impl LibreDb {
                 return Err(LibreDbError::NodeNotFound(nid));
             }
         }
-        let (payload_map, io_reads) = self.read_coalesced_extents(&snap, &valid_ids)?;
+        let (payload_map, io_reads) = match self.read_coalesced_extents(&snap, &valid_ids) {
+            Ok(res) => res,
+            Err(LibreDbError::ChecksumMismatch { .. }) if self.sync_from_disk_if_changed()? => {
+                snap = Arc::clone(&self.state.read());
+                self.read_coalesced_extents(&snap, &valid_ids)?
+            }
+            Err(e) => return Err(e),
+        };
         let mut records = Vec::with_capacity(valid_ids.len());
         for nid in valid_ids {
             let inode = &snap.inodes[&nid];
