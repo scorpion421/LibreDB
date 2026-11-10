@@ -36,6 +36,8 @@ function Install-BinaryHotSafe {
 }
 
 $TargetExe = Join-Path $BinDir "libredb.exe"
+Get-Process libredb -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Start-Sleep -Milliseconds 150
 Install-BinaryHotSafe -Src $ReleaseExe -Dst $TargetExe
 if (Test-Path $ReleaseDll) {
     Install-BinaryHotSafe -Src $ReleaseDll -Dst (Join-Path $BinDir "libredb.pyd")
@@ -97,7 +99,7 @@ $PluginJson = @'
 {
   "name": "libredb",
   "displayName": "LibreDB Cognitive Memory",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "description": "Full Rust replacement for SQLite SkillsDB: single-file cognitive memory, silent SQLite auto-porter, sub-2ms hooks, guardrails, causal code graph, and local Gitea automation.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
@@ -270,6 +272,6 @@ To switch cleanly to pure single-engine operation, disable `AntiGraviton SkillsD
 '@
 [System.IO.File]::WriteAllText((Join-Path $PluginDir "README.md"), $PluginReadme, $Utf8NoBom)
 
-Write-Output "[OK] Deployed LibreDB v0.5.2 standalone binaries to: $BinDir"
+Write-Output "[OK] Deployed LibreDB v0.5.3 standalone binaries to: $BinDir"
 Write-Output "[OK] Hydrated global 19-table store at: $GlobalLdb"
 Write-Output "[OK] Installed complete Antigravity replacement plugin at: $PluginDir"

@@ -83,6 +83,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         print_usage();
         return Ok(());
     }
+    if args[0] == "--version" || args[0] == "-V" || args[0] == "version" {
+        println!("libredb {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
 
     match args[0].as_str() {
         "mcp-serve" => {
@@ -939,9 +943,30 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             if args.len() < 2 {
                 return Err("Usage: libredb stats <db.ldb> [--json]".into());
             }
-            let db = LibreDb::open(&args[1])?;
+            let mut db_arg: Option<&str> = None;
+            let mut json_out = false;
+            let mut i = 1usize;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--db" if i + 1 < args.len() => {
+                        db_arg = Some(&args[i + 1]);
+                        i += 2;
+                    }
+                    "--json" => {
+                        json_out = true;
+                        i += 1;
+                    }
+                    other if !other.starts_with('-') && db_arg.is_none() => {
+                        db_arg = Some(other);
+                        i += 1;
+                    }
+                    other => return Err(format!("Unknown flag '{other}'").into()),
+                }
+            }
+            let db_path = db_arg.ok_or("Usage: libredb stats <db.ldb> [--json]")?;
+            let db = LibreDb::open(db_path)?;
             let st = db.stats()?;
-            if args.get(2).map(String::as_str) == Some("--json") {
+            if json_out {
                 println!("{}", serde_json::to_string_pretty(&st)?);
             } else {
                 println!("=== LibreDB Statistics ===");

@@ -308,10 +308,27 @@ fn dispatch_tool(
 
             let brain = state.resolve_brain_mut(cwd_hint.or(Some(target)), cid_arg)?;
             let proj_db = Arc::clone(brain.project_db());
+            let resolved_target: PathBuf = {
+                let tp = Path::new(target);
+                if tp.is_relative() {
+                    if let Some(c) = args.get("cwd").and_then(Value::as_str) {
+                        let candidate = Path::new(c).join(tp);
+                        if candidate.exists() {
+                            candidate
+                        } else {
+                            tp.to_path_buf()
+                        }
+                    } else {
+                        tp.to_path_buf()
+                    }
+                } else {
+                    tp.to_path_buf()
+                }
+            };
 
             match action {
                 "skeleton" => {
-                    let (skel, _) = FileSkeleton::index_or_get_cached(&proj_db, Path::new(target), None)?;
+                    let (skel, _) = FileSkeleton::index_or_get_cached(&proj_db, &resolved_target, None)?;
                     Ok(skel.render_compact(sym, sym.is_some()))
                 }
                 "impact" => {
@@ -319,11 +336,11 @@ fn dispatch_tool(
                     Ok(serde_json::to_string_pretty(&reports)?)
                 }
                 "fim" => {
-                    let bundle = extract_fim_slice(&proj_db, Path::new(target), sym, line, pad)?;
+                    let bundle = extract_fim_slice(&proj_db, &resolved_target, sym, line, pad)?;
                     Ok(bundle.format_compact())
                 }
                 "index" => {
-                    let rep = index_workspace(&proj_db, Path::new(target), false)?;
+                    let rep = index_workspace(&proj_db, &resolved_target, false)?;
                     let mut cog = CognitiveEngine::open_db(proj_db)?;
                     cog.save_index_snapshot()?;
                     brain.refresh_if_needed()?;

@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.3] - 2026-11-10
+
+### Fixed
+
+- Resolved relative `target` file paths against `cwd` inside `libredb_code` (`skeleton`, `fim`, `index`) in `crates/libredb-cli/src/mcp.rs` so relative workspace paths work identically to absolute paths.
+- Added `--version` / `-V` CLI flag support and `--db <path>` flag parsing to `libredb stats` in `crates/libredb-cli/src/main.rs`.
+- Added automatic termination of stale `libredb` MCP daemon processes during `scripts/deploy_plugin.ps1` upgrades so newly deployed binaries and open `.ldb` handles refresh immediately.
+
 ## [0.5.2] - 2026-11-10
 
 ### Fixed
