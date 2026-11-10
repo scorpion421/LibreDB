@@ -346,7 +346,9 @@ pub fn cmd_gitea_config(
 pub fn cmd_gitea_status(global_opt: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
     let ldb = open_global_ldb(global_opt)?;
     let cfg = GiteaConfig::load(&ldb);
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut svc_state = query_service_state(&cfg.service_name);
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut ver_opt = check_gitea_version(&cfg);
 
     #[cfg(windows)]
@@ -356,8 +358,6 @@ pub fn cmd_gitea_status(global_opt: Option<&Path>) -> Result<(), Box<dyn std::er
         svc_state = query_service_state(&cfg.service_name);
         ver_opt = check_gitea_version(&cfg);
     }
-    #[cfg(not(windows))]
-    let _ = &mut svc_state;
 
     let svc_label = if cfg!(windows) {
         "Windows Service:"

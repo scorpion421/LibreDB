@@ -1354,8 +1354,56 @@ fn fill_csprng(dest: &mut [u8]) -> Result<(), String> {
     }
 }
 
-/// Loads an existing 32-byte `.vault.key` from `dir`, or creates a new one exclusively with
-/// `create_new(true)` (`O_CREAT | O_EXCL`) when missing and `create_if_missing == true`.
+#[cfg_attr(windows, allow(dead_code))]
+fn read_existing_posix_vault_key(key_path: &Path, meta: &fs::Metadata) -> Result<[u8; 32], String> {
+    if meta.file_type().is_symlink() {
+        return Err("Refusing to use symlinked POSIX vault keyfile (.vault.key)".to_owned());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if (meta.permissions().mode() & 0o077) != 0 {
+            let _ = fs::set_permissions(key_path, fs::Permissions::from_mode(0o600));
+        }
+    }
+    let mut raw = fs::read(key_path).map_err(|e| {
+        format!("Failed to read existing POSIX .vault.key (refusing to overwrite): {e}")
+    })?;
+    if raw.len() != 32 {
+        let bad_len = raw.len();
+        secure_zero(&mut raw);
+        return Err(format!(
+            "Existing POSIX .vault.key has invalid length {bad_len} bytes (expected 32); refusing to overwrite"
+        ));
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&raw);
+    secure_zero(&mut raw);
+    Ok(arr)
+}
+
+#[cfg_attr(windows, allow(dead_code))]
+fn read_winner_posix_vault_key_after_race(key_path: &Path) -> Result<[u8; 32], String> {
+    for attempt in 0..6u8 {
+        let meta = fs::symlink_metadata(key_path).map_err(|e| {
+            format!("Cannot inspect POSIX .vault.key metadata after concurrent init: {e}")
+        })?;
+        if meta.len() == 0 && attempt < 5 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            continue;
+        }
+        return read_existing_posix_vault_key(key_path, &meta);
+    }
+    let meta = fs::symlink_metadata(key_path).map_err(|e| {
+        format!("Cannot inspect POSIX .vault.key metadata after concurrent init: {e}")
+    })?;
+    read_existing_posix_vault_key(key_path, &meta)
+}
+
+/// Loads an existing 32-byte `.vault.key` from `dir`, or initializes a new `0600` keyfile
+/// atomically when missing and `create_if_missing == true` by staging a `32`-byte flushed sibling
+/// file and linking it into `.vault.key` via `fs::hard_link` (falling back to `create_new(true)`
+/// on filesystems without hard links, and reading the winning key on `AlreadyExists` races).
 /// Never truncates or overwrites an existing `.vault.key` if it is corrupt, unreadable, or symlinked.
 #[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn load_or_create_posix_vault_key_at(
@@ -1375,32 +1423,7 @@ pub(crate) fn load_or_create_posix_vault_key_at(
 
     let key_path = dir.join(".vault.key");
     match fs::symlink_metadata(&key_path) {
-        Ok(meta) => {
-            if meta.file_type().is_symlink() {
-                return Err("Refusing to use symlinked POSIX vault keyfile (.vault.key)".to_owned());
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if (meta.permissions().mode() & 0o077) != 0 {
-                    let _ = fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600));
-                }
-            }
-            let mut raw = fs::read(&key_path).map_err(|e| {
-                format!("Failed to read existing POSIX .vault.key (refusing to overwrite): {e}")
-            })?;
-            if raw.len() != 32 {
-                let bad_len = raw.len();
-                secure_zero(&mut raw);
-                return Err(format!(
-                    "Existing POSIX .vault.key has invalid length {bad_len} bytes (expected 32); refusing to overwrite"
-                ));
-            }
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&raw);
-            secure_zero(&mut raw);
-            Ok(arr)
-        }
+        Ok(meta) => read_existing_posix_vault_key(&key_path, &meta),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             if !create_if_missing {
                 return Err(
@@ -1410,6 +1433,54 @@ pub(crate) fn load_or_create_posix_vault_key_at(
             }
             let mut key = [0u8; 32];
             fill_csprng(&mut key)?;
+            let mut rand_tag = [0u8; 8];
+            if let Err(rng_err) = fill_csprng(&mut rand_tag) {
+                secure_zero(&mut key);
+                return Err(rng_err);
+            }
+            let tmp_path = dir.join(format!(
+                ".vault.key.init.{}.{:016x}",
+                std::process::id(),
+                u64::from_le_bytes(rand_tag)
+            ));
+
+            let mut tmp_opts = fs::OpenOptions::new();
+            tmp_opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                tmp_opts.mode(0o600);
+            }
+
+            if let Ok(mut tmp_file) = tmp_opts.open(&tmp_path) {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = tmp_file.set_permissions(fs::Permissions::from_mode(0o600));
+                }
+                use std::io::Write;
+                if let Err(w_err) = tmp_file.write_all(&key).and_then(|()| tmp_file.sync_all()) {
+                    drop(tmp_file);
+                    let _ = fs::remove_file(&tmp_path);
+                    secure_zero(&mut key);
+                    return Err(w_err.to_string());
+                }
+                drop(tmp_file);
+
+                let link_res = fs::hard_link(&tmp_path, &key_path);
+                let _ = fs::remove_file(&tmp_path);
+                match link_res {
+                    Ok(()) => return Ok(key),
+                    Err(link_err) if link_err.kind() == std::io::ErrorKind::AlreadyExists => {
+                        secure_zero(&mut key);
+                        return read_winner_posix_vault_key_after_race(&key_path);
+                    }
+                    Err(_) => {
+                        // Fall through to direct `create_new(true)` for filesystems that disallow hard links.
+                    }
+                }
+            }
+
             let mut opts = fs::OpenOptions::new();
             opts.write(true).create_new(true);
             #[cfg(unix)]
@@ -1417,21 +1488,31 @@ pub(crate) fn load_or_create_posix_vault_key_at(
                 use std::os::unix::fs::OpenOptionsExt;
                 opts.mode(0o600);
             }
-            let mut f = opts.open(&key_path).map_err(|open_err| {
-                secure_zero(&mut key);
-                format!("Failed to create new POSIX .vault.key exclusively: {open_err}")
-            })?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = f.set_permissions(fs::Permissions::from_mode(0o600));
+            match opts.open(&key_path) {
+                Ok(mut f) => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = f.set_permissions(fs::Permissions::from_mode(0o600));
+                    }
+                    use std::io::Write;
+                    if let Err(w_err) = f.write_all(&key).and_then(|()| f.sync_all()) {
+                        secure_zero(&mut key);
+                        return Err(w_err.to_string());
+                    }
+                    Ok(key)
+                }
+                Err(open_err) if open_err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    secure_zero(&mut key);
+                    read_winner_posix_vault_key_after_race(&key_path)
+                }
+                Err(open_err) => {
+                    secure_zero(&mut key);
+                    Err(format!(
+                        "Failed to create new POSIX .vault.key exclusively: {open_err}"
+                    ))
+                }
             }
-            use std::io::Write;
-            if let Err(w_err) = f.write_all(&key) {
-                secure_zero(&mut key);
-                return Err(w_err.to_string());
-            }
-            Ok(key)
         }
         Err(e) => Err(format!(
             "Cannot inspect POSIX .vault.key metadata (refusing to overwrite): {e}"
@@ -1777,6 +1858,58 @@ mod tests {
         assert_eq!(k1, k2);
 
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn concurrent_posix_vault_key_first_creation_never_races() {
+        for round in 0..5u32 {
+            let tmp = std::env::temp_dir().join(format!(
+                "libredb_vaultkey_race_{}_{}_{}",
+                std::process::id(),
+                round,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .subsec_nanos()
+            ));
+            let _ = fs::remove_dir_all(&tmp);
+            fs::create_dir_all(&tmp).unwrap();
+
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+            let mut handles = Vec::with_capacity(8);
+            for _ in 0..8 {
+                let dir_clone = tmp.clone();
+                let bar_clone = std::sync::Arc::clone(&barrier);
+                handles.push(std::thread::spawn(move || {
+                    bar_clone.wait();
+                    load_or_create_posix_vault_key_at(&dir_clone, true)
+                }));
+            }
+
+            let mut keys = Vec::with_capacity(8);
+            for h in handles {
+                let k = h
+                    .join()
+                    .expect("vault key racer thread panicked")
+                    .expect("concurrent load_or_create_posix_vault_key_at must not fail with AlreadyExists");
+                keys.push(k);
+            }
+            for k in &keys[1..] {
+                assert_eq!(
+                    k, &keys[0],
+                    "All concurrent threads must observe the exact same 32-byte .vault.key"
+                );
+            }
+            assert_eq!(fs::read(tmp.join(".vault.key")).unwrap(), keys[0]);
+            for entry in fs::read_dir(&tmp).unwrap() {
+                let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+                assert_eq!(
+                    name, ".vault.key",
+                    "No temporary .vault.key.init.* files may remain after initialization"
+                );
+            }
+            let _ = fs::remove_dir_all(&tmp);
+        }
     }
 
     #[test]

@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.5] - 2026-11-10
+
+### Fixed
+
+- Made initial POSIX `.vault.key` generation in `load_or_create_posix_vault_key_at` (`crates/libredb-cli/src/security.rs`) concurrency-safe and zero-partial-read atomic: new `32`-byte `0600` keys are flushed (`sync_all`) to a unique sibling `.vault.key.init.<pid>.<nonce>` file and linked atomically via `fs::hard_link` (with `create_new(true)` fallback on non-hardlink filesystems), resolving `ErrorKind::AlreadyExists` (`os error 17`) races when parallel threads or processes initialize `~/.gemini/libredb/.vault.key` simultaneously while strictly preserving non-destructive failure on corrupt or symlinked keyfiles.
+- Silenced a conditional `#[cfg(not(windows))]` `unused_mut` compiler warning on `ver_opt` in `cmd_gitea_status` (`crates/libredb-cli/src/gitea.rs`) so Linux release and test builds compile with zero warnings.
+
 ## [0.9.4] - 2026-11-10
 
 ### Fixed
