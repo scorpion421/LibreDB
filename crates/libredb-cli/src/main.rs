@@ -1130,15 +1130,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         "compact" => {
             if args.len() < 2 {
-                return Err("Usage: libredb compact <db.ldb>".into());
+                return Err("Usage: libredb compact <db.ldb> [--prune]".into());
             }
+            let prune = args.iter().skip(2).any(|a| a == "--prune");
             let t0 = Instant::now();
             let db = Arc::new(LibreDb::open(&args[1])?);
             let mut cog = CognitiveEngine::open_db(Arc::clone(&db))?;
             cog.save_index_snapshot()?;
-            let rep = db.compact_with_gravity()?;
+            let rep = db.compact_with_options(prune)?;
             println!(
-                "Gravity compaction + index snapshot finished in {:.2} ms: {} -> {} bytes ({} hot nodes in {} locality groups, {} cold nodes archived)",
+                "Gravity compaction{} + index snapshot finished in {:.2} ms: {} -> {} bytes ({} hot nodes in {} locality groups, {} cold nodes archived)",
+                if prune { " (--prune)" } else { "" },
                 t0.elapsed().as_secs_f64() * 1000.0,
                 rep.bytes_before,
                 rep.bytes_after,
@@ -1496,6 +1498,9 @@ fn modernize_global_db(
     if gdb.deprecate_key(NodeKind::Generic, "skill_full::customizations-db")? {
         deprecated_legacy += 1;
     }
+    if gdb.deprecate_key(NodeKind::Generic, "sqlite_mirror::central")? {
+        deprecated_legacy += 1;
+    }
     for (_, k_opt, _) in gdb.list_inodes(Some(NodeKind::SkillSection), false) {
         if let Some(k) = k_opt {
             if k.starts_with("customizations-db::")
@@ -1504,6 +1509,17 @@ fn modernize_global_db(
                 deprecated_legacy += 1;
             }
         }
+    }
+
+    // Purge legacy SQLite telemetry bloat (`QuotaEvent` and `TranscriptCursor`) from global customizations.ldb
+    let mut telemetry_ids: Vec<u64> = Vec::new();
+    for kind in [NodeKind::QuotaEvent, NodeKind::TranscriptCursor] {
+        for (ino, _, _) in gdb.list_inodes(Some(kind), false) {
+            telemetry_ids.push(ino.node_id);
+        }
+    }
+    if !telemetry_ids.is_empty() {
+        deprecated_legacy += gdb.deprecate_nodes(&telemetry_ids)?;
     }
 
     let mut rules_updated = 0usize;
@@ -1650,7 +1666,7 @@ fn modernize_global_db(
 
     let mut cog = CognitiveEngine::open_db(Arc::clone(gdb))?;
     cog.save_index_snapshot()?;
-    let comp = gdb.compact_with_gravity()?;
+    let comp = gdb.compact_with_options(true)?;
 
     println!(
         "[OK] Modernized global LibreDB in {:.2} ms: {} legacy customizations-db capsules deprecated, {} rules updated to libredb, {} libredb skill sections synced, {} reflexes active ({} -> {} bytes)",

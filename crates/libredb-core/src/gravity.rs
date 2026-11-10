@@ -1,6 +1,6 @@
 //! Gravity locality planner (`ext4` block-group style co-location + cold archive segregation).
 
-use crate::format::{Inode, NodeFlags, Synapse, GRAVITY_BLOCK_GROUP_BYTES};
+use crate::format::{EdgeKind, Inode, NodeFlags, NodeKind, Synapse, GRAVITY_BLOCK_GROUP_BYTES};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Deterministic physical layout plan computed during the "sleep phase" (`compact_with_gravity`).
@@ -14,35 +14,69 @@ pub struct GravityPlan {
     pub locality_groups: usize,
 }
 
-/// Computes the optimal physical extent write order for all non-tombstone Inodes.
+#[inline]
+fn is_causal_history_kind(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::Rule
+            | NodeKind::Skill
+            | NodeKind::SkillSection
+            | NodeKind::Decision
+            | NodeKind::Fact
+            | NodeKind::Task
+            | NodeKind::TaskVerification
+            | NodeKind::Handoff
+            | NodeKind::Snapshot
+            | NodeKind::CompactionCheckpoint
+    )
+}
+
+/// Computes the optimal physical extent write order and garbage-collects dead extents.
 ///
 /// Design:
-/// 1. Segregates `SUPERSEDED` and `COLD_ARCHIVE` nodes into `cold_node_ids` so historical baggage
-///    never fragments hot active reads while remaining 100% intact for causal time-travel.
-/// 2. Builds an undirected affinity graph across active nodes from all structural synapses
+/// 1. Retains all live active Inodes in `hot_node_ids`.
+/// 2. Garbage-collects all `TOMBSTONE` nodes, all superseded ephemeral/system/cache extents
+///    (`Generic`, `WorkingSet`, `Symbol`, `QuotaEvent`, `TranscriptCursor`, `SynonymCluster`),
+///    and any `2+` generation obsolete nodes. When `prune_all_cold` is false, retains `1-hop`
+///    `EdgeKind::Supersedes` predecessors of live active knowledge capsules in `cold_node_ids`
+///    for causal time-travel. When `prune_all_cold` is true, purges 100% of cold nodes.
+/// 3. Builds an undirected affinity graph across active nodes from all structural synapses
 ///    (`HasSection`, `Governs`, `DependsOn`, `Calls`, `Verifies`, `Delegates`, `Touches`, etc.).
-/// 3. Ranks anchor seeds by `(PINNED, structural_degree, importance, access_count)` and performs
+/// 4. Ranks anchor seeds by `(PINNED, structural_degree, importance, access_count)` and performs
 ///    bounded Breadth-First Locality Packing into `64 KB` (`GRAVITY_BLOCK_GROUP_BYTES`) windows.
 pub fn compute_gravity_plan(
     inodes: &HashMap<u64, Inode>,
     all_synapses: &HashMap<u64, Vec<Synapse>>,
-    keep_tombstones: bool,
+    prune_all_cold: bool,
 ) -> GravityPlan {
     let mut active_ids: Vec<u64> = Vec::new();
     let mut cold_ids: Vec<u64> = Vec::new();
 
     for (&id, inode) in inodes {
-        if inode.flags.contains(NodeFlags::TOMBSTONE) && !keep_tombstones {
-            continue;
-        }
-        if inode.flags.contains(NodeFlags::SUPERSEDED)
-            || inode.flags.contains(NodeFlags::COLD_ARCHIVE)
-            || inode.flags.contains(NodeFlags::TOMBSTONE)
-        {
-            cold_ids.push(id);
-        } else {
+        if inode.flags.is_live_active() {
             active_ids.push(id);
         }
+    }
+
+    if !prune_all_cold {
+        let mut protected_cold: HashSet<u64> = HashSet::new();
+        for &src_id in &active_ids {
+            if let Some(syns) = all_synapses.get(&src_id) {
+                for syn in syns {
+                    if syn.kind == EdgeKind::Supersedes {
+                        if let Some(target_ino) = inodes.get(&syn.target_id) {
+                            if !target_ino.flags.contains(NodeFlags::TOMBSTONE)
+                                && !target_ino.flags.is_live_active()
+                                && is_causal_history_kind(target_ino.kind)
+                            {
+                                protected_cold.insert(syn.target_id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        cold_ids.extend(protected_cold);
     }
 
     // Sort cold nodes deterministically by NodeId for reproducible binary output.

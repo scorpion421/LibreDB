@@ -69,8 +69,8 @@ $PluginJson = @'
 {
   "name": "libredb",
   "displayName": "LibreDB Cognitive Memory",
-  "version": "0.7.2",
-  "description": "Full Rust replacement for SQLite SkillsDB: single-file cognitive memory, silent SQLite auto-porter, sub-2ms hooks, guardrails, 12-language causal code graph, and dynamic multi-remote Git/Gitea automation.",
+  "version": "0.8.0",
+  "description": "Full Rust replacement for SQLite SkillsDB: single-file cognitive memory, silent SQLite auto-porter, sub-2ms hooks, guardrails, 14-language causal code graph, and dynamic multi-remote Git/Gitea automation.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
     "Run a LibreDB cognitive pulse on the active workspace to load deduplicated context",
@@ -194,9 +194,9 @@ description: >-
 1. **`libredb_pulse`** (`query`, `cwd`, `cid`, `budget`, `error`):
    - Retrieves relevant rules, micro-skills, decisions, facts, tasks, snapshots, and symbols across global + workspace layers within `budget` tokens.
    - Always pass `cid` (Conversation ID) and `cwd` so RAM-first `Zero-Repeat Delta` suppresses already-delivered items (`0` disk I/O reads on Turn 2+) and automatically re-hydrates after `/compact`.
-2. **`libredb_code`** (`action`: `"index"` | `"skeleton"` | `"impact"` | `"fim"`, `target`, `cwd`, `symbol`, `line`, `pad`):
+2. **`libredb_code`** (`action`: `"index"` | `"skeleton"` | `"impact"` | `"fim"`, `target`, `files`, `cwd`, `cid`, `force`, `symbol`, `line`, `pad`):
    - `"index"`: Incrementally scans all non-binary source files in `target`, wiring `Calls` and `Decision -> Governs -> Symbol` synapses.
-   - `"skeleton"`: Returns a `92-99%` compressed `[Lstart-Lend]` contract map of a large file (`> 800` lines).
+   - `"skeleton"`: Returns a `92-99%` compressed `[Lstart-Lend]` contract map of a single `target` file or a multi-file batch (`files: [...]`) across 14+ languages (including `.smali`, `.asm`, and `.md`) with session-aware `[Zero-Repeat Skeleton]` deduplication (`cid`).
    - `"impact"`: Returns bidirectional callers, callees, and governing architectural decisions for a symbol.
    - `"fim"`: Returns a surgical `[Lstart-Lend]` edit slice with blast-radius callers and governing decisions attached.
 3. **`libredb_memorize`** (`cwd`, `cid`, `facts`, `decisions`, `tasks`, `snapshot`, `learn_assoc`, `learn_reflex`, `sync_central_sqlite`):
@@ -205,6 +205,7 @@ description: >-
 ## CLI commands (`libredb`)
 
 - **Guardrails:** `libredb guardrail check --path "<dir>" [--staged] [--strict]`
+- **Compaction & GC:** `libredb compact <db.ldb> [--prune]`
 - **Rules, skills & reflexes:**
   - `libredb get-skill <skill_name> [--section "<Section Title>"]`
   - `libredb sync-skill <SKILL.md> [--name <skill_name>]`
@@ -247,10 +248,11 @@ $LogoSvg = @'
 
 # 7. Write user-facing README.md inside plugin bundle
 $PluginReadme = @'
-# LibreDB cognitive memory plugin (v0.7.1)
+# LibreDB cognitive memory plugin (v0.8.0)
 
 Complete standalone Rust replacement for `AntiGraviton SkillsDB` (`customizations-db`):
-- `libredb-mcp`: 3-tool multi-workspace cognitive memory & 12-language causal code-graph server with zero-I/O RAM session delta and automatic incremental workspace refresh.
+- `libredb-mcp`: 3-tool multi-workspace cognitive memory & 14-language causal code-graph server with zero-I/O RAM session delta, `[Zero-Repeat Skeleton]` deduplication, and automatic incremental workspace refresh.
+- Compaction garbage collection (`compact_with_options`) and `INDEX_FORMAT_VERSION = 2` selective cognitive `HybridIndex`.
 - Silent background 1:1 auto-migration for any pre-existing `.agents/memory.db` in older projects or chats; pure `.ldb` operation for all new projects and chats.
 - Native compiled `< 2 ms` `PreInvocation` and `PreToolUse` guardrail hooks (`hooks.json`) with post-compaction epoch hydration, live `transcript.jsonl` workspace inference, `research -> flash` subagent routing, and `CRLF`/BOM normalization.
 - Global system directives (`rules/AGENTS.md`) and dynamic multi-remote Git/Gitea release automation (`libredb git-sync` / `git-release` & `gitea-sync` / `gitea-release`).
@@ -259,6 +261,6 @@ To switch cleanly to pure single-engine operation, disable `AntiGraviton SkillsD
 '@
 [System.IO.File]::WriteAllText((Join-Path $PluginDir "README.md"), $PluginReadme, $Utf8NoBom)
 
-Write-Output "[OK] Deployed LibreDB v0.7.1 standalone binaries to: $BinDir"
+Write-Output "[OK] Deployed LibreDB v0.8.0 standalone binaries to: $BinDir"
 Write-Output "[OK] Hydrated and modernized global 19-table store at: $GlobalLdb"
 Write-Output "[OK] Installed complete Antigravity replacement plugin at: $PluginDir"

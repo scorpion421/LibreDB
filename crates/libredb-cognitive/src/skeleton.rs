@@ -57,6 +57,8 @@ impl FileSkeleton {
         let symbols = match lang.as_str() {
             "python" => extract_python_symbols(&lines, total_lines),
             "smali" => extract_smali_symbols(&lines, total_lines),
+            "asm" => extract_asm_symbols(&lines, total_lines),
+            "markdown" => extract_markdown_symbols(&lines, total_lines),
             "sql" => extract_sql_symbols(&lines, total_lines),
             "powershell" => extract_powershell_symbols(&lines, total_lines),
             "shell" => extract_shell_symbols(&lines, total_lines),
@@ -107,6 +109,53 @@ impl FileSkeleton {
         )?;
 
         Ok((skel, false))
+    }
+
+    /// Extracts or retrieves hash-cached `FileSkeleton`s for a batch of files and commits all
+    /// cache misses in a **single `commit_batch` (`1` `fsync` total instead of `N` `fsync` calls!)**.
+    pub fn index_or_get_cached_batch(
+        db: &LibreDb,
+        items: &[(&Path, Option<&str>)],
+    ) -> Result<Vec<(Self, bool)>> {
+        let mut results: Vec<(Self, bool)> = Vec::with_capacity(items.len());
+        let mut pending_writes: Vec<libredb_core::PreparedWrite> = Vec::new();
+
+        for (idx, &(path, display_label)) in items.iter().enumerate() {
+            let raw_bytes = std::fs::read(path)?;
+            let current_hash = hash_key(99, &raw_bytes);
+            let label = display_label
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| path.to_string_lossy().replace('\\', "/"));
+            let key = format!("{SKELETON_KEY_PREFIX}{label}");
+
+            if let Ok(rec) = db.get_by_key(NodeKind::WorkingSet, &key) {
+                if let Ok(cached) = serde_json::from_slice::<FileSkeleton>(&rec.payload) {
+                    if cached.content_hash == current_hash {
+                        results.push((cached, true));
+                        continue;
+                    }
+                }
+            }
+
+            let text = String::from_utf8_lossy(&raw_bytes);
+            let skel = Self::extract(label, &text);
+            let encoded = serde_json::to_vec(&skel)
+                .map_err(|_| LibreDbError::CorruptFormat("skeleton json serialize"))?;
+            let prep = db.prepare(
+                WriteRequest::new(NodeKind::WorkingSet, encoded)
+                    .with_key(key)
+                    .with_importance(200),
+                idx,
+            )?;
+            pending_writes.push(prep);
+            results.push((skel, false));
+        }
+
+        if !pending_writes.is_empty() {
+            db.commit_batch(&pending_writes)?;
+        }
+
+        Ok(results)
     }
 
     /// Renders a dense, LLM-optimized contract map (`95-99%` smaller than raw file reads).
@@ -189,6 +238,14 @@ fn detect_language(label: &str) -> String {
         "go".to_owned()
     } else if low.ends_with(".smali") {
         "smali".to_owned()
+    } else if low.ends_with(".asm")
+        || low.ends_with(".s")
+        || low.ends_with(".inc")
+        || low.ends_with(".dis")
+    {
+        "asm".to_owned()
+    } else if low.ends_with(".md") || low.ends_with(".markdown") || low.ends_with(".mdx") {
+        "markdown".to_owned()
     } else if low.ends_with(".ps1") || low.ends_with(".psm1") {
         "powershell".to_owned()
     } else if low.ends_with(".sql") {
@@ -399,6 +456,199 @@ fn extract_smali_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContra
                 }
             }
         }
+    }
+    out
+}
+
+fn strip_disasm_address_prefix(line: &str) -> &str {
+    let trimmed = line.trim_start();
+    // Handle IDA/Ghidra/objdump prefixes such as `.text:0000000140001000 ` or `00007ff612345678 `
+    let Some((first_tok, rest)) = trimmed.split_once(char::is_whitespace) else {
+        return trimmed;
+    };
+    let rest = rest.trim_start();
+    if let Some((seg, addr)) = first_tok.split_once(':') {
+        if (seg.starts_with('.') || seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+            && !addr.is_empty()
+            && addr.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            return rest;
+        }
+    }
+    if first_tok.len() >= 6
+        && first_tok.len() <= 18
+        && first_tok.trim_end_matches(':').chars().all(|c| c.is_ascii_hexdigit())
+    {
+        return rest;
+    }
+    trimmed
+}
+
+fn is_local_branch_label(name: &str) -> bool {
+    let low = name.to_ascii_lowercase();
+    name.starts_with('.')
+        || name.starts_with("@@")
+        || low.starts_with("loc_")
+        || low.starts_with("locret_")
+        || low.starts_with("jpt_")
+        || low.starts_with("def_")
+}
+
+fn extract_asm_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContract> {
+    let mut raw: Vec<(usize, Option<usize>, String, String, String)> = Vec::new();
+
+    for (idx, &line) in lines.iter().enumerate() {
+        let stripped = strip_disasm_address_prefix(line);
+        let code_part = stripped.split(';').next().unwrap_or(stripped).trim();
+        if code_part.is_empty() || code_part.starts_with("//") || code_part.starts_with('#') {
+            continue;
+        }
+
+        let tokens: Vec<&str> = code_part.split_whitespace().collect();
+        if tokens.is_empty() {
+            continue;
+        }
+
+        // 1. Section / segment directives (`SECTION .text`, `.section .text`, `.text`)
+        let t0_up = tokens[0].to_ascii_uppercase();
+        if matches!(t0_up.as_str(), "SECTION" | ".SECTION" | "SEGMENT") && tokens.len() >= 2 {
+            let sec_name = tokens[1].trim_matches([',', '"']);
+            raw.push((
+                idx + 1,
+                Some(idx + 1),
+                "section".to_owned(),
+                sec_name.to_owned(),
+                truncate_chars(code_part, 115),
+            ));
+            continue;
+        }
+
+        // 2. MASM / IDA `<name> PROC ...`
+        if tokens.len() >= 2 && tokens[1].eq_ignore_ascii_case("PROC") {
+            let proc_name = tokens[0].trim_end_matches(':');
+            if !proc_name.is_empty() && !is_local_branch_label(proc_name) {
+                let mut end_opt = None;
+                for (s_idx, &s_line) in lines.iter().enumerate().skip(idx + 1) {
+                    let s_clean = strip_disasm_address_prefix(s_line)
+                        .split(';')
+                        .next()
+                        .unwrap_or("")
+                        .trim();
+                    let s_toks: Vec<&str> = s_clean.split_whitespace().collect();
+                    if s_toks.iter().any(|t| t.eq_ignore_ascii_case("ENDP")) {
+                        end_opt = Some(s_idx + 1);
+                        break;
+                    }
+                }
+                raw.push((
+                    idx + 1,
+                    end_opt,
+                    "proc".to_owned(),
+                    proc_name.to_owned(),
+                    truncate_chars(code_part, 115),
+                ));
+                continue;
+            }
+        }
+
+        // 3. objdump `<00401000 <func_name>:` or top-level `<label>:`
+        if let Some(before_colon) = code_part.strip_suffix(':') {
+            let cand = before_colon.trim();
+            let label = if let (Some(lt), Some(gt)) = (cand.find('<'), cand.rfind('>')) {
+                if lt + 1 < gt {
+                    &cand[lt + 1..gt]
+                } else {
+                    cand
+                }
+            } else {
+                cand
+            };
+            if !label.is_empty()
+                && !label.contains(char::is_whitespace)
+                && !is_local_branch_label(label)
+                && label
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || matches!(c, '_' | '?' | '@'))
+            {
+                raw.push((
+                    idx + 1,
+                    None,
+                    "label".to_owned(),
+                    label.to_owned(),
+                    truncate_chars(code_part, 115),
+                ));
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(raw.len());
+    for i in 0..raw.len() {
+        let (start, explicit_end, ref kind, ref name, ref sig) = raw[i];
+        let end_line = explicit_end.unwrap_or_else(|| {
+            if i + 1 < raw.len() {
+                raw[i + 1].0.saturating_sub(1).max(start)
+            } else {
+                total_lines.max(start)
+            }
+        });
+        out.push(SymbolContract {
+            kind: kind.clone(),
+            name: name.clone(),
+            signature: sig.clone(),
+            doc_summary: String::new(),
+            start_line: start,
+            end_line,
+        });
+    }
+    out
+}
+
+fn extract_markdown_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContract> {
+    let mut raw: Vec<(usize, usize, String, String)> = Vec::new();
+    let mut in_fence = false;
+
+    for (idx, &line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence || !trimmed.starts_with('#') {
+            continue;
+        }
+        let hashes = trimmed.chars().take_while(|&c| c == '#').count();
+        if (1..=4).contains(&hashes) {
+            let rest = trimmed[hashes..].trim();
+            if !rest.is_empty() {
+                raw.push((
+                    idx + 1,
+                    hashes,
+                    rest.to_owned(),
+                    truncate_chars(trimmed.trim_end(), 115),
+                ));
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(raw.len());
+    for i in 0..raw.len() {
+        let (start, level, ref title, ref sig) = raw[i];
+        let mut end_line = total_lines.max(start);
+        for &(next_start, next_level, _, _) in &raw[i + 1..] {
+            if next_level <= level {
+                end_line = next_start.saturating_sub(1).max(start);
+                break;
+            }
+        }
+        out.push(SymbolContract {
+            kind: format!("h{level}"),
+            name: title.clone(),
+            signature: sig.clone(),
+            doc_summary: String::new(),
+            start_line: start,
+            end_line,
+        });
     }
     out
 }
@@ -814,5 +1064,19 @@ mod tests {
         assert_eq!(sk_cpp.language, "cpp");
         assert!(sk_cpp.symbols.iter().any(|s| s.kind == "class" && s.name == "EngineCore"));
         assert!(sk_cpp.symbols.iter().any(|s| s.kind == "method" && s.name == "initializeGraph"));
+
+        let asm_src = "SECTION .text\n.text:0000000140001000 sub_140001000 PROC NEAR\n.text:0000000140001000 mov rax, rcx\n.text:0000000140001003 loc_140001003:\n.text:0000000140001003 ret\n.text:0000000140001004 sub_140001000 ENDP\nDecryptPayload:\n    xor eax, eax\n    ret\n";
+        let sk_asm = FileSkeleton::extract("dump.asm", asm_src);
+        assert_eq!(sk_asm.language, "asm");
+        assert!(sk_asm.symbols.iter().any(|s| s.kind == "section" && s.name == ".text"));
+        assert!(sk_asm.symbols.iter().any(|s| s.kind == "proc" && s.name == "sub_140001000" && s.start_line == 2 && s.end_line == 6));
+        assert!(sk_asm.symbols.iter().any(|s| s.kind == "label" && s.name == "DecryptPayload" && s.start_line == 7 && s.end_line == 9));
+        assert!(!sk_asm.symbols.iter().any(|s| s.name == "loc_140001003"));
+
+        let md_src = "# Top Guide\nIntro\n## Architecture\n```python\n# comment inside fence\n```\n### Subcomponent\nDetails\n## Benchmarks\nDone\n";
+        let sk_md = FileSkeleton::extract("README.md", md_src);
+        assert_eq!(sk_md.language, "markdown");
+        assert_eq!(sk_md.symbols.len(), 4);
+        assert!(sk_md.symbols.iter().any(|s| s.kind == "h2" && s.name == "Architecture" && s.start_line == 3 && s.end_line == 8));
     }
 }

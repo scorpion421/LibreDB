@@ -16,6 +16,9 @@ pub struct SessionState {
     pub active_epoch: u32,
     /// Maps `node_id -> last_delivered_generation` within `active_epoch`.
     pub delivered_generations: HashMap<u64, u32>,
+    /// Maps `file_label -> content_hash` of file skeletons already delivered in `active_epoch`.
+    #[serde(default)]
+    pub delivered_skeletons: HashMap<String, u64>,
     pub cumulative_tokens_saved: u64,
     pub duplicate_hits_suppressed: u64,
 }
@@ -26,6 +29,7 @@ impl SessionState {
             conversation_id: conversation_id.into(),
             active_epoch,
             delivered_generations: HashMap::new(),
+            delivered_skeletons: HashMap::new(),
             cumulative_tokens_saved: 0,
             duplicate_hits_suppressed: 0,
         }
@@ -42,6 +46,7 @@ impl SessionState {
                 if current_epoch != parsed.active_epoch {
                     parsed.active_epoch = current_epoch;
                     parsed.delivered_generations.clear();
+                    parsed.delivered_skeletons.clear();
                 }
                 Ok(parsed)
             }
@@ -65,6 +70,21 @@ impl SessionState {
     #[inline]
     pub fn mark_delivered(&mut self, node_id: u64, generation: u32) {
         self.delivered_generations.insert(node_id, generation);
+    }
+
+    /// Returns true if the file skeleton for `file_label` with `content_hash` was already delivered in `active_epoch`.
+    #[inline]
+    pub fn is_skeleton_in_context(&self, file_label: &str, content_hash: u64) -> bool {
+        self.delivered_skeletons
+            .get(file_label)
+            .copied()
+            .is_some_and(|seen_hash| seen_hash == content_hash)
+    }
+
+    /// Records that the file skeleton for `file_label` with `content_hash` has been delivered in `active_epoch`.
+    #[inline]
+    pub fn mark_skeleton_delivered(&mut self, file_label: impl Into<String>, content_hash: u64) {
+        self.delivered_skeletons.insert(file_label.into(), content_hash);
     }
 
     /// Records a suppressed duplicate delivery and adds `saved_tokens` to session telemetry.

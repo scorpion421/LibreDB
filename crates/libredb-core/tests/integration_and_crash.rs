@@ -461,3 +461,47 @@ fn multi_handle_interleaved_ipc_commits_preserve_every_update_and_lock_free_read
     let verifier = LibreDb::open(&db_path).unwrap();
     verifier.verify_integrity().unwrap();
 }
+
+#[test]
+fn compaction_garbage_collects_superseded_system_extents_and_keeps_1_hop_causal_history() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("gc_compaction.ldb");
+    let db = LibreDb::open(&db_path).unwrap();
+
+    // 1. Write 5 iterations of a large `sys::index_snapshot` (`NodeKind::Generic`) -> 4 superseded + 1 active
+    let big_snap = vec![b'X'; 32_768];
+    for _ in 0..5 {
+        db.put(
+            WriteRequest::new(NodeKind::Generic, big_snap.clone())
+                .with_key("sys::index_snapshot")
+                .with_importance(5),
+        )
+        .unwrap();
+    }
+
+    // 2. Write 3 generations of a `Decision` (`dec_1` -> `dec_2` -> `dec_3`):
+    //    `dec_3` is active, `dec_2` is 1-hop predecessor (kept by default compaction), `dec_1` is 2-hop (purged!)
+    let id_v1 = db
+        .put(WriteRequest::new(NodeKind::Decision, b"v1_obsolete".to_vec()).with_key("arch_dec"))
+        .unwrap();
+    let id_v2 = db
+        .put(WriteRequest::new(NodeKind::Decision, b"v2_prev".to_vec()).with_key("arch_dec"))
+        .unwrap();
+    let id_v3 = db
+        .put(WriteRequest::new(NodeKind::Decision, b"v3_live".to_vec()).with_key("arch_dec"))
+        .unwrap();
+
+    let rep1 = db.compact_with_gravity().unwrap();
+    assert_eq!(rep1.hot_nodes_packed, 2); // active `sys::index_snapshot` + active `dec_3`
+    assert_eq!(rep1.cold_nodes_archived, 1); // ONLY 1-hop `dec_2` kept; all 4 old `sys::index_snapshot` + `dec_1` purged!
+    assert!(db.get(id_v3).is_ok());
+    assert!(db.get(id_v2).is_ok());
+    assert!(db.get(id_v1).is_err());
+
+    // 3. Full `--prune` (`compact_with_options(true)`) purges 100% of cold nodes:
+    let rep2 = db.compact_with_options(true).unwrap();
+    assert_eq!(rep2.hot_nodes_packed, 2);
+    assert_eq!(rep2.cold_nodes_archived, 0);
+    assert!(db.get(id_v2).is_err());
+    db.verify_integrity().unwrap();
+}

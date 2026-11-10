@@ -482,8 +482,8 @@ fn is_known_source_extension(low: &str) -> bool {
     [
         ".rs", ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".dart", ".go", ".c", ".h",
         ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".cs", ".java", ".kt", ".kts", ".swift", ".smali",
-        ".ps1", ".psm1", ".sql", ".sh", ".bash", ".zsh", ".rb", ".php", ".lua", ".zig", ".scala",
-        ".groovy", ".gradle", ".proto",
+        ".asm", ".s", ".inc", ".dis", ".ps1", ".psm1", ".sql", ".sh", ".bash", ".zsh", ".rb",
+        ".php", ".lua", ".zig", ".scala", ".groovy", ".gradle", ".proto",
     ]
     .iter()
     .any(|ext| low.ends_with(ext))

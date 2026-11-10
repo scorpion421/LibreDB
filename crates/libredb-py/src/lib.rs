@@ -159,6 +159,25 @@ impl PyBrain {
         Ok(skel.render_compact(filter, filter.is_some()))
     }
 
+    /// Extracts or retrieves hash-cached skeletons for a batch of files in a single `commit_batch` (`1` `fsync`).
+    #[pyo3(signature = (file_paths, filter=None))]
+    pub fn skeleton_batch(
+        &self,
+        file_paths: Vec<String>,
+        filter: Option<&str>,
+    ) -> PyResult<Vec<String>> {
+        let items: Vec<(&Path, Option<&str>)> = file_paths
+            .iter()
+            .map(|p| (Path::new(p.as_str()), None))
+            .collect();
+        let batch =
+            FileSkeleton::index_or_get_cached_batch(&self.project_db, &items).map_err(to_py_err)?;
+        Ok(batch
+            .into_iter()
+            .map(|(sk, _)| sk.render_compact(filter, filter.is_some()))
+            .collect())
+    }
+
     /// Indexes all non-binary source files under `root_dir` and wires call + governance synapses.
     #[pyo3(signature = (root_dir, force=false))]
     pub fn index_workspace(&self, root_dir: &str, force: bool) -> PyResult<String> {
@@ -269,10 +288,14 @@ impl PyBrain {
     }
 
     /// Runs Gravity locality compaction, refreshes the persistent index snapshot, and verifies CRC integrity.
-    pub fn compact(&self) -> PyResult<String> {
+    #[pyo3(signature = (prune=false))]
+    pub fn compact(&self, prune: bool) -> PyResult<String> {
         let mut cog = CognitiveEngine::open_db(Arc::clone(&self.project_db)).map_err(to_py_err)?;
         cog.save_index_snapshot().map_err(to_py_err)?;
-        let rep = self.project_db.compact_with_gravity().map_err(to_py_err)?;
+        let rep = self
+            .project_db
+            .compact_with_options(prune)
+            .map_err(to_py_err)?;
         serde_json::to_string(&rep).map_err(to_py_err)
     }
 

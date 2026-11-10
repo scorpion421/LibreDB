@@ -203,7 +203,21 @@ impl CognitiveEngine {
             NodeKind::CompactionCheckpoint,
             NodeKind::Handoff,
         ];
-        let lexical_hits = self.index.search(query, Some(&searchable_kinds), 24);
+        let mut lexical_hits = self.index.search(query, Some(&searchable_kinds), 24);
+        if lexical_hits.is_empty() {
+            // Fallback for pure code-symbol queries when no prose capsule matched:
+            // match active `NodeKind::Symbol` keys directly in RAM (`0` disk I/O, `0` index bloat).
+            let q_tokens = libredb_index::segment_universal_tokens(query);
+            for (sym_id, sym_score) in self.db.match_active_keys_by_kind(NodeKind::Symbol, &q_tokens, 8) {
+                lexical_hits.push(libredb_index::SearchHit {
+                    node_id: sym_id,
+                    kind: NodeKind::Symbol,
+                    key: None,
+                    score: sym_score,
+                    matched_features: Vec::new(),
+                });
+            }
+        }
         if lexical_hits.is_empty() {
             return Vec::new();
         }

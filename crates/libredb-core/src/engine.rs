@@ -984,6 +984,85 @@ impl LibreDb {
         Ok(true)
     }
 
+    /// Tombstones a batch of `node_ids` (keyed or unkeyed) in a single atomic commit frame.
+    pub fn deprecate_nodes(&self, node_ids: &[u64]) -> Result<usize> {
+        if node_ids.is_empty() {
+            return Ok(0);
+        }
+        let _guard = self.commit_lock.lock();
+        let _ipc_guard = IpcWriteGuard::acquire(&*self.backend)?;
+        self.sync_from_disk_if_changed()?;
+        let old_snap = Arc::clone(&self.state.read());
+
+        let mut next_snap = SnapshotState {
+            superblock: old_snap.superblock,
+            inodes: old_snap.inodes.clone(),
+            overflow_synapses: old_snap.overflow_synapses.clone(),
+            key_dir: old_snap.key_dir.clone(),
+            reverse_keys: old_snap.reverse_keys.clone(),
+        };
+
+        let now = now_unix_ns();
+        let mut modified_inodes = Vec::new();
+        let mut key_ops = Vec::new();
+
+        for &target_id in node_ids {
+            let Some(inode) = next_snap.inodes.get_mut(&target_id) else {
+                continue;
+            };
+            if inode.flags.contains(NodeFlags::TOMBSTONE) {
+                continue;
+            }
+            if inode.flags.is_live_active() {
+                next_snap.superblock.active_node_count =
+                    next_snap.superblock.active_node_count.saturating_sub(1);
+            }
+            inode.flags.insert(NodeFlags::TOMBSTONE | NodeFlags::SUPERSEDED);
+            inode.updated_ns = now;
+            modified_inodes.push(inode.clone());
+
+            if let Some((k_kind, k_str)) = next_snap.reverse_keys.remove(&target_id) {
+                next_snap.key_dir.remove(&(k_kind, k_str.clone()));
+                key_ops.push(KeyMutation::Remove {
+                    kind: k_kind,
+                    key: k_str,
+                });
+            }
+        }
+
+        if modified_inodes.is_empty() {
+            return Ok(0);
+        }
+
+        let count = modified_inodes.len();
+        let new_seq = next_snap.superblock.commit_seq + 1;
+        let commit_frame = encode_metadata_frame(
+            COMMIT_FRAME_MAGIC,
+            new_seq,
+            &modified_inodes,
+            &key_ops,
+        )?;
+
+        let env_start = next_snap.superblock.data_tail_offset;
+        let total_env_len = (12 + commit_frame.len()) as u32;
+        let mut envelope_buf = Vec::with_capacity(total_env_len as usize);
+        envelope_buf.extend_from_slice(b"LDBE");
+        envelope_buf.extend_from_slice(&total_env_len.to_le_bytes());
+        envelope_buf.extend_from_slice(&12u32.to_le_bytes());
+        envelope_buf.extend_from_slice(&commit_frame);
+
+        self.backend.write_at(env_start, &envelope_buf)?;
+        self.backend.sync_data()?;
+
+        next_snap.superblock.commit_seq = new_seq;
+        next_snap.superblock.data_tail_offset = env_start + (total_env_len as u64);
+        next_snap.superblock.last_commit_ns = now;
+        self.write_superblock_slot(&next_snap.superblock)?;
+
+        *self.state.write() = Arc::new(next_snap);
+        Ok(count)
+    }
+
     /// Lock-free `O(1)` snapshot read by `NodeId` (never blocks or gets blocked by concurrent writers).
     pub fn get(&self, node_id: u64) -> Result<NodeRecord> {
         let snap = Arc::clone(&self.state.read());
@@ -1152,6 +1231,56 @@ impl LibreDb {
         let key = snap.reverse_keys.get(&node_id).map(|(_, k)| k.clone());
         let syns = collect_node_synapses(&snap, &ino);
         Some((ino, key, syns))
+    }
+
+    /// Matches active logical keys of `kind` against lowercase `query_tokens` in RAM without cloning Inodes (`0` disk I/O).
+    pub fn match_active_keys_by_kind(
+        &self,
+        kind: NodeKind,
+        query_tokens: &[String],
+        limit: usize,
+    ) -> Vec<(u64, f64)> {
+        if query_tokens.is_empty() || limit == 0 {
+            return Vec::new();
+        }
+        let snap = self.state.read();
+        let mut hits: Vec<(u64, f64)> = Vec::new();
+        for ((k_kind, key_str), &nid) in &snap.key_dir {
+            if *k_kind != kind {
+                continue;
+            }
+            let Some(ino) = snap.inodes.get(&nid) else {
+                continue;
+            };
+            if !ino.flags.is_live_active() {
+                continue;
+            }
+            let key_low = key_str.to_ascii_lowercase();
+            let short_low = key_low.rsplit("::").next().unwrap_or(&key_low);
+            let mut score = 0.0_f64;
+            for tok in query_tokens {
+                if tok.len() < 3 {
+                    continue;
+                }
+                if short_low == tok {
+                    score += 6.0;
+                } else if short_low.contains(tok.as_str()) {
+                    score += 3.5;
+                } else if key_low.contains(tok.as_str()) {
+                    score += 1.5;
+                }
+            }
+            if score > 0.0 {
+                hits.push((nid, score));
+            }
+        }
+        hits.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        hits.truncate(limit);
+        hits
     }
 
     /// Traces temporal and causal lineage (`Supersedes`, `CausedBy`, `Governs`) starting at `root_id`.
@@ -1353,13 +1482,19 @@ impl LibreDb {
 
     /// Executes the crash-proof two-phase disjoint-window Gravity Compaction ("sleep phase"):
     ///
-    /// 1. Packs active `Inode` families into contiguous `64 KB` Gravity locality groups and moves
-    ///    `SUPERSEDED`/`COLD` nodes to the Cold Archive Tail.
+    /// 1. Packs active `Inode` families into contiguous `64 KB` Gravity locality groups, retains
+    ///    1-hop `Supersedes` history for active knowledge capsules, and garbage-collects all
+    ///    superseded system/cache/symbol extents and tombstones.
     /// 2. Stages the compacted image at `T_stage = align_up(max(current_tail, 8192 + Lc), 4096)`,
     ///    flushes, and flips `Superblock #1` (zero overlap with live data!).
     /// 3. Relocates the compacted image to `[8192 .. 8192 + Lc]` (100% disjoint from `T_stage`!),
     ///    flushes, flips `Superblock #2`, and shrinks the file via `set_len(8192 + Lc)`.
     pub fn compact_with_gravity(&self) -> Result<CompactionReport> {
+        self.compact_with_options(false)
+    }
+
+    /// Executes Gravity Compaction with optional full cold-archive pruning (`prune_all_cold = true`).
+    pub fn compact_with_options(&self, prune_all_cold: bool) -> Result<CompactionReport> {
         let _guard = self.commit_lock.lock();
         let _ipc_guard = IpcWriteGuard::acquire(&*self.backend)?;
         self.sync_from_disk_if_changed()?;
@@ -1373,19 +1508,21 @@ impl LibreDb {
             full_synapses.insert(nid, collect_node_synapses(&old_snap, inode));
         }
 
-        let plan = compute_gravity_plan(&old_snap.inodes, &full_synapses, false);
+        let plan = compute_gravity_plan(&old_snap.inodes, &full_synapses, prune_all_cold);
         let ordered_ids: Vec<u64> = plan
             .hot_node_ids
             .iter()
             .chain(plan.cold_node_ids.iter())
             .copied()
             .collect();
+        let kept_ids: HashSet<u64> = ordered_ids.iter().copied().collect();
 
         // Read raw stored extent slices once and build relative offsets `0 .. extents_bytes_len`.
         struct RelEntry {
             inode: Inode,
             data_rel: Option<(u64, Vec<u8>, u32)>,
             edge_rel: Option<(u64, Vec<u8>, u32)>,
+            overflow_syns: Vec<Synapse>,
         }
 
         let mut rel_cursor = 0u64;
@@ -1404,7 +1541,23 @@ impl LibreDb {
                 active_count += 1;
             }
 
-            let over_syns = old_snap.overflow_synapses.get(&nid);
+            // Strip any synapses pointing to garbage-collected node_ids.
+            let mut valid_syns: Vec<Synapse> = full_synapses
+                .get(&nid)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|s| kept_ids.contains(&s.target_id))
+                .collect();
+            inode.inline_synapses = [None; INLINE_SYNAPSE_CAP];
+            for (idx, syn) in valid_syns.iter().take(INLINE_SYNAPSE_CAP).enumerate() {
+                inode.inline_synapses[idx] = Some(*syn);
+            }
+            let over_syns: Vec<Synapse> = if valid_syns.len() > INLINE_SYNAPSE_CAP {
+                valid_syns.split_off(INLINE_SYNAPSE_CAP)
+            } else {
+                Vec::new()
+            };
 
             match inode.storage {
                 InodeStorage::Inline { .. } => {
@@ -1412,6 +1565,7 @@ impl LibreDb {
                         inode,
                         data_rel: None,
                         edge_rel: None,
+                        overflow_syns: Vec::new(),
                     });
                 }
                 InodeStorage::Extent {
@@ -1433,15 +1587,11 @@ impl LibreDb {
                     let d_rel = rel_cursor;
                     rel_cursor += stored_bytes.len() as u64;
 
-                    let e_rel = if let Some(syns) = over_syns {
-                        if !syns.is_empty() {
-                            let e_buf = encode_overflow_synapses(syns);
-                            let off = rel_cursor;
-                            rel_cursor += e_buf.len() as u64;
-                            Some((off, e_buf, syns.len() as u32))
-                        } else {
-                            None
-                        }
+                    let e_rel = if !over_syns.is_empty() {
+                        let e_buf = encode_overflow_synapses(&over_syns);
+                        let off = rel_cursor;
+                        rel_cursor += e_buf.len() as u64;
+                        Some((off, e_buf, over_syns.len() as u32))
                     } else {
                         None
                     };
@@ -1450,6 +1600,7 @@ impl LibreDb {
                         inode,
                         data_rel: Some((d_rel, stored_bytes, data_crc32)),
                         edge_rel: e_rel,
+                        overflow_syns: over_syns,
                     });
                 }
             }
@@ -1588,14 +1739,12 @@ impl LibreDb {
         self.backend.set_len(final_eof)?;
         self.backend.sync_data()?;
 
-        // Rebuild clean in-memory SnapshotState without tombstones.
+        // Rebuild clean in-memory SnapshotState without tombstones or pruned cold nodes.
         let mut new_inodes_map = HashMap::with_capacity(final_inodes.len());
         let mut new_overflow = HashMap::new();
-        for ino in final_inodes {
-            if let Some(syns) = old_snap.overflow_synapses.get(&ino.node_id) {
-                if !syns.is_empty() {
-                    new_overflow.insert(ino.node_id, syns.clone());
-                }
+        for (entry, ino) in rel_entries.into_iter().zip(final_inodes.into_iter()) {
+            if !entry.overflow_syns.is_empty() {
+                new_overflow.insert(ino.node_id, entry.overflow_syns);
             }
             new_inodes_map.insert(ino.node_id, ino);
         }

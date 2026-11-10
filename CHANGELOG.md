@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-11-10
+
+### Added
+
+- Added native assembly/disassembly (`.asm`, `.s`, `.inc`, `.dis` supporting MASM/NASM/GAS/IDA/Ghidra `PROC .. ENDP`, sections, and non-local labels) and Markdown (`.md`, `.markdown`, `.mdx` ATX `#`..`####` sections ignoring fenced code blocks) contract extractors in `crates/libredb-cognitive/src/skeleton.rs`.
+- Added single-transaction multi-file batch skeleton extraction (`FileSkeleton::index_or_get_cached_batch` in `crates/libredb-cognitive/src/skeleton.rs`, `Brain.skeleton_batch` in `crates/libredb-py/src/lib.rs`, and `files: [...]` + session-aware `Zero-Repeat Skeleton` deduplication in `libredb_code` in `crates/libredb-cli/src/mcp.rs`), replacing per-file `fsync` commits with a single `commit_batch`.
+- Added `LibreDb::compact_with_options(prune_all_cold: bool)` and `LibreDb::deprecate_nodes` in `crates/libredb-core/src/engine.rs`, exposed via `libredb compact <db.ldb> [--prune]` and `Brain.compact(prune=False)`.
+
+### Changed
+
+- Upgraded `compute_gravity_plan` (`crates/libredb-core/src/gravity.rs`) and `compact_with_options` (`crates/libredb-core/src/engine.rs`) to garbage-collect all superseded system, cache, symbol, and telemetry extents (`sys::index_snapshot`, `session::*`, `skeleton::*`, `Symbol`, `QuotaEvent`, `TranscriptCursor`) and `2+` generation obsolete nodes while retaining `1-hop` `EdgeKind::Supersedes` history for active knowledge capsules (`Rule`, `Skill`, `Decision`, `Fact`, `Task`), and stripping dangling synapses to pruned nodes.
+- Added `is_indexable_cognitive_node` and `INDEX_FORMAT_VERSION = 2` in `crates/libredb-index/src/lib.rs` plus `LibreDb::match_active_keys_by_kind` in `crates/libredb-core/src/engine.rs` so non-prose nodes (`Symbol`, `QuotaEvent`, `TranscriptCursor`, `WorkingSet`, `Generic`) no longer bloat the `BM25` + `3-gram` `sys::index_snapshot`.
+- Updated `modernize_global_db` (`crates/libredb-cli/src/main.rs`) to purge legacy SQLite `QuotaEvent`, `TranscriptCursor`, and `sqlite_mirror::central` bloat nodes and run `compact_with_options(true)`.
+
 ## [0.7.2] - 2026-11-10
 
 ### Changed

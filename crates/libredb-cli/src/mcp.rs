@@ -14,7 +14,7 @@ use libredb_bridge::import_sqlite_readonly;
 use libredb_cognitive::{
     create_subagent_handoff, execute_atomic_batch, extract_fim_slice, index_workspace,
     query_symbol_impact, sync_transcript_epoch, AtomicBatchSpec, CognitiveEngine, FileSkeleton,
-    OverlayBrain, PulseRequest, ReflexEngine, ReflexRule,
+    OverlayBrain, PulseRequest, ReflexEngine, ReflexRule, SessionState,
 };
 use libredb_core::LibreDb;
 use serde_json::{json, Value};
@@ -181,18 +181,21 @@ pub fn handle_rpc_method(
                 },
                 {
                     "name": "libredb_code",
-                    "description": "Zero-bloat source code graph: 'skeleton' (-95% file map), 'impact' (callers + governing decisions), 'fim' (surgical edit slice + callers + decisions), or 'index' (scan workspace).",
+                    "description": "Zero-bloat source code graph: 'skeleton' (-95% file map, supports single 'target' or batch 'files'), 'impact' (callers + governing decisions), 'fim' (surgical edit slice + callers + decisions), or 'index' (scan workspace).",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "action": { "type": "string", "enum": ["skeleton", "impact", "fim", "index"] },
                             "target": { "type": "string", "description": "File path, workspace directory, or symbol query" },
+                            "files": { "type": "array", "items": { "type": "string" }, "description": "Optional batch of file paths for action='skeleton' (single fsync)" },
                             "cwd": { "type": "string" },
+                            "cid": { "type": "string", "description": "Optional conversation ID for Zero-Repeat Skeleton deduplication" },
+                            "force": { "type": "boolean", "description": "Force full skeleton emission even if unchanged in session" },
                             "symbol": { "type": "string", "description": "Symbol filter or FIM target" },
                             "line": { "type": "integer" },
                             "pad": { "type": "integer", "default": 12 }
                         },
-                        "required": ["action", "target"]
+                        "required": ["action"]
                     }
                 },
                 {
@@ -301,29 +304,36 @@ fn dispatch_tool(
         }
         "libredb_code" => {
             let action = args.get("action").and_then(Value::as_str).unwrap_or("skeleton");
-            let target = args.get("target").and_then(Value::as_str).ok_or("Missing target")?;
+            let target_opt = args.get("target").and_then(Value::as_str);
+            let files_arr: Vec<String> = args
+                .get("files")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .map(ToOwned::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let first_file_hint = target_opt.or_else(|| files_arr.first().map(String::as_str));
             let sym = args.get("symbol").and_then(Value::as_str);
             let line = args.get("line").and_then(Value::as_u64).map(|n| n as usize);
             let pad = args.get("pad").and_then(Value::as_u64).unwrap_or(12) as usize;
+            let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
 
-            let brain = state.resolve_brain_mut(cwd_hint.or(Some(target)), cid_arg)?;
+            let brain = state.resolve_brain_mut(cwd_hint.or(first_file_hint), cid_arg)?;
             let proj_db = Arc::clone(brain.project_db());
-            let resolved_target: PathBuf = {
-                let tp = Path::new(target);
+            let resolve_rel = |raw_p: &str| -> PathBuf {
+                let tp = Path::new(raw_p);
                 if tp.is_relative() {
                     if let Some(c) = args.get("cwd").and_then(Value::as_str) {
                         let candidate = Path::new(c).join(tp);
                         if candidate.exists() {
-                            candidate
-                        } else {
-                            tp.to_path_buf()
+                            return candidate;
                         }
-                    } else {
-                        tp.to_path_buf()
                     }
-                } else {
-                    tp.to_path_buf()
                 }
+                tp.to_path_buf()
             };
 
             let ws_root: Option<PathBuf> = args
@@ -334,10 +344,76 @@ fn dispatch_tool(
 
             match action {
                 "skeleton" => {
-                    let (skel, _) = FileSkeleton::index_or_get_cached(&proj_db, &resolved_target, None)?;
-                    Ok(skel.render_compact(sym, sym.is_some()))
+                    let mut requested_paths: Vec<PathBuf> = Vec::new();
+                    if let Some(t) = target_opt {
+                        if !t.trim().is_empty() {
+                            requested_paths.push(resolve_rel(t));
+                        }
+                    }
+                    for f in &files_arr {
+                        let rp = resolve_rel(f);
+                        if !requested_paths.contains(&rp) {
+                            requested_paths.push(rp);
+                        }
+                    }
+                    if requested_paths.is_empty() {
+                        return Err("Missing 'target' or 'files' for action='skeleton'".into());
+                    }
+
+                    let items: Vec<(&Path, Option<&str>)> = requested_paths
+                        .iter()
+                        .map(|p| (p.as_path(), None))
+                        .collect();
+                    let skeletons = FileSkeleton::index_or_get_cached_batch(&proj_db, &items)?;
+
+                    let mut session_opt: Option<SessionState> = if let Some(cid) = cid_arg {
+                        let mut epoch = 1u32;
+                        if let Some(tp) = infer_antigravity_transcript_path(cid) {
+                            if tp.exists() {
+                                epoch = sync_transcript_epoch(&proj_db, cid, &tp).unwrap_or(1);
+                            }
+                        }
+                        SessionState::load_or_init(&proj_db, cid, epoch).ok()
+                    } else {
+                        None
+                    };
+
+                    let mut out_blocks: Vec<String> = Vec::with_capacity(skeletons.len());
+                    let mut session_dirty = false;
+
+                    for (skel, _) in skeletons {
+                        if !force && sym.is_none() {
+                            if let Some(ref mut sess) = session_opt {
+                                if sess.is_skeleton_in_context(&skel.file_label, skel.content_hash) {
+                                    sess.record_suppression(skel.raw_tokens, 16);
+                                    session_dirty = true;
+                                    out_blocks.push(format!(
+                                        "=== [Zero-Repeat Skeleton]: {} (unchanged in session, hash={:016x}, L1-L{}, {} contracts, saved ~{} tok) ===\n",
+                                        skel.file_label,
+                                        skel.content_hash,
+                                        skel.total_lines,
+                                        skel.symbols.len(),
+                                        skel.raw_tokens.saturating_sub(16)
+                                    ));
+                                    continue;
+                                }
+                                sess.mark_skeleton_delivered(skel.file_label.clone(), skel.content_hash);
+                                session_dirty = true;
+                            }
+                        }
+                        out_blocks.push(skel.render_compact(sym, sym.is_some()));
+                    }
+
+                    if session_dirty {
+                        if let Some(ref sess) = session_opt {
+                            let _ = sess.save(&proj_db);
+                        }
+                    }
+
+                    Ok(out_blocks.join("\n"))
                 }
                 "impact" => {
+                    let target = target_opt.ok_or("Missing target")?;
                     if let Some(ref root) = ws_root {
                         if let Ok(rep) = index_workspace(&proj_db, root, false) {
                             if rep.files_reindexed > 0 {
@@ -352,6 +428,8 @@ fn dispatch_tool(
                     Ok(serde_json::to_string_pretty(&reports)?)
                 }
                 "fim" => {
+                    let target = target_opt.ok_or("Missing target")?;
+                    let resolved_target = resolve_rel(target);
                     if let Some(ref root) = ws_root {
                         if let Ok(rep) = index_workspace(&proj_db, root, false) {
                             if rep.files_reindexed > 0 {
@@ -366,6 +444,8 @@ fn dispatch_tool(
                     Ok(bundle.format_compact())
                 }
                 "index" => {
+                    let target = target_opt.ok_or("Missing target")?;
+                    let resolved_target = resolve_rel(target);
                     let rep = index_workspace(&proj_db, &resolved_target, false)?;
                     let mut cog = CognitiveEngine::open_db(proj_db)?;
                     cog.save_index_snapshot()?;

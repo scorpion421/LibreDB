@@ -20,6 +20,9 @@ use std::collections::{HashMap, HashSet};
 
 pub const HEBBIAN_KEY_PREFIX: &str = "hebbian::";
 pub const INDEX_SNAPSHOT_KEY: &str = "sys::index_snapshot";
+/// Binary schema/filtering version for `sys::index_snapshot`. Bumping this automatically
+/// rebuilds any older bloated snapshot (e.g. v1 with `Symbol`/`QuotaEvent` postings) on open.
+pub const INDEX_FORMAT_VERSION: u32 = 2;
 
 /// Ranked search hit produced by `HybridIndex::search`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,6 +56,8 @@ struct DocMeta {
 /// Universal, zero-hardcoded-language hybrid index (`BM25 Words + BM25 Character N-Grams + Learned Hebbian Bridges`).
 #[derive(Default, Serialize, Deserialize)]
 pub struct HybridIndex {
+    #[serde(default)]
+    format_version: u32,
     indexed_commit_seq: u64,
     docs: HashMap<u64, DocMeta>,
     total_word_len: u64,
@@ -68,23 +73,28 @@ pub struct HybridIndex {
 impl HybridIndex {
     /// Creates an empty index with zero hardcoded language assumptions or dictionaries.
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            format_version: INDEX_FORMAT_VERSION,
+            ..Self::default()
+        }
     }
 
     /// Loads a persisted `sys::index_snapshot` from `db` and incrementally reconciles any new or
     /// superseded `Inodes` since `indexed_commit_seq` (`< 5 ms` cold startup on thousands of nodes),
-    /// falling back to a full build if no snapshot exists yet.
+    /// falling back to a full build if no snapshot exists yet or if the snapshot format was upgraded.
     pub fn load_or_build(db: &LibreDb) -> Result<Self> {
         let current_seq = db.stats()?.commit_seq;
 
         if let Ok(snap_rec) = db.get_by_key(NodeKind::Generic, INDEX_SNAPSHOT_KEY) {
             if let Ok(mut cached) = serde_json::from_slice::<HybridIndex>(&snap_rec.payload) {
-                if cached.indexed_commit_seq == current_seq {
+                if cached.format_version == INDEX_FORMAT_VERSION {
+                    if cached.indexed_commit_seq == current_seq {
+                        return Ok(cached);
+                    }
+                    // Incrementally reconcile only changed/added/superseded Inodes!
+                    cached.reconcile_delta(db, current_seq)?;
                     return Ok(cached);
                 }
-                // Incrementally reconcile only changed/added/superseded Inodes!
-                cached.reconcile_delta(db, current_seq)?;
-                return Ok(cached);
             }
         }
 
@@ -94,6 +104,7 @@ impl HybridIndex {
     /// Persists the compiled `HybridIndex` inside `db` (`LZ4`-compressed single extent) so subsequent
     /// CLI processes start in milliseconds without re-tokenizing unchanged capsules.
     pub fn save_snapshot(&mut self, db: &LibreDb) -> Result<u64> {
+        self.format_version = INDEX_FORMAT_VERSION;
         let payload = serde_json::to_vec(self)
             .map_err(|_| libredb_core::LibreDbError::CorruptFormat("index snapshot serialize"))?;
         let nid = db.put(
@@ -102,13 +113,10 @@ impl HybridIndex {
                 .with_importance(5),
         )?;
         self.indexed_commit_seq = db.stats()?.commit_seq;
-        // Re-write header seq if needed? Wait: `commit_seq` just incremented by 1 when storing `INDEX_SNAPSHOT_KEY`!
-        // Because `INDEX_SNAPSHOT_KEY` is excluded from indexing (`is_internal_system_key`), any snapshot whose
-        // `reconcile_delta` sees 0 new non-system nodes completes in `O(N_inodes)` RAM scan (< 0.2 ms) with 0 disk reads!
         Ok(nid)
     }
 
-    /// Full build from all live active capsules in `db`.
+    /// Full build from all live active prose/cognitive capsules in `db`.
     pub fn build_from_db(db: &LibreDb) -> Result<Self> {
         let mut idx = Self::new();
         let current_seq = db.stats()?.commit_seq;
@@ -118,10 +126,8 @@ impl HybridIndex {
         let mut meta_lookup: HashMap<u64, (Option<String>, u32)> = HashMap::with_capacity(active.len());
 
         for (ino, key, _) in active {
-            if let Some(ref k) = key {
-                if is_internal_system_key(k) {
-                    continue;
-                }
+            if !is_indexable_cognitive_node(ino.kind, key.as_deref()) {
+                continue;
             }
             fetch_ids.push(ino.node_id);
             meta_lookup.insert(ino.node_id, (key, ino.generation));
@@ -156,10 +162,8 @@ impl HybridIndex {
         let mut meta_lookup: HashMap<u64, (Option<String>, u32)> = HashMap::new();
 
         for (ino, key, _) in active {
-            if let Some(ref k) = key {
-                if is_internal_system_key(k) {
-                    continue;
-                }
+            if !is_indexable_cognitive_node(ino.kind, key.as_deref()) {
+                continue;
             }
             live_ids.insert(ino.node_id);
             let needs_index = match self.docs.get(&ino.node_id) {
@@ -607,6 +611,24 @@ pub fn is_internal_system_key(k: &str) -> bool {
         || k.starts_with("session::")
         || k.starts_with("skeleton::")
         || k.starts_with("sys::")
+}
+
+/// Returns true if `(kind, key)` is a prose/cognitive capsule that belongs in the `BM25` + `3-gram`
+/// `HybridIndex`. Excludes telemetry (`QuotaEvent`, `TranscriptCursor`), raw internal blobs (`Generic`),
+/// cached file skeletons (`WorkingSet`), and raw code symbols (`Symbol`, which are queried via RAM
+/// `key_dir` and the code graph without bloating `sys::index_snapshot`).
+pub fn is_indexable_cognitive_node(kind: NodeKind, key: Option<&str>) -> bool {
+    if key.is_some_and(is_internal_system_key) {
+        return false;
+    }
+    !matches!(
+        kind,
+        NodeKind::Generic
+            | NodeKind::QuotaEvent
+            | NodeKind::TranscriptCursor
+            | NodeKind::WorkingSet
+            | NodeKind::Symbol
+    )
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
