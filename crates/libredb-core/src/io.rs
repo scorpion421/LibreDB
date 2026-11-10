@@ -171,10 +171,33 @@ impl OsFileBackend {
     }
 }
 
-/// Detects UNC paths (`\\server\share` or `\\?\UNC\...`) to apply SMB-safe sync semantics.
+/// Detects UNC paths (`\\server\share`, `\\?\UNC\...`) and mapped SMB network drives (`Q:\...`)
+/// to apply SMB-safe sync semantics without misclassifying local `\\?\C:\...` verbatim paths.
 pub fn detect_network_path(path: &Path) -> bool {
     let raw = path.to_string_lossy();
-    raw.starts_with("\\\\")
+    if raw.len() >= 8 && raw[..8].eq_ignore_ascii_case(r"\\?\UNC\") {
+        return true;
+    }
+    if raw.starts_with(r"\\?\") {
+        return false;
+    }
+    if raw.starts_with(r"\\") {
+        return true;
+    }
+    let probe = if path.exists() {
+        Some(path)
+    } else {
+        path.parent().filter(|p| p.exists())
+    };
+    if let Some(p) = probe {
+        if let Ok(canon) = std::fs::canonicalize(p) {
+            let cs = canon.to_string_lossy();
+            if cs.len() >= 8 && cs[..8].eq_ignore_ascii_case(r"\\?\UNC\") {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 impl StorageBackend for OsFileBackend {
@@ -430,5 +453,24 @@ impl StorageBackend for FaultInjectingBackend {
 
     fn write_ops_count(&self) -> u64 {
         self.write_ops.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::detect_network_path;
+    use std::path::Path;
+
+    #[test]
+    fn detect_network_path_distinguishes_unc_from_local_verbatim() {
+        assert!(detect_network_path(Path::new(
+            r"\\?\UNC\fileserver.corp.example\share\workspace\.agents\memory.ldb"
+        )));
+        assert!(detect_network_path(Path::new(
+            r"\\fileserver.corp.example\share\workspace\.agents\memory.ldb"
+        )));
+        assert!(!detect_network_path(Path::new(
+            r"\\?\D:\Antigravity\LibreDB\.agents\memory.ldb"
+        )));
     }
 }

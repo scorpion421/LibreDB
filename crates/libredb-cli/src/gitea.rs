@@ -1101,8 +1101,11 @@ fn record_learned_workspace(ldb: &LibreDb, clean_root: &Path) {
     }
 }
 
-fn strip_verbatim_prefix(p: &Path) -> PathBuf {
+pub fn strip_verbatim_prefix(p: &Path) -> PathBuf {
     let s = p.to_string_lossy();
+    if s.len() >= 8 && s[..8].eq_ignore_ascii_case(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{}", &s[8..]));
+    }
     if let Some(stripped) = s.strip_prefix(r"\\?\") {
         PathBuf::from(stripped)
     } else {
@@ -1369,4 +1372,34 @@ fn percent_encode(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_verbatim_prefix;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn strip_verbatim_prefix_preserves_unc_and_drive_paths() {
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(
+                r"\\?\UNC\fileserver.corp.example\home$\user\Antigravity\LibreDB"
+            )),
+            PathBuf::from(r"\\fileserver.corp.example\home$\user\Antigravity\LibreDB")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(
+                r"\\?\unc\fileserver.corp.example\share\workspace"
+            )),
+            PathBuf::from(r"\\fileserver.corp.example\share\workspace")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\D:\Antigravity\LibreDB")),
+            PathBuf::from(r"D:\Antigravity\LibreDB")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"Q:\Antigravity\LibreDB")),
+            PathBuf::from(r"Q:\Antigravity\LibreDB")
+        );
+    }
 }

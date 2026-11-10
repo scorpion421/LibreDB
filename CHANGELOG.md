@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.3] - 2026-11-10
+
+### Added
+
+- Added automatic `Unblock-File` (`Zone.Identifier` removal) and a live `cmd.exe /c` execution probe in `scripts/deploy_plugin.ps1` before writing `hooks.json`, automatically setting `"enabled": false` when Enterprise Active Directory `AppLocker` or `SRP` policies block `cmd.exe /c` hook execution so `PreToolUse` never aborts tool calls.
+- Added `no-hardcoded-hosts-or-domains` (`detect_hardcoded_internal_unc`) in `crates/libredb-cognitive/src/guardrail.rs` to block internal `.local` Active Directory UNC FQDNs in source and test files.
+
+### Changed
+
+- Updated `scripts/deploy_plugin.ps1` to deploy the native `libredb.exe` PE binary directly into `~/.gemini/antigravity/bin/libredb.exe` (and remove any legacy `libredb.cmd` batch wrapper), avoiding Enterprise Active Directory `AppLocker` / `SRP` batch-script blocks in user profile directories and eliminating `cmd.exe` subprocess startup overhead.
+- Upgraded `detect_network_path` in `crates/libredb-core/src/io.rs` to detect mapped SMB network drives (`Q:\...` resolving to `\\?\UNC\...`) for SMB-safe `sync_all()` durability without misclassifying local `\\?\C:\...` verbatim paths.
+
+### Fixed
+
+- Fixed `strip_verbatim_prefix` in `crates/libredb-cli/src/gitea.rs` to check `\\?\UNC\` (case-insensitively) and rewrite it to `\\<server>\<share>\...` before falling back to `\\?\`, resolving `os error 267` when `std::fs::canonicalize` resolves a mapped SMB network drive (`Q:\...`) to `\\?\UNC\<server>\<share>\...`.
+
 ## [0.8.2] - 2026-11-10
 
 ### Changed

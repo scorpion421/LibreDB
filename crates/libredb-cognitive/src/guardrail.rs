@@ -95,6 +95,19 @@ pub fn check_text_guardrails(text: &str, filename: &str) -> Vec<GuardrailViolati
             });
         }
 
+        if let Some(host_leak) = detect_hardcoded_internal_unc(line) {
+            out.push(GuardrailViolation {
+                rule: "no-hardcoded-hosts-or-domains".to_owned(),
+                severity: "CRITICAL".to_owned(),
+                file: filename.to_owned(),
+                line: line_no,
+                message: format!(
+                    "Hardcoded internal AD domain or UNC host path detected ({host_leak}). Use generic '.example' placeholders in tests and runtime configuration elsewhere."
+                ),
+                snippet: truncate_ascii_safe(line.trim(), 70),
+            });
+        }
+
         if is_changelog {
             let trimmed = line.trim();
             if trimmed.eq_ignore_ascii_case("# changelog") {
@@ -299,14 +312,7 @@ pub fn audit_workspace_guardrails(
 
 pub fn is_test_or_scratch_path(path_str: &str) -> bool {
     let norm = path_str.to_ascii_lowercase().replace('\\', "/");
-    if norm.contains("/scratch/") || norm.contains("/tests/") || norm.contains("/__tests__/") {
-        return true;
-    }
-    let fname = norm.rsplit('/').next().unwrap_or(&norm);
-    fname.starts_with("test_")
-        || fname.contains("_test.")
-        || fname.contains(".test.")
-        || fname.contains(".spec.")
+    norm.contains("/scratch/")
 }
 
 fn find_emoji_codepoint(s: &str) -> Option<char> {
@@ -361,6 +367,21 @@ fn detect_secret_leak(line: &str) -> Option<&'static str> {
             if alnum_len >= min_tail {
                 return Some(label);
             }
+        }
+    }
+    None
+}
+
+fn detect_hardcoded_internal_unc(line: &str) -> Option<&'static str> {
+    let low = line.to_ascii_lowercase();
+    let marker = concat!(".lo", "cal\\");
+    if let Some(pos) = low.find(marker) {
+        let before = &low[..pos];
+        if (before.contains("\\\\") || before.contains("//"))
+            && !low.contains(".example")
+            && !low.contains("example.")
+        {
+            return Some("internal .local Active Directory UNC FQDN");
         }
     }
     None
