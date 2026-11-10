@@ -42,16 +42,16 @@ Antigravity Cognitive & Code-Graph Commands:
   libredb modernize-global [--global <customizations.ldb>] [--skill-md <SKILL.md>]
   libredb mcp-serve [<default_project.ldb>] [--global <customizations.ldb>]
 
-Native Antigravity Hooks, Guardrails & Gitea Automation:
+Native Antigravity Hooks, Guardrails & Dynamic Git/Gitea Automation:
   libredb guardrail check [--path <dir>] [--staged] [--strict]
   libredb hook-pre-tool [--global <customizations.ldb>]
   libredb hook-pre-invocation [--global <customizations.ldb>]
   libredb gitea-status [--global <customizations.ldb>]
   libredb gitea-config [--url <u>] [--user <usr>] [--token <tok>] [--register-helper]
   libredb gitea-credential-helper [get]
-  libredb gitea-init [<dir>] [--name <repo>] [--use-existing] [--overwrite]
-  libredb gitea-sync [-m <msg>] [--project <dir>] [--releases] [--allow-unversioned]
-  libredb gitea-release [vX.Y.Z] [--project <dir>]
+  libredb git-init | gitea-init [<dir>] [--name <repo>] [--use-existing] [--overwrite]
+  libredb git-sync | gitea-sync [-m <msg>] [--project <dir>] [--remote <r>] [--all-remotes] [--github] [--releases] [--allow-unversioned]
+  libredb git-release | gitea-release [vX.Y.Z] [--project <dir>] [--remote <r>] [--all-remotes] [--github]
 
 Lossless 1:1 SQLite Bridge Commands:
   libredb import-sqlite <db.ldb> <source.db> [--scope central|project]
@@ -405,7 +405,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let action = args.get(1).map(String::as_str).unwrap_or("get");
             gitea::cmd_gitea_credential_helper(action, None)?;
         }
-        "gitea-status" => {
+        "gitea-status" | "git-status" => {
             let mut global_path: Option<PathBuf> = None;
             if args.len() >= 3 && args[1] == "--global" {
                 global_path = Some(PathBuf::from(&args[2]));
@@ -452,7 +452,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 reg_helper,
             )?;
         }
-        "gitea-init" => {
+        "gitea-init" | "git-init" => {
             let mut dir = env::current_dir()?;
             let mut name: Option<String> = None;
             let mut use_existing = false;
@@ -481,16 +481,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         dir = PathBuf::from(pos);
                         i += 1;
                     }
-                    other => return Err(format!("Unknown gitea-init flag '{other}'").into()),
+                    other => return Err(format!("Unknown git-init flag '{other}'").into()),
                 }
             }
             gitea::cmd_gitea_init(&dir, name.as_deref(), use_existing, overwrite, global_path.as_deref())?;
         }
-        "gitea-sync" => {
+        "gitea-sync" | "git-sync" => {
             let mut dir = env::current_dir()?;
             let mut msg = "Synchronize workspace".to_owned();
             let mut releases = false;
             let mut allow_unversioned = false;
+            let mut target_remote: Option<String> = None;
+            let mut all_remotes = false;
+            let mut github = false;
             let mut global_path: Option<PathBuf> = None;
             let mut i = 1usize;
             while i < args.len() {
@@ -503,9 +506,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         dir = PathBuf::from(&args[i + 1]);
                         i += 2;
                     }
+                    "--remote" if i + 1 < args.len() => {
+                        target_remote = Some(args[i + 1].clone());
+                        i += 2;
+                    }
                     "--global" if i + 1 < args.len() => {
                         global_path = Some(PathBuf::from(&args[i + 1]));
                         i += 2;
+                    }
+                    "--all-remotes" => {
+                        all_remotes = true;
+                        i += 1;
+                    }
+                    "--github" => {
+                        github = true;
+                        i += 1;
                     }
                     "--releases" => {
                         releases = true;
@@ -515,14 +530,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         allow_unversioned = true;
                         i += 1;
                     }
-                    other => return Err(format!("Unknown gitea-sync flag '{other}'").into()),
+                    other => return Err(format!("Unknown git-sync flag '{other}'").into()),
                 }
             }
-            gitea::cmd_gitea_sync(&dir, &msg, releases, allow_unversioned, global_path.as_deref())?;
+            gitea::cmd_gitea_sync(
+                &dir,
+                &msg,
+                releases,
+                allow_unversioned,
+                target_remote.as_deref(),
+                all_remotes,
+                github,
+                global_path.as_deref(),
+            )?;
         }
-        "gitea-release" => {
+        "gitea-release" | "git-release" => {
             let mut dir = env::current_dir()?;
             let mut tag: Option<String> = None;
+            let mut target_remote: Option<String> = None;
+            let mut all_remotes = false;
+            let mut github = false;
             let mut global_path: Option<PathBuf> = None;
             let mut i = 1usize;
             while i < args.len() {
@@ -531,18 +558,37 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         dir = PathBuf::from(&args[i + 1]);
                         i += 2;
                     }
+                    "--remote" if i + 1 < args.len() => {
+                        target_remote = Some(args[i + 1].clone());
+                        i += 2;
+                    }
                     "--global" if i + 1 < args.len() => {
                         global_path = Some(PathBuf::from(&args[i + 1]));
                         i += 2;
+                    }
+                    "--all-remotes" => {
+                        all_remotes = true;
+                        i += 1;
+                    }
+                    "--github" => {
+                        github = true;
+                        i += 1;
                     }
                     pos if !pos.starts_with("--") && tag.is_none() => {
                         tag = Some(pos.to_owned());
                         i += 1;
                     }
-                    other => return Err(format!("Unknown gitea-release flag '{other}'").into()),
+                    other => return Err(format!("Unknown git-release flag '{other}'").into()),
                 }
             }
-            gitea::cmd_gitea_release(&dir, tag.as_deref(), global_path.as_deref())?;
+            gitea::cmd_gitea_release(
+                &dir,
+                tag.as_deref(),
+                target_remote.as_deref(),
+                all_remotes,
+                github,
+                global_path.as_deref(),
+            )?;
         }
         "pulse" => {
             if args.len() < 3 {
@@ -1534,9 +1580,16 @@ fn modernize_global_db(
         ReflexRule {
             id: "gitea-collision-and-github-guard".to_owned(),
             stack_any: vec!["git".to_owned(), "gitea".to_owned()],
-            action_any: vec!["gitea-init".to_owned(), "gitea-sync".to_owned(), "gitea-release".to_owned(), "push".to_owned()],
-            env_or_error_any: vec!["GITEA REPOSITORY COLLISION".to_owned(), "UNVERSIONED WORKSPACE".to_owned()],
-            directive: "Auto-sync only to local Gitea (never push to GitHub unless explicitly requested). Pause and ask user on [GITEA REPOSITORY COLLISION] or before --allow-unversioned.".to_owned(),
+            action_any: vec!["gitea-init".to_owned(), "gitea-sync".to_owned(), "gitea-release".to_owned(), "git-sync".to_owned(), "git-release".to_owned(), "push".to_owned()],
+            env_or_error_any: vec!["GITEA REPOSITORY COLLISION".to_owned(), "UNVERSIONED WORKSPACE".to_owned(), "SEMVER IMMUTABILITY VIOLATION".to_owned()],
+            directive: "Never hijack existing non-Gitea origin remotes or leak Gitea Basic Auth headers to external servers. Pause and ask user on [GITEA REPOSITORY COLLISION] or before --allow-unversioned.".to_owned(),
+        },
+        ReflexRule {
+            id: "candid-architectural-pushback".to_owned(),
+            stack_any: vec!["architecture".to_owned(), "design".to_owned(), "coding".to_owned(), "refactor".to_owned()],
+            action_any: vec!["plan".to_owned(), "design".to_owned(), "build".to_owned(), "implement".to_owned(), "architecture".to_owned()],
+            env_or_error_any: Vec::new(),
+            directive: "Always give candid, unvarnished engineering feedback: if a proposed idea shoots past the target or introduces unnecessary complexity, say so directly and propose the cleaner alternative.".to_owned(),
         },
         ReflexRule {
             id: "semver-changelog-discipline".to_owned(),
@@ -1585,6 +1638,15 @@ fn modernize_global_db(
     for r in &core_reflexes {
         ReflexEngine::learn_reflex(gdb, r)?;
     }
+
+    // Ensure the permanent candid architectural pushback rule is stored in customizations.ldb
+    let pushback_rule = "[Rule: candid-architectural-pushback | priority=100 | enforcement=CRITICAL]\nSummary: Candid engineering pushback without false politeness when coding ideas overshoot the target.\nWhenever a user idea or architectural direction shoots past the target, introduces unnecessary complexity, hardcodes a fragile assumption, or heads in the wrong technical direction, state directly and candidly that it is suboptimal and immediately propose the cleaner engineering alternative. Never hold back technical criticism out of personal consideration.";
+    gdb.put(
+        WriteRequest::new(NodeKind::Rule, pushback_rule.as_bytes().to_vec())
+            .with_key("rule:global::candid-architectural-pushback")
+            .with_importance(245)
+            .with_pinned(true),
+    )?;
 
     let mut cog = CognitiveEngine::open_db(Arc::clone(gdb))?;
     cog.save_index_snapshot()?;

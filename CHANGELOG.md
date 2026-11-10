@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-11-10
+
+### Added
+
+- Provider-aware, multi-remote Git and release engine in `crates/libredb-cli/src/gitea.rs` (`libredb git-sync` / `git-release` / `git-init` aliases alongside `gitea-*` with `--remote <name>`, `--all-remotes`, and `--github` flags):
+  - Never hijacks or overwrites an existing non-Gitea `origin` remote (`https://github.com/...`, GitLab, or enterprise Git); links local Gitea as a dedicated `gitea` remote when `origin` already points elsewhere.
+  - Pre-commit and pre-release SemVer 2.0.0 tag-SHA immutability verification (`resolve_git_tag_commit` vs. `HEAD`), blocking unversioned code modifications onto an already tagged release unless `--allow-unversioned` is explicitly confirmed.
+  - Automatic GitHub release and deliverable asset synchronization via `gh release` when pushing to a GitHub remote (`--github` or `--all-remotes`).
+- Full 12+ language polyglot contract skeleton parser in `crates/libredb-cognitive/src/skeleton.rs` and centralized `has_project_root_marker` in `crates/libredb-cognitive/src/workspace.rs`:
+  - Added dedicated extractors for Android Smali bytecode (`.class`, `.field`, `.method .. .end method`), SQL DDL (`CREATE TABLE/VIEW/FUNCTION/PROCEDURE/TRIGGER/INDEX`), PowerShell (`function`, `filter`, `class`, `enum`), POSIX shell functions, Go receiver methods, and typed C/C++/C#/Java/Kotlin/Dart/Swift class methods.
+  - Unified project root detection across `hooks.rs`, `mcp.rs`, and `workspace.rs` covering Android (`apktool.yml`, `AndroidManifest.xml`, `build.gradle(.kts)`), C/C++ (`CMakeLists.txt`, `Makefile`), and .NET (`*.sln`, `*.csproj`).
+- Added Keep a Changelog 1.1.0 format and duplicate-version validation (`changelog-duplicate-version`, `keep-a-changelog-format`) and hardcoded secret/private-key leak detection (`no-hardcoded-secrets`) in `crates/libredb-cognitive/src/guardrail.rs`.
+- Added live `transcript.jsonl` workspace path inference (`infer_workspace_from_transcript`), `PreToolUse` `invoke_subagent(TypeName="research") -> Model="flash"` quota enforcement, and automatic `CRLF -> LF` / UTF-8 BOM normalization before file edits in `crates/libredb-cli/src/hooks.rs`.
+- Codified the permanent candid architectural pushback rule (`rule:global::candid-architectural-pushback` and `reflex::candid-architectural-pushback`) across `AGENTS.md` and `customizations.ldb`.
+
+### Fixed
+
+- Removed the early `if invocation_num > 1 { return }` guard in `run_pre_invocation_hook` (`crates/libredb-cli/src/hooks.rs`) that prevented `sync_transcript_epoch` from detecting mid-session `<CONTEXT_SUMMARY>` (`CHECKPOINT`) compactions when `invocationNum > 1`; per-epoch deduplication is handled exclusively by `dedup_token` (`<workspace>@ep=<epoch>`).
+
+### Security
+
+- Fixed a credential-routing flaw in `crates/libredb-cli/src/gitea.rs` (`GiteaConfig::git_auth_args_for_remote`): transient `Authorization: Basic` Gitea headers are now attached strictly when the target remote URL matches the configured local Gitea host, preventing local Gitea tokens from ever being sent to GitHub or external Git servers.
+
 ## [0.6.2] - 2026-11-10
 
 ### Fixed

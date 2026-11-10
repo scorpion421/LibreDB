@@ -3,8 +3,8 @@
 
 use libredb_bridge::open_or_auto_migrate;
 use libredb_cognitive::{
-    check_command_guardrails, check_text_guardrails, is_test_or_scratch_path,
-    sync_transcript_epoch, CognitiveEngine,
+    check_command_guardrails, check_text_guardrails, has_project_root_marker,
+    is_test_or_scratch_path, sync_transcript_epoch, CognitiveEngine,
 };
 use libredb_core::{LibreDb, NodeKind, WriteRequest};
 use serde_json::{json, Value};
@@ -74,6 +74,32 @@ pub fn run_pre_tool_hook(_global_ldb_opt: Option<&Path>) -> Result<(), Box<dyn s
         .or_else(|| payload.get("arguments"))
         .or_else(|| payload.get("args"))
         .unwrap_or(&payload);
+
+    // 0. Subagent Model Enforcer (Rule 5 & Rule 7): automatically route read-only `research`
+    // subagents to `Model="flash"` so they never burn `Argon High` / `Claude` code-gen quota.
+    if tool_name == "invoke_subagent" {
+        let type_name = args
+            .get("TypeName")
+            .or_else(|| args.get("typeName"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if type_name.eq_ignore_ascii_case("research") {
+            let model_str = args
+                .get("Model")
+                .or_else(|| args.get("model"))
+                .and_then(Value::as_str)
+                .unwrap_or("inherit");
+            if !model_str.eq_ignore_ascii_case("flash")
+                && !model_str.eq_ignore_ascii_case("flash_lite")
+            {
+                emit_json(&json!({
+                    "decision": "allow",
+                    "overwrite": { "Model": "flash" }
+                }))?;
+                return Ok(());
+            }
+        }
+    }
 
     // 1. Shell command guardrails + automatic WaitMsBeforeAsync upgrade to 10000ms
     let cmd_opt = args
@@ -194,7 +220,14 @@ pub fn run_pre_tool_hook(_global_ldb_opt: Option<&Path>) -> Result<(), Box<dyn s
         }
 
         if target_file != "<tool_input>" && !is_test_or_scratch_path(target_file) {
-            let _ = record_working_set_edit(Path::new(target_file));
+            let target_path = Path::new(target_file);
+            if matches!(
+                tool_name,
+                "edit_file" | "replace_file_content" | "multi_replace_file_content"
+            ) {
+                normalize_file_crlf_and_bom_before_edit(target_path);
+            }
+            let _ = record_working_set_edit(target_path);
         }
     }
 
@@ -210,15 +243,6 @@ pub fn run_pre_invocation_hook(
     let _ = io::stdin().read_to_string(&mut raw);
     let payload: Value = serde_json::from_str(raw.trim()).unwrap_or_else(|_| json!({}));
 
-    let invocation_num = payload
-        .get("invocationNum")
-        .and_then(Value::as_u64)
-        .unwrap_or(1);
-    if invocation_num > 1 {
-        emit_json(&json!({ "injectSteps": [] }))?;
-        return Ok(());
-    }
-
     let Ok(global_db) = open_global_ldb(global_ldb_opt) else {
         emit_json(&json!({ "injectSteps": [] }))?;
         return Ok(());
@@ -229,7 +253,7 @@ pub fn run_pre_invocation_hook(
         None => (None, None),
     };
 
-    let ws_root = resolve_hook_workspace(&payload);
+    let ws_root = resolve_hook_workspace(&payload, transcript_opt.as_deref());
     let target_ldb: Option<PathBuf> = if let Some(ref root) = ws_root {
         // Record learned workspace path into `customizations.ldb` (`workspace:<name>`)
         if let Some(name) = root.file_name().and_then(|n| n.to_str()) {
@@ -561,7 +585,31 @@ fn record_working_set_edit(target_file: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn resolve_hook_workspace(payload: &Value) -> Option<PathBuf> {
+fn normalize_file_crlf_and_bom_before_edit(path: &Path) {
+    if !path.is_file() {
+        return;
+    }
+    let Ok(raw) = std::fs::read(path) else {
+        return;
+    };
+    let probe = raw.len().min(4096);
+    if raw[..probe].contains(&0u8) {
+        return;
+    }
+    let has_bom = raw.starts_with(&[0xEF, 0xBB, 0xBF]);
+    let body = if has_bom { &raw[3..] } else { &raw[..] };
+    let has_crlf = body.windows(2).any(|w| w == b"\r\n");
+    if !has_bom && !has_crlf {
+        return;
+    }
+    let Ok(text) = std::str::from_utf8(body) else {
+        return;
+    };
+    let normalized = text.replace("\r\n", "\n");
+    let _ = std::fs::write(path, normalized.as_bytes());
+}
+
+fn resolve_hook_workspace(payload: &Value, transcript_opt: Option<&Path>) -> Option<PathBuf> {
     if let Some(arr) = payload.get("workspacePaths").and_then(Value::as_array) {
         for item in arr {
             if let Some(s) = item.as_str() {
@@ -573,6 +621,50 @@ fn resolve_hook_workspace(payload: &Value) -> Option<PathBuf> {
                         }
                     }
                     return Some(p);
+                }
+            }
+        }
+    }
+    if let Some(tp) = transcript_opt {
+        if let Some(inferred) = infer_workspace_from_transcript(tp) {
+            return Some(inferred);
+        }
+    }
+    None
+}
+
+fn infer_workspace_from_transcript(transcript_path: &Path) -> Option<PathBuf> {
+    use std::io::{Seek, SeekFrom};
+    let mut f = std::fs::File::open(transcript_path).ok()?;
+    let len = f.metadata().ok()?.len();
+    if len == 0 {
+        return None;
+    }
+    let read_len = len.min(65_536);
+    let offset = len - read_len;
+    f.seek(SeekFrom::Start(offset)).ok()?;
+    let mut buf = vec![0u8; read_len as usize];
+    f.read_exact(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf);
+
+    for line in text.lines().rev().take(40) {
+        for key in ["\"Path\":", "\"TargetFile\":", "\"cwd\":", "\"SearchPath\":", "\"DirectoryPath\":"] {
+            let mut rest = line;
+            while let Some(pos) = rest.find(key) {
+                rest = &rest[pos + key.len()..];
+                let trimmed = rest.trim_start();
+                if let Some(after_quote) = trimmed.strip_prefix('"') {
+                    if let Some(end_q) = after_quote.find('"') {
+                        let raw_p = after_quote[..end_q].replace("\\\\", "\\");
+                        let candidate = PathBuf::from(&raw_p);
+                        if candidate.exists() && !is_protected_profile_dir(&candidate) {
+                            if let Some(root) = find_workspace_root(&candidate) {
+                                if !is_protected_profile_dir(&root) {
+                                    return Some(root);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -589,22 +681,12 @@ pub fn find_workspace_root(start: &Path) -> Option<PathBuf> {
     if is_protected_profile_dir(dir) {
         return None;
     }
-    let markers = [
-        ".agents",
-        ".git",
-        "Cargo.toml",
-        "pyproject.toml",
-        "package.json",
-        "pubspec.yaml",
-        "go.mod",
-        "pom.xml",
-    ];
     let mut curr = Some(dir);
     while let Some(c) = curr {
         if c.parent().is_none() || is_protected_profile_dir(c) {
             break;
         }
-        if markers.iter().any(|m| c.join(m).exists()) {
+        if has_project_root_marker(c) {
             return Some(c.to_path_buf());
         }
         curr = c.parent();

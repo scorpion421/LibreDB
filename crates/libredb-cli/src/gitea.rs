@@ -69,8 +69,19 @@ impl GiteaConfig {
         }
     }
 
-    pub fn git_auth_args(&self) -> Vec<String> {
-        if !self.user.is_empty() && !self.token.is_empty() {
+    pub fn is_gitea_remote_url(&self, remote_url: &str) -> bool {
+        let low = remote_url.trim().to_ascii_lowercase();
+        let cfg_low = self.url.trim().trim_end_matches('/').to_ascii_lowercase();
+        (!cfg_low.is_empty() && low.starts_with(&cfg_low))
+            || low.starts_with("http://127.0.0.1:3000")
+            || low.starts_with("http://localhost:3000")
+    }
+
+    /// Returns transient Basic Auth args ONLY when `remote_url` matches the configured Gitea host.
+    /// Never attaches local Gitea credentials to GitHub, GitLab, or external Git servers!
+    pub fn git_auth_args_for_remote(&self, remote_url: &str) -> Vec<String> {
+        if self.is_gitea_remote_url(remote_url) && !self.user.is_empty() && !self.token.is_empty()
+        {
             let b64 = base64_encode(format!("{}:{}", self.user, self.token).as_bytes());
             vec![
                 "-c".to_owned(),
@@ -248,16 +259,30 @@ pub fn cmd_gitea_init(
     ensure_local_git_initialized(&clean_root)?;
 
     let clone_url = ensure_remote_repo_created(&cfg, &repo_name)?;
-    let rem_out = Command::new("git")
-        .args(["remote"])
-        .current_dir(&clean_root)
-        .output()?;
-    let remotes_str = String::from_utf8_lossy(&rem_out.stdout);
-    if remotes_str.split_whitespace().any(|r| r == "origin") {
-        let _ = Command::new("git")
-            .args(["remote", "set-url", "origin", &clone_url])
-            .current_dir(&clean_root)
-            .output()?;
+    let remotes = list_git_remotes(&clean_root);
+    let mut linked_remote_name = "origin";
+
+    if let Some((_, existing_origin_url)) = remotes.iter().find(|(n, _)| n == "origin") {
+        if cfg.is_gitea_remote_url(existing_origin_url) {
+            let _ = Command::new("git")
+                .args(["remote", "set-url", "origin", &clone_url])
+                .current_dir(&clean_root)
+                .output()?;
+        } else {
+            // Preserve non-Gitea `origin` (e.g., GitHub/GitLab) and attach local Gitea as `gitea` remote!
+            linked_remote_name = "gitea";
+            if remotes.iter().any(|(n, _)| n == "gitea") {
+                let _ = Command::new("git")
+                    .args(["remote", "set-url", "gitea", &clone_url])
+                    .current_dir(&clean_root)
+                    .output()?;
+            } else {
+                let _ = Command::new("git")
+                    .args(["remote", "add", "gitea", &clone_url])
+                    .current_dir(&clean_root)
+                    .output()?;
+            }
+        }
     } else {
         let _ = Command::new("git")
             .args(["remote", "add", "origin", &clone_url])
@@ -267,7 +292,7 @@ pub fn cmd_gitea_init(
 
     record_learned_workspace(&ldb, &clean_root);
     println!(
-        "[OK] Initialized Git & linked workspace '{}' -> {}/{}/{}",
+        "[OK] Initialized Git & linked remote '{linked_remote_name}' ('{}') -> {}/{}/{}",
         clean_root.display(),
         cfg.url,
         cfg.user,
@@ -281,6 +306,9 @@ pub fn cmd_gitea_sync(
     message: &str,
     sync_releases: bool,
     allow_unversioned: bool,
+    target_remote_opt: Option<&str>,
+    push_all_remotes: bool,
+    push_github: bool,
     global_opt: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let abs_dir = fs::canonicalize(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
@@ -322,7 +350,7 @@ pub fn cmd_gitea_sync(
     if !audit.passed(false) {
         let first = &audit.violations[0];
         return Err(format!(
-            "Guardrail audit blocked gitea-sync ({} in {}:L{}): {}",
+            "Guardrail audit blocked git-sync ({} in {}:L{}): {}",
             first.rule, first.file, first.line, first.message
         )
         .into());
@@ -336,6 +364,23 @@ pub fn cmd_gitea_sync(
         .lines()
         .filter(|l| !l.trim().is_empty())
         .count();
+
+    // Strict SemVer 2.0.0 Tag Immutability Guard: if new code changes are staged and `--allow-unversioned`
+    // was NOT passed, verify that the top version in `CHANGELOG.md` is not already locked to an existing Git tag!
+    if changed_cnt > 0 && !allow_unversioned && clean_root.join("CHANGELOG.md").is_file() {
+        if let Ok(entries) = parse_keep_a_changelog(&clean_root.join("CHANGELOG.md")) {
+            if let Some(latest) = entries.first() {
+                if let Some(existing_tag_sha) = resolve_git_tag_commit(&clean_root, &latest.tag) {
+                    return Err(format!(
+                        "[SEMVER IMMUTABILITY VIOLATION]: Top CHANGELOG.md version {} is already tagged at commit {}. Never overwrite or append code changes to an already published release version; increment VERSION and add a new '## [X.Y.Z] - YYYY-MM-DD' section in CHANGELOG.md first (or ask user confirmation before passing --allow-unversioned).",
+                        latest.tag,
+                        &existing_tag_sha[..existing_tag_sha.len().min(7)]
+                    )
+                    .into());
+                }
+            }
+        }
+    }
 
     if changed_cnt > 0 {
         let c_out = Command::new("git")
@@ -366,43 +411,55 @@ pub fn cmd_gitea_sync(
     let short_hash = String::from_utf8_lossy(&rev_out.stdout).trim().to_owned();
 
     let repo_name = resolve_repo_name_from_git_or_dir(&clean_root);
-    let rem_out = Command::new("git")
-        .args(["remote"])
-        .current_dir(&clean_root)
-        .output()?;
-    if !String::from_utf8_lossy(&rem_out.stdout)
-        .split_whitespace()
-        .any(|r| r == "origin")
-    {
+    let mut remotes = list_git_remotes(&clean_root);
+    if remotes.is_empty() && !cfg.user.is_empty() && !cfg.token.is_empty() {
         if let Ok(clone_url) = ensure_remote_repo_created(&cfg, &repo_name) {
             let _ = Command::new("git")
                 .args(["remote", "add", "origin", &clone_url])
                 .current_dir(&clean_root)
                 .output();
+            remotes = list_git_remotes(&clean_root);
         }
     }
 
-    let branch = current_git_branch(&clean_root);
-    let mut push_args = cfg.git_auth_args();
-    push_args.extend(["push".to_owned(), "-u".to_owned(), "origin".to_owned(), branch]);
-    let p_out = Command::new("git")
-        .args(&push_args)
-        .current_dir(&clean_root)
-        .output()?;
-    if !p_out.status.success() {
-        return Err(format!(
-            "git push to Gitea failed: {}",
-            String::from_utf8_lossy(&p_out.stderr)
-        )
-        .into());
+    let target_remotes = select_target_remotes(
+        &remotes,
+        target_remote_opt,
+        push_all_remotes,
+        push_github,
+    );
+    if target_remotes.is_empty() {
+        return Err("No Git remotes configured for workspace. Run 'libredb gitea-init' or 'git remote add origin <url>'.".into());
     }
 
+    let branch = current_git_branch(&clean_root);
     println!("Synchronizing workspace: {} ({})", repo_name, clean_root.display());
     println!("  [OK] HEAD commit:    {short_hash} ({changed_cnt} files committed)");
-    println!("  [OK] Pushed to Gitea: {}/{}/{}", cfg.url, cfg.user, repo_name);
+
+    for (rem_name, rem_url) in &target_remotes {
+        if cfg.is_gitea_remote_url(rem_url) && !cfg.user.is_empty() && !cfg.token.is_empty() {
+            let _ = ensure_remote_repo_created(&cfg, &repo_name);
+        }
+        let mut push_args = cfg.git_auth_args_for_remote(rem_url);
+        push_args.extend(["push".to_owned(), "-u".to_owned(), rem_name.clone(), branch.clone()]);
+        let p_out = Command::new("git")
+            .args(&push_args)
+            .current_dir(&clean_root)
+            .output()?;
+        if !p_out.status.success() {
+            return Err(format!(
+                "git push to remote '{}' ({}) failed: {}",
+                rem_name,
+                rem_url,
+                String::from_utf8_lossy(&p_out.stderr)
+            )
+            .into());
+        }
+        println!("  [OK] Pushed to '{rem_name}': {rem_url}");
+    }
 
     if sync_releases && clean_root.join("CHANGELOG.md").is_file() {
-        let synced = publish_gitea_release_internal(&clean_root, None, &cfg)?;
+        let synced = publish_gitea_release_internal(&clean_root, None, &cfg, &target_remotes)?;
         if !synced.is_empty() {
             println!("  [OK] Synced Keep a Changelog releases: {}", synced.join(", "));
         }
@@ -413,6 +470,9 @@ pub fn cmd_gitea_sync(
 pub fn cmd_gitea_release(
     project_dir: &Path,
     tag_opt: Option<&str>,
+    target_remote_opt: Option<&str>,
+    push_all_remotes: bool,
+    push_github: bool,
     global_opt: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let abs_dir = fs::canonicalize(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
@@ -420,11 +480,19 @@ pub fn cmd_gitea_release(
     let ldb = open_global_ldb(global_opt)?;
     let cfg = GiteaConfig::load(&ldb);
 
-    let synced = publish_gitea_release_internal(&clean_root, tag_opt, &cfg)?;
+    let remotes = list_git_remotes(&clean_root);
+    let target_remotes = select_target_remotes(
+        &remotes,
+        target_remote_opt,
+        push_all_remotes,
+        push_github,
+    );
+
+    let synced = publish_gitea_release_internal(&clean_root, tag_opt, &cfg, &target_remotes)?;
     let repo_name = resolve_repo_name_from_git_or_dir(&clean_root);
     for t in &synced {
         println!(
-            "  [OK] Published Gitea Release {t}: {}/{}/{repo_name}/releases/tag/{t}",
+            "  [OK] Published Release {t} for {repo_name} ({}/{}/{repo_name}/releases/tag/{t})",
             cfg.url, cfg.user
         );
     }
@@ -435,6 +503,7 @@ fn publish_gitea_release_internal(
     project_root: &Path,
     target_tag_opt: Option<&str>,
     cfg: &GiteaConfig,
+    target_remotes: &[(String, String)],
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let changelog_path = project_root.join("CHANGELOG.md");
     let entries = parse_keep_a_changelog(&changelog_path)?;
@@ -454,19 +523,26 @@ fn publish_gitea_release_internal(
 
     let repo_name = resolve_repo_name_from_git_or_dir(project_root);
 
-    // Ensure local annotated Git tag exists for selected release(s) and push tags to origin
-    let tag_list_out = Command::new("git")
-        .args(["tag"])
-        .current_dir(project_root)
-        .output()?;
-    let existing_local_tags: Vec<String> = String::from_utf8_lossy(&tag_list_out.stdout)
-        .lines()
-        .map(|s| s.trim().to_owned())
-        .collect();
-
+    // Ensure local annotated Git tag exists for selected release(s) and verify SemVer tag immutability!
+    let head_sha = resolve_git_head_commit(project_root);
     let mut created_any_tag = false;
     for entry in &selected {
-        if !existing_local_tags.iter().any(|t| t == &entry.tag) {
+        if let Some(tag_sha) = resolve_git_tag_commit(project_root, &entry.tag) {
+            // If explicitly releasing the top changelog version (`entries[0]`) and its tag points to an older commit than HEAD:
+            if target_tag_opt.is_some()
+                && entry.tag == entries[0].tag
+                && !head_sha.is_empty()
+                && tag_sha != head_sha
+            {
+                return Err(format!(
+                    "[SEMVER IMMUTABILITY VIOLATION]: Tag '{}' already exists at commit {}, which differs from current HEAD ({}). Never move or re-tag an existing release; bump VERSION and add a new CHANGELOG.md entry.",
+                    entry.tag,
+                    &tag_sha[..tag_sha.len().min(7)],
+                    &head_sha[..head_sha.len().min(7)]
+                )
+                .into());
+            }
+        } else {
             let _ = Command::new("git")
                 .args([
                     "-c",
@@ -485,12 +561,24 @@ fn publish_gitea_release_internal(
         }
     }
     if created_any_tag || target_tag_opt.is_some() {
-        let mut tpush = cfg.git_auth_args();
-        tpush.extend(["push".to_owned(), "origin".to_owned(), "--tags".to_owned()]);
-        let _ = Command::new("git")
-            .args(&tpush)
-            .current_dir(project_root)
-            .output();
+        for (rem_name, rem_url) in target_remotes {
+            let mut tpush = cfg.git_auth_args_for_remote(rem_url);
+            tpush.extend(["push".to_owned(), rem_name.clone(), "--tags".to_owned()]);
+            let _ = Command::new("git")
+                .args(&tpush)
+                .current_dir(project_root)
+                .output();
+        }
+    }
+
+    // If any target remote is GitHub (`github.com`), also sync the release + assets via `gh release` when available
+    let has_github_target = target_remotes
+        .iter()
+        .any(|(n, u)| n == "github" || u.to_ascii_lowercase().contains("github.com"));
+    if has_github_target {
+        for entry in &selected {
+            publish_github_cli_release(project_root, &repo_name, entry);
+        }
     }
 
     if cfg.user.is_empty() || cfg.token.is_empty() {
@@ -834,20 +922,170 @@ fn resolve_repo_name_from_git_or_dir(root: &Path) -> String {
 }
 
 fn get_configured_gitea_url(root: &Path, base_url: &str) -> Option<String> {
+    for (rem_name, rem_url) in list_git_remotes(root) {
+        if rem_name == "gitea"
+            || rem_url.contains("localhost:3000")
+            || rem_url.contains("127.0.0.1:3000")
+            || rem_url.starts_with(base_url)
+        {
+            return Some(rem_url.trim_end_matches(".git").to_owned());
+        }
+    }
+    None
+}
+
+fn list_git_remotes(root: &Path) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let Ok(rem_out) = Command::new("git")
+        .args(["remote"])
+        .current_dir(root)
+        .output()
+    else {
+        return out;
+    };
+    if !rem_out.status.success() {
+        return out;
+    }
+    for name in String::from_utf8_lossy(&rem_out.stdout).lines() {
+        let rem = name.trim();
+        if rem.is_empty() {
+            continue;
+        }
+        if let Ok(u_out) = Command::new("git")
+            .args(["remote", "get-url", rem])
+            .current_dir(root)
+            .output()
+        {
+            if u_out.status.success() {
+                let u = String::from_utf8_lossy(&u_out.stdout).trim().to_owned();
+                if !u.is_empty() {
+                    out.push((rem.to_owned(), u));
+                }
+            }
+        }
+    }
+    out
+}
+
+fn select_target_remotes(
+    remotes: &[(String, String)],
+    target_remote_opt: Option<&str>,
+    push_all_remotes: bool,
+    push_github: bool,
+) -> Vec<(String, String)> {
+    if push_all_remotes {
+        return remotes.to_vec();
+    }
+    if let Some(target_name) = target_remote_opt {
+        return remotes
+            .iter()
+            .filter(|(n, _)| n == target_name)
+            .cloned()
+            .collect();
+    }
+    let mut selected = Vec::new();
+    if let Some(orig) = remotes.iter().find(|(n, _)| n == "origin") {
+        selected.push(orig.clone());
+    } else if let Some(first) = remotes.first() {
+        selected.push(first.clone());
+    }
+    if let Some(gt) = remotes.iter().find(|(n, _)| n == "gitea") {
+        if !selected.iter().any(|(n, _)| n == &gt.0) {
+            selected.push(gt.clone());
+        }
+    }
+    if push_github {
+        for r in remotes {
+            if (r.0 == "github" || r.1.to_ascii_lowercase().contains("github.com"))
+                && !selected.iter().any(|(n, _)| n == &r.0)
+            {
+                selected.push(r.clone());
+            }
+        }
+    }
+    selected
+}
+
+fn resolve_git_tag_commit(root: &Path, tag: &str) -> Option<String> {
     let out = Command::new("git")
-        .args(["remote", "get-url", "origin"])
+        .args(["rev-list", "-n", "1", tag])
         .current_dir(root)
         .output()
         .ok()?;
     if !out.status.success() {
         return None;
     }
-    let raw = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-    if raw.contains("localhost:3000") || raw.contains("127.0.0.1:3000") || raw.starts_with(base_url)
-    {
-        Some(raw.trim_end_matches(".git").to_owned())
-    } else {
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    if sha.is_empty() {
         None
+    } else {
+        Some(sha)
+    }
+}
+
+fn resolve_git_head_commit(root: &Path) -> String {
+    Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .unwrap_or_default()
+}
+
+fn publish_github_cli_release(project_root: &Path, repo_name: &str, entry: &ChangelogEntry) {
+    let title = format!("{repo_name} {}", entry.tag);
+    let deliverables = discover_deliverable_files(project_root, &entry.tag);
+    let view_ok = Command::new("gh")
+        .args(["release", "view", &entry.tag])
+        .current_dir(project_root)
+        .output()
+        .is_ok_and(|o| o.status.success());
+
+    if view_ok {
+        let _ = Command::new("gh")
+            .args([
+                "release",
+                "edit",
+                &entry.tag,
+                "--title",
+                &title,
+                "--notes",
+                &entry.body,
+            ])
+            .current_dir(project_root)
+            .output();
+        for f in &deliverables {
+            if let Some(fs_str) = f.to_str() {
+                let _ = Command::new("gh")
+                    .args(["release", "upload", &entry.tag, fs_str, "--clobber"])
+                    .current_dir(project_root)
+                    .output();
+            }
+        }
+    } else {
+        let mut create_args = vec![
+            "release".to_owned(),
+            "create".to_owned(),
+            entry.tag.clone(),
+            "--title".to_owned(),
+            title,
+            "--notes".to_owned(),
+            entry.body.clone(),
+        ];
+        if entry.version.contains('-') {
+            create_args.push("--prerelease".to_owned());
+        }
+        for f in &deliverables {
+            if let Some(fs_str) = f.to_str() {
+                create_args.push(fs_str.to_owned());
+            }
+        }
+        let _ = Command::new("gh")
+            .args(&create_args)
+            .current_dir(project_root)
+            .output();
     }
 }
 

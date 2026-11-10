@@ -69,8 +69,8 @@ $PluginJson = @'
 {
   "name": "libredb",
   "displayName": "LibreDB Cognitive Memory",
-  "version": "0.6.2",
-  "description": "Full Rust replacement for SQLite SkillsDB: single-file cognitive memory, silent SQLite auto-porter, sub-2ms hooks, guardrails, causal code graph, and local Gitea automation.",
+  "version": "0.7.0",
+  "description": "Full Rust replacement for SQLite SkillsDB: single-file cognitive memory, silent SQLite auto-porter, sub-2ms hooks, guardrails, 12-language causal code graph, and dynamic multi-remote Git/Gitea automation.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
     "Run a LibreDB cognitive pulse on the active workspace to load deduplicated context",
@@ -113,7 +113,7 @@ $HooksJson = @'
     ],
     "PreToolUse": [
       {
-        "matcher": "run_command|write_file|edit_file|write_to_file|replace_file_content|multi_replace_file_content",
+        "matcher": "run_command|invoke_subagent|write_file|edit_file|write_to_file|replace_file_content|multi_replace_file_content",
         "hooks": [
           {
             "type": "command",
@@ -143,6 +143,7 @@ All system rules, coding standards, administrative credentials, and skills are m
    - Always use informal German ("Du" / "Dein" for the user, "wir" / "unser" for joint work; strictly NEVER formal "Sie" or plural "Ihr" / "Euer" / "Euch").
    - Use natural German spelling including umlauts (__UMLAUT_LIST__).
    - **German compound nouns (strictly no Deppenbindestriche)**: Always write German compound nouns (Komposita) as a single joined word (e.g., "Abteilungskontingent" never "Abteilungs-Kontingent", "Browsertool" never "Browser-Tool", "Tabwechsel" never "Tab-Wechsel", "Standardeinstellung" never "Standard-Einstellung", "Kontextkompaktierung" never "Kontext-Kompaktierung", "Subagentenisolation" never "Subagenten-Isolation", "Tokenreduktion" never "Token-Reduktion", "__TOKEN_OEKONOMIE__" never "__TOKEN_OEKONOMIE_BAD__").
+   - **Candid architectural pushback (zero sugarcoating)**: When the user's idea or direction in a coding project shoots past the target, introduces unnecessary complexity, hardcodes a fragile pattern, or is technically suboptimal, tell the user directly that it is wrong or suboptimal and propose the better engineering approach immediately. Never hold back technical critique out of personal consideration.
 
 3. **Coding and scripting standards (strict language separation, SemVer 2.0.0, and Keep a Changelog 1.1.0)**:
    - **Language boundary (zero exceptions)**: All code, comments, console outputs, logs, UI labels, buttons, dialogs, error strings, and commit messages MUST be in grammatically correct English (ASCII only). Never translate UI strings to German.
@@ -162,7 +163,7 @@ All system rules, coding standards, administrative credentials, and skills are m
 6. **Autonomous project memory, silent SQLite migration, Gitea sync, and knowledge protocol (pure Pull)**:
    - Persist facts, architectural decisions, tasks, snapshots, Hebbian associations, and situational reflexes in `.agents/memory.ldb` via `libredb_memorize` (`cwd`, `cid`, `facts`, `decisions`, `tasks`, `snapshot`, `learn_assoc`, `learn_reflex`). Any pre-existing `.agents/memory.db` in an older project or chat is automatically and silently migrated 1:1 into `.agents/memory.ldb` on first access, while new projects and chats use `.agents/memory.ldb` exclusively.
    - Recall deduplicated rules, domain micro-skills, decisions, and facts on demand via `libredb_pulse` (`query`, `cwd`, `cid`, `budget`) or `libredb get-skill <name> [--section "<Section>"]`.
-   - **Gitea sync**: Use `libredb gitea-init "<dir>"`, `libredb gitea-sync -m "<msg>" --project "<dir>" [--releases]`, `libredb gitea-release [vX.Y.Z] --project "<dir>"`, and `libredb gitea-status`. Ask confirmation before `--allow-unversioned` ("Soll ich das wirklich ohne Versionierung hochladen?") and pause on `[GITEA REPOSITORY COLLISION]` (`--use-existing`, `--name`, or `--overwrite`). Format Gitea/GitHub URLs as clickable links `[Label](url)`.
+   - **Dynamic Git & Gitea sync**: Use `libredb git-init "<dir>"` (`gitea-init`), `libredb git-sync -m "<msg>" --project "<dir>" [--remote <r>] [--all-remotes] [--github] [--releases]` (`gitea-sync`), `libredb git-release [vX.Y.Z] --project "<dir>" [--all-remotes] [--github]` (`gitea-release`), and `libredb gitea-status`. Existing non-Gitea `origin` remotes are never hijacked, and Gitea Basic Auth headers are sent exclusively to the configured Gitea host. Ask confirmation before `--allow-unversioned` ("Soll ich das wirklich ohne Versionierung hochladen?") and pause on `[GITEA REPOSITORY COLLISION]` (`--use-existing`, `--name`, or `--overwrite`). Format Gitea/GitHub URLs as clickable links `[Label](url)`.
 
 7. **Model & concurrency catalog (pure Pull, zero background control plane)**:
    - Supports `ultra` (16 parallel reader lanes) and `pro` (8 lanes) across `Gemini 4 Argon`, `Gemini 3.8 Flash`, `Claude Opus 5.5`, `Claude Sonnet 5.5`, and `GPT-OSS 120B`. Keep 100% of code generation on `Gemini 4 Argon` or `Claude 5.5`; route only read-only `research` subagents to `Model="flash"`.
@@ -209,11 +210,11 @@ description: >-
   - `libredb sync-skill <SKILL.md> [--name <skill_name>]`
   - `libredb list-rules`, `libredb list-skills`, `libredb list-reflexes`
   - `libredb modernize-global`
-- **Gitea workflow:**
+- **Dynamic Git & Gitea workflow:**
   - `libredb gitea-status`
-  - `libredb gitea-init "<dir>" [--name <repo>] [--use-existing] [--overwrite]`
-  - `libredb gitea-sync -m "<commit message>" --project "<dir>" [--releases] [--allow-unversioned]`
-  - `libredb gitea-release [vX.Y.Z] --project "<dir>"`
+  - `libredb git-init "<dir>" [--name <repo>] [--use-existing] [--overwrite]` (alias: `gitea-init`)
+  - `libredb git-sync -m "<commit message>" --project "<dir>" [--remote <r>] [--all-remotes] [--github] [--releases] [--allow-unversioned]` (alias: `gitea-sync`)
+  - `libredb git-release [vX.Y.Z] --project "<dir>" [--remote <r>] [--all-remotes] [--github]` (alias: `gitea-release`)
   - `libredb gitea-config [--url <u>] [--user <usr>] [--token <tok>] [--register-helper]`
 '@
 $SkillMdPath = Join-Path $SkillDir "SKILL.md"
@@ -246,18 +247,18 @@ $LogoSvg = @'
 
 # 7. Write user-facing README.md inside plugin bundle
 $PluginReadme = @'
-# LibreDB cognitive memory plugin (v0.6.0)
+# LibreDB cognitive memory plugin (v0.7.0)
 
 Complete standalone Rust replacement for `AntiGraviton SkillsDB` (`customizations-db`):
-- `libredb-mcp`: 3-tool multi-workspace cognitive memory & causal code-graph server with zero-I/O RAM session delta and automatic incremental workspace refresh.
+- `libredb-mcp`: 3-tool multi-workspace cognitive memory & 12-language causal code-graph server with zero-I/O RAM session delta and automatic incremental workspace refresh.
 - Silent background 1:1 auto-migration for any pre-existing `.agents/memory.db` in older projects or chats; pure `.ldb` operation for all new projects and chats.
-- Native compiled `< 2 ms` `PreInvocation` and `PreToolUse` guardrail hooks (`hooks.json`).
-- Global system directives (`rules/AGENTS.md`) and native local Gitea release automation (`libredb gitea-sync` / `gitea-release`).
+- Native compiled `< 2 ms` `PreInvocation` and `PreToolUse` guardrail hooks (`hooks.json`) with post-compaction epoch hydration, live `transcript.jsonl` workspace inference, `research -> flash` subagent routing, and `CRLF`/BOM normalization.
+- Global system directives (`rules/AGENTS.md`) and dynamic multi-remote Git/Gitea release automation (`libredb git-sync` / `git-release` & `gitea-sync` / `gitea-release`).
 
 To switch cleanly to pure single-engine operation, disable `AntiGraviton SkillsDB` (`customizations-db`) in Customizations and leave `LibreDB Cognitive Memory` (`libredb`) enabled.
 '@
 [System.IO.File]::WriteAllText((Join-Path $PluginDir "README.md"), $PluginReadme, $Utf8NoBom)
 
-Write-Output "[OK] Deployed LibreDB v0.6.0 standalone binaries to: $BinDir"
+Write-Output "[OK] Deployed LibreDB v0.7.0 standalone binaries to: $BinDir"
 Write-Output "[OK] Hydrated and modernized global 19-table store at: $GlobalLdb"
 Write-Output "[OK] Installed complete Antigravity replacement plugin at: $PluginDir"

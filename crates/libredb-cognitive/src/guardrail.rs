@@ -48,6 +48,10 @@ pub fn check_text_guardrails(text: &str, filename: &str) -> Vec<GuardrailViolati
         });
     }
 
+    let is_changelog = low_name == "changelog.md" || low_name.ends_with("/changelog.md");
+    let mut seen_changelog_versions: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut has_changelog_h1 = false;
+
     for (idx, line) in text.lines().enumerate() {
         let line_no = idx + 1;
         for ch in line.chars() {
@@ -78,6 +82,55 @@ pub fn check_text_guardrails(text: &str, filename: &str) -> Vec<GuardrailViolati
             });
         }
 
+        if let Some(secret_kind) = detect_secret_leak(line) {
+            out.push(GuardrailViolation {
+                rule: "no-hardcoded-secrets".to_owned(),
+                severity: "CRITICAL".to_owned(),
+                file: filename.to_owned(),
+                line: line_no,
+                message: format!(
+                    "Hardcoded secret or private key detected ({secret_kind}). Store credentials in DPAPI or customizations.ldb instead."
+                ),
+                snippet: truncate_ascii_safe(line.trim(), 70),
+            });
+        }
+
+        if is_changelog {
+            let trimmed = line.trim();
+            if trimmed.eq_ignore_ascii_case("# changelog") {
+                has_changelog_h1 = true;
+            } else if let Some(rest) = trimmed.strip_prefix("## [") {
+                if let Some(end_br) = rest.find(']') {
+                    let ver = rest[..end_br].trim_start_matches(['v', 'V']).trim();
+                    if !ver.eq_ignore_ascii_case("unreleased") {
+                        if !seen_changelog_versions.insert(ver.to_ascii_lowercase()) {
+                            out.push(GuardrailViolation {
+                                rule: "changelog-duplicate-version".to_owned(),
+                                severity: "CRITICAL".to_owned(),
+                                file: filename.to_owned(),
+                                line: line_no,
+                                message: format!(
+                                    "Duplicate version section '[{ver}]' in CHANGELOG.md. Never overwrite or duplicate a published SemVer release; increment to a new version."
+                                ),
+                                snippet: truncate_ascii_safe(trimmed, 90),
+                            });
+                        }
+                        let after = rest[end_br + 1..].trim();
+                        if !is_valid_changelog_date_suffix(after) {
+                            out.push(GuardrailViolation {
+                                rule: "keep-a-changelog-format".to_owned(),
+                                severity: "CRITICAL".to_owned(),
+                                file: filename.to_owned(),
+                                line: line_no,
+                                message: "Keep a Changelog 1.1.0 requires release headings to follow '## [X.Y.Z] - YYYY-MM-DD'.".to_owned(),
+                                snippet: truncate_ascii_safe(trimmed, 90),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
         if is_executable_script_ext(&low_name) {
             let l_low = line.to_ascii_lowercase();
             if l_low.contains("createobject(\"wscript.")
@@ -95,6 +148,17 @@ pub fn check_text_guardrails(text: &str, filename: &str) -> Vec<GuardrailViolati
                 });
             }
         }
+    }
+
+    if is_changelog && !text.trim().is_empty() && !has_changelog_h1 {
+        out.push(GuardrailViolation {
+            rule: "keep-a-changelog-format".to_owned(),
+            severity: "CRITICAL".to_owned(),
+            file: filename.to_owned(),
+            line: 1,
+            message: "CHANGELOG.md must start with a '# Changelog' heading per Keep a Changelog 1.1.0.".to_owned(),
+            snippet: truncate_ascii_safe(text.lines().next().unwrap_or(""), 90),
+        });
     }
 
     out
@@ -262,6 +326,46 @@ fn is_executable_script_ext(low_name: &str) -> bool {
         .any(|ext| low_name.ends_with(ext))
 }
 
+fn is_valid_changelog_date_suffix(after_bracket: &str) -> bool {
+    let Some(rest) = after_bracket.strip_prefix('-') else {
+        return false;
+    };
+    let d = rest.trim();
+    let bytes = d.as_bytes();
+    bytes.len() >= 10
+        && bytes[0..4].iter().all(u8::is_ascii_digit)
+        && bytes[4] == b'-'
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[7] == b'-'
+        && bytes[8..10].iter().all(u8::is_ascii_digit)
+}
+
+fn detect_secret_leak(line: &str) -> Option<&'static str> {
+    let t = line.trim();
+    if t.starts_with("-----BEGIN ") && t.ends_with("PRIVATE KEY-----") {
+        return Some("PEM private key");
+    }
+    for (prefix, label, min_tail) in [
+        ("ghp_", "GitHub Personal Access Token", 28usize),
+        ("github_pat_", "GitHub Fine-Grained PAT", 28usize),
+        ("sk-proj-", "OpenAI API Key", 24usize),
+        ("sk-ant-", "Anthropic API Key", 24usize),
+        ("AKIA", "AWS Access Key ID", 16usize),
+    ] {
+        if let Some(pos) = line.find(prefix) {
+            let tail = &line[pos + prefix.len()..];
+            let alnum_len = tail
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+                .count();
+            if alnum_len >= min_tail {
+                return Some(label);
+            }
+        }
+    }
+    None
+}
+
 fn should_skip_binary_ext(path: &Path) -> bool {
     let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
         return false;
@@ -417,5 +521,9 @@ mod tests {
         assert!(check_command_guardrails("git tag -f v1.2.0").is_some());
         assert!(check_command_guardrails("git tag -a v1.2.0 -m \"msg\"").is_none());
         assert!(check_command_guardrails("sc.exe \\\\fileserver create badsvc").is_some());
+
+        let dup_cl = "# Changelog\n\n## [0.2.0] - 2026-11-10\n### Added\n- A\n\n## [0.2.0] - 2026-11-09\n### Added\n- B\n";
+        let v_cl = check_text_guardrails(dup_cl, "CHANGELOG.md");
+        assert!(v_cl.iter().any(|x| x.rule == "changelog-duplicate-version"));
     }
 }

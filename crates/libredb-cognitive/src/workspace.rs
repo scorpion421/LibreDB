@@ -480,8 +480,10 @@ fn collect_source_files(
 
 fn is_known_source_extension(low: &str) -> bool {
     [
-        ".rs", ".py", ".ts", ".tsx", ".js", ".jsx", ".dart", ".go", ".c", ".h", ".cpp", ".hpp",
-        ".cs", ".java", ".kt", ".swift", ".ps1",
+        ".rs", ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".dart", ".go", ".c", ".h",
+        ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".cs", ".java", ".kt", ".kts", ".swift", ".smali",
+        ".ps1", ".psm1", ".sql", ".sh", ".bash", ".zsh", ".rb", ".php", ".lua", ".zig", ".scala",
+        ".groovy", ".gradle", ".proto",
     ]
     .iter()
     .any(|ext| low.ends_with(ext))
@@ -490,10 +492,49 @@ fn is_known_source_extension(low: &str) -> bool {
 fn is_known_binary_extension(low: &str) -> bool {
     [
         ".exe", ".dll", ".pyd", ".so", ".dylib", ".rlib", ".rmeta", ".pdb", ".obj", ".o", ".ldb",
-        ".db", ".db-wal", ".db-shm", ".png", ".jpg", ".zip", ".whl", ".apk",
+        ".db", ".db-wal", ".db-shm", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".zip",
+        ".7z", ".gz", ".xz", ".zst", ".whl", ".apk", ".aab", ".dex", ".arsc", ".flat", ".class",
+        ".jar", ".pdf", ".woff", ".woff2", ".ttf", ".otf", ".mp3", ".mp4", ".ogg", ".wav",
     ]
     .iter()
     .any(|ext| low.ends_with(ext))
+}
+
+/// Centralized check for whether `dir` contains a recognized project or decompiled workspace marker.
+pub fn has_project_root_marker(dir: &Path) -> bool {
+    const MARKERS: &[&str] = &[
+        ".agents",
+        ".git",
+        "Cargo.toml",
+        "pyproject.toml",
+        "package.json",
+        "pubspec.yaml",
+        "go.mod",
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts",
+        "settings.gradle",
+        "settings.gradle.kts",
+        "AndroidManifest.xml",
+        "apktool.yml",
+        "CMakeLists.txt",
+        "Makefile",
+        "composer.json",
+        "Gemfile",
+        "mix.exs",
+    ];
+    if MARKERS.iter().any(|m| dir.join(m).exists()) {
+        return true;
+    }
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for entry in rd.flatten().take(64) {
+            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            if name.ends_with(".sln") || name.ends_with(".csproj") {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn extract_code_identifiers(text: &str) -> HashSet<String> {

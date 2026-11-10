@@ -9,7 +9,7 @@
 //! 3. **Hands-Free `/compact` Detection:** Automatically locates Antigravity's `transcript.jsonl`
 //!    from `cid` (`~/.gemini/antigravity/brain/<cid>/.system_generated/logs/transcript.jsonl`).
 
-use crate::hooks::{is_protected_profile_dir, open_global_ldb, open_project_ldb_silent};
+use crate::hooks::{find_workspace_root, is_protected_profile_dir, open_global_ldb, open_project_ldb_silent};
 use libredb_bridge::import_sqlite_readonly;
 use libredb_cognitive::{
     create_subagent_handoff, execute_atomic_batch, extract_fim_slice, index_workspace,
@@ -584,26 +584,8 @@ fn resolve_workspace_ldb_path(probe: &Path, fallback: &Path) -> PathBuf {
         return fallback.to_path_buf();
     }
 
-    let markers = [
-        ".git",
-        ".agents",
-        "Cargo.toml",
-        "pyproject.toml",
-        "package.json",
-        "pubspec.yaml",
-        "go.mod",
-        "pom.xml",
-    ];
-
-    let mut curr_opt = Some(start_dir);
-    while let Some(curr) = curr_opt {
-        if curr.parent().is_none() || is_protected_profile_dir(curr) {
-            break;
-        }
-        if markers.iter().any(|m| curr.join(m).exists()) {
-            return curr.join(".agents").join("memory.ldb");
-        }
-        curr_opt = curr.parent();
+    if let Some(root) = find_workspace_root(start_dir) {
+        return root.join(".agents").join("memory.ldb");
     }
 
     if start_dir.exists() && start_dir.parent().is_some() {
