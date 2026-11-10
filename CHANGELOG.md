@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.2] - 2026-11-10
+
+### Fixed
+
+- Updated `scripts/deploy_plugin.ps1` to hot-swap `libredb.exe` via `Install-BinaryHotSafe` (`Move-Item` to `.old`) without terminating the active `libredb-mcp` stdio process, and to run `libredb modernize-global` directly in-place on `customizations.ldb` using `LibreDB`'s IPC writer lock so live MCP sessions never disconnect during upgrades.
+
 ## [0.6.1] - 2026-11-10
 
 ### Fixed

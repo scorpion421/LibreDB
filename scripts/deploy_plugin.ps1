@@ -36,8 +36,6 @@ function Install-BinaryHotSafe {
 }
 
 $TargetExe = Join-Path $BinDir "libredb.exe"
-Get-Process libredb -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-Start-Sleep -Milliseconds 150
 Install-BinaryHotSafe -Src $ReleaseExe -Dst $TargetExe
 if (Test-Path $ReleaseDll) {
     Install-BinaryHotSafe -Src $ReleaseDll -Dst (Join-Path $BinDir "libredb.pyd")
@@ -55,15 +53,11 @@ if ($SkillsDbCmd -and $SkillsDbCmd.Source) {
     }
 }
 
-# Seed or update ~/.gemini/libredb/customizations.ldb without ever overwriting live additions from old SQLite
+# Seed ~/.gemini/libredb/customizations.ldb on first install; update in-place via transactional IPC lock afterwards
 $CentralSqlite = Join-Path $GeminiDir "database\customizations.db"
 $GlobalLdb = Join-Path $LibreHome "customizations.ldb"
-$StagingLdb = "$GlobalLdb.staging"
-if (Test-Path $StagingLdb) { Remove-Item $StagingLdb -Force }
-if (Test-Path $GlobalLdb) {
-    Copy-Item $GlobalLdb $StagingLdb -Force
-} elseif (Test-Path $CentralSqlite) {
-    & $TargetExe import-sqlite $StagingLdb $CentralSqlite --scope central
+if ((-not (Test-Path $GlobalLdb)) -and (Test-Path $CentralSqlite)) {
+    & $TargetExe import-sqlite $GlobalLdb $CentralSqlite --scope central
 }
 
 $ExeForward = $TargetExe.Replace('\', '/')
@@ -75,7 +69,7 @@ $PluginJson = @'
 {
   "name": "libredb",
   "displayName": "LibreDB Cognitive Memory",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "Full Rust replacement for SQLite SkillsDB: single-file cognitive memory, silent SQLite auto-porter, sub-2ms hooks, guardrails, causal code graph, and local Gitea automation.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
@@ -225,10 +219,8 @@ description: >-
 $SkillMdPath = Join-Path $SkillDir "SKILL.md"
 [System.IO.File]::WriteAllText($SkillMdPath, $SkillMd, $Utf8NoBom)
 
-# Modernize staging DB (deprecate legacy customizations-db skill, update rule texts to libredb, sync SKILL.md, seed 9 core reflexes, compact)
-& $TargetExe modernize-global --global $StagingLdb --skill-md $SkillMdPath
-Install-BinaryHotSafe -Src $StagingLdb -Dst $GlobalLdb
-Remove-Item $StagingLdb -Force -ErrorAction SilentlyContinue
+# Modernize global DB in-place via LibreDB IPC writer lock (zero handle invalidation for running MCP server)
+& $TargetExe modernize-global --global $GlobalLdb --skill-md $SkillMdPath
 
 # Incrementally index LibreDB's own workspace into .agents/memory.ldb
 $SelfLdb = Join-Path $ProjectRoot ".agents\memory.ldb"
