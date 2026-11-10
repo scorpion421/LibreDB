@@ -42,7 +42,7 @@ Antigravity Cognitive & Code-Graph Commands:
   libredb list-rules [--global <customizations.ldb>]
   libredb list-skills [--global <customizations.ldb>]
   libredb list-reflexes [--global <customizations.ldb>]
-  libredb modernize-global [--global <customizations.ldb>] [--skill-md <SKILL.md>]
+  libredb modernize-global [--global <customizations.ldb>] [--skill-md <SKILL.md>] [--profile neutral|personal] [--migrate-legacy]
   libredb mcp-serve [<default_project.ldb>] [--global <customizations.ldb>]
 
 Security, Trust & Universal Configuration Commands:
@@ -281,10 +281,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     other => return Err(format!("Unknown config flag '{other}'").into()),
                 }
             }
+            let mut proj_ldb_for_seal: Option<PathBuf> = None;
             let db: Arc<LibreDb> = if let Some(ref pdir) = proj_dir {
                 let abs = std::fs::canonicalize(pdir).unwrap_or_else(|_| pdir.clone());
                 let clean = gitea::strip_verbatim_prefix(&abs);
-                let (pdb, _) = hooks::open_project_ldb_silent(&clean.join(".agents").join("memory.ldb"))?;
+                let ldb_p = clean.join(".agents").join("memory.ldb");
+                let (pdb, _) = hooks::open_project_ldb_silent(&ldb_p)?;
+                proj_ldb_for_seal = Some(ldb_p);
                 pdb
             } else {
                 hooks::open_global_ldb(global_path.as_deref())?
@@ -313,6 +316,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             .with_key(key)
                             .with_importance(190),
                     )?;
+                    if let Some(ref ldb_p) = proj_ldb_for_seal {
+                        let gdb_opt = hooks::open_global_ldb_if_exists(global_path.as_deref());
+                        security::refresh_seal_if_authorized(gdb_opt.as_deref(), ldb_p, &db);
+                    }
                     println!(
                         "[OK] Updated config '{}'{}",
                         key,
@@ -329,7 +336,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         .ok_or("Usage: libredb config get <key> [--project <dir>] [--global <g.ldb>]")?;
                     let rec = db.get_by_key(NodeKind::Config, key)?;
                     let raw = String::from_utf8_lossy(&rec.payload);
-                    if is_secret_key(key) || security::is_protected_secret(&raw) {
+                    if is_secret_key(key) || security::is_ciphertext_envelope(&raw) {
                         println!("<redacted:encrypted-in-os-vault>");
                     } else {
                         println!("{}", raw.trim());
@@ -340,6 +347,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         .first()
                         .ok_or("Usage: libredb config unset <key> [--project <dir>] [--global <g.ldb>]")?;
                     if db.deprecate_key(NodeKind::Config, key)? {
+                        if let Some(ref ldb_p) = proj_ldb_for_seal {
+                            let gdb_opt = hooks::open_global_ldb_if_exists(global_path.as_deref());
+                            security::refresh_seal_if_authorized(gdb_opt.as_deref(), ldb_p, &db);
+                        }
                         println!("[OK] Removed config '{key}'");
                     } else {
                         println!("Config '{key}' not found");
@@ -354,7 +365,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         if let Ok(rec) = db.get(ino.node_id) {
                             let raw = String::from_utf8_lossy(&rec.payload).trim().to_owned();
-                            let shown = if is_secret_key(&k) || security::is_protected_secret(&raw) {
+                            let shown = if is_secret_key(&k) || security::is_ciphertext_envelope(&raw) {
                                 "<redacted:encrypted-in-os-vault>".to_owned()
                             } else {
                                 raw.lines().collect::<Vec<_>>().join(", ")
@@ -566,22 +577,63 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "modernize-global" => {
             let mut global_path: Option<PathBuf> = None;
             let mut skill_md: Option<PathBuf> = None;
+            let mut personal = false;
+            let mut migrate_legacy = false;
             let mut i = 1usize;
-            while i + 1 < args.len() {
+            while i < args.len() {
                 match args[i].as_str() {
-                    "--global" => {
+                    "--global" if i + 1 < args.len() => {
                         global_path = Some(PathBuf::from(&args[i + 1]));
                         i += 2;
                     }
-                    "--skill-md" => {
+                    "--skill-md" if i + 1 < args.len() => {
                         skill_md = Some(PathBuf::from(&args[i + 1]));
                         i += 2;
+                    }
+                    "--profile" if i + 1 < args.len() => {
+                        match args[i + 1].trim().to_ascii_lowercase().as_str() {
+                            "personal" => personal = true,
+                            "neutral" => personal = false,
+                            other => {
+                                return Err(format!(
+                                    "Invalid --profile '{other}'; expected 'neutral' or 'personal'"
+                                )
+                                .into());
+                            }
+                        }
+                        i += 2;
+                    }
+                    "--personal" | "--personal-rules" => {
+                        personal = true;
+                        i += 1;
+                    }
+                    "--migrate-legacy" => {
+                        migrate_legacy = true;
+                        i += 1;
                     }
                     other => return Err(format!("Unknown modernize-global flag '{other}'").into()),
                 }
             }
-            let gdb = hooks::open_global_ldb(global_path.as_deref())?;
-            modernize_global_db(&gdb, skill_md.as_deref())?;
+            let target_global = global_path
+                .clone()
+                .unwrap_or_else(hooks::default_global_ldb_path);
+            if let Some(parent) = target_global.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent)?;
+                }
+            }
+            let gdb = if personal || migrate_legacy {
+                let central_sql = hooks::default_central_sqlite_path();
+                let sql_opt = if global_path.is_none() || migrate_legacy {
+                    Some(central_sql.as_path())
+                } else {
+                    None
+                };
+                open_or_auto_migrate(&target_global, sql_opt, "central")?.0
+            } else {
+                Arc::new(LibreDb::open(&target_global)?)
+            };
+            modernize_global_db(&gdb, skill_md.as_deref(), personal)?;
         }
         "gitea-credential-helper" => {
             let action = args.get(1).map(String::as_str).unwrap_or("get");
@@ -1000,8 +1052,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             let t0 = Instant::now();
-            let (db, _) = hooks::open_project_ldb_silent(Path::new(&args[1]))?;
+            let db_path = Path::new(&args[1]);
+            let (db, _) = hooks::open_project_ldb_silent(db_path)?;
             let rep = execute_atomic_batch(&db, &spec)?;
+            security::refresh_seal_if_authorized(
+                hooks::open_global_ldb_if_exists(None).as_deref(),
+                db_path,
+                &db,
+            );
             println!(
                 "[OK] Committed {} capsules and wired {} governance synapses in {:.2} ms (IDs: {:?})",
                 rep.nodes_committed,
@@ -1018,8 +1076,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             if args.len() >= 7 && args[5] == "--notes" {
                 notes = &args[6];
             }
-            let (db, _) = hooks::open_project_ldb_silent(Path::new(&args[1]))?;
+            let db_path = Path::new(&args[1]);
+            let (db, _) = hooks::open_project_ldb_silent(db_path)?;
             let (_, block) = create_subagent_handoff(&db, &args[2], &args[3], &args[4], notes)?;
+            security::refresh_seal_if_authorized(
+                hooks::open_global_ldb_if_exists(None).as_deref(),
+                db_path,
+                &db,
+            );
             print!("{block}");
         }
         "learn-assoc" => {
@@ -1067,8 +1131,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 i += 2;
             }
-            let (db, _) = hooks::open_project_ldb_silent(Path::new(&args[1]))?;
+            let db_path = Path::new(&args[1]);
+            let (db, _) = hooks::open_project_ldb_silent(db_path)?;
             let nid = ReflexEngine::learn_reflex(&db, &rule)?;
+            security::refresh_seal_if_authorized(
+                hooks::open_global_ldb_if_exists(None).as_deref(),
+                db_path,
+                &db,
+            );
             println!("Learned situational reflex '{}' as node #{nid}", rule.id);
         }
         "import-sqlite" => {
@@ -1080,8 +1150,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 scope = &args[4];
             }
             let t0 = Instant::now();
-            let db = Arc::new(LibreDb::open(&args[1])?);
+            let db_path = Path::new(&args[1]);
+            let db = Arc::new(LibreDb::open(db_path)?);
             let sum = import_sqlite_readonly(Path::new(&args[2]), &db, scope)?;
+            security::refresh_seal_if_authorized(
+                hooks::open_global_ldb_if_exists(None).as_deref(),
+                db_path,
+                &db,
+            );
             // Pre-build and persist the inverted index snapshot so cold CLI `pulse` runs in <10 ms!
             let mut cog = CognitiveEngine::open_db(db)?;
             cog.save_index_snapshot()?;
@@ -1198,8 +1274,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            let db = LibreDb::open(&args[1])?;
+            let db_path = Path::new(&args[1]);
+            let db = LibreDb::open(db_path)?;
             let id = db.put(req)?;
+            security::refresh_seal_if_authorized(
+                hooks::open_global_ldb_if_exists(None).as_deref(),
+                db_path,
+                &db,
+            );
             let rec = db.get(id)?;
             println!(
                 "Stored node #{} (kind={}, gen={}, tokens={}, bytes={})",
@@ -1257,9 +1339,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             let kind = NodeKind::parse(&args[2])
                 .ok_or_else(|| format!("Unknown node kind '{}'", args[2]))?;
-            let db = LibreDb::open(&args[1])?;
+            let db_path = Path::new(&args[1]);
+            let db = LibreDb::open(db_path)?;
             let removed = db.deprecate_key(kind, &args[3])?;
             if removed {
+                security::refresh_seal_if_authorized(
+                    hooks::open_global_ldb_if_exists(None).as_deref(),
+                    db_path,
+                    &db,
+                );
                 println!("Deprecated active key '{}' ({})", args[3], kind.as_str());
             } else {
                 println!("Key '{}' ({}) not found", args[3], kind.as_str());
@@ -1341,8 +1429,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             let prune = args.iter().skip(2).any(|a| a == "--prune");
             let t0 = Instant::now();
-            let (db, _) = hooks::open_project_ldb_silent(Path::new(&args[1]))?;
+            let db_path = Path::new(&args[1]);
+            let (db, _) = hooks::open_project_ldb_silent(db_path)?;
             let initial_bytes = db.stats()?.file_bytes;
+            security::refresh_seal_if_authorized(
+                hooks::open_global_ldb_if_exists(None).as_deref(),
+                db_path,
+                &db,
+            );
             let mut cog = CognitiveEngine::open_db(Arc::clone(&db))?;
             cog.save_index_snapshot()?;
             let rep = db.compact_with_options(prune)?;
@@ -1696,6 +1790,7 @@ fn sync_skill_markdown(
 fn modernize_global_db(
     gdb: &Arc<LibreDb>,
     skill_md_opt: Option<&Path>,
+    personal: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let t0 = Instant::now();
     let mut deprecated_legacy = 0usize;
@@ -1731,39 +1826,67 @@ fn modernize_global_db(
     }
 
     let mut rules_updated = 0usize;
-    let mut rule_writes = Vec::new();
-    for (idx, (ino, k_opt, _)) in gdb
-        .list_inodes(Some(NodeKind::Rule), false)
-        .into_iter()
-        .enumerate()
-    {
-        let Some(key) = k_opt else { continue };
-        if key.starts_with("reflex::") {
-            continue;
+    if personal {
+        let mut rule_writes = Vec::new();
+        for (idx, (ino, k_opt, _)) in gdb
+            .list_inodes(Some(NodeKind::Rule), false)
+            .into_iter()
+            .enumerate()
+        {
+            let Some(key) = k_opt else { continue };
+            if key.starts_with("reflex::") {
+                continue;
+            }
+            let rec = gdb.get(ino.node_id)?;
+            let orig = String::from_utf8_lossy(&rec.payload).into_owned();
+            let updated = orig
+                .replace("skillsdb ", "libredb ")
+                .replace("(skillsdb ", "(libredb ")
+                .replace("`skillsdb`", "`libredb`")
+                .replace("customizations-db", "libredb")
+                .replace("customizations.db", "customizations.ldb")
+                .replace("memory.db", "memory.ldb")
+                .replace("SkillsDB", "LibreDB");
+            if updated != orig {
+                rule_writes.push(
+                    gdb.prepare(
+                        WriteRequest::new(NodeKind::Rule, updated.into_bytes())
+                            .with_key(key)
+                            .with_importance(230)
+                            .with_pinned(true),
+                        idx,
+                    )?,
+                );
+                rules_updated += 1;
+            }
         }
-        let rec = gdb.get(ino.node_id)?;
-        let orig = String::from_utf8_lossy(&rec.payload).into_owned();
-        let updated = orig
-            .replace("skillsdb ", "libredb ")
-            .replace("(skillsdb ", "(libredb ")
-            .replace("`skillsdb`", "`libredb`")
-            .replace("customizations-db", "libredb")
-            .replace("customizations.db", "customizations.ldb")
-            .replace("memory.db", "memory.ldb")
-            .replace("SkillsDB", "LibreDB");
-        if updated != orig {
-            rule_writes.push(gdb.prepare(
-                WriteRequest::new(NodeKind::Rule, updated.into_bytes())
-                    .with_key(key)
-                    .with_importance(230)
-                    .with_pinned(true),
-                idx,
-            )?);
-            rules_updated += 1;
+        if !rule_writes.is_empty() {
+            gdb.commit_batch(&rule_writes)?;
         }
-    }
-    if !rule_writes.is_empty() {
-        gdb.commit_batch(&rule_writes)?;
+    } else {
+        // Enterprise-neutral profile (`--profile neutral`, default): ensure zero personal workflow
+        // rules or personal author reflexes remain active in `customizations.ldb`, while preserving
+        // any custom organization-defined rules whose keys do not belong to the personal profile.
+        for (_, k_opt, _) in gdb.list_inodes(Some(NodeKind::Rule), false) {
+            if let Some(k) = k_opt {
+                if k.starts_with("rule:global::") && gdb.deprecate_key(NodeKind::Rule, &k)? {
+                    deprecated_legacy += 1;
+                }
+            }
+        }
+        for personal_reflex_id in [
+            "rust-guardrail-staged",
+            "candid-architectural-pushback",
+            "semver-changelog-discipline",
+            "anti-salami-code-slicing",
+            "windows-soc-admin-audit",
+            "formatting-and-language-boundary",
+            "rust-gitea-dist",
+        ] {
+            if gdb.deprecate_key(NodeKind::Rule, &format!("reflex::{personal_reflex_id}"))? {
+                deprecated_legacy += 1;
+            }
+        }
     }
 
     let default_skill_md = env::var_os("USERPROFILE")
@@ -1786,14 +1909,8 @@ fn modernize_global_db(
         synced_sections = cnt;
     }
 
-    let core_reflexes = [
-        ReflexRule {
-            id: "rust-guardrail-staged".to_owned(),
-            stack_any: vec!["rust".to_owned(), "cargo".to_owned()],
-            action_any: vec!["commit".to_owned(), "gitea".to_owned(), "release".to_owned(), "sync".to_owned()],
-            env_or_error_any: Vec::new(),
-            directive: "Ensure /target/ and /dist/ are in .gitignore and run 'libredb guardrail check --path <dir> --staged --strict' before committing.".to_owned(),
-        },
+    // Strictly technical, developer-agnostic engine safety reflexes (safe for all corporate & neutral users):
+    let technical_reflexes = [
         ReflexRule {
             id: "windows-hooks-cmd-quoting".to_owned(),
             stack_any: vec!["windows".to_owned(), "hooks".to_owned(), "json".to_owned()],
@@ -1807,6 +1924,24 @@ fn modernize_global_db(
             action_any: vec!["gitea-init".to_owned(), "gitea-sync".to_owned(), "gitea-release".to_owned(), "git-sync".to_owned(), "git-release".to_owned(), "push".to_owned()],
             env_or_error_any: vec!["GITEA REPOSITORY COLLISION".to_owned(), "UNVERSIONED WORKSPACE".to_owned(), "SEMVER IMMUTABILITY VIOLATION".to_owned()],
             directive: "Never hijack existing non-Gitea origin remotes or leak Gitea Basic Auth headers to external servers. Pause and ask user on [GITEA REPOSITORY COLLISION] or before --allow-unversioned.".to_owned(),
+        },
+        ReflexRule {
+            id: "git-non-acl-safe-dir".to_owned(),
+            stack_any: vec!["git".to_owned()],
+            action_any: vec!["git".to_owned(), "gitea-init".to_owned()],
+            env_or_error_any: vec!["dubious ownership".to_owned()],
+            directive: "On non-ACL drives, run 'git config --global --add safe.directory <repo>' right after git init.".to_owned(),
+        },
+    ];
+
+    // Maintainer's personal workflow & formatting reflexes (`--profile personal` ONLY):
+    let personal_reflexes = [
+        ReflexRule {
+            id: "rust-guardrail-staged".to_owned(),
+            stack_any: vec!["rust".to_owned(), "cargo".to_owned()],
+            action_any: vec!["commit".to_owned(), "gitea".to_owned(), "release".to_owned(), "sync".to_owned()],
+            env_or_error_any: Vec::new(),
+            directive: "Ensure /target/ and /dist/ are in .gitignore and run 'libredb guardrail check --path <dir> --staged --strict' before committing.".to_owned(),
         },
         ReflexRule {
             id: "candid-architectural-pushback".to_owned(),
@@ -1850,51 +1985,45 @@ fn modernize_global_db(
             env_or_error_any: Vec::new(),
             directive: "Copy compiled release deliverables into dist/ before running 'libredb gitea-release' so assets attach automatically.".to_owned(),
         },
-        ReflexRule {
-            id: "git-non-acl-safe-dir".to_owned(),
-            stack_any: vec!["git".to_owned()],
-            action_any: vec!["git".to_owned(), "gitea-init".to_owned()],
-            env_or_error_any: vec!["dubious ownership".to_owned()],
-            directive: "On non-ACL drives, run 'git config --global --add safe.directory <repo>' right after git init.".to_owned(),
-        },
     ];
 
-    for r in &core_reflexes {
+    for r in &technical_reflexes {
         ReflexEngine::learn_reflex(gdb, r)?;
     }
 
-    // Ensure the permanent candid architectural pushback rule is stored in customizations.ldb
-    let pushback_rule = "[Rule: candid-architectural-pushback | priority=100 | enforcement=CRITICAL]\nSummary: Candid engineering pushback without false politeness when coding ideas overshoot the target.\nWhenever a user idea or architectural direction shoots past the target, introduces unnecessary complexity, hardcodes a fragile assumption, or heads in the wrong technical direction, state directly and candidly that it is suboptimal and immediately propose the cleaner engineering alternative. Never hold back technical criticism out of personal consideration.";
-    gdb.put(
-        WriteRequest::new(NodeKind::Rule, pushback_rule.as_bytes().to_vec())
-            .with_key("rule:global::candid-architectural-pushback")
-            .with_importance(245)
-            .with_pinned(true),
-    )?;
+    let mut active_reflex_count = technical_reflexes.len();
+    if personal {
+        for r in &personal_reflexes {
+            ReflexEngine::learn_reflex(gdb, r)?;
+        }
+        active_reflex_count += personal_reflexes.len();
 
-    // Transparently upgrade any legacy plaintext `gitea_token` to OS vault (`dpapi:v1:` / `vault:v1:`)
+        let pushback_rule = "[Rule: candid-architectural-pushback | priority=100 | enforcement=CRITICAL]\nSummary: Candid engineering pushback without false politeness when coding ideas overshoot the target.\nWhenever a user idea or architectural direction shoots past the target, introduces unnecessary complexity, hardcodes a fragile assumption, or heads in the wrong technical direction, state directly and candidly that it is suboptimal and immediately propose the cleaner engineering alternative. Never hold back technical criticism out of personal consideration.";
+        gdb.put(
+            WriteRequest::new(NodeKind::Rule, pushback_rule.as_bytes().to_vec())
+                .with_key("rule:global::candid-architectural-pushback")
+                .with_importance(245)
+                .with_pinned(true),
+        )?;
+    }
+
+    // Transparently upgrade any legacy plaintext or POSIX `vault:v1:` `gitea_token` to OS vault (`dpapi:v1:` / `vault:v2:`)
     // BEFORE `--prune` compaction physically purges superseded extents from `customizations.ldb`!
     let _ = gitea::GiteaConfig::load(gdb);
 
-    // Cryptographically seal all existing locally learned workspaces (`workspace:*`) whose `.agents/memory.ldb`
-    // is not tracked inside `.git/index`.
+    // Cryptographically seal all trusted and locally learned workspaces (`trust:allowed::*` and `workspace:*`)
+    // whose `.agents/memory.ldb` is not tracked inside `.git/index`, upgrading seals to content-bound `hmac-sha256:v3:`.
     let mut sealed_workspaces = 0usize;
-    for (ino, k_opt, _) in gdb.list_inodes(Some(NodeKind::Config), false) {
-        if let Some(k) = k_opt {
-            if k.starts_with("workspace:") {
-                if let Ok(rec) = gdb.get(ino.node_id) {
-                    let ws_path = PathBuf::from(String::from_utf8_lossy(&rec.payload).trim());
-                    let ldb_p = ws_path.join(".agents").join("memory.ldb");
-                    if ws_path.is_dir()
-                        && ldb_p.is_file()
-                        && !security::is_git_index_tracking_agents_db(&ws_path)
-                    {
-                        if let Ok(pdb) = LibreDb::open(&ldb_p) {
-                            if security::seal_workspace_memory(gdb, &pdb, &ws_path).is_ok() {
-                                sealed_workspaces += 1;
-                            }
-                        }
-                    }
+    for (_, raw_ws) in security::list_trusted_workspaces(gdb) {
+        let ws_path = PathBuf::from(raw_ws.trim());
+        let ldb_p = ws_path.join(".agents").join("memory.ldb");
+        if ws_path.is_dir()
+            && ldb_p.is_file()
+            && !security::is_git_index_tracking_agents_db(&ws_path)
+        {
+            if let Ok(pdb) = LibreDb::open(&ldb_p) {
+                if security::seal_workspace_memory(gdb, &pdb, &ws_path).is_ok() {
+                    sealed_workspaces += 1;
                 }
             }
         }
@@ -1905,15 +2034,84 @@ fn modernize_global_db(
     let comp = gdb.compact_with_options(true)?;
 
     println!(
-        "[OK] Modernized global LibreDB in {:.2} ms: {} legacy customizations-db capsules deprecated, {} rules updated to libredb, {} libredb skill sections synced, {} reflexes active, {} workspaces sealed ({} -> {} bytes)",
+        "[OK] Modernized global LibreDB (profile={}) in {:.2} ms: {} legacy capsules deprecated, {} rules updated, {} libredb skill sections synced, {} reflexes active, {} workspaces sealed ({} -> {} bytes)",
+        if personal { "personal" } else { "neutral" },
         t0.elapsed().as_secs_f64() * 1000.0,
         deprecated_legacy,
         rules_updated,
         synced_sections,
-        core_reflexes.len(),
+        active_reflex_count,
         sealed_workspaces,
         comp.bytes_before,
         comp.bytes_after
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn neutral_modernize_global_contains_zero_personal_rules_and_downgrades_cleanly() {
+        let dir = std::env::temp_dir().join(format!(
+            "libredb_cli_neutral_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ldb_path = dir.join("customizations.ldb");
+        let dummy_skill = dir.join("SKILL.md");
+        std::fs::write(
+            &dummy_skill,
+            "---\nname: libredb\ndescription: Test skill\n---\n\n# LibreDB\n\n## Overview\nTest body.\n",
+        )
+        .unwrap();
+
+        let gdb = Arc::new(LibreDb::open(&ldb_path).unwrap());
+
+        // 1. Clean neutral install must create 0 active non-reflex rules and only 3 technical reflexes
+        modernize_global_db(&gdb, Some(&dummy_skill), false).unwrap();
+        let count_non_reflex_rules = |db: &LibreDb| -> usize {
+            db.list_inodes(Some(NodeKind::Rule), false)
+                .into_iter()
+                .filter(|(_, k, _)| !k.as_deref().is_some_and(|s| s.starts_with("reflex::")))
+                .count()
+        };
+        let count_reflexes = |db: &LibreDb| -> usize {
+            db.list_inodes(Some(NodeKind::Rule), false)
+                .into_iter()
+                .filter(|(_, k, _)| k.as_deref().is_some_and(|s| s.starts_with("reflex::")))
+                .count()
+        };
+        assert_eq!(count_non_reflex_rules(&gdb), 0);
+        assert_eq!(count_reflexes(&gdb), 3);
+
+        // 2. Switching to personal profile adds personal pushback rule + all 10 reflexes
+        modernize_global_db(&gdb, Some(&dummy_skill), true).unwrap();
+        assert_eq!(count_non_reflex_rules(&gdb), 1);
+        assert_eq!(count_reflexes(&gdb), 10);
+
+        // 3. Preserving corporate custom rule while downgrading back to neutral removes all personal rules/reflexes!
+        gdb.put(
+            WriteRequest::new(NodeKind::Rule, b"Corporate SOC policy".to_vec())
+                .with_key("corp:soc-policy")
+                .with_importance(200),
+        )
+        .unwrap();
+        modernize_global_db(&gdb, Some(&dummy_skill), false).unwrap();
+        assert_eq!(count_non_reflex_rules(&gdb), 1);
+        assert!(gdb
+            .get_by_key(NodeKind::Rule, "rule:global::candid-architectural-pushback")
+            .is_err());
+        assert!(gdb.get_by_key(NodeKind::Rule, "corp:soc-policy").is_ok());
+        assert_eq!(count_reflexes(&gdb), 3);
+
+        drop(gdb);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.1] - 2026-11-10
+
+### Added
+
+- Added `--profile neutral|personal` and `--migrate-legacy` flags to `libredb modernize-global` (`crates/libredb-cli/src/main.rs`), `-MigrateLegacy` to `scripts/deploy_plugin.ps1`, `--migrate-legacy` to `scripts/deploy_plugin.sh`, and `install-migrate-legacy` to `Makefile`, decoupling legacy `~/.gemini/database/customizations.db` `SQLite` imports from default enterprise-neutral installations unless explicitly requested.
+- Embedded the complete verbatim GNU Affero General Public License v3.0 (`AGPL-3.0`) text beneath the `Commons Clause` License Condition v1.0 header in `LICENSE`, and added hard CI assertions in `.github/workflows/ci.yml` verifying `Active Rules (0)` and `Active Situational Reflexes (3)` on neutral installs alongside upper-bound hook latency gates (`< 5.0 ms` median on Linux, `< 25.0 ms` median on Windows).
+
+### Changed
+
+- Made `modernize_global_db` in `crates/libredb-cli/src/main.rs` 100% developer-neutral by default (`--profile neutral`): neutral installations never seed `rule:global::candid-architectural-pushback` or personal formatting/German/admin/release reflexes, actively remove personal `rule:global::*` capsules, personal `AGENTS.md`, and personal `libredb config` toggles when downgrading an existing `Personal` installation to `Neutral` (while preserving custom corporate rules), and seed only `3` strictly technical engine-safety reflexes (`windows-hooks-cmd-quoting`, `gitea-collision-and-github-guard`, `git-non-acl-safe-dir`).
+- Removed silent central `customizations.db` fallback auto-migration from `open_global_ldb_if_exists` and custom `--global <path>` overrides in `crates/libredb-cli/src/hooks.rs` so lifecycle hooks and `MCP` sessions never implicitly import legacy personal `SQLite` data into neutral environments.
+
+### Security
+
+- Added safe read-only `vault:v1:` -> `vault:v2:` POSIX credential migration (`legacy_v1_open_for_migration` and `is_ciphertext_envelope` in `crates/libredb-cli/src/security.rs`) so existing `v0.8.7`/`v0.8.8` `vault:v1:` tokens are decrypted and upgraded to RFC 8439 `ChaCha20-Poly1305` `vault:v2:` without ever treating unknown or cross-platform ciphertexts as plaintext or double-encrypting them, and hardened `load_or_create_posix_vault_key_at` (`create_new(true)`) and `ensure_trust_anchor_secret` so pre-existing `.vault.key` files and trust secrets are never overwritten on decode errors.
+- Upgraded `check_mcp_read_path_policy` and `check_tool_write_path_policy_with_base` (`canonicalize_with_missing_tail` and `lexical_normalize_lower` in `crates/libredb-cli/src/security.rs`, wired across `hooks.rs` and `mcp.rs`) to canonicalize symlinks, Windows directory junctions, and `..` segments before policy evaluation, and hardened `collect_source_files` (`crates/libredb-cognitive/src/workspace.rs`) to skip file/directory symlinks and sensitive key/dotenv files (`.env`, `.env.*`, `.pem`, `.p12`, `.pfx`, `.jks`, `.kdbx`, `.vault.key`) during `index-workspace`.
+- Upgraded workspace trust anchors from path-only `hmac-sha256:v2:` to content-authenticated `hmac-sha256:v3:` (`compute_cognitive_content_digest` and `compute_workspace_seal_v3` in `crates/libredb-cli/src/security.rs`, refreshed automatically after authorized `MCP` and `CLI` cognitive writes), binding the `HMAC-SHA256` seal to a deterministic `SHA-256` digest over all active cognitive capsules (`Rule`, `Skill`, `Decision`, `Fact`, `Task`, `Handoff`, `Snapshot`, `CompactionCheckpoint`, and `Config`) so offline tampering of `.agents/memory.ldb` invalidates trust immediately while keeping `WorkingSet` and `Symbol` cache updates zero-friction.
+
 ## [0.9.0] - 2026-11-10
 
 ### Added

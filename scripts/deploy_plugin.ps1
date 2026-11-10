@@ -1,7 +1,8 @@
 param(
     [ValidateSet("Neutral", "Personal")]
     [string]$Profile = "Neutral",
-    [switch]$NoHooks
+    [switch]$NoHooks,
+    [switch]$MigrateLegacy
 )
 
 $ErrorActionPreference = "Stop"
@@ -75,11 +76,16 @@ foreach ($PathDir in $TargetPathDirs) {
     }
 }
 
-# Seed ~/.gemini/libredb/customizations.ldb on first install; update in-place via transactional IPC lock afterwards
+# Seed ~/.gemini/libredb/customizations.ldb cleanly on neutral installs; import legacy customizations.db
+# only when explicitly requested (-MigrateLegacy) or when deploying the maintainer's -Profile Personal.
 $CentralSqlite = Join-Path $GeminiDir "database\customizations.db"
 $GlobalLdb = Join-Path $LibreHome "customizations.ldb"
-if ((-not (Test-Path $GlobalLdb)) -and (Test-Path $CentralSqlite)) {
-    & $TargetExe import-sqlite $GlobalLdb $CentralSqlite --scope central
+if (-not (Test-Path $GlobalLdb)) {
+    if ((($Profile -eq "Personal") -or $MigrateLegacy) -and (Test-Path $CentralSqlite)) {
+        & $TargetExe import-sqlite $GlobalLdb $CentralSqlite --scope central
+    } else {
+        & $TargetExe init $GlobalLdb | Out-Null
+    }
 }
 
 $ExeForward = $TargetExe.Replace('\', '/')
@@ -91,8 +97,8 @@ $PluginJson = @'
 {
   "name": "libredb",
   "displayName": "LibreDB Cognitive Memory",
-  "version": "0.9.0",
-  "description": "Enterprise-ready Rust cognitive memory & MCP code graph: single-file LIBREDB1 storage, silent SQLite auto-porter, sub-2ms hooks, HMAC-SHA256 workspace trust anchors, DPAPI / ChaCha20-Poly1305 credential vault, 20-language DI-aware causal code graph, and multi-remote Git/Gitea/GitHub automation.",
+  "version": "0.9.1",
+  "description": "Enterprise-ready Rust cognitive memory & MCP code graph: single-file LIBREDB1 storage, silent SQLite auto-porter, sub-2ms hooks, content-bound HMAC-SHA256 workspace trust seals, DPAPI / ChaCha20-Poly1305 credential vault, 20-language DI-aware causal code graph, and multi-remote Git/Gitea/GitHub automation.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
     "Run a LibreDB cognitive pulse on the active workspace to load deduplicated context",
@@ -289,7 +295,13 @@ All system rules, coding standards, administrative credentials, and skills are m
     [System.IO.File]::WriteAllText($AgentsMdPath, $AgentsMd, $Utf8NoBom)
     Write-Output "[OK] Installed personal AGENTS.md rules directive (-Profile Personal)."
 } elseif (Test-Path $AgentsMdPath) {
-    Write-Output "[INFO] Neutral profile: preserving pre-existing rules/AGENTS.md without modification."
+    $FirstLine = (Get-Content -Path $AgentsMdPath -TotalCount 1 -ErrorAction SilentlyContinue) -join ""
+    if ($FirstLine.StartsWith("# Central LibreDB rules directive")) {
+        Remove-Item -Path $AgentsMdPath -Force
+        Write-Output "[OK] Neutral profile: removed previous personal rules/AGENTS.md."
+    } else {
+        Write-Output "[INFO] Neutral profile: preserving custom organization rules/AGENTS.md without modification."
+    }
 } else {
     Write-Output "[OK] Neutral enterprise profile: no personal rules/AGENTS.md installed."
 }
@@ -344,8 +356,12 @@ description: >-
 $SkillMdPath = Join-Path $SkillDir "SKILL.md"
 [System.IO.File]::WriteAllText($SkillMdPath, $SkillMd, $Utf8NoBom)
 
-# Modernize global DB in-place via LibreDB IPC writer lock (encrypting plaintext tokens via DPAPI + HMAC-SHA256 workspace seals)
-& $TargetExe modernize-global --global $GlobalLdb --skill-md $SkillMdPath
+# Modernize global DB in-place via LibreDB IPC writer lock (encrypting plaintext tokens via DPAPI + content-bound HMAC-SHA256 v3 workspace seals)
+$ModernizeArgs = @("modernize-global", "--global", $GlobalLdb, "--skill-md", $SkillMdPath, "--profile", $Profile.ToLowerInvariant())
+if ($MigrateLegacy) {
+    $ModernizeArgs += "--migrate-legacy"
+}
+& $TargetExe @ModernizeArgs
 
 if ($Profile -eq "Personal") {
     & $TargetExe config set "hook:subagent_flash_routing" "true" --global $GlobalLdb | Out-Null
@@ -353,6 +369,12 @@ if ($Profile -eq "Personal") {
     & $TargetExe config set "guardrail:style_rules" "true" --global $GlobalLdb | Out-Null
     & $TargetExe config set "git:author_name" "Antigravity" --global $GlobalLdb | Out-Null
     & $TargetExe config set "git:author_email" "antigravity@local.dev" --global $GlobalLdb | Out-Null
+} else {
+    & $TargetExe config unset "hook:subagent_flash_routing" --global $GlobalLdb | Out-Null
+    & $TargetExe config unset "hook:exploratory_firewall" --global $GlobalLdb | Out-Null
+    & $TargetExe config unset "guardrail:style_rules" --global $GlobalLdb | Out-Null
+    & $TargetExe config unset "git:author_name" --global $GlobalLdb | Out-Null
+    & $TargetExe config unset "git:author_email" --global $GlobalLdb | Out-Null
 }
 
 # Incrementally index LibreDB's own workspace into .agents/memory.ldb
@@ -380,12 +402,12 @@ $LogoSvg = @'
 
 # 7. Write user-facing README.md inside plugin bundle
 $PluginReadme = @'
-# LibreDB cognitive memory plugin (v0.9.0)
+# LibreDB cognitive memory plugin (v0.9.1)
 
 Enterprise-ready standalone Rust cognitive memory & code-graph engine for `Antigravity`:
-- `libredb-mcp`: 3-tool multi-workspace cognitive memory & 20-language zero-hardcode causal code-graph server with DI interface/implementation resolution (`implementors`), zero-I/O RAM session delta, `[Zero-Repeat Skeleton]` deduplication, and corpus-`IDF` call-graph disambiguation.
-- Standards-compliant security: RFC 2104 `HMAC-SHA256` workspace trust seals (`libredb trust`), Windows `DPAPI` (`CryptProtectData`) and POSIX RFC 8439 `ChaCha20-Poly1305` AEAD OS credential vault, control-plane path protection (`hooks.json`, `mcp_config.json`, `.git/hooks/*`), and universal `libredb config` customization.
-- Enterprise-neutral by default: `deploy_plugin.ps1` (`-Profile Neutral`, default) installs `libredb-mcp` and security guardrails without injecting personal workflow rules or overriding corporate `git config` identity; pass `-Profile Personal` for personal author rules or `-NoHooks` for MCP-only evaluation.
+- `libredb-mcp`: 3-tool multi-workspace cognitive memory & 20-language zero-hardcode heuristic DI code-graph server with interface/implementation resolution (`implementors`), zero-I/O RAM session delta, `[Zero-Repeat Skeleton]` deduplication, and corpus-`IDF` call-graph disambiguation.
+- Standards-compliant security: content-bound RFC 2104 `HMAC-SHA256` (`v3`) workspace trust seals (`libredb trust`), Windows `DPAPI` (`CryptProtectData`) and POSIX RFC 8439 `ChaCha20-Poly1305` AEAD OS credential vault, symlink-canonicalized control-plane & credential path protection (`hooks.json`, `mcp_config.json`, `.git/hooks/*`, `.env`), and universal `libredb config` customization.
+- Strictly neutral by default: `deploy_plugin.ps1` (`-Profile Neutral`, default) installs `libredb-mcp` and security guardrails with `0` personal rules, `0` implicit legacy DB imports, and preserved corporate `git config` identity; pass `-Profile Personal` for maintainer rules, `-MigrateLegacy` to import legacy `customizations.db`, or `-NoHooks` for MCP-only evaluation.
 - Compaction garbage collection (`compact_with_options`, `maybe_auto_compact`) and `INDEX_FORMAT_VERSION = 4` `HybridIndex` with dead-posting garbage collection across superseded Inodes.
 '@
 [System.IO.File]::WriteAllText((Join-Path $PluginDir "README.md"), $PluginReadme, $Utf8NoBom)
@@ -409,6 +431,6 @@ if (Test-Path $AgyConfigPath) {
     }
 }
 
-Write-Output "[OK] Deployed LibreDB v0.9.0 standalone binaries to: $BinDir (Profile=$Profile)"
-Write-Output "[OK] Hydrated and modernized global 19-table store at: $GlobalLdb"
+Write-Output "[OK] Deployed LibreDB v0.9.1 standalone binaries to: $BinDir (Profile=$Profile)"
+Write-Output "[OK] Hydrated and modernized global store at: $GlobalLdb"
 Write-Output "[OK] Installed complete Antigravity plugin at: $PluginDir"

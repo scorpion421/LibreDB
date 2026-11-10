@@ -19,6 +19,8 @@ jobs:
           make install
           test ! -f "$HOME/.gemini/config/plugins/libredb/rules/AGENTS.md"
           "$HOME/.local/bin/libredb" --version
+          "$HOME/.local/bin/libredb" list-rules | grep -F "Active Rules (0)"
+          "$HOME/.local/bin/libredb" list-reflexes | grep -F "Active Situational Reflexes (3)"
           "$HOME/.local/bin/libredb" trust --list
           make bench
           python3 -c '
@@ -34,7 +36,9 @@ jobs:
                   subprocess.run([exe, hook], input=payload, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
                   samples.append((time.perf_counter() - t0) * 1000.0)
               samples.sort()
-              print(f"[CI Hook Benchmark] {hook}: min={samples[0]:.2f} ms | median={statistics.median(samples):.2f} ms | p95={samples[int(len(samples)*0.95)]:.2f} ms")
+              med = statistics.median(samples)
+              print(f"[CI Hook Benchmark] {hook}: min={samples[0]:.2f} ms | median={med:.2f} ms | p95={samples[int(len(samples)*0.95)]:.2f} ms")
+              assert med < 5.0, f"{hook} median latency {med:.2f} ms exceeded 5.0 ms Linux ceiling"
           '
           make guardrail
 
@@ -52,6 +56,14 @@ jobs:
           pwsh -ExecutionPolicy Bypass -File .\scripts\deploy_plugin.ps1
           if (Test-Path "$HOME\.gemini\config\plugins\libredb\rules\AGENTS.md") {
             throw "Default Neutral install must not create personal rules/AGENTS.md"
+          }
+          $rulesOut = (.\target\release\libredb.exe list-rules) -join "`n"
+          if ($rulesOut -notmatch "Active Rules \(0\)") {
+            throw "Default Neutral install must report Active Rules (0), got: $rulesOut"
+          }
+          $reflexOut = (.\target\release\libredb.exe list-reflexes) -join "`n"
+          if ($reflexOut -notmatch "Active Situational Reflexes \(3\)") {
+            throw "Default Neutral install must report only 3 technical reflexes, got: $reflexOut"
           }
           .\target\release\libredb.exe bench --nodes 2000 --threads 8
           $exe = (Resolve-Path .\target\release\libredb.exe).Path
@@ -71,5 +83,8 @@ jobs:
             $med = [Math]::Round($sorted[[int]($sorted.Count / 2)], 2)
             $p95 = [Math]::Round($sorted[[int]($sorted.Count * 0.95)], 2)
             Write-Host "[CI Hook Benchmark] $($entry.Hook): min=$min ms | median=$med ms | p95=$p95 ms"
+            if ($med -gt 25.0) {
+              throw "$($entry.Hook) median latency ${med}ms exceeded 25.0ms Windows PE spawn ceiling"
+            }
           }
           .\target\release\libredb.exe guardrail check --path . --strict

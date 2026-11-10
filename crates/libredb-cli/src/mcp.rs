@@ -66,12 +66,18 @@ impl McpServerState {
         )
     }
 
-    fn resolve_brain_mut(
+    fn seal_project_db_if_authorized(&self, ws_root_opt: Option<&Path>, proj_db: &LibreDb) {
+        if let (Some(ref gdb), Some(ws_root)) = (&self.global_db, ws_root_opt) {
+            let _ = crate::security::seal_workspace_memory(gdb, proj_db, ws_root);
+        }
+    }
+
+    fn resolve_brain_with_seal_target(
         &mut self,
         hint_path: Option<&str>,
         cid_opt: Option<&str>,
         is_explicit_memorize: bool,
-    ) -> Result<&mut OverlayBrain, String> {
+    ) -> Result<(Option<PathBuf>, &mut OverlayBrain), String> {
         let candidate_path = match hint_path {
             Some(raw) if !raw.trim().is_empty() => {
                 resolve_workspace_ldb_path(Path::new(raw.trim()), &self.default_project_path)
@@ -91,7 +97,7 @@ impl McpServerState {
                 candidate_path
             } else if is_explicit_memorize {
                 return Err(format!(
-                    "Workspace memory at '{}' is quarantined because a pre-existing unsealed or Git-tracked .agents database was detected. Run 'libredb trust \"{}\"' in a terminal if you trust this repository.",
+                    "Workspace memory at '{}' is quarantined because a pre-existing unsealed, tampered, or Git-tracked .agents database was detected. Run 'libredb trust \"{}\"' in a terminal if you trust this repository.",
                     candidate_path.display(),
                     ws_root.display()
                 ));
@@ -104,20 +110,24 @@ impl McpServerState {
 
         if !self.brains.contains_key(&db_path) {
             let (proj_db, _) = open_project_ldb_silent(&db_path)?;
-            if let (Some(ref gdb), Some(ref ws_root)) = (&self.global_db, &ws_root_to_seal) {
-                let _ = crate::security::seal_workspace_memory(gdb, &proj_db, ws_root);
-            }
             let brain =
                 OverlayBrain::open(self.global_db.clone(), proj_db).map_err(|e| e.to_string())?;
             self.brains.insert(db_path.clone(), brain);
-        } else if let (Some(ref gdb), Some(ref ws_root)) = (&self.global_db, &ws_root_to_seal) {
-            if let Some(existing) = self.brains.get(&db_path) {
-                let _ = crate::security::seal_workspace_memory(gdb, existing.project_db(), ws_root);
-            }
         }
 
         let brain = self.brains.get_mut(&db_path).unwrap();
         brain.refresh_if_needed().map_err(|e| e.to_string())?;
+        Ok((ws_root_to_seal, brain))
+    }
+
+    fn resolve_brain_mut(
+        &mut self,
+        hint_path: Option<&str>,
+        cid_opt: Option<&str>,
+        is_explicit_memorize: bool,
+    ) -> Result<&mut OverlayBrain, String> {
+        let (_, brain) =
+            self.resolve_brain_with_seal_target(hint_path, cid_opt, is_explicit_memorize)?;
         Ok(brain)
     }
 
@@ -374,9 +384,8 @@ fn dispatch_tool(
                 let tp = Path::new(raw_p);
                 if tp.is_relative() {
                     if let Some(c) = args.get("cwd").and_then(Value::as_str) {
-                        let candidate = Path::new(c).join(tp);
-                        if candidate.exists() {
-                            return candidate;
+                        if !c.trim().is_empty() {
+                            return Path::new(c.trim()).join(tp);
                         }
                     }
                 }
@@ -567,8 +576,11 @@ fn dispatch_tool(
                 }
             }
 
-            let brain = state.resolve_brain_mut(cwd_hint, cid_arg, true)?;
-            let proj_db = Arc::clone(brain.project_db());
+            let (ws_root_to_seal, proj_db) = {
+                let (ws_opt, brain) =
+                    state.resolve_brain_with_seal_target(cwd_hint, cid_arg, true)?;
+                (ws_opt, Arc::clone(brain.project_db()))
+            };
 
             let mut spec = AtomicBatchSpec::default();
             if let Some(fmap) = args.get("facts").and_then(Value::as_object) {
@@ -656,6 +668,8 @@ fn dispatch_tool(
                 }
             }
 
+            state.seal_project_db_if_authorized(ws_root_to_seal.as_deref(), &proj_db);
+            let brain = state.resolve_brain_mut(cwd_hint, cid_arg, false)?;
             brain.refresh_if_needed()?;
             if outputs.is_empty() {
                 Ok("No mutations requested.".to_owned())
@@ -667,15 +681,26 @@ fn dispatch_tool(
         "libredb_skeleton" => {
             let fp = args.get("file_path").and_then(Value::as_str).ok_or("Missing file_path")?;
             let flt = args.get("filter").and_then(Value::as_str);
+            let resolved_fp = if Path::new(fp).is_relative() {
+                args.get("cwd")
+                    .and_then(Value::as_str)
+                    .filter(|c| !c.trim().is_empty())
+                    .map(|c| Path::new(c.trim()).join(fp))
+                    .unwrap_or_else(|| PathBuf::from(fp))
+            } else {
+                PathBuf::from(fp)
+            };
             let proj_db = {
-                let brain = state.resolve_brain_mut(Some(fp), cid_arg, false)?;
+                let brain = state.resolve_brain_mut(cwd_hint.or(Some(fp)), cid_arg, false)?;
                 Arc::clone(brain.project_db())
             };
             let protected = state.custom_protected_paths(Some(&proj_db));
-            if let Some(err) = crate::security::check_mcp_read_path_policy(Path::new(fp), &protected) {
+            if let Some(err) =
+                crate::security::check_mcp_read_path_policy(&resolved_fp, &protected)
+            {
                 return Err(err.into());
             }
-            let (skel, _) = FileSkeleton::index_or_get_cached(&proj_db, Path::new(fp), None)?;
+            let (skel, _) = FileSkeleton::index_or_get_cached(&proj_db, &resolved_fp, None)?;
             Ok(skel.render_compact(flt, flt.is_some()))
         }
         "libredb_impact" => {
@@ -689,15 +714,26 @@ fn dispatch_tool(
             let sym = args.get("symbol").and_then(Value::as_str);
             let line = args.get("line").and_then(Value::as_u64).map(|n| n as usize);
             let pad = args.get("pad").and_then(Value::as_u64).unwrap_or(12) as usize;
+            let resolved_fp = if Path::new(fp).is_relative() {
+                args.get("cwd")
+                    .and_then(Value::as_str)
+                    .filter(|c| !c.trim().is_empty())
+                    .map(|c| Path::new(c.trim()).join(fp))
+                    .unwrap_or_else(|| PathBuf::from(fp))
+            } else {
+                PathBuf::from(fp)
+            };
             let proj_db = {
-                let brain = state.resolve_brain_mut(Some(fp), cid_arg, false)?;
+                let brain = state.resolve_brain_mut(cwd_hint.or(Some(fp)), cid_arg, false)?;
                 Arc::clone(brain.project_db())
             };
             let protected = state.custom_protected_paths(Some(&proj_db));
-            if let Some(err) = crate::security::check_mcp_read_path_policy(Path::new(fp), &protected) {
+            if let Some(err) =
+                crate::security::check_mcp_read_path_policy(&resolved_fp, &protected)
+            {
                 return Err(err.into());
             }
-            let bundle = extract_fim_slice(&proj_db, Path::new(fp), sym, line, pad)?;
+            let bundle = extract_fim_slice(&proj_db, &resolved_fp, sym, line, pad)?;
             Ok(bundle.format_compact())
         }
         "libredb_handoff" => {
@@ -705,8 +741,15 @@ fn dispatch_tool(
             let tkey = args.get("task_key").and_then(Value::as_str).ok_or("Missing task_key")?;
             let role = args.get("role").and_then(Value::as_str).ok_or("Missing role")?;
             let notes = args.get("instructions").and_then(Value::as_str).unwrap_or("");
-            let brain = state.resolve_brain_mut(cwd_hint, cid_arg, true)?;
-            let (_, block) = create_subagent_handoff(brain.project_db(), hid, tkey, role, notes)?;
+            let (ws_root_to_seal, proj_db) = {
+                let (ws_opt, brain) =
+                    state.resolve_brain_with_seal_target(cwd_hint, cid_arg, true)?;
+                (ws_opt, Arc::clone(brain.project_db()))
+            };
+            let (_, block) = create_subagent_handoff(&proj_db, hid, tkey, role, notes)?;
+            state.seal_project_db_if_authorized(ws_root_to_seal.as_deref(), &proj_db);
+            let brain = state.resolve_brain_mut(cwd_hint, cid_arg, false)?;
+            brain.refresh_if_needed()?;
             Ok(block)
         }
         other => Err(format!("Unknown tool '{other}'").into()),

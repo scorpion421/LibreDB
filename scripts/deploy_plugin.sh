@@ -1,10 +1,11 @@
 #!/bin/sh
-# POSIX / Linux / macOS Antigravity plugin installer for LibreDB (v0.9.0)
-# Enterprise-neutral by default (never installs personal AGENTS.md unless --personal-rules is passed).
+# POSIX / Linux / macOS Antigravity plugin installer for LibreDB (v0.9.1)
+# Enterprise-neutral by default (never installs personal rules or imports legacy SQLite unless requested).
 set -eu
 
 PROFILE="neutral"
 NO_HOOKS=0
+MIGRATE_LEGACY=0
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --personal-rules|--personal)
@@ -19,8 +20,12 @@ while [ "$#" -gt 0 ]; do
             NO_HOOKS=1
             shift
             ;;
+        --migrate-legacy)
+            MIGRATE_LEGACY=1
+            shift
+            ;;
         -h|--help)
-            echo "Usage: ./scripts/deploy_plugin.sh [--personal-rules | --profile neutral|personal] [--no-hooks]"
+            echo "Usage: ./scripts/deploy_plugin.sh [--personal-rules | --profile neutral|personal] [--no-hooks] [--migrate-legacy]"
             exit 0
             ;;
         *)
@@ -108,8 +113,12 @@ done
 
 CENTRAL_SQLITE="$GEMINI_DIR/database/customizations.db"
 GLOBAL_LDB="$LIBRE_HOME/customizations.ldb"
-if [ ! -f "$GLOBAL_LDB" ] && [ -f "$CENTRAL_SQLITE" ]; then
-    "$TARGET_EXE" import-sqlite "$GLOBAL_LDB" "$CENTRAL_SQLITE" --scope central
+if [ ! -f "$GLOBAL_LDB" ]; then
+    if { [ "$PROFILE" = "personal" ] || [ "$MIGRATE_LEGACY" -eq 1 ]; } && [ -f "$CENTRAL_SQLITE" ]; then
+        "$TARGET_EXE" import-sqlite "$GLOBAL_LDB" "$CENTRAL_SQLITE" --scope central
+    else
+        "$TARGET_EXE" init "$GLOBAL_LDB" >/dev/null
+    fi
 fi
 
 escape_json_str() {
@@ -124,8 +133,8 @@ cat > "$PLUGIN_DIR/plugin.json" <<'EOF'
 {
   "name": "libredb",
   "displayName": "LibreDB Cognitive Memory",
-  "version": "0.9.0",
-  "description": "Enterprise-ready Rust cognitive memory & MCP code graph: single-file LIBREDB1 storage, silent SQLite auto-porter, sub-2ms hooks, HMAC-SHA256 workspace trust anchors, ChaCha20-Poly1305 OS credential vault, 20-language DI-aware causal code graph, and multi-remote Git/Gitea/GitHub automation.",
+  "version": "0.9.1",
+  "description": "Enterprise-ready Rust cognitive memory & MCP code graph: single-file LIBREDB1 storage, silent SQLite auto-porter, sub-2ms hooks, content-bound HMAC-SHA256 workspace trust seals, ChaCha20-Poly1305 OS credential vault, 20-language DI-aware causal code graph, and multi-remote Git/Gitea/GitHub automation.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
     "Run a LibreDB cognitive pulse on the active workspace to load deduplicated context",
@@ -272,7 +281,16 @@ All system rules, coding standards, administrative credentials, and skills are m
 EOF
     echo "[OK] Installed personal AGENTS.md rules directive (--personal-rules)."
 elif [ -f "$RULES_DIR/AGENTS.md" ]; then
-    echo "[INFO] Neutral profile: preserving pre-existing rules/AGENTS.md without modification."
+    first_line=$(head -n 1 "$RULES_DIR/AGENTS.md" 2>/dev/null || true)
+    case "$first_line" in
+        "# Central LibreDB rules directive"*)
+            rm -f "$RULES_DIR/AGENTS.md"
+            echo "[OK] Neutral profile: removed previous personal rules/AGENTS.md."
+            ;;
+        *)
+            echo "[INFO] Neutral profile: preserving custom organization rules/AGENTS.md without modification."
+            ;;
+    esac
 else
     echo "[OK] Neutral enterprise profile: no personal rules/AGENTS.md installed."
 fi
@@ -326,8 +344,12 @@ description: >-
   - `libredb gitea-config [--url <u>] [--user <usr>] [--token <tok> | --token-stdin] [--allow-insecure-http <bool>] [--register-helper]`
 EOF
 
-# Modernize global DB in-place (encrypting any plaintext tokens via ChaCha20-Poly1305 + HMAC-SHA256 workspace seals)
-"$TARGET_EXE" modernize-global --global "$GLOBAL_LDB" --skill-md "$SKILL_MD_PATH"
+# Modernize global DB in-place (encrypting any plaintext/v1 tokens via ChaCha20-Poly1305 + content-bound HMAC-SHA256 v3 workspace seals)
+if [ "$MIGRATE_LEGACY" -eq 1 ]; then
+    "$TARGET_EXE" modernize-global --global "$GLOBAL_LDB" --skill-md "$SKILL_MD_PATH" --profile "$PROFILE" --migrate-legacy
+else
+    "$TARGET_EXE" modernize-global --global "$GLOBAL_LDB" --skill-md "$SKILL_MD_PATH" --profile "$PROFILE"
+fi
 
 if [ "$PROFILE" = "personal" ]; then
     "$TARGET_EXE" config set "hook:subagent_flash_routing" "true" --global "$GLOBAL_LDB" >/dev/null
@@ -335,6 +357,12 @@ if [ "$PROFILE" = "personal" ]; then
     "$TARGET_EXE" config set "guardrail:style_rules" "true" --global "$GLOBAL_LDB" >/dev/null
     "$TARGET_EXE" config set "git:author_name" "Antigravity" --global "$GLOBAL_LDB" >/dev/null
     "$TARGET_EXE" config set "git:author_email" "antigravity@local.dev" --global "$GLOBAL_LDB" >/dev/null
+else
+    "$TARGET_EXE" config unset "hook:subagent_flash_routing" --global "$GLOBAL_LDB" >/dev/null
+    "$TARGET_EXE" config unset "hook:exploratory_firewall" --global "$GLOBAL_LDB" >/dev/null
+    "$TARGET_EXE" config unset "guardrail:style_rules" --global "$GLOBAL_LDB" >/dev/null
+    "$TARGET_EXE" config unset "git:author_name" --global "$GLOBAL_LDB" >/dev/null
+    "$TARGET_EXE" config unset "git:author_email" --global "$GLOBAL_LDB" >/dev/null
 fi
 
 # Seal and incrementally index LibreDB's own workspace into .agents/memory.ldb
@@ -357,12 +385,12 @@ EOF
 
 # 7. Write user-facing README.md inside plugin bundle
 cat > "$PLUGIN_DIR/README.md" <<'EOF'
-# LibreDB cognitive memory plugin (v0.9.0)
+# LibreDB cognitive memory plugin (v0.9.1)
 
 Enterprise-ready standalone Rust cognitive memory & code-graph engine for `Antigravity`:
-- `libredb-mcp`: 3-tool multi-workspace cognitive memory & 20-language zero-hardcode causal code-graph server with DI interface/implementation resolution (`implementors`), zero-I/O RAM session delta, `[Zero-Repeat Skeleton]` deduplication, and corpus-`IDF` call-graph disambiguation.
-- Standards-compliant security: RFC 2104 `HMAC-SHA256` workspace trust seals (`libredb trust`), RFC 8439 `ChaCha20-Poly1305` AEAD OS credential vault (`0600` `.vault.key` with symlink guards), control-plane path protection (`hooks.json`, `mcp_config.json`, `.git/hooks/*`), and universal `libredb config` customization.
-- Enterprise-neutral by default: `deploy_plugin.sh` installs `libredb-mcp` and security guardrails without injecting personal workflow rules or overriding corporate `git config` identity; pass `--personal-rules` for personal author rules or `--no-hooks` for MCP-only evaluation.
+- `libredb-mcp`: 3-tool multi-workspace cognitive memory & 20-language zero-hardcode heuristic DI code-graph server with interface/implementation resolution (`implementors`), zero-I/O RAM session delta, `[Zero-Repeat Skeleton]` deduplication, and corpus-`IDF` call-graph disambiguation.
+- Standards-compliant security: content-bound RFC 2104 `HMAC-SHA256` (`v3`) workspace trust seals (`libredb trust`), RFC 8439 `ChaCha20-Poly1305` AEAD OS credential vault (`0600` `.vault.key` with safe `vault:v1` -> `vault:v2` migration and symlink guards), symlink-canonicalized control-plane & credential path protection (`hooks.json`, `mcp_config.json`, `.git/hooks/*`, `.env`), and universal `libredb config` customization.
+- Strictly neutral by default: `deploy_plugin.sh` installs `libredb-mcp` and security guardrails with `0` personal rules, `0` implicit legacy DB imports, and preserved corporate `git config` identity; pass `--personal-rules` for maintainer rules, `--migrate-legacy` to import legacy `customizations.db`, or `--no-hooks` for MCP-only evaluation.
 - Compaction garbage collection (`compact_with_options`, `maybe_auto_compact`) and `INDEX_FORMAT_VERSION = 4` `HybridIndex` with dead-posting garbage collection across superseded Inodes.
 EOF
 
@@ -383,6 +411,6 @@ PYEOF
     fi
 fi
 
-echo "[OK] Deployed LibreDB v0.9.0 standalone binary to: $BIN_DIR (profile=$PROFILE)"
-echo "[OK] Hydrated and modernized global 19-table store at: $GLOBAL_LDB"
+echo "[OK] Deployed LibreDB v0.9.1 standalone binary to: $BIN_DIR (profile=$PROFILE)"
+echo "[OK] Hydrated and modernized global store at: $GLOBAL_LDB"
 echo "[OK] Installed complete Antigravity plugin at: $PLUGIN_DIR"

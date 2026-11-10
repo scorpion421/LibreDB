@@ -899,16 +899,29 @@ fn collect_source_files(
     };
 
     for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        // Never follow file or directory symlinks during workspace indexing so repository symlinks
+        // cannot escape the workspace boundary or ingest external credential/dotenv files.
+        if ft.is_symlink() {
+            continue;
+        }
         let p = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
         let low = name.to_ascii_lowercase();
 
-        if p.is_dir() {
-            if cfg.ignore_dirs.contains(&low) {
+        if ft.is_dir() {
+            if cfg.ignore_dirs.contains(&low)
+                || matches!(low.as_str(), ".ssh" | ".gnupg" | ".aws" | ".azure" | ".kube")
+            {
                 continue;
             }
             collect_source_files(root, &p, cfg, out, binary_skipped)?;
-        } else if p.is_file() {
+        } else if ft.is_file() {
+            if is_sensitive_filename(&low) {
+                continue;
+            }
             if is_known_source_extension(&low)
                 || cfg.extra_extensions.iter().any(|ext| low.ends_with(ext))
             {
@@ -924,6 +937,28 @@ fn collect_source_files(
         }
     }
     Ok(())
+}
+
+fn is_sensitive_filename(low: &str) -> bool {
+    if low == ".env"
+        || (low.starts_with(".env.")
+            && !low.ends_with(".example")
+            && !low.ends_with(".sample")
+            && !low.ends_with(".template")
+            && !low.ends_with(".dist"))
+    {
+        return true;
+    }
+    low.ends_with(".credential.xml")
+        || low.ends_with(".pem")
+        || low.ends_with(".p12")
+        || low.ends_with(".pfx")
+        || low.ends_with(".jks")
+        || low.ends_with(".kdbx")
+        || matches!(
+            low,
+            ".vault.key" | ".netrc" | "_netrc" | ".git-credentials" | "id_rsa" | "id_ed25519" | "id_ecdsa"
+        )
 }
 
 fn is_known_source_extension(low: &str) -> bool {

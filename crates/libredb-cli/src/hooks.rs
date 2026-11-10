@@ -32,8 +32,13 @@ pub fn open_global_ldb(override_path: Option<&Path>) -> Result<Arc<LibreDb>, Str
         .map(Path::to_path_buf)
         .unwrap_or_else(default_global_ldb_path);
     let central_sql = default_central_sqlite_path();
-    let (db, migrated) = open_or_auto_migrate(&target, Some(&central_sql), "central")
-        .map_err(|e| e.to_string())?;
+    let sql_opt = if override_path.is_none() {
+        Some(central_sql.as_path())
+    } else {
+        None
+    };
+    let (db, migrated) =
+        open_or_auto_migrate(&target, sql_opt, "central").map_err(|e| e.to_string())?;
     if migrated.is_some() {
         if let Ok(mut cog) = CognitiveEngine::open_db(Arc::clone(&db)) {
             let _ = cog.save_index_snapshot();
@@ -48,8 +53,6 @@ pub fn open_global_ldb_if_exists(override_path: Option<&Path>) -> Option<Arc<Lib
         .unwrap_or_else(default_global_ldb_path);
     if target.is_file() {
         LibreDb::open(&target).ok().map(Arc::new)
-    } else if override_path.is_none() && default_central_sqlite_path().is_file() {
-        open_global_ldb(None).ok()
     } else {
         None
     }
@@ -190,9 +193,12 @@ pub fn run_pre_tool_hook(global_ldb_opt: Option<&Path>) -> Result<(), Box<dyn st
                 proj_db_ro.as_ref(),
                 "guardrail:protected_paths",
             );
-            if let Some(reason) =
-                crate::security::check_tool_write_path_policy(target_file, &custom_protected)
-            {
+            let hook_ws = resolve_hook_workspace(&payload, None).or_else(|| env::current_dir().ok());
+            if let Some(reason) = crate::security::check_tool_write_path_policy_with_base(
+                target_file,
+                hook_ws.as_deref(),
+                &custom_protected,
+            ) {
                 emit_json(&json!({
                     "decision": "deny",
                     "reason": format!("LibreDB Control-Plane Guardrail Blocked Write: {reason}")
@@ -328,7 +334,7 @@ pub fn run_pre_invocation_hook(
         }
     }
 
-    let Ok((proj_db, _did_migrate)) = open_project_ldb_silent(&mem_ldb_path) else {
+    let Ok((proj_db, did_migrate)) = open_project_ldb_silent(&mem_ldb_path) else {
         emit_json(&json!({ "injectSteps": [] }))?;
         return Ok(());
     };
@@ -379,13 +385,13 @@ pub fn run_pre_invocation_hook(
         }
     }
 
-    // Only touch global `customizations.ldb` on the first turn in a workspace (or when an explicit
-    // `--db` override is passed) so routine turns never contend on or dirty `customizations.ldb`.
-    if !had_prior_cursor || global_ldb_opt.is_some() {
+    // Only touch global `customizations.ldb` on first workspace touch / legacy `.db` migration (or when
+    // an explicit `--global` override is passed), and never auto-import `customizations.db` on neutral hosts.
+    if did_migrate || !had_prior_cursor || global_ldb_opt.is_some() {
         if let Some(ref root) = ws_root {
             if !is_protected_profile_dir(root) {
                 if let Some(name) = root.file_name().and_then(|n| n.to_str()) {
-                    if let Ok(global_db) = open_global_ldb(global_ldb_opt) {
+                    if let Some(global_db) = open_global_ldb_if_exists(global_ldb_opt) {
                         let _ = crate::security::seal_workspace_memory(&global_db, &proj_db, root);
                         let ws_cfg_key = format!("workspace:{name}");
                         let root_str = root.to_string_lossy().into_owned();
