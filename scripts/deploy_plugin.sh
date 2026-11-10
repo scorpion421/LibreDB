@@ -1,5 +1,5 @@
 #!/bin/sh
-# POSIX / Linux / macOS Antigravity plugin installer for LibreDB (v0.9.1)
+# POSIX / Linux / macOS Antigravity plugin installer for LibreDB (v0.9.2)
 # Enterprise-neutral by default (never installs personal rules or imports legacy SQLite unless requested).
 set -eu
 
@@ -133,7 +133,7 @@ cat > "$PLUGIN_DIR/plugin.json" <<'EOF'
 {
   "name": "libredb",
   "displayName": "LibreDB Cognitive Memory",
-  "version": "0.9.1",
+  "version": "0.9.2",
   "description": "Enterprise-ready Rust cognitive memory & MCP code graph: single-file LIBREDB1 storage, silent SQLite auto-porter, sub-2ms hooks, content-bound HMAC-SHA256 workspace trust seals, ChaCha20-Poly1305 OS credential vault, 20-language DI-aware causal code graph, and multi-remote Git/Gitea/GitHub automation.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
@@ -328,7 +328,7 @@ description: >-
 
 - **Guardrails:** `libredb guardrail check --path "<dir>" [--staged] [--strict]`
 - **Workspace trust & universal config:**
-  - `libredb trust [<dir>] [--revoke] [--list]`
+  - `libredb trust [<dir>] [--revoke] [--list] [--migrate-v2] [--if-clean]`
   - `libredb config <get|set|unset|list> [<key>] [<value>] [--project "<dir>"]`
 - **Compaction & GC:** `libredb compact <db.ldb> [--prune]`
 - **Rules, skills & reflexes:**
@@ -344,7 +344,7 @@ description: >-
   - `libredb gitea-config [--url <u>] [--user <usr>] [--token <tok> | --token-stdin] [--allow-insecure-http <bool>] [--register-helper]`
 EOF
 
-# Modernize global DB in-place (encrypting any plaintext/v1 tokens via ChaCha20-Poly1305 + content-bound HMAC-SHA256 v3 workspace seals)
+# Modernize global DB in-place (encrypting any plaintext/v1 tokens via ChaCha20-Poly1305 + read-only v3 workspace seal audit)
 if [ "$MIGRATE_LEGACY" -eq 1 ]; then
     "$TARGET_EXE" modernize-global --global "$GLOBAL_LDB" --skill-md "$SKILL_MD_PATH" --profile "$PROFILE" --migrate-legacy
 else
@@ -365,10 +365,14 @@ else
     "$TARGET_EXE" config unset "git:author_email" --global "$GLOBAL_LDB" >/dev/null
 fi
 
-# Seal and incrementally index LibreDB's own workspace into .agents/memory.ldb
+# Seal and incrementally index LibreDB's own workspace into .agents/memory.ldb ONLY if clean/untampered
 SELF_LDB="$PROJECT_ROOT/.agents/memory.ldb"
-"$TARGET_EXE" trust "$PROJECT_ROOT" --global "$GLOBAL_LDB" >/dev/null 2>&1 || true
-"$TARGET_EXE" index-workspace "$SELF_LDB" "$PROJECT_ROOT" --force || echo "[INFO] Workspace index skipped while older handle drains."
+trust_out=$("$TARGET_EXE" trust "$PROJECT_ROOT" --if-clean --global "$GLOBAL_LDB" 2>&1 || true)
+printf '%s\n' "$trust_out"
+case "$trust_out" in
+    "[WARN]"*) ;;
+    *) "$TARGET_EXE" index-workspace "$SELF_LDB" "$PROJECT_ROOT" --force || echo "[INFO] Workspace index skipped while older handle drains." ;;
+esac
 
 # 6. Write square transparent SVG logo
 cat > "$ASSETS_DIR/logo.svg" <<'EOF'
@@ -385,7 +389,7 @@ EOF
 
 # 7. Write user-facing README.md inside plugin bundle
 cat > "$PLUGIN_DIR/README.md" <<'EOF'
-# LibreDB cognitive memory plugin (v0.9.1)
+# LibreDB cognitive memory plugin (v0.9.2)
 
 Enterprise-ready standalone Rust cognitive memory & code-graph engine for `Antigravity`:
 - `libredb-mcp`: 3-tool multi-workspace cognitive memory & 20-language zero-hardcode heuristic DI code-graph server with interface/implementation resolution (`implementors`), zero-I/O RAM session delta, `[Zero-Repeat Skeleton]` deduplication, and corpus-`IDF` call-graph disambiguation.
@@ -411,6 +415,6 @@ PYEOF
     fi
 fi
 
-echo "[OK] Deployed LibreDB v0.9.1 standalone binary to: $BIN_DIR (profile=$PROFILE)"
+echo "[OK] Deployed LibreDB v0.9.2 standalone binary to: $BIN_DIR (profile=$PROFILE)"
 echo "[OK] Hydrated and modernized global store at: $GLOBAL_LDB"
 echo "[OK] Installed complete Antigravity plugin at: $PLUGIN_DIR"

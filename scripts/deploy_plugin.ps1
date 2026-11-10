@@ -97,7 +97,7 @@ $PluginJson = @'
 {
   "name": "libredb",
   "displayName": "LibreDB Cognitive Memory",
-  "version": "0.9.1",
+  "version": "0.9.2",
   "description": "Enterprise-ready Rust cognitive memory & MCP code graph: single-file LIBREDB1 storage, silent SQLite auto-porter, sub-2ms hooks, content-bound HMAC-SHA256 workspace trust seals, DPAPI / ChaCha20-Poly1305 credential vault, 20-language DI-aware causal code graph, and multi-remote Git/Gitea/GitHub automation.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
@@ -338,7 +338,7 @@ description: >-
 
 - **Guardrails:** `libredb guardrail check --path "<dir>" [--staged] [--strict]`
 - **Workspace trust & universal config:**
-  - `libredb trust [<dir>] [--revoke] [--list]`
+  - `libredb trust [<dir>] [--revoke] [--list] [--migrate-v2] [--if-clean]`
   - `libredb config <get|set|unset|list> [<key>] [<value>] [--project "<dir>"]`
 - **Compaction & GC:** `libredb compact <db.ldb> [--prune]`
 - **Rules, skills & reflexes:**
@@ -356,7 +356,7 @@ description: >-
 $SkillMdPath = Join-Path $SkillDir "SKILL.md"
 [System.IO.File]::WriteAllText($SkillMdPath, $SkillMd, $Utf8NoBom)
 
-# Modernize global DB in-place via LibreDB IPC writer lock (encrypting plaintext tokens via DPAPI + content-bound HMAC-SHA256 v3 workspace seals)
+# Modernize global DB in-place via LibreDB IPC writer lock (encrypting plaintext tokens via DPAPI + read-only v3 workspace seal audit)
 $ModernizeArgs = @("modernize-global", "--global", $GlobalLdb, "--skill-md", $SkillMdPath, "--profile", $Profile.ToLowerInvariant())
 if ($MigrateLegacy) {
     $ModernizeArgs += "--migrate-legacy"
@@ -377,11 +377,14 @@ if ($Profile -eq "Personal") {
     & $TargetExe config unset "git:author_email" --global $GlobalLdb | Out-Null
 }
 
-# Incrementally index LibreDB's own workspace into .agents/memory.ldb
+# Seal and incrementally index LibreDB's own workspace into .agents/memory.ldb ONLY if clean/untampered
 $SelfLdb = Join-Path $ProjectRoot ".agents\memory.ldb"
 try {
-    & $TargetExe trust $ProjectRoot --global $GlobalLdb | Out-Null
-    & $TargetExe index-workspace $SelfLdb $ProjectRoot --force
+    $TrustOut = (& $TargetExe trust $ProjectRoot --if-clean --global $GlobalLdb) -join "`n"
+    Write-Output $TrustOut
+    if ($TrustOut -notmatch '^\[WARN\]') {
+        & $TargetExe index-workspace $SelfLdb $ProjectRoot --force
+    }
 } catch {
     Write-Output "[INFO] Workspace index skipped while older handle drains: $_"
 }
@@ -402,7 +405,7 @@ $LogoSvg = @'
 
 # 7. Write user-facing README.md inside plugin bundle
 $PluginReadme = @'
-# LibreDB cognitive memory plugin (v0.9.1)
+# LibreDB cognitive memory plugin (v0.9.2)
 
 Enterprise-ready standalone Rust cognitive memory & code-graph engine for `Antigravity`:
 - `libredb-mcp`: 3-tool multi-workspace cognitive memory & 20-language zero-hardcode heuristic DI code-graph server with interface/implementation resolution (`implementors`), zero-I/O RAM session delta, `[Zero-Repeat Skeleton]` deduplication, and corpus-`IDF` call-graph disambiguation.
@@ -431,6 +434,6 @@ if (Test-Path $AgyConfigPath) {
     }
 }
 
-Write-Output "[OK] Deployed LibreDB v0.9.1 standalone binaries to: $BinDir (Profile=$Profile)"
+Write-Output "[OK] Deployed LibreDB v0.9.2 standalone binaries to: $BinDir (Profile=$Profile)"
 Write-Output "[OK] Hydrated and modernized global store at: $GlobalLdb"
 Write-Output "[OK] Installed complete Antigravity plugin at: $PluginDir"

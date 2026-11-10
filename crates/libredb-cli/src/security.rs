@@ -20,6 +20,7 @@ const VAULT_V1_PREFIX: &str = "vault:v1:";
 const VAULT_V2_PREFIX: &str = "vault:v2:";
 const VAULT_AEAD_AAD: &[u8] = b"LibreDB::CredentialVault::v2";
 const CONTENT_DIGEST_DOMAIN: &[u8] = b"LibreDB::CognitiveContent::v3\0";
+const SEAL_V2_DOMAIN_SEP: &[u8] = b"LibreDB::WorkspaceTrustSeal::v2\0";
 const SEAL_V3_DOMAIN_SEP: &[u8] = b"LibreDB::WorkspaceTrustSeal::v3\0";
 const TRUST_SECRET_KEY: &str = "sys::trust_anchor_secret";
 const TRUST_SEALS_KEY: &str = "sys::trust_seals";
@@ -617,21 +618,173 @@ pub fn seal_workspace_memory(
             )
             .map_err(|e| e.to_string())?;
     }
+    let v3_ratchet_key = format!("trust:v3_upgraded::{norm}");
+    if global_db.get_by_key(NodeKind::Config, &v3_ratchet_key).is_err() {
+        global_db
+            .put(
+                WriteRequest::new(NodeKind::Config, b"v3".to_vec())
+                    .with_key(v3_ratchet_key)
+                    .with_importance(180),
+            )
+            .map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
-/// Refreshes the `hmac-sha256:v3:` content seal on `proj_db` if `db_path` is `<ws_root>/.agents/memory.ldb`
-/// for an already-authorized workspace in `global_db`. Never auto-authorizes untrusted workspaces.
-pub fn refresh_seal_if_authorized(global_db: Option<&LibreDb>, db_path: &Path, proj_db: &LibreDb) {
-    let Some(gdb) = global_db else { return };
-    let Some(parent) = db_path.parent() else { return };
-    if parent.file_name().and_then(|n| n.to_str()) != Some(".agents") {
-        return;
+/// Type-enforced pre-mutation trust guard whose private `authorized_ws` field can ONLY be
+/// populated by verifying `is_workspace_memory_trusted` BEFORE mutating `proj_db`.
+/// Prevents post-hoc re-sealing ("trust laundering") of offline-tampered workspace databases.
+pub struct PreMutationSealGuard {
+    authorized_ws: Option<PathBuf>,
+}
+
+impl PreMutationSealGuard {
+    pub fn verify_before_write(
+        global_db: Option<&LibreDb>,
+        db_path: &Path,
+    ) -> Result<Self, String> {
+        let Some(gdb) = global_db else {
+            return Ok(Self {
+                authorized_ws: None,
+            });
+        };
+        let resolved_db = if db_path.is_relative() {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(db_path))
+                .unwrap_or_else(|_| db_path.to_path_buf())
+        } else {
+            db_path.to_path_buf()
+        };
+        let Some(parent) = resolved_db.parent() else {
+            return Ok(Self {
+                authorized_ws: None,
+            });
+        };
+        if parent.file_name().and_then(|n| n.to_str()) != Some(".agents") {
+            return Ok(Self {
+                authorized_ws: None,
+            });
+        }
+        let Some(ws_root) = parent.parent() else {
+            return Ok(Self {
+                authorized_ws: None,
+            });
+        };
+        if !is_workspace_path_authorized(Some(gdb), ws_root) {
+            // Workspace is not registered as trusted in `global_db`; never auto-authorize or seal it.
+            return Ok(Self {
+                authorized_ws: None,
+            });
+        }
+        if !is_workspace_memory_trusted(Some(gdb), ws_root) {
+            return Err(format!(
+                "Workspace memory at '{}' failed hmac-sha256:v3 content-seal verification (offline modification or legacy seal detected). Inspect the database and run 'libredb trust \"{}\"' (or 'libredb trust --migrate-v2 \"{}\"') before writing to it.",
+                db_path.display(),
+                ws_root.display(),
+                ws_root.display()
+            ));
+        }
+        Ok(Self {
+            authorized_ws: Some(ws_root.to_path_buf()),
+        })
     }
-    let Some(ws_root) = parent.parent() else { return };
-    if is_workspace_path_authorized(Some(gdb), ws_root) {
-        let _ = seal_workspace_memory(gdb, proj_db, ws_root);
+
+    pub fn reseal_after_write(&self, global_db: Option<&LibreDb>, proj_db: &LibreDb) {
+        if let (Some(gdb), Some(ref ws_root)) = (global_db, &self.authorized_ws) {
+            let _ = seal_workspace_memory(gdb, proj_db, ws_root);
+        }
     }
+}
+
+/// Explicitly migrates a legacy `v0.9.0` path-bound `hmac-sha256:v2:` workspace seal to a
+/// content-bound `hmac-sha256:v3:` seal ONLY after verifying:
+/// 1. `ws_root` is authorized in `global_db` and `.agents/memory.*` is not tracked in `.git/index`.
+/// 2. `<ws_root>/.agents/memory.ldb` does NOT already carry a broken/tampered `v3` seal for this host.
+/// 3. `sys::trust_seals` carries a genuine `hmac-sha256:v2:` tag matching this host's `sys::trust_anchor_secret`.
+pub fn migrate_workspace_seal_v2_to_v3(
+    global_db: &LibreDb,
+    ws_root: &Path,
+) -> Result<bool, String> {
+    let norm = normalize_workspace_key(ws_root);
+    if global_db
+        .get_by_key(NodeKind::Config, &format!("trust:revoked::{norm}"))
+        .is_ok()
+    {
+        return Err(format!(
+            "Workspace '{}' has been explicitly revoked; run 'libredb trust \"{}\"' to re-authorize.",
+            ws_root.display(),
+            ws_root.display()
+        ));
+    }
+    if !is_workspace_path_authorized(Some(global_db), ws_root) {
+        return Err(format!(
+            "Workspace '{}' is not registered as trusted in customizations.ldb.",
+            ws_root.display()
+        ));
+    }
+    if is_git_index_tracking_agents_db(ws_root)
+        && global_db
+            .get_by_key(NodeKind::Config, &format!("trust:allowed::{norm}"))
+            .is_err()
+    {
+        return Err(format!(
+            "Workspace '{}' tracks .agents/memory.* inside .git/index; refusing automatic v2 seal migration.",
+            ws_root.display()
+        ));
+    }
+    if is_workspace_memory_trusted(Some(global_db), ws_root) {
+        return Ok(false);
+    }
+
+    let ldb_path = ws_root.join(".agents").join("memory.ldb");
+    if !ldb_path.is_file() {
+        return Ok(false);
+    }
+    let pdb = LibreDb::open(&ldb_path).map_err(|e| e.to_string())?;
+    let rec = pdb.get_by_key(NodeKind::Config, TRUST_SEALS_KEY).map_err(|_| {
+        format!(
+            "Workspace memory at '{}' has no sys::trust_seals entry; inspect and run 'libredb trust \"{}\"' if trusted.",
+            ldb_path.display(),
+            ws_root.display()
+        )
+    })?;
+
+    let mut secret = ensure_trust_anchor_secret(global_db)?;
+    let host_tag = compute_host_seal_slot_id(&secret, &norm);
+    let expected_v2 = compute_legacy_workspace_seal_v2(&secret, &norm);
+    secure_zero(&mut secret);
+
+    let seals_txt = String::from_utf8_lossy(&rec.payload);
+    // Monotonic anti-downgrade ratchet: if `global_db` (`customizations.ldb`) already recorded a `v3` seal
+    // for this workspace OR `sys::trust_seals` carries a `v3` slot entry for this host (which failed
+    // `is_workspace_memory_trusted` above), refuse `--migrate-v2` even if an attacker stripped the `v3` line
+    // from `.agents/memory.ldb` and replayed a captured `v0.9.0` `v2` tag!
+    let already_v3_in_global = global_db
+        .get_by_key(NodeKind::Config, &format!("trust:v3_upgraded::{norm}"))
+        .is_ok();
+    let has_failed_host_v3 = seals_txt
+        .lines()
+        .any(|l| l.trim().starts_with(&format!("{host_tag}=hmac-sha256:v3:")));
+    if already_v3_in_global || has_failed_host_v3 {
+        return Err(format!(
+            "Workspace memory at '{}' was already upgraded to hmac-sha256:v3 on this host (content tampering or v2 replay downgrade detected); refusing v2 migration.",
+            ldb_path.display()
+        ));
+    }
+
+    let has_valid_v2 = seals_txt
+        .lines()
+        .any(|line| constant_time_eq(line.trim().as_bytes(), expected_v2.as_bytes()));
+    if !has_valid_v2 {
+        return Err(format!(
+            "Workspace memory at '{}' does not carry a valid hmac-sha256:v2 seal for this host; inspect and run 'libredb trust \"{}\"'.",
+            ldb_path.display(),
+            ws_root.display()
+        ));
+    }
+
+    seal_workspace_memory(global_db, &pdb, ws_root)?;
+    Ok(true)
 }
 
 /// Revokes workspace trust in `global_db` and removes `sys::trust_seals` from `<ws_root>/.agents/memory.ldb` if present.
@@ -1008,6 +1161,18 @@ fn ensure_trust_anchor_secret(global_db: &LibreDb) -> Result<[u8; 32], String> {
         )
         .map_err(|e| e.to_string())?;
     Ok(secret)
+}
+
+pub(crate) fn compute_legacy_workspace_seal_v2(
+    secret: &[u8; 32],
+    normalized_ws_key: &str,
+) -> String {
+    let mut mac =
+        <HmacSha256 as Mac>::new_from_slice(secret).expect("HMAC-SHA256 accepts 256-bit keys");
+    mac.update(SEAL_V2_DOMAIN_SEP);
+    mac.update(normalized_ws_key.as_bytes());
+    let tag = mac.finalize().into_bytes();
+    format!("hmac-sha256:v2:{}", hex_encode(tag.as_slice()))
 }
 
 pub(crate) fn compute_workspace_seal_v3(
@@ -1517,11 +1682,107 @@ mod tests {
             "Tampered cognitive capsule must invalidate hmac-sha256:v3 workspace seal!"
         );
 
-        // 5. Re-sealing via authorized `refresh_seal_if_authorized` restores validity, and `revoke` quarantines:
-        refresh_seal_if_authorized(Some(&gdb), &pdb_path, &pdb);
+        // 5. Attempting an automatic `PreMutationSealGuard` on a tampered DB MUST fail (no trust laundering!):
+        assert!(
+            PreMutationSealGuard::verify_before_write(Some(&gdb), &pdb_path).is_err(),
+            "PreMutationSealGuard must reject offline-tampered .agents/memory.ldb before write!"
+        );
+        assert!(!is_workspace_memory_trusted(Some(&gdb), &repo));
+
+        // 6. Only an explicit human `seal_workspace_memory` (`libredb trust`) restores trust,
+        //    after which `PreMutationSealGuard` allows authorized writes and updates the v3 seal:
+        seal_workspace_memory(&gdb, &pdb, &repo).unwrap();
         assert!(is_workspace_memory_trusted(Some(&gdb), &repo));
+        let guard = PreMutationSealGuard::verify_before_write(Some(&gdb), &pdb_path).unwrap();
+        pdb.put(
+            WriteRequest::new(NodeKind::Fact, b"authorized_update = 1".to_vec())
+                .with_key("authorized_update"),
+        )
+        .unwrap();
+        guard.reseal_after_write(Some(&gdb), &pdb);
+        assert!(is_workspace_memory_trusted(Some(&gdb), &repo));
+
         revoke_workspace_trust(&gdb, &repo).unwrap();
         assert!(!is_workspace_memory_trusted(Some(&gdb), &repo));
+
+        drop(pdb);
+        drop(gdb);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn explicit_v2_to_v3_seal_migration_verifies_v2_hmac_and_blocks_downgrade() {
+        let tmp = std::env::temp_dir().join(format!(
+            "libredb_v2_mig_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        let repo = tmp.join("legacy_v2_repo");
+        fs::create_dir_all(repo.join(".agents")).unwrap();
+
+        let gdb = LibreDb::open(tmp.join("customizations.ldb")).unwrap();
+        let pdb_path = repo.join(".agents").join("memory.ldb");
+        let pdb = LibreDb::open(&pdb_path).unwrap();
+        pdb.put(
+            WriteRequest::new(NodeKind::Fact, b"legacy_fact = ok".to_vec()).with_key("legacy_fact"),
+        )
+        .unwrap();
+
+        let norm = normalize_workspace_key(&repo);
+        gdb.put(
+            WriteRequest::new(NodeKind::Config, repo.to_string_lossy().into_owned().into_bytes())
+                .with_key(format!("trust:allowed::{norm}")),
+        )
+        .unwrap();
+        let secret = ensure_trust_anchor_secret(&gdb).unwrap();
+
+        // Forged v2 tag must fail migration:
+        pdb.put(
+            WriteRequest::new(
+                NodeKind::Config,
+                b"hmac-sha256:v2:0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_vec(),
+            )
+            .with_key(TRUST_SEALS_KEY),
+        )
+        .unwrap();
+        assert!(migrate_workspace_seal_v2_to_v3(&gdb, &repo).is_err());
+        assert!(!is_workspace_memory_trusted(Some(&gdb), &repo));
+
+        // Genuine v2 tag for this host's secret migrates cleanly to v3:
+        let genuine_v2 = compute_legacy_workspace_seal_v2(&secret, &norm);
+        pdb.put(
+            WriteRequest::new(NodeKind::Config, genuine_v2.as_bytes().to_vec())
+                .with_key(TRUST_SEALS_KEY),
+        )
+        .unwrap();
+        assert!(!is_workspace_memory_trusted(Some(&gdb), &repo));
+        assert!(migrate_workspace_seal_v2_to_v3(&gdb, &repo).unwrap());
+        assert!(is_workspace_memory_trusted(Some(&gdb), &repo));
+
+        // Appending a genuine v2 line alongside a broken v3 slot must STILL fail (anti-downgrade):
+        let existing_seals = String::from_utf8_lossy(
+            &pdb.get_by_key(NodeKind::Config, TRUST_SEALS_KEY)
+                .unwrap()
+                .payload,
+        )
+        .into_owned();
+        pdb.put(
+            WriteRequest::new(NodeKind::Rule, b"tampered".to_vec()).with_key("rule:tampered"),
+        )
+        .unwrap();
+        let downgrade_attempt = format!("{existing_seals}\n{genuine_v2}");
+        pdb.put(
+            WriteRequest::new(NodeKind::Config, downgrade_attempt.into_bytes())
+                .with_key(TRUST_SEALS_KEY),
+        )
+        .unwrap();
+        assert!(!is_workspace_memory_trusted(Some(&gdb), &repo));
+        assert!(migrate_workspace_seal_v2_to_v3(&gdb, &repo).is_err());
 
         drop(pdb);
         drop(gdb);

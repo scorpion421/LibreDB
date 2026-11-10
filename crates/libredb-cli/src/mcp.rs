@@ -95,13 +95,16 @@ impl McpServerState {
                     ws_root_to_seal = Some(ws_root);
                 }
                 candidate_path
-            } else if is_explicit_memorize {
-                return Err(format!(
-                    "Workspace memory at '{}' is quarantined because a pre-existing unsealed, tampered, or Git-tracked .agents database was detected. Run 'libredb trust \"{}\"' in a terminal if you trust this repository.",
-                    candidate_path.display(),
-                    ws_root.display()
-                ));
             } else {
+                // Evict any cached OverlayBrain for this path so post-cache offline tampering is immediately quarantined.
+                self.brains.remove(&candidate_path);
+                if is_explicit_memorize {
+                    return Err(format!(
+                        "Workspace memory at '{}' is quarantined because a pre-existing unsealed, tampered, or Git-tracked .agents database was detected. Run 'libredb trust \"{}\"' in a terminal if you trust this repository.",
+                        candidate_path.display(),
+                        ws_root.display()
+                    ));
+                }
                 default_libredb_home().join("quarantined_workspace.ldb")
             }
         } else {
@@ -761,9 +764,16 @@ fn default_libredb_home() -> PathBuf {
 }
 
 fn workspace_root_from_agents_ldb(db_path: &Path) -> Option<PathBuf> {
-    let parent = db_path.parent()?;
+    let resolved = if db_path.is_relative() {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(db_path))
+            .unwrap_or_else(|_| db_path.to_path_buf())
+    } else {
+        db_path.to_path_buf()
+    };
+    let parent = resolved.parent()?;
     if parent.file_name().and_then(|n| n.to_str()) == Some(".agents") {
-        parent.parent().map(Path::to_path_buf)
+        parent.parent().filter(|p| !p.as_os_str().is_empty()).map(Path::to_path_buf)
     } else {
         None
     }

@@ -386,13 +386,17 @@ pub fn run_pre_invocation_hook(
     }
 
     // Only touch global `customizations.ldb` on first workspace touch / legacy `.db` migration (or when
-    // an explicit `--global` override is passed), and never auto-import `customizations.db` on neutral hosts.
+    // an explicit `--global` override is passed). Never re-seal an existing `.ldb` file automatically;
+    // seal strictly when `did_migrate` just created `.ldb` from an already-authorized legacy `.db`.
     if did_migrate || !had_prior_cursor || global_ldb_opt.is_some() {
         if let Some(ref root) = ws_root {
             if !is_protected_profile_dir(root) {
                 if let Some(name) = root.file_name().and_then(|n| n.to_str()) {
                     if let Some(global_db) = open_global_ldb_if_exists(global_ldb_opt) {
-                        let _ = crate::security::seal_workspace_memory(&global_db, &proj_db, root);
+                        if did_migrate {
+                            let _ =
+                                crate::security::seal_workspace_memory(&global_db, &proj_db, root);
+                        }
                         let ws_cfg_key = format!("workspace:{name}");
                         let root_str = root.to_string_lossy().into_owned();
                         let already_same = global_db

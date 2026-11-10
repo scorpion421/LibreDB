@@ -46,7 +46,7 @@ Antigravity Cognitive & Code-Graph Commands:
   libredb mcp-serve [<default_project.ldb>] [--global <customizations.ldb>]
 
 Security, Trust & Universal Configuration Commands:
-  libredb trust [<dir>] [--revoke] [--list] [--global <customizations.ldb>]
+  libredb trust [<dir>] [--revoke] [--list] [--migrate-v2] [--if-clean] [--global <customizations.ldb>]
   libredb config <get|set|unset|list> [<key>] [<value>] [--project <dir>] [--global <customizations.ldb>]
   libredb guardrail check [--path <dir>] [--staged] [--strict]
   libredb hook-pre-tool [--global <customizations.ldb>]
@@ -210,6 +210,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let mut dir_opt: Option<PathBuf> = None;
             let mut revoke = false;
             let mut list = false;
+            let mut migrate_v2 = false;
+            let mut if_clean = false;
             let mut global_path: Option<PathBuf> = None;
             let mut i = 1usize;
             while i < args.len() {
@@ -220,6 +222,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     "--list" => {
                         list = true;
+                        i += 1;
+                    }
+                    "--migrate-v2" => {
+                        migrate_v2 = true;
+                        i += 1;
+                    }
+                    "--if-clean" => {
+                        if_clean = true;
                         i += 1;
                     }
                     "--global" if i + 1 < args.len() => {
@@ -240,6 +250,46 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 for (_, display_path) in items {
                     println!("  * {display_path}");
                 }
+            } else if migrate_v2 {
+                if let Some(target_dir) = dir_opt {
+                    let abs = std::fs::canonicalize(&target_dir).unwrap_or(target_dir);
+                    let clean = gitea::strip_verbatim_prefix(&abs);
+                    if security::migrate_workspace_seal_v2_to_v3(&gdb, &clean)? {
+                        println!(
+                            "[OK] Verified legacy v2 HMAC and upgraded workspace '{}' to content-bound v3 seal",
+                            clean.display()
+                        );
+                    } else {
+                        println!(
+                            "[OK] Workspace '{}' already carries a valid content-bound v3 trust seal",
+                            clean.display()
+                        );
+                    }
+                } else {
+                    let mut migrated = 0usize;
+                    let mut already_valid = 0usize;
+                    let mut rejected = 0usize;
+                    for (_, raw_ws) in security::list_trusted_workspaces(&gdb) {
+                        let ws_path = PathBuf::from(raw_ws.trim());
+                        if !ws_path.is_dir() || !ws_path.join(".agents").join("memory.ldb").is_file() {
+                            continue;
+                        }
+                        match security::migrate_workspace_seal_v2_to_v3(&gdb, &ws_path) {
+                            Ok(true) => migrated += 1,
+                            Ok(false) => already_valid += 1,
+                            Err(msg) => {
+                                rejected += 1;
+                                eprintln!("[WARN] Refused v2->v3 seal migration for '{}': {msg}", ws_path.display());
+                            }
+                        }
+                    }
+                    println!(
+                        "[OK] Workspace v2->v3 seal migration summary: {migrated} upgraded, {already_valid} already v3, {rejected} rejected"
+                    );
+                    if rejected > 0 {
+                        return Err(format!("{rejected} workspace(s) failed v2 HMAC verification and remain quarantined").into());
+                    }
+                }
             } else {
                 let target_dir = dir_opt.unwrap_or(env::current_dir()?);
                 let abs = std::fs::canonicalize(&target_dir).unwrap_or(target_dir);
@@ -247,6 +297,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 if revoke {
                     security::revoke_workspace_trust(&gdb, &clean)?;
                     println!("[OK] Revoked workspace trust for '{}'", clean.display());
+                } else if if_clean {
+                    if security::is_workspace_memory_trusted(Some(&gdb), &clean) {
+                        let ldb_path = clean.join(".agents").join("memory.ldb");
+                        let (pdb, _) = hooks::open_project_ldb_silent(&ldb_path)?;
+                        security::seal_workspace_memory(&gdb, &pdb, &clean)?;
+                        println!(
+                            "[OK] Trusted and cryptographically sealed clean workspace '{}'",
+                            clean.display()
+                        );
+                    } else {
+                        println!(
+                            "[WARN] Skipping automatic workspace trust for '{}': pre-existing .agents database has an unverified or modified seal; inspect and run 'libredb trust \"{}\"' manually if trusted.",
+                            clean.display(),
+                            clean.display()
+                        );
+                    }
                 } else {
                     let ldb_path = clean.join(".agents").join("memory.ldb");
                     let (pdb, _) = hooks::open_project_ldb_silent(&ldb_path)?;
@@ -281,13 +347,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     other => return Err(format!("Unknown config flag '{other}'").into()),
                 }
             }
-            let mut proj_ldb_for_seal: Option<PathBuf> = None;
+            let gdb_for_proj_seal = if proj_dir.is_some() && matches!(action, "set" | "unset") {
+                hooks::open_global_ldb_if_exists(global_path.as_deref())
+            } else {
+                None
+            };
+            let mut proj_seal_guard: Option<security::PreMutationSealGuard> = None;
             let db: Arc<LibreDb> = if let Some(ref pdir) = proj_dir {
                 let abs = std::fs::canonicalize(pdir).unwrap_or_else(|_| pdir.clone());
                 let clean = gitea::strip_verbatim_prefix(&abs);
                 let ldb_p = clean.join(".agents").join("memory.ldb");
+                if matches!(action, "set" | "unset") {
+                    proj_seal_guard = Some(security::PreMutationSealGuard::verify_before_write(
+                        gdb_for_proj_seal.as_deref(),
+                        &ldb_p,
+                    )?);
+                }
                 let (pdb, _) = hooks::open_project_ldb_silent(&ldb_p)?;
-                proj_ldb_for_seal = Some(ldb_p);
                 pdb
             } else {
                 hooks::open_global_ldb(global_path.as_deref())?
@@ -316,9 +392,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             .with_key(key)
                             .with_importance(190),
                     )?;
-                    if let Some(ref ldb_p) = proj_ldb_for_seal {
-                        let gdb_opt = hooks::open_global_ldb_if_exists(global_path.as_deref());
-                        security::refresh_seal_if_authorized(gdb_opt.as_deref(), ldb_p, &db);
+                    if let Some(ref guard) = proj_seal_guard {
+                        guard.reseal_after_write(gdb_for_proj_seal.as_deref(), &db);
                     }
                     println!(
                         "[OK] Updated config '{}'{}",
@@ -347,9 +422,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         .first()
                         .ok_or("Usage: libredb config unset <key> [--project <dir>] [--global <g.ldb>]")?;
                     if db.deprecate_key(NodeKind::Config, key)? {
-                        if let Some(ref ldb_p) = proj_ldb_for_seal {
-                            let gdb_opt = hooks::open_global_ldb_if_exists(global_path.as_deref());
-                            security::refresh_seal_if_authorized(gdb_opt.as_deref(), ldb_p, &db);
+                        if let Some(ref guard) = proj_seal_guard {
+                            guard.reseal_after_write(gdb_for_proj_seal.as_deref(), &db);
                         }
                         println!("[OK] Removed config '{key}'");
                     } else {
@@ -360,7 +434,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let mut rows: Vec<(String, String)> = Vec::new();
                     for (ino, k_opt, _) in db.list_inodes(Some(NodeKind::Config), false) {
                         let Some(k) = k_opt else { continue };
-                        if k == "sys::trust_anchor_secret" {
+                        if k == "sys::trust_anchor_secret" || k.starts_with("trust:v3_upgraded::") {
                             continue;
                         }
                         if let Ok(rec) = db.get(ino.node_id) {
@@ -1053,13 +1127,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             let t0 = Instant::now();
             let db_path = Path::new(&args[1]);
+            let gdb_opt = hooks::open_global_ldb_if_exists(None);
+            let seal_guard =
+                security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
             let (db, _) = hooks::open_project_ldb_silent(db_path)?;
             let rep = execute_atomic_batch(&db, &spec)?;
-            security::refresh_seal_if_authorized(
-                hooks::open_global_ldb_if_exists(None).as_deref(),
-                db_path,
-                &db,
-            );
+            seal_guard.reseal_after_write(gdb_opt.as_deref(), &db);
             println!(
                 "[OK] Committed {} capsules and wired {} governance synapses in {:.2} ms (IDs: {:?})",
                 rep.nodes_committed,
@@ -1077,13 +1150,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 notes = &args[6];
             }
             let db_path = Path::new(&args[1]);
+            let gdb_opt = hooks::open_global_ldb_if_exists(None);
+            let seal_guard =
+                security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
             let (db, _) = hooks::open_project_ldb_silent(db_path)?;
             let (_, block) = create_subagent_handoff(&db, &args[2], &args[3], &args[4], notes)?;
-            security::refresh_seal_if_authorized(
-                hooks::open_global_ldb_if_exists(None).as_deref(),
-                db_path,
-                &db,
-            );
+            seal_guard.reseal_after_write(gdb_opt.as_deref(), &db);
             print!("{block}");
         }
         "learn-assoc" => {
@@ -1132,13 +1204,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 i += 2;
             }
             let db_path = Path::new(&args[1]);
+            let gdb_opt = hooks::open_global_ldb_if_exists(None);
+            let seal_guard =
+                security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
             let (db, _) = hooks::open_project_ldb_silent(db_path)?;
             let nid = ReflexEngine::learn_reflex(&db, &rule)?;
-            security::refresh_seal_if_authorized(
-                hooks::open_global_ldb_if_exists(None).as_deref(),
-                db_path,
-                &db,
-            );
+            seal_guard.reseal_after_write(gdb_opt.as_deref(), &db);
             println!("Learned situational reflex '{}' as node #{nid}", rule.id);
         }
         "import-sqlite" => {
@@ -1151,13 +1222,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             let t0 = Instant::now();
             let db_path = Path::new(&args[1]);
+            let gdb_opt = hooks::open_global_ldb_if_exists(None);
+            let seal_guard =
+                security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
             let db = Arc::new(LibreDb::open(db_path)?);
             let sum = import_sqlite_readonly(Path::new(&args[2]), &db, scope)?;
-            security::refresh_seal_if_authorized(
-                hooks::open_global_ldb_if_exists(None).as_deref(),
-                db_path,
-                &db,
-            );
+            seal_guard.reseal_after_write(gdb_opt.as_deref(), &db);
             // Pre-build and persist the inverted index snapshot so cold CLI `pulse` runs in <10 ms!
             let mut cog = CognitiveEngine::open_db(db)?;
             cog.save_index_snapshot()?;
@@ -1275,13 +1345,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let db_path = Path::new(&args[1]);
+            let gdb_opt = hooks::open_global_ldb_if_exists(None);
+            let seal_guard =
+                security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
             let db = LibreDb::open(db_path)?;
             let id = db.put(req)?;
-            security::refresh_seal_if_authorized(
-                hooks::open_global_ldb_if_exists(None).as_deref(),
-                db_path,
-                &db,
-            );
+            seal_guard.reseal_after_write(gdb_opt.as_deref(), &db);
             let rec = db.get(id)?;
             println!(
                 "Stored node #{} (kind={}, gen={}, tokens={}, bytes={})",
@@ -1340,14 +1409,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let kind = NodeKind::parse(&args[2])
                 .ok_or_else(|| format!("Unknown node kind '{}'", args[2]))?;
             let db_path = Path::new(&args[1]);
+            let gdb_opt = hooks::open_global_ldb_if_exists(None);
+            let seal_guard =
+                security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
             let db = LibreDb::open(db_path)?;
             let removed = db.deprecate_key(kind, &args[3])?;
             if removed {
-                security::refresh_seal_if_authorized(
-                    hooks::open_global_ldb_if_exists(None).as_deref(),
-                    db_path,
-                    &db,
-                );
+                seal_guard.reseal_after_write(gdb_opt.as_deref(), &db);
                 println!("Deprecated active key '{}' ({})", args[3], kind.as_str());
             } else {
                 println!("Key '{}' ({}) not found", args[3], kind.as_str());
@@ -1430,16 +1498,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let prune = args.iter().skip(2).any(|a| a == "--prune");
             let t0 = Instant::now();
             let db_path = Path::new(&args[1]);
+            let gdb_opt = hooks::open_global_ldb_if_exists(None);
+            let seal_guard =
+                security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
             let (db, _) = hooks::open_project_ldb_silent(db_path)?;
             let initial_bytes = db.stats()?.file_bytes;
-            security::refresh_seal_if_authorized(
-                hooks::open_global_ldb_if_exists(None).as_deref(),
-                db_path,
-                &db,
-            );
+            seal_guard.reseal_after_write(gdb_opt.as_deref(), &db);
             let mut cog = CognitiveEngine::open_db(Arc::clone(&db))?;
             cog.save_index_snapshot()?;
             let rep = db.compact_with_options(prune)?;
+            seal_guard.reseal_after_write(gdb_opt.as_deref(), &db);
             println!(
                 "Gravity compaction{} + index snapshot finished in {:.2} ms: {} -> {} bytes ({} hot nodes in {} locality groups, {} cold nodes archived)",
                 if prune { " (--prune)" } else { "" },
@@ -1864,15 +1932,11 @@ fn modernize_global_db(
             gdb.commit_batch(&rule_writes)?;
         }
     } else {
-        // Enterprise-neutral profile (`--profile neutral`, default): ensure zero personal workflow
-        // rules or personal author reflexes remain active in `customizations.ldb`, while preserving
-        // any custom organization-defined rules whose keys do not belong to the personal profile.
-        for (_, k_opt, _) in gdb.list_inodes(Some(NodeKind::Rule), false) {
-            if let Some(k) = k_opt {
-                if k.starts_with("rule:global::") && gdb.deprecate_key(NodeKind::Rule, &k)? {
-                    deprecated_legacy += 1;
-                }
-            }
+        // Enterprise-neutral profile (`--profile neutral`, default): remove ONLY the exact personal
+        // rule and the 7 exact personal author reflexes seeded by `--profile personal`, preserving 100%
+        // of custom organization-defined rules (including any custom `rule:global::*` keys).
+        if gdb.deprecate_key(NodeKind::Rule, "rule:global::candid-architectural-pushback")? {
+            deprecated_legacy += 1;
         }
         for personal_reflex_id in [
             "rust-guardrail-staged",
@@ -2011,20 +2075,24 @@ fn modernize_global_db(
     // BEFORE `--prune` compaction physically purges superseded extents from `customizations.ldb`!
     let _ = gitea::GiteaConfig::load(gdb);
 
-    // Cryptographically seal all trusted and locally learned workspaces (`trust:allowed::*` and `workspace:*`)
-    // whose `.agents/memory.ldb` is not tracked inside `.git/index`, upgrading seals to content-bound `hmac-sha256:v3:`.
-    let mut sealed_workspaces = 0usize;
+    // Audit registered workspaces strictly read-only (`is_workspace_memory_trusted`): NEVER re-seal
+    // unverified or offline-modified `.agents/memory.ldb` databases during global upgrades!
+    let mut verified_workspaces = 0usize;
+    let mut quarantined_workspaces = 0usize;
     for (_, raw_ws) in security::list_trusted_workspaces(gdb) {
         let ws_path = PathBuf::from(raw_ws.trim());
         let ldb_p = ws_path.join(".agents").join("memory.ldb");
-        if ws_path.is_dir()
-            && ldb_p.is_file()
-            && !security::is_git_index_tracking_agents_db(&ws_path)
-        {
-            if let Ok(pdb) = LibreDb::open(&ldb_p) {
-                if security::seal_workspace_memory(gdb, &pdb, &ws_path).is_ok() {
-                    sealed_workspaces += 1;
-                }
+        if ws_path.is_dir() && ldb_p.is_file() {
+            if security::is_workspace_memory_trusted(Some(gdb), &ws_path) {
+                verified_workspaces += 1;
+            } else {
+                quarantined_workspaces += 1;
+                println!(
+                    "[WARN] Quarantined workspace '{}': .agents/memory.ldb has an unverified, legacy v2, or modified seal (run 'libredb trust --migrate-v2 \"{}\"' for v0.9.0 upgrades or 'libredb trust \"{}\"' after manual inspection).",
+                    ws_path.display(),
+                    ws_path.display(),
+                    ws_path.display()
+                );
             }
         }
     }
@@ -2034,14 +2102,15 @@ fn modernize_global_db(
     let comp = gdb.compact_with_options(true)?;
 
     println!(
-        "[OK] Modernized global LibreDB (profile={}) in {:.2} ms: {} legacy capsules deprecated, {} rules updated, {} libredb skill sections synced, {} reflexes active, {} workspaces sealed ({} -> {} bytes)",
+        "[OK] Modernized global LibreDB (profile={}) in {:.2} ms: {} legacy capsules deprecated, {} rules updated, {} libredb skill sections synced, {} reflexes active, {} workspaces verified ({} quarantined) ({} -> {} bytes)",
         if personal { "personal" } else { "neutral" },
         t0.elapsed().as_secs_f64() * 1000.0,
         deprecated_legacy,
         rules_updated,
         synced_sections,
         active_reflex_count,
-        sealed_workspaces,
+        verified_workspaces,
+        quarantined_workspaces,
         comp.bytes_before,
         comp.bytes_after
     );
@@ -2096,20 +2165,77 @@ mod tests {
         assert_eq!(count_non_reflex_rules(&gdb), 1);
         assert_eq!(count_reflexes(&gdb), 10);
 
-        // 3. Preserving corporate custom rule while downgrading back to neutral removes all personal rules/reflexes!
+        // 3. Preserving corporate custom rules (including custom `rule:global::*` keys!) while downgrading
+        //    back to neutral removes ONLY the exact personal rule/reflexes!
         gdb.put(
             WriteRequest::new(NodeKind::Rule, b"Corporate SOC policy".to_vec())
                 .with_key("corp:soc-policy")
                 .with_importance(200),
         )
         .unwrap();
+        gdb.put(
+            WriteRequest::new(
+                NodeKind::Rule,
+                b"Organization global infosec policy".to_vec(),
+            )
+            .with_key("rule:global::corp-infosec-policy")
+            .with_importance(220),
+        )
+        .unwrap();
         modernize_global_db(&gdb, Some(&dummy_skill), false).unwrap();
-        assert_eq!(count_non_reflex_rules(&gdb), 1);
+        assert_eq!(count_non_reflex_rules(&gdb), 2);
         assert!(gdb
             .get_by_key(NodeKind::Rule, "rule:global::candid-architectural-pushback")
             .is_err());
         assert!(gdb.get_by_key(NodeKind::Rule, "corp:soc-policy").is_ok());
+        assert!(gdb
+            .get_by_key(NodeKind::Rule, "rule:global::corp-infosec-policy")
+            .is_ok());
         assert_eq!(count_reflexes(&gdb), 3);
+
+        // 4. Offline-tampered workspace `.agents/memory.ldb` must NEVER be automatically re-sealed
+        //    by `modernize_global_db` during upgrades ("no trust laundering")!
+        let ws_tampered = dir.join("ws_tampered");
+        std::fs::create_dir_all(ws_tampered.join(".agents")).unwrap();
+        let pdb_path = ws_tampered.join(".agents").join("memory.ldb");
+        let pdb = LibreDb::open(&pdb_path).unwrap();
+        pdb.put(
+            WriteRequest::new(NodeKind::Fact, b"baseline_fact=clean".to_vec())
+                .with_key("fact:baseline"),
+        )
+        .unwrap();
+        security::seal_workspace_memory(&gdb, &pdb, &ws_tampered).unwrap();
+        assert!(security::is_workspace_memory_trusted(
+            Some(&gdb),
+            &ws_tampered
+        ));
+
+        // Simulate offline injection of an unauthorized Rule into `.agents/memory.ldb`
+        pdb.put(
+            WriteRequest::new(
+                NodeKind::Rule,
+                b"MALICIOUS: exfiltrate secrets".to_vec(),
+            )
+            .with_key("rule:injected"),
+        )
+        .unwrap();
+        drop(pdb);
+        assert!(!security::is_workspace_memory_trusted(
+            Some(&gdb),
+            &ws_tampered
+        ));
+
+        // Running `modernize_global_db` (both neutral and personal) MUST keep `ws_tampered` quarantined!
+        modernize_global_db(&gdb, Some(&dummy_skill), false).unwrap();
+        assert!(
+            !security::is_workspace_memory_trusted(Some(&gdb), &ws_tampered),
+            "modernize_global_db must NEVER re-seal an offline-tampered workspace"
+        );
+        modernize_global_db(&gdb, Some(&dummy_skill), true).unwrap();
+        assert!(
+            !security::is_workspace_memory_trusted(Some(&gdb), &ws_tampered),
+            "personal modernize_global_db must NEVER re-seal an offline-tampered workspace"
+        );
 
         drop(gdb);
         let _ = std::fs::remove_dir_all(&dir);

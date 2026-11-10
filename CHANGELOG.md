@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.2] - 2026-11-10
+
+### Added
+
+- Added `--migrate-v2` and `--if-clean` flags to `libredb trust` (`migrate_workspace_seal_v2_to_v3` in `crates/libredb-cli/src/security.rs` and `crates/libredb-cli/src/main.rs`): `--migrate-v2` explicitly verifies a legacy `v0.9.0` `hmac-sha256:v2:` workspace HMAC against this host's `sys::trust_anchor_secret` (while rejecting downgrade attempts if a `slot:<id>=hmac-sha256:v3:` entry already exists and failed verification) before issuing a content-bound `hmac-sha256:v3:` seal, and `--if-clean` allows plugin installers (`scripts/deploy_plugin.ps1` and `scripts/deploy_plugin.sh`) to seal fresh or already-valid workspaces without ever auto-trusting a modified `.agents/memory.ldb`.
+
+### Fixed
+
+- Narrowed neutral-profile rule cleanup in `modernize_global_db` (`crates/libredb-cli/src/main.rs`) from the prefix wildcard `k.starts_with("rule:global::")` to the exact personal rule key `"rule:global::candid-architectural-pushback"` (plus the `7` exact personal reflex IDs), ensuring custom organization-defined global rules under the `rule:global::*` namespace survive `--profile neutral` upgrades and `Personal -> Neutral` switches untouched.
+
+### Security
+
+- Eliminated post-hoc workspace re-sealing ("trust laundering") across global upgrades, CLI mutations, lifecycle hooks, and `MCP` caching: `modernize_global_db` (`crates/libredb-cli/src/main.rs`) now audits registered workspaces strictly read-only via `is_workspace_memory_trusted` (quarantining and warning on modified or unverified `.agents/memory.ldb` files instead of calling `seal_workspace_memory`), all project-mutating CLI commands (`config set/unset --project`, `batch`, `handoff`, `learn-reflex`, `import-sqlite`, `put`, `deprecate`, `compact`) enforce a pre-mutation `PreMutationSealGuard::verify_before_write` check before touching disk, `run_pre_invocation_hook` (`crates/libredb-cli/src/hooks.rs`) seals strictly when `did_migrate == true`, and `McpServerState::resolve_brain_with_seal_target` (`crates/libredb-cli/src/mcp.rs`) evicts cached RAM `OverlayBrain` instances immediately on seal mismatch.
+
 ## [0.9.1] - 2026-11-10
 
 ### Added
