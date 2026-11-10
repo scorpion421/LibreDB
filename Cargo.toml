@@ -8,9 +8,16 @@ members = [
     "crates/libredb-cli",
     "crates/libredb-py",
 ]
+default-members = [
+    "crates/libredb-core",
+    "crates/libredb-index",
+    "crates/libredb-cognitive",
+    "crates/libredb-bridge",
+    "crates/libredb-cli",
+]
 
 [workspace.package]
-version = "0.8.7"
+version = "0.8.8"
 edition = "2021"
 authors = ["Antigravity <antigravity@local.dev>"]
 license = "AGPL-3.0-only"

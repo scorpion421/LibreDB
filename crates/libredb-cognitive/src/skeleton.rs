@@ -11,8 +11,8 @@ use std::path::Path;
 
 pub const SKELETON_KEY_PREFIX: &str = "skeleton::";
 /// Content-hash seed bumped whenever `FileSkeleton` extraction semantics upgrade (e.g. `container`
-/// qualification, `[T; N]` array-return brace parsing, and PowerShell/Shell quote/escape rules in v0.8.7).
-pub const SKELETON_HASH_SEED: u8 = 107;
+/// qualification, `[T; N]` array-return brace parsing, PowerShell/Shell quote rules, and `Makefile` targets in v0.8.8).
+pub const SKELETON_HASH_SEED: u8 = 108;
 
 /// Section boundary (e.g., `# SECTION: skillsdb.core.db` or `mod ...`) inside a source file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +75,7 @@ impl FileSkeleton {
             "smali" => extract_smali_symbols(&lines, total_lines),
             "asm" => extract_asm_symbols(&lines, total_lines),
             "markdown" => extract_markdown_symbols(&lines, total_lines),
+            "makefile" => extract_makefile_symbols(&lines, total_lines),
             "sql" => extract_sql_symbols(&lines, total_lines),
             "powershell" => extract_powershell_symbols(&lines, total_lines),
             "shell" => extract_shell_symbols(&lines, total_lines),
@@ -257,6 +258,10 @@ impl FileSkeleton {
 
 fn detect_language(label: &str) -> String {
     let low = label.to_ascii_lowercase();
+    let fname = low.rsplit(['/', '\\']).next().unwrap_or(&low);
+    if matches!(fname, "makefile" | "gnumakefile" | "justfile") || low.ends_with(".mk") {
+        return "makefile".to_owned();
+    }
     if low.ends_with(".rs") {
         "rust".to_owned()
     } else if low.ends_with(".py") {
@@ -704,6 +709,88 @@ fn extract_markdown_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolCon
             doc_summary: String::new(),
             start_line: start,
             end_line,
+        });
+    }
+    out
+}
+
+fn extract_makefile_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContract> {
+    let mut raw: Vec<(usize, String, String, String)> = Vec::new();
+    let mut pending_doc = String::new();
+
+    for (idx, &line) in lines.iter().enumerate() {
+        if line.starts_with('\t') {
+            pending_doc.clear();
+            continue;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            pending_doc.clear();
+            continue;
+        }
+        if let Some(comment) = trimmed.strip_prefix('#') {
+            let c = comment.trim();
+            if !c.is_empty() && pending_doc.is_empty() {
+                pending_doc = c.to_owned();
+            }
+            continue;
+        }
+        if trimmed.starts_with('.') {
+            pending_doc.clear();
+            continue;
+        }
+        // Distinguish target rules (`build: deps`) from variable assignments (`CC := gcc`, `CFLAGS ?= ...`)
+        if let Some((lhs, rhs)) = trimmed.split_once(':') {
+            if rhs.starts_with('=') || lhs.ends_with(['?', '+', '!']) || lhs.contains('=') {
+                pending_doc.clear();
+                continue;
+            }
+            let target = lhs.split_whitespace().next().unwrap_or("").trim();
+            if !target.is_empty()
+                && !target.contains('$')
+                && target
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '/' | '.'))
+            {
+                let inline_doc = rhs.split_once("##").map_or("", |(_, d)| d.trim());
+                let doc = if !inline_doc.is_empty() {
+                    inline_doc.to_owned()
+                } else {
+                    std::mem::take(&mut pending_doc)
+                };
+                let sig = trimmed.split("##").next().unwrap_or(trimmed).trim();
+                raw.push((idx + 1, target.to_owned(), truncate_chars(sig, 115), doc));
+                pending_doc.clear();
+                continue;
+            }
+        }
+        pending_doc.clear();
+    }
+
+    let mut out = Vec::with_capacity(raw.len());
+    for i in 0..raw.len() {
+        let (start, ref name, ref sig, ref doc) = raw[i];
+        let mut end_line = start;
+        for (s_idx, &s_line) in lines.iter().enumerate().skip(start) {
+            if i + 1 < raw.len() && s_idx + 1 >= raw[i + 1].0 {
+                break;
+            }
+            if s_line.starts_with('\t') || s_line.trim_end().ends_with('\\') {
+                end_line = s_idx + 1;
+            } else if s_line.trim().is_empty() {
+                continue;
+            } else {
+                break;
+            }
+        }
+        out.push(SymbolContract {
+            kind: "target".to_owned(),
+            name: name.clone(),
+            container: None,
+            signature: sig.clone(),
+            doc_summary: truncate_chars(doc, 85),
+            start_line: start,
+            end_line: end_line.min(total_lines.max(start)),
         });
     }
     out
@@ -1522,6 +1609,12 @@ mod tests {
         assert_eq!(sk_md.language, "markdown");
         assert_eq!(sk_md.symbols.len(), 4);
         assert!(sk_md.symbols.iter().any(|s| s.kind == "h2" && s.name == "Architecture" && s.start_line == 3 && s.end_line == 8));
+
+        let mk_src = "CARGO ?= cargo\n\n## Build optimized release binary\nbuild: check-deps\n\t$(CARGO) build --release\n\ninstall: build ## Install plugin\n\tsh ./scripts/deploy_plugin.sh\n";
+        let sk_mk = FileSkeleton::extract("Makefile", mk_src);
+        assert_eq!(sk_mk.language, "makefile");
+        assert!(sk_mk.symbols.iter().any(|s| s.kind == "target" && s.name == "build" && s.start_line == 4 && s.end_line == 5));
+        assert!(sk_mk.symbols.iter().any(|s| s.kind == "target" && s.name == "install" && s.start_line == 7 && s.end_line == 8));
     }
 
     #[test]

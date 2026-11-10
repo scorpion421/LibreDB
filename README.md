@@ -1,11 +1,11 @@
 # LibreDB
 
-[![Version](https://img.shields.io/badge/version-0.8.7-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.8.8-blue.svg)](CHANGELOG.md)
 [![Tests](https://img.shields.io/badge/tests-passing%20(36%20suites%20%2B%2010k%20crash%20sims)-brightgreen.svg)](crates/libredb-bridge/tests/)
 [![Tech Stack](https://img.shields.io/badge/rust-1.99%2B%20%7C%20PyO3%20abi3%20%7C%20MCP-orange.svg)](Cargo.toml)
 [![License](https://img.shields.io/badge/license-AGPLv3%20%2B%20Commons%20Clause-purple.svg)](LICENSE)
 
-`LibreDB` is a local-first, zero-configuration, single-file cognitive database, lifecycle hook engine, dynamic multi-remote Git/Gitea automation suite, and multi-workspace `MCP` memory substrate (`*.ldb`) built in Rust specifically for `Antigravity` and `LLMs`. It replaces `SQLite` + Python memory overhead with zero-I/O RAM-first `Zero-Repeat Delta` deduplication, cryptographic workspace trust anchors (`libredb trust`), OS-vault `DPAPI` secret protection, `< 2 ms` compiled `PreInvocation`/`PreToolUse` hooks, 14+ language zero-hardcode causal code-graph `FIM` slicing, and provider-aware Git/Gitea/GitHub release automation.
+`LibreDB` is a local-first, zero-configuration, single-file cognitive database, lifecycle hook engine, dynamic multi-remote Git/Gitea automation suite, and multi-workspace `MCP` memory substrate (`*.ldb`) built in Rust specifically for `Antigravity` and `LLMs`. It replaces `SQLite` + Python memory overhead with zero-I/O RAM-first `Zero-Repeat Delta` deduplication, cryptographic workspace trust anchors (`libredb trust`), OS-vault secret protection (`DPAPI` / POSIX `0600`), `< 2 ms` compiled `PreInvocation`/`PreToolUse` hooks, 15+ language zero-hardcode causal code-graph `FIM` slicing, and provider-aware Git/Gitea/GitHub release automation across Windows, Linux, and macOS.
 
 ## Table of contents
 
@@ -17,12 +17,12 @@
 
 ## Executive summary and impact
 
-| Dimension | Legacy Python + `SQLite` (`SkillsDB`) | `LibreDB v0.8.7` (Pure `Rust` + `MCP` + `PyO3`) |
+| Dimension | Legacy Python + `SQLite` (`SkillsDB`) | `LibreDB v0.8.8` (Pure `Rust` + `MCP` + `PyO3`) |
 | :--- | :--- | :--- |
 | **Lifecycle hook latency** | `350-500 ms` Python startup + `SQLite` WAL per edit/turn | **`< 2 ms` native compiled `hook-pre-tool` & `hook-pre-invocation`** |
 | **Turn 2+ recall & I/O** | `300-1500 ms` subprocess + repeated full text output | **`0` disk I/O reads (`~3 ms` `MCP` / `PyO3`) via RAM-first `Zero-Repeat Delta`** |
-| **Workspace trust & secrets** | Plaintext DB tokens & unverified `.agents/memory.db` loads | **Windows `DPAPI` OS vault + cryptographic `sys::trust_seals` (`libredb trust`)** |
-| **Source inspection & edits** | Full `read_file` scans + separate `symbol_index` / `decisions` | **Unified `1.5 ms` 14-language `fim`, `impact` & batched `skeleton`** (`.rs`, `.py`, `.smali`, `.asm`, `.md`, `.cpp`, `.sql`, `.ps1`) |
+| **Workspace trust & secrets** | Plaintext DB tokens & unverified `.agents/memory.db` loads | **Windows `DPAPI` / POSIX `0600` vault + cryptographic `sys::trust_seals` (`libredb trust`)** |
+| **Source inspection & edits** | Full `read_file` scans + separate `symbol_index` / `decisions` | **Unified `1.5 ms` 15-language `fim`, `impact` & batched `skeleton`** (`.rs`, `.py`, `.smali`, `.asm`, `Makefile`, `.md`, `.cpp`, `.sql`, `.ps1`) |
 | **Universal zero-hardcode design** | Hardcoded stopword & bilingual synonym dictionaries | **100% language-agnostic corpus-`IDF` call-graph & `n-gram` recall + `libredb config`** |
 | **Guardrails & Git/Gitea DevOps** | `15,492`-line Python script + forced `origin` rewrites | **Binary-safe `< 0.5 ms` Rust guardrails + dynamic multi-remote Git/Gitea/GitHub sync** |
 
@@ -30,15 +30,21 @@
 
 ### Prerequisites
 
-- **Rust toolchain:** `1.85+` (`x86_64-pc-windows-msvc` or POSIX target)
-- **Optional Python integration:** `Python 3.12+` (verified on `Python 3.14.5` via Stable ABI `abi3`)
+- **Rust toolchain:** `1.89+` (`cargo` + `rustc`, plus a standard C compiler `cc`/`gcc`/`clang` on Linux/macOS or MSVC on Windows for bundled `sqlite3.c` - zero external `-dev` libraries required)
+- **Optional Python integration:** `Python 3.12+` (verified on `Python 3.14.5` via Stable ABI `abi3`, decoupled from default `CLI`/`MCP` builds)
 
-### Build, verify, and deploy complete Antigravity replacement plugin
+### Linux and macOS (source build & plugin install via Makefile)
+
+```sh
+make test
+make install
+```
+
+### Windows (PowerShell build & plugin install)
 
 ```powershell
-$env:PYO3_USE_ABI3_FORWARD_COMPATIBILITY = "1"
-cargo test --release --workspace --exclude libredb-py
-cargo build --release --workspace
+cargo test --release
+cargo build --release
 pwsh -ExecutionPolicy Bypass -File .\scripts\deploy_plugin.ps1
 ```
 
@@ -58,20 +64,22 @@ pwsh -ExecutionPolicy Bypass -File .\scripts\deploy_plugin.ps1
 
 ```text
 LibreDB/
-|-- Cargo.toml                                     # Rust workspace (6 modular crates)
-|-- VERSION                                        # Semantic Version (0.8.7)
+|-- Cargo.toml                                     # Rust workspace (5 default CLI/MCP crates + optional PyO3 crate)
+|-- Makefile                                       # Zero-dependency POSIX/Linux/macOS source build & installer
+|-- VERSION                                        # Semantic Version (0.8.8)
 |-- CHANGELOG.md                                   # Keep a Changelog 1.1.0 release history
 |-- LICENSE                                        # AGPLv3 + Commons Clause license
 |-- README.md                                      # 9-block standardized documentation
 |-- scripts/
-|   |-- deploy_plugin.ps1                          # Full standalone Antigravity replacement plugin installer
+|   |-- deploy_plugin.ps1                          # Windows PowerShell Antigravity replacement plugin installer
+|   |-- deploy_plugin.sh                           # POSIX/Linux/macOS Antigravity replacement plugin installer
 |-- crates/
     |-- libredb-core/                              # Frozen single-file LIBREDB1 storage kernel (Inodes, Extents, MVCC)
     |-- libredb-index/                             # Language-agnostic IDF n-grams, Hebbian learner & persistent index snapshot
     |-- libredb-cognitive/                         # OverlayBrain, Session Delta, Guardrails, Reflexes, WorkspaceGraph & FIM
     |-- libredb-bridge/                            # Zero-amnesia 19-table silent SQLite auto-porter & parity verifier
     |-- libredb-cli/                               # CLI, Multi-Workspace MCP Server, Lifecycle Hooks & Native Gitea Suite
-    |-- libredb-py/                                # Native PyO3 abi3 Python extension (`libredb.pyd` / `.so`)
+    |-- libredb-py/                                # Optional PyO3 abi3 Python extension (`libredb.pyd` / `.so`)
 ```
 
 ## Versioning and license

@@ -781,6 +781,20 @@ pub fn is_protected_profile_dir(p: &Path) -> bool {
         || low.contains("\\windows\\")
         || trimmed.ends_with("\\windows")
         || low.contains("\\program files")
+        || low.starts_with("\\etc\\")
+        || trimmed == "\\etc"
+        || low.starts_with("\\usr\\")
+        || trimmed == "\\usr"
+        || low.starts_with("\\proc\\")
+        || trimmed == "\\proc"
+        || low.starts_with("\\sys\\")
+        || trimmed == "\\sys"
+        || low.starts_with("\\dev\\")
+        || trimmed == "\\dev"
+        || low.starts_with("\\run\\")
+        || trimmed == "\\run"
+        || low.starts_with("\\var\\tmp\\")
+        || trimmed == "\\var\\tmp"
 }
 
 /// Resolves `<appDataDir>/brain/<cid>` across Antigravity 2.0 (`antigravity`),

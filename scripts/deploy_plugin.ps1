@@ -85,8 +85,8 @@ $PluginJson = @'
 {
   "name": "libredb",
   "displayName": "LibreDB Cognitive Memory",
-  "version": "0.8.7",
-  "description": "Full Rust replacement for SQLite SkillsDB: single-file cognitive memory, silent SQLite auto-porter, sub-2ms hooks, workspace trust anchors, DPAPI credential vault, 14-language zero-hardcode causal code graph, and dynamic multi-remote Git/Gitea automation.",
+  "version": "0.8.8",
+  "description": "Full Rust replacement for SQLite SkillsDB: single-file cognitive memory, silent SQLite auto-porter, sub-2ms hooks, workspace trust anchors, DPAPI credential vault, 15-language zero-hardcode causal code graph, and dynamic multi-remote Git/Gitea automation.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
     "Run a LibreDB cognitive pulse on the active workspace to load deduplicated context",
@@ -352,10 +352,10 @@ $LogoSvg = @'
 
 # 7. Write user-facing README.md inside plugin bundle
 $PluginReadme = @'
-# LibreDB cognitive memory plugin (v0.8.7)
+# LibreDB cognitive memory plugin (v0.8.8)
 
 Complete standalone Rust replacement for `AntiGraviton SkillsDB` (`customizations-db`):
-- `libredb-mcp`: 3-tool multi-workspace cognitive memory & 14-language zero-hardcode causal code-graph server with zero-I/O RAM session delta, `[Zero-Repeat Skeleton]` deduplication, corpus-`IDF` call-graph disambiguation, and automatic incremental workspace refresh.
+- `libredb-mcp`: 3-tool multi-workspace cognitive memory & 15-language zero-hardcode causal code-graph server with zero-I/O RAM session delta, `[Zero-Repeat Skeleton]` deduplication, corpus-`IDF` call-graph disambiguation, and automatic incremental workspace refresh.
 - Cryptographic workspace trust anchors (`libredb trust`, `sys::trust_seals`), Windows `DPAPI` (`CryptProtectData`) OS credential vault for `gitea_token`, control-plane path protection (`hooks.json`, `mcp_config.json`, `.git/hooks/*`), and universal `libredb config` customization.
 - Compaction garbage collection (`compact_with_options`, `maybe_auto_compact`) and `INDEX_FORMAT_VERSION = 4` `HybridIndex` with dead-posting garbage collection across superseded Inodes.
 - Silent background 1:1 auto-migration for trusted `.agents/memory.db` in older projects or chats; pure `.ldb` operation for all new projects and chats.
@@ -384,6 +384,6 @@ if (Test-Path $AgyConfigPath) {
     }
 }
 
-Write-Output "[OK] Deployed LibreDB v0.8.7 standalone binaries to: $BinDir"
+Write-Output "[OK] Deployed LibreDB v0.8.8 standalone binaries to: $BinDir"
 Write-Output "[OK] Hydrated and modernized global 19-table store at: $GlobalLdb"
 Write-Output "[OK] Installed complete Antigravity replacement plugin at: $PluginDir"

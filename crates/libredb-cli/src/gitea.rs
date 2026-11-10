@@ -349,17 +349,26 @@ pub fn cmd_gitea_status(global_opt: Option<&Path>) -> Result<(), Box<dyn std::er
     let mut svc_state = query_service_state(&cfg.service_name);
     let mut ver_opt = check_gitea_version(&cfg);
 
-    if ver_opt.is_none() || svc_state == "STOPPED" {
+    #[cfg(windows)]
+    if (ver_opt.is_none() || svc_state == "STOPPED") && is_loopback_http_url(&cfg.url) {
         let _ = Command::new("sc.exe").args(["start", &cfg.service_name]).output();
         std::thread::sleep(Duration::from_millis(900));
         svc_state = query_service_state(&cfg.service_name);
         ver_opt = check_gitea_version(&cfg);
     }
+    #[cfg(not(windows))]
+    let _ = &mut svc_state;
+
+    let svc_label = if cfg!(windows) {
+        "Windows Service:"
+    } else {
+        "System Service: "
+    };
 
     println!("============================================================");
     println!("LibreDB - Gitea Integration Status");
     println!("============================================================");
-    println!("Windows Service:  {} ({svc_state})", cfg.service_name);
+    println!("{svc_label}  {} ({svc_state})", cfg.service_name);
     println!("Server URL:       {}", cfg.url);
     if let Some(ver) = ver_opt {
         println!("API Health:       ONLINE");
@@ -1403,8 +1412,25 @@ fn query_service_state(service_name: &str) -> String {
                 }
             }
         }
+        return "UNKNOWN".to_owned();
     }
-    "UNKNOWN".to_owned()
+    if cfg!(unix) {
+        for extra_flag in [None, Some("--user")] {
+            let mut cmd = Command::new("systemctl");
+            if let Some(flag) = extra_flag {
+                cmd.arg(flag);
+            }
+            if let Ok(out) = cmd.args(["is-active", service_name]).output() {
+                let state = String::from_utf8_lossy(&out.stdout).trim().to_ascii_lowercase();
+                match state.as_str() {
+                    "active" | "activating" => return "RUNNING".to_owned(),
+                    "inactive" | "failed" | "deactivating" => return "STOPPED".to_owned(),
+                    _ => {}
+                }
+            }
+        }
+    }
+    "N/A".to_owned()
 }
 
 fn check_gitea_version(cfg: &GiteaConfig) -> Option<String> {

@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.8] - 2026-11-10
+
+### Added
+
+- Added first-class POSIX / Linux / macOS zero-dependency source build and plugin deployment workflow: root `Makefile` (`build`, `build-native`, `test`, `install`, `python`, `guardrail`, `uninstall`, `clean`, `help`), POSIX installer `scripts/deploy_plugin.sh` (atomic `mv -f` hot-swap binary updates, `test_safe_binary_dir` world-writable permission checks, `/bin/sh -c` hook verification, `~/.local/bin` + `~/.gemini` installation, and `modernize-global` + `trust` sealing), `.gitattributes` enforcing `LF` line endings on POSIX scripts and Makefiles, and cross-platform `.github/workflows/ci.yml` (`ubuntu-latest` + `windows-latest`).
+- Added pure-Rust Linux network filesystem detection (`is_linux_network_mount` via `/proc/mounts` for `nfs`, `nfs4`, `cifs`, `smb3`, `smbfs`, `fuse.sshfs`, `9p`, `lustre`, `ceph`, and `glusterfs`) and bounded non-blocking `unix_lock::lock_with_timeout` (`file.try_lock()` with `1,500 ms` network / `3,000 ms` local exponential backoff) in `crates/libredb-core/src/io.rs`.
+- Added native `Makefile` / `GNUmakefile` / `*.mk` target rule extraction (`extract_makefile_symbols`, `SKELETON_HASH_SEED = 108`) in `crates/libredb-cognitive/src/skeleton.rs` and `crates/libredb-cognitive/src/workspace.rs`.
+
+### Changed
+
+- Configured `default-members` in root `Cargo.toml` to decouple the optional `libredb-py` `cdylib` extension from default `cargo build --release` and `cargo test --release` invocations so Linux, macOS, and Windows hosts compile the full `libredb` CLI and `MCP` server with zero Python interpreter or header requirements (`make python` builds `libredb-py` explicitly).
+- Updated `cmd_gitea_status` and `query_service_state` in `crates/libredb-cli/src/gitea.rs` for cross-platform operation (`systemctl is-active` / `--user` probing on Unix, Windows `sc.exe` restricted strictly to `#[cfg(windows)]` loopback services), and extended `is_protected_profile_dir` in `crates/libredb-cli/src/hooks.rs` to guard Unix system hierarchies (`/etc`, `/usr`, `/proc`, `/sys`, `/dev`, `/run`, `/var/tmp`).
+
 ## [0.8.7] - 2026-11-10
 
 ### Added

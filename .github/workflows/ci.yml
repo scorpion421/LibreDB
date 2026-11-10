@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  linux:
+    name: Linux source build, test & plugin install
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify Makefile test, install, and strict guardrails
+        run: |
+          make test
+          make install
+          "$HOME/.local/bin/libredb" --version
+          "$HOME/.local/bin/libredb" trust --list
+          make guardrail
+
+  windows:
+    name: Windows build, test & guardrails
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run release tests and strict guardrails
+        shell: pwsh
+        run: |
+          cargo test --release
+          cargo build --release
+          .\target\release\libredb.exe guardrail check --path . --strict

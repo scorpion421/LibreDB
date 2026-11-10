@@ -145,6 +145,33 @@ mod win_lock {
     }
 }
 
+#[cfg(unix)]
+mod unix_lock {
+    use std::fs::{File, TryLockError};
+    use std::io;
+
+    pub fn lock_with_timeout(file: &File, timeout_ms: u64) -> io::Result<()> {
+        let start = std::time::Instant::now();
+        let mut sleep_ms = 1u64;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(()),
+                Err(TryLockError::WouldBlock) => {
+                    if start.elapsed().as_millis() as u64 >= timeout_ms {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!("IPC writer lock timed out after {timeout_ms}ms (WouldBlock)"),
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+                    sleep_ms = (sleep_ms * 2).min(16);
+                }
+                Err(TryLockError::Error(err)) => return Err(err),
+            }
+        }
+    }
+}
+
 /// Production OS file backend using overlap/positional reads (`seek_read` on Windows, `read_at` on Unix).
 pub struct OsFileBackend {
     file: File,
@@ -183,8 +210,9 @@ impl OsFileBackend {
     }
 }
 
-/// Detects UNC paths (`\\server\share`, `\\?\UNC\...`) and mapped SMB network drives (`Q:\...`)
-/// to apply SMB-safe sync semantics without misclassifying local `\\?\C:\...` verbatim paths.
+/// Detects UNC paths (`\\server\share`, `\\?\UNC\...`), mapped SMB network drives (`Q:\...`),
+/// and POSIX network mounts (`nfs`, `nfs4`, `cifs`, `smb3`, `fuse.sshfs`, `9p` via `/proc/mounts`)
+/// to apply network-safe sync and lock-timeout semantics without misclassifying local paths.
 pub fn detect_network_path(path: &Path) -> bool {
     let raw = path.to_string_lossy();
     if raw.len() >= 8 && raw[..8].eq_ignore_ascii_case(r"\\?\UNC\") {
@@ -207,9 +235,61 @@ pub fn detect_network_path(path: &Path) -> bool {
             if cs.len() >= 8 && cs[..8].eq_ignore_ascii_case(r"\\?\UNC\") {
                 return true;
             }
+            #[cfg(target_os = "linux")]
+            if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
+                if is_linux_network_mount(&cs, &mounts) {
+                    return true;
+                }
+            }
         }
     }
     false
+}
+
+/// Pure-Rust `/proc/mounts` longest-prefix resolver for Linux network filesystems.
+pub fn is_linux_network_mount(canon_path: &str, proc_mounts: &str) -> bool {
+    let mut best_mount_len = 0usize;
+    let mut best_fstype = "";
+    for line in proc_mounts.lines() {
+        let mut cols = line.split_whitespace();
+        let _dev = match cols.next() {
+            Some(d) => d,
+            None => continue,
+        };
+        let raw_mp = match cols.next() {
+            Some(m) => m,
+            None => continue,
+        };
+        let fstype = match cols.next() {
+            Some(t) => t,
+            None => continue,
+        };
+        let mp = raw_mp.replace(r"\040", " ").replace(r"\011", "\t");
+        let matches = if mp == "/" {
+            canon_path.starts_with('/')
+        } else {
+            canon_path == mp
+                || (canon_path.starts_with(&mp)
+                    && canon_path.as_bytes().get(mp.len()) == Some(&b'/'))
+        };
+        if matches && mp.len() >= best_mount_len {
+            best_mount_len = mp.len();
+            best_fstype = fstype;
+        }
+    }
+    matches!(
+        best_fstype.to_ascii_lowercase().as_str(),
+        "nfs"
+            | "nfs4"
+            | "cifs"
+            | "smb3"
+            | "smbfs"
+            | "fuse.sshfs"
+            | "9p"
+            | "lustre"
+            | "ceph"
+            | "glusterfs"
+    )
 }
 
 impl StorageBackend for OsFileBackend {
@@ -284,14 +364,14 @@ impl StorageBackend for OsFileBackend {
     }
 
     fn lock_write_region(&self) -> Result<()> {
+        let timeout_ms = if self.is_network { 1_500 } else { 3_000 };
         #[cfg(windows)]
         {
-            let timeout_ms = if self.is_network { 1_500 } else { 3_000 };
             win_lock::lock_high_byte(&self.file, timeout_ms)?;
         }
         #[cfg(unix)]
         {
-            self.file.lock()?;
+            unix_lock::lock_with_timeout(&self.file, timeout_ms)?;
         }
         Ok(())
     }
@@ -471,11 +551,11 @@ impl StorageBackend for FaultInjectingBackend {
 
 #[cfg(test)]
 mod tests {
-    use super::detect_network_path;
+    use super::{detect_network_path, is_linux_network_mount};
     use std::path::Path;
 
     #[test]
-    fn detect_network_path_distinguishes_unc_from_local_verbatim() {
+    fn detect_network_path_distinguishes_unc_and_linux_nfs_cifs_from_local_mounts() {
         assert!(detect_network_path(Path::new(
             r"\\?\UNC\fileserver.corp.example\share\workspace\.agents\memory.ldb"
         )));
@@ -485,5 +565,16 @@ mod tests {
         assert!(!detect_network_path(Path::new(
             r"\\?\D:\Antigravity\LibreDB\.agents\memory.ldb"
         )));
+
+        let sample_proc_mounts = "\
+/dev/nvme0n1p2 / ext4 rw,relatime 0 0\n\
+nas01:/export/home /mnt/nfs_home nfs4 rw,relatime,vers=4.2 0 0\n\
+//fs01/team\\040share /mnt/team\\040share cifs rw,vers=3.1.1 0 0\n\
+/dev/nvme0n1p3 /mnt/nfs_home/local_ssd xfs rw,relatime 0 0\n";
+
+        assert!(!is_linux_network_mount("/home/dev/LibreDB/.agents/memory.ldb", sample_proc_mounts));
+        assert!(is_linux_network_mount("/mnt/nfs_home/dev/LibreDB/.agents/memory.ldb", sample_proc_mounts));
+        assert!(is_linux_network_mount("/mnt/team share/proj/.agents/memory.ldb", sample_proc_mounts));
+        assert!(!is_linux_network_mount("/mnt/nfs_home/local_ssd/proj/.agents/memory.ldb", sample_proc_mounts));
     }
 }

@@ -773,13 +773,17 @@ fn is_known_source_extension(low: &str) -> bool {
     if low.ends_with(".min.js") || low.ends_with(".min.css") {
         return false;
     }
+    let fname = low.rsplit(['/', '\\']).next().unwrap_or(low);
+    if matches!(fname, "makefile" | "gnumakefile" | "justfile" | "cmakelists.txt") {
+        return true;
+    }
     [
         ".rs", ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".svelte", ".astro",
         ".dart", ".go", ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".cs", ".java", ".kt",
         ".kts", ".swift", ".smali", ".asm", ".s", ".inc", ".dis", ".ps1", ".psm1", ".sql", ".sh",
         ".bash", ".zsh", ".rb", ".php", ".lua", ".zig", ".scala", ".groovy", ".gradle", ".proto",
         ".ex", ".exs", ".erl", ".gleam", ".nim", ".jl", ".r", ".tf", ".hcl", ".nix", ".cmake",
-        ".wgsl", ".glsl", ".hlsl",
+        ".mk", ".wgsl", ".glsl", ".hlsl",
     ]
     .iter()
     .any(|ext| low.ends_with(ext))
