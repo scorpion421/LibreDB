@@ -10,8 +10,8 @@
 //!    from `cid` (`~/.gemini/antigravity/brain/<cid>/.system_generated/logs/transcript.jsonl`).
 
 use crate::hooks::{
-    find_workspace_root, is_protected_profile_dir, open_global_ldb, open_project_ldb_silent,
-    resolve_brain_conv_dir,
+    default_global_ldb_path, find_workspace_root, is_protected_profile_dir, open_global_ldb,
+    open_global_ldb_if_exists, open_project_ldb_silent, resolve_brain_conv_dir, user_home_dir,
 };
 use libredb_bridge::import_sqlite_readonly;
 use libredb_cognitive::{
@@ -22,7 +22,6 @@ use libredb_cognitive::{
 use libredb_core::LibreDb;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::env;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -40,10 +39,15 @@ impl McpServerState {
             Some(p) => p.to_path_buf(),
             None => default_libredb_home().join("default_memory.ldb"),
         };
-        let global_path_buf = global_path.map(Path::to_path_buf);
+        let global_path_buf = global_path
+            .map(Path::to_path_buf)
+            .or_else(|| {
+                let def = default_global_ldb_path();
+                def.is_file().then_some(def)
+            });
         let global_db = match global_path {
             Some(gp) => Some(open_global_ldb(Some(gp))?),
-            None => None,
+            None => open_global_ldb_if_exists(None),
         };
 
         Ok(Self {
@@ -54,12 +58,21 @@ impl McpServerState {
         })
     }
 
+    fn custom_protected_paths(&self, proj_db: Option<&LibreDb>) -> Vec<String> {
+        crate::security::load_config_list(
+            self.global_db.as_deref(),
+            proj_db,
+            "guardrail:protected_paths",
+        )
+    }
+
     fn resolve_brain_mut(
         &mut self,
         hint_path: Option<&str>,
         cid_opt: Option<&str>,
+        is_explicit_memorize: bool,
     ) -> Result<&mut OverlayBrain, String> {
-        let db_path = match hint_path {
+        let candidate_path = match hint_path {
             Some(raw) if !raw.trim().is_empty() => {
                 resolve_workspace_ldb_path(Path::new(raw.trim()), &self.default_project_path)
             }
@@ -69,11 +82,38 @@ impl McpServerState {
             },
         };
 
+        let mut ws_root_to_seal: Option<PathBuf> = None;
+        let db_path = if let Some(ws_root) = workspace_root_from_agents_ldb(&candidate_path) {
+            if crate::security::is_workspace_memory_trusted(self.global_db.as_deref(), &ws_root) {
+                if is_explicit_memorize {
+                    ws_root_to_seal = Some(ws_root);
+                }
+                candidate_path
+            } else if is_explicit_memorize {
+                return Err(format!(
+                    "Workspace memory at '{}' is quarantined because a pre-existing unsealed or Git-tracked .agents database was detected. Run 'libredb trust \"{}\"' in a terminal if you trust this repository.",
+                    candidate_path.display(),
+                    ws_root.display()
+                ));
+            } else {
+                default_libredb_home().join("quarantined_workspace.ldb")
+            }
+        } else {
+            candidate_path
+        };
+
         if !self.brains.contains_key(&db_path) {
             let (proj_db, _) = open_project_ldb_silent(&db_path)?;
+            if let (Some(ref gdb), Some(ref ws_root)) = (&self.global_db, &ws_root_to_seal) {
+                let _ = crate::security::seal_workspace_memory(gdb, &proj_db, ws_root);
+            }
             let brain =
                 OverlayBrain::open(self.global_db.clone(), proj_db).map_err(|e| e.to_string())?;
             self.brains.insert(db_path.clone(), brain);
+        } else if let (Some(ref gdb), Some(ref ws_root)) = (&self.global_db, &ws_root_to_seal) {
+            if let Some(existing) = self.brains.get(&db_path) {
+                let _ = crate::security::seal_workspace_memory(gdb, existing.project_db(), ws_root);
+            }
         }
 
         let brain = self.brains.get_mut(&db_path).unwrap();
@@ -287,7 +327,7 @@ fn dispatch_tool(
                 req.error_context = Some(err.to_owned());
             }
 
-            let brain = state.resolve_brain_mut(cwd_hint, cid_arg)?;
+            let brain = state.resolve_brain_mut(cwd_hint, cid_arg, false)?;
             if let Some(cid) = cid_arg {
                 req.conversation_id = Some(cid.to_owned());
                 let tp_opt = args
@@ -324,8 +364,12 @@ fn dispatch_tool(
             let pad = args.get("pad").and_then(Value::as_u64).unwrap_or(12) as usize;
             let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
 
-            let brain = state.resolve_brain_mut(cwd_hint.or(first_file_hint), cid_arg)?;
-            let proj_db = Arc::clone(brain.project_db());
+            let proj_db = {
+                let brain =
+                    state.resolve_brain_mut(cwd_hint.or(first_file_hint), cid_arg, false)?;
+                Arc::clone(brain.project_db())
+            };
+            let protected_paths = state.custom_protected_paths(Some(&proj_db));
             let resolve_rel = |raw_p: &str| -> PathBuf {
                 let tp = Path::new(raw_p);
                 if tp.is_relative() {
@@ -361,6 +405,13 @@ fn dispatch_tool(
                     }
                     if requested_paths.is_empty() {
                         return Err("Missing 'target' or 'files' for action='skeleton'".into());
+                    }
+                    for rp in &requested_paths {
+                        if let Some(err) =
+                            crate::security::check_mcp_read_path_policy(rp, &protected_paths)
+                        {
+                            return Err(err.into());
+                        }
                     }
 
                     let items: Vec<(&Path, Option<&str>)> = requested_paths
@@ -418,12 +469,24 @@ fn dispatch_tool(
                 "impact" => {
                     let target = target_opt.ok_or("Missing target")?;
                     if let Some(ref root) = ws_root {
-                        if let Ok(rep) = index_workspace(&proj_db, root, false) {
-                            if rep.files_reindexed > 0 {
-                                if let Ok(mut cog) = CognitiveEngine::open_db(Arc::clone(&proj_db)) {
-                                    let _ = cog.save_index_snapshot();
+                        if crate::security::check_mcp_read_path_policy(root, &protected_paths)
+                            .is_none()
+                        {
+                            if let Ok(rep) = index_workspace(&proj_db, root, false) {
+                                if rep.files_reindexed > 0 {
+                                    if let Ok(mut cog) =
+                                        CognitiveEngine::open_db(Arc::clone(&proj_db))
+                                    {
+                                        let _ = cog.save_index_snapshot();
+                                    }
+                                    if let Ok(brain) = state.resolve_brain_mut(
+                                        cwd_hint.or(first_file_hint),
+                                        cid_arg,
+                                        false,
+                                    ) {
+                                        let _ = brain.refresh_if_needed();
+                                    }
                                 }
-                                let _ = brain.refresh_if_needed();
                             }
                         }
                     }
@@ -433,13 +496,31 @@ fn dispatch_tool(
                 "fim" => {
                     let target = target_opt.ok_or("Missing target")?;
                     let resolved_target = resolve_rel(target);
+                    if let Some(err) = crate::security::check_mcp_read_path_policy(
+                        &resolved_target,
+                        &protected_paths,
+                    ) {
+                        return Err(err.into());
+                    }
                     if let Some(ref root) = ws_root {
-                        if let Ok(rep) = index_workspace(&proj_db, root, false) {
-                            if rep.files_reindexed > 0 {
-                                if let Ok(mut cog) = CognitiveEngine::open_db(Arc::clone(&proj_db)) {
-                                    let _ = cog.save_index_snapshot();
+                        if crate::security::check_mcp_read_path_policy(root, &protected_paths)
+                            .is_none()
+                        {
+                            if let Ok(rep) = index_workspace(&proj_db, root, false) {
+                                if rep.files_reindexed > 0 {
+                                    if let Ok(mut cog) =
+                                        CognitiveEngine::open_db(Arc::clone(&proj_db))
+                                    {
+                                        let _ = cog.save_index_snapshot();
+                                    }
+                                    if let Ok(brain) = state.resolve_brain_mut(
+                                        cwd_hint.or(first_file_hint),
+                                        cid_arg,
+                                        false,
+                                    ) {
+                                        let _ = brain.refresh_if_needed();
+                                    }
                                 }
-                                let _ = brain.refresh_if_needed();
                             }
                         }
                     }
@@ -449,9 +530,17 @@ fn dispatch_tool(
                 "index" => {
                     let target = target_opt.ok_or("Missing target")?;
                     let resolved_target = resolve_rel(target);
+                    if let Some(err) = crate::security::check_mcp_read_path_policy(
+                        &resolved_target,
+                        &protected_paths,
+                    ) {
+                        return Err(err.into());
+                    }
                     let rep = index_workspace(&proj_db, &resolved_target, false)?;
                     let mut cog = CognitiveEngine::open_db(proj_db)?;
                     cog.save_index_snapshot()?;
+                    let brain =
+                        state.resolve_brain_mut(cwd_hint.or(first_file_hint), cid_arg, false)?;
                     brain.refresh_if_needed()?;
                     Ok(serde_json::to_string_pretty(&rep)?)
                 }
@@ -478,7 +567,7 @@ fn dispatch_tool(
                 }
             }
 
-            let brain = state.resolve_brain_mut(cwd_hint, cid_arg)?;
+            let brain = state.resolve_brain_mut(cwd_hint, cid_arg, true)?;
             let proj_db = Arc::clone(brain.project_db());
 
             let mut spec = AtomicBatchSpec::default();
@@ -578,13 +667,20 @@ fn dispatch_tool(
         "libredb_skeleton" => {
             let fp = args.get("file_path").and_then(Value::as_str).ok_or("Missing file_path")?;
             let flt = args.get("filter").and_then(Value::as_str);
-            let brain = state.resolve_brain_mut(Some(fp), cid_arg)?;
-            let (skel, _) = FileSkeleton::index_or_get_cached(brain.project_db(), Path::new(fp), None)?;
+            let proj_db = {
+                let brain = state.resolve_brain_mut(Some(fp), cid_arg, false)?;
+                Arc::clone(brain.project_db())
+            };
+            let protected = state.custom_protected_paths(Some(&proj_db));
+            if let Some(err) = crate::security::check_mcp_read_path_policy(Path::new(fp), &protected) {
+                return Err(err.into());
+            }
+            let (skel, _) = FileSkeleton::index_or_get_cached(&proj_db, Path::new(fp), None)?;
             Ok(skel.render_compact(flt, flt.is_some()))
         }
         "libredb_impact" => {
             let sym = args.get("symbol").and_then(Value::as_str).ok_or("Missing symbol")?;
-            let brain = state.resolve_brain_mut(cwd_hint, cid_arg)?;
+            let brain = state.resolve_brain_mut(cwd_hint, cid_arg, false)?;
             let reports = query_symbol_impact(brain.project_db(), sym)?;
             Ok(serde_json::to_string_pretty(&reports)?)
         }
@@ -593,8 +689,15 @@ fn dispatch_tool(
             let sym = args.get("symbol").and_then(Value::as_str);
             let line = args.get("line").and_then(Value::as_u64).map(|n| n as usize);
             let pad = args.get("pad").and_then(Value::as_u64).unwrap_or(12) as usize;
-            let brain = state.resolve_brain_mut(Some(fp), cid_arg)?;
-            let bundle = extract_fim_slice(brain.project_db(), Path::new(fp), sym, line, pad)?;
+            let proj_db = {
+                let brain = state.resolve_brain_mut(Some(fp), cid_arg, false)?;
+                Arc::clone(brain.project_db())
+            };
+            let protected = state.custom_protected_paths(Some(&proj_db));
+            if let Some(err) = crate::security::check_mcp_read_path_policy(Path::new(fp), &protected) {
+                return Err(err.into());
+            }
+            let bundle = extract_fim_slice(&proj_db, Path::new(fp), sym, line, pad)?;
             Ok(bundle.format_compact())
         }
         "libredb_handoff" => {
@@ -602,7 +705,7 @@ fn dispatch_tool(
             let tkey = args.get("task_key").and_then(Value::as_str).ok_or("Missing task_key")?;
             let role = args.get("role").and_then(Value::as_str).ok_or("Missing role")?;
             let notes = args.get("instructions").and_then(Value::as_str).unwrap_or("");
-            let brain = state.resolve_brain_mut(cwd_hint, cid_arg)?;
+            let brain = state.resolve_brain_mut(cwd_hint, cid_arg, true)?;
             let (_, block) = create_subagent_handoff(brain.project_db(), hid, tkey, role, notes)?;
             Ok(block)
         }
@@ -610,15 +713,17 @@ fn dispatch_tool(
     }
 }
 
-fn user_home_dir() -> PathBuf {
-    env::var_os("USERPROFILE")
-        .or_else(|| env::var_os("HOME"))
-        .map(PathBuf::from)
-        .unwrap_or_else(env::temp_dir)
-}
-
 fn default_libredb_home() -> PathBuf {
     user_home_dir().join(".gemini").join("libredb")
+}
+
+fn workspace_root_from_agents_ldb(db_path: &Path) -> Option<PathBuf> {
+    let parent = db_path.parent()?;
+    if parent.file_name().and_then(|n| n.to_str()) == Some(".agents") {
+        parent.parent().map(Path::to_path_buf)
+    } else {
+        None
+    }
 }
 
 fn infer_chat_memory_ldb_path(cid: &str) -> Option<PathBuf> {

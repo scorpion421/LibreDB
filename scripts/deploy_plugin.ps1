@@ -85,8 +85,8 @@ $PluginJson = @'
 {
   "name": "libredb",
   "displayName": "LibreDB Cognitive Memory",
-  "version": "0.8.6",
-  "description": "Full Rust replacement for SQLite SkillsDB: single-file cognitive memory, silent SQLite auto-porter, sub-2ms hooks, guardrails, 14-language causal code graph, and dynamic multi-remote Git/Gitea automation.",
+  "version": "0.8.7",
+  "description": "Full Rust replacement for SQLite SkillsDB: single-file cognitive memory, silent SQLite auto-porter, sub-2ms hooks, workspace trust anchors, DPAPI credential vault, 14-language zero-hardcode causal code graph, and dynamic multi-remote Git/Gitea automation.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
     "Run a LibreDB cognitive pulse on the active workspace to load deduplicated context",
@@ -114,17 +114,41 @@ $McpJson = @"
 "@
 [System.IO.File]::WriteAllText((Join-Path $PluginDir "mcp_config.json"), $McpJson, $Utf8NoBom)
 
-# 3. Write hooks.json with Enterprise GPO / AppLocker & Zone.Identifier self-probe
+# 3. Write hooks.json with Enterprise GPO / AppLocker, ACL verification & stable non-target staging
 # Note: Antigravity executes hooks via Go `exec.Command("cmd", "/C", cmd)`. On Enterprise AD workstations
-# where AppLocker/SRP blocks `cmd.exe /c` from launching binaries in `%USERPROFILE%`, a failing PreToolUse
-# hook would abort every tool call. We probe `cmd.exe /c` first and disable hooks automatically if blocked.
-$HookExeCandidates = @(
+# where AppLocker/SRP blocks `cmd.exe /c` inside `%USERPROFILE%`, we stage a dedicated binary outside `target\`
+# (so `cargo clean` never breaks hooks) and verify directory ACLs before enabling it.
+function Test-SafeBinaryAcl {
+    param([string]$CheckPath)
+    try {
+        $Acl = Get-Acl -Path $CheckPath -ErrorAction Stop
+        foreach ($Rule in $Acl.Access) {
+            if ($Rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) {
+                continue
+            }
+            $Id = $Rule.IdentityReference.Value
+            $IsBroad = $Id -match '^(Everyone|Jeder|BUILTIN\\Users|BUILTIN\\Benutzer|NT AUTHORITY\\Authenticated Users|NT-AUTORIT.+\\Authentifizierte Benutzer)$' -or
+                       $Id -match '\\(Domain Users|Dom.+nen-Benutzer)$'
+            if ($IsBroad) {
+                $Rights = [int]$Rule.FileSystemRights
+                # FileSystemRights: WriteData/CreateFiles (2), AppendData (4), Write (278), Modify (197055), FullControl (2032127), GenericWrite (0x40000000), GenericAll (0x10000000)
+                if (($Rights -band 0x50030116) -ne 0) {
+                    return $false
+                }
+            }
+        }
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+$PrimaryHookCandidates = @(
     "%USERPROFILE%\.gemini\libredb\bin\libredb.exe",
-    "%USERPROFILE%\.gemini\antigravity\bin\libredb.exe",
-    $ReleaseExe
+    "%USERPROFILE%\.gemini\antigravity\bin\libredb.exe"
 )
 $VerifiedHookCmd = $null
-foreach ($CandExe in $HookExeCandidates) {
+foreach ($CandExe in $PrimaryHookCandidates) {
     $FormattedCmd = if ($CandExe.Contains(' ')) { '"' + $CandExe + '"' } else { $CandExe }
     try {
         $ProbeOut = "{}" | & $env:ComSpec /c "$FormattedCmd hook-pre-invocation" 2>$null
@@ -133,6 +157,33 @@ foreach ($CandExe in $HookExeCandidates) {
             break
         }
     } catch {
+    }
+}
+
+# Fallback for Enterprise AD workstations where `%USERPROFILE%` is SRP-blocked and `$ProjectRoot`
+# resides on an ACL-restricted personal network home share (e.g. `Q:\`): stage outside `target\`!
+if ($null -eq $VerifiedHookCmd) {
+    $HomeRoot = [System.IO.Path]::GetPathRoot($UserHome)
+    $ProjDriveRoot = [System.IO.Path]::GetPathRoot($ProjectRoot)
+    if ($ProjDriveRoot -and (-not $ProjDriveRoot.Equals($HomeRoot, [System.StringComparison]::OrdinalIgnoreCase))) {
+        if (Test-SafeBinaryAcl -CheckPath $ProjDriveRoot) {
+            $DriveHookDir = Join-Path $ProjDriveRoot ".gemini\libredb\bin"
+            try {
+                New-Item -ItemType Directory -Force -Path $DriveHookDir -ErrorAction Stop | Out-Null
+                if (Test-SafeBinaryAcl -CheckPath $DriveHookDir) {
+                    $DriveHookExe = Join-Path $DriveHookDir "libredb.exe"
+                    Install-BinaryHotSafe -Src $ReleaseExe -Dst $DriveHookExe
+                    $FormattedCmd = if ($DriveHookExe.Contains(' ')) { '"' + $DriveHookExe + '"' } else { $DriveHookExe }
+                    $ProbeOut = "{}" | & $env:ComSpec /c "$FormattedCmd hook-pre-invocation" 2>$null
+                    if ($LASTEXITCODE -eq 0 -and ($ProbeOut -join "") -match "injectSteps") {
+                        $VerifiedHookCmd = $FormattedCmd
+                    }
+                }
+            } catch {
+            }
+        } else {
+            Write-Output "[WARN] Skipping fallback drive hook root $ProjDriveRoot due to broad multi-user write ACL."
+        }
     }
 }
 
@@ -254,6 +305,9 @@ description: >-
 ## CLI commands (`libredb`)
 
 - **Guardrails:** `libredb guardrail check --path "<dir>" [--staged] [--strict]`
+- **Workspace trust & universal config:**
+  - `libredb trust [<dir>] [--revoke] [--list]`
+  - `libredb config <get|set|unset|list> [<key>] [<value>] [--project "<dir>"]`
 - **Compaction & GC:** `libredb compact <db.ldb> [--prune]`
 - **Rules, skills & reflexes:**
   - `libredb get-skill <skill_name> [--section "<Section Title>"]`
@@ -265,17 +319,18 @@ description: >-
   - `libredb git-init "<dir>" [--name <repo>] [--use-existing] [--overwrite]` (alias: `gitea-init`)
   - `libredb git-sync -m "<commit message>" --project "<dir>" [--remote <r>] [--all-remotes] [--github] [--releases] [--allow-unversioned]` (alias: `gitea-sync`)
   - `libredb git-release [vX.Y.Z] --project "<dir>" [--remote <r>] [--all-remotes] [--github]` (alias: `gitea-release`)
-  - `libredb gitea-config [--url <u>] [--user <usr>] [--token <tok>] [--register-helper]`
+  - `libredb gitea-config [--url <u>] [--user <usr>] [--token <tok> | --token-stdin] [--allow-insecure-http <bool>] [--register-helper]`
 '@
 $SkillMdPath = Join-Path $SkillDir "SKILL.md"
 [System.IO.File]::WriteAllText($SkillMdPath, $SkillMd, $Utf8NoBom)
 
-# Modernize global DB in-place via LibreDB IPC writer lock (zero handle invalidation for running MCP server)
+# Modernize global DB in-place via LibreDB IPC writer lock (encrypting plaintext tokens via DPAPI + sealing workspaces)
 & $TargetExe modernize-global --global $GlobalLdb --skill-md $SkillMdPath
 
 # Incrementally index LibreDB's own workspace into .agents/memory.ldb
 $SelfLdb = Join-Path $ProjectRoot ".agents\memory.ldb"
 try {
+    & $TargetExe trust $ProjectRoot --global $GlobalLdb | Out-Null
     & $TargetExe index-workspace $SelfLdb $ProjectRoot --force
 } catch {
     Write-Output "[INFO] Workspace index skipped while older handle drains: $_"
@@ -297,14 +352,14 @@ $LogoSvg = @'
 
 # 7. Write user-facing README.md inside plugin bundle
 $PluginReadme = @'
-# LibreDB cognitive memory plugin (v0.8.6)
+# LibreDB cognitive memory plugin (v0.8.7)
 
 Complete standalone Rust replacement for `AntiGraviton SkillsDB` (`customizations-db`):
-- `libredb-mcp`: 3-tool multi-workspace cognitive memory & 14-language causal code-graph server with zero-I/O RAM session delta, `[Zero-Repeat Skeleton]` deduplication, qualified `Type::method` symbol resolution, and automatic incremental workspace refresh.
+- `libredb-mcp`: 3-tool multi-workspace cognitive memory & 14-language zero-hardcode causal code-graph server with zero-I/O RAM session delta, `[Zero-Repeat Skeleton]` deduplication, corpus-`IDF` call-graph disambiguation, and automatic incremental workspace refresh.
+- Cryptographic workspace trust anchors (`libredb trust`, `sys::trust_seals`), Windows `DPAPI` (`CryptProtectData`) OS credential vault for `gitea_token`, control-plane path protection (`hooks.json`, `mcp_config.json`, `.git/hooks/*`), and universal `libredb config` customization.
 - Compaction garbage collection (`compact_with_options`, `maybe_auto_compact`) and `INDEX_FORMAT_VERSION = 4` `HybridIndex` with dead-posting garbage collection across superseded Inodes.
-- Silent background 1:1 auto-migration for any pre-existing `.agents/memory.db` in older projects or chats; pure `.ldb` operation for all new projects and chats.
-- Native compiled `< 2 ms` `PreInvocation` (`systemMessage`) and `PreToolUse` guardrail hooks (`hooks.json`) with post-compaction epoch hydration, multi-product `brain` discovery (`antigravity`, `antigravity-ide`, `antigravity-cli`), live `transcript.jsonl` workspace inference, and `research -> flash` subagent routing.
-- Global system directives (`rules/AGENTS.md`) and dynamic multi-remote Git/Gitea release automation (`libredb git-sync` / `git-release` & `gitea-sync` / `gitea-release`) with zero command-line token exposure (`GIT_CONFIG_COUNT` + RAII `curl -K`).
+- Silent background 1:1 auto-migration for trusted `.agents/memory.db` in older projects or chats; pure `.ldb` operation for all new projects and chats.
+- Native compiled `< 2 ms` `PreInvocation` (`systemMessage`) and `PreToolUse` guardrail hooks (`hooks.json`) with ACL-verified non-`target\` network-drive staging, post-compaction epoch hydration, multi-product `brain` discovery, and `research -> flash` subagent routing.
 
 To switch cleanly to pure single-engine operation, disable `AntiGraviton SkillsDB` (`customizations-db`) in Customizations and leave `LibreDB Cognitive Memory` (`libredb`) enabled.
 '@
@@ -329,6 +384,6 @@ if (Test-Path $AgyConfigPath) {
     }
 }
 
-Write-Output "[OK] Deployed LibreDB v0.8.6 standalone binaries to: $BinDir"
+Write-Output "[OK] Deployed LibreDB v0.8.7 standalone binaries to: $BinDir"
 Write-Output "[OK] Hydrated and modernized global 19-table store at: $GlobalLdb"
 Write-Output "[OK] Installed complete Antigravity replacement plugin at: $PluginDir"

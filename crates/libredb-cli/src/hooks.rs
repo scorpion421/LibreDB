@@ -3,7 +3,7 @@
 
 use libredb_bridge::open_or_auto_migrate;
 use libredb_cognitive::{
-    check_command_guardrails, check_text_guardrails_with_mode, has_project_root_marker,
+    check_command_guardrails, check_text_guardrails_with_options, has_project_root_marker,
     is_compaction_checkpoint_line, is_test_or_scratch_path, sync_transcript_epoch, CognitiveEngine,
 };
 use libredb_core::{LibreDb, NodeKind, WriteRequest};
@@ -42,6 +42,19 @@ pub fn open_global_ldb(override_path: Option<&Path>) -> Result<Arc<LibreDb>, Str
     Ok(db)
 }
 
+pub fn open_global_ldb_if_exists(override_path: Option<&Path>) -> Option<Arc<LibreDb>> {
+    let target = override_path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_global_ldb_path);
+    if target.is_file() {
+        LibreDb::open(&target).ok().map(Arc::new)
+    } else if override_path.is_none() && default_central_sqlite_path().is_file() {
+        open_global_ldb(None).ok()
+    } else {
+        None
+    }
+}
+
 pub fn open_project_ldb_silent(ldb_path: &Path) -> Result<(Arc<LibreDb>, bool), String> {
     let (db, migrated) =
         open_or_auto_migrate(ldb_path, None, "project").map_err(|e| e.to_string())?;
@@ -55,7 +68,7 @@ pub fn open_project_ldb_silent(ldb_path: &Path) -> Result<(Arc<LibreDb>, bool), 
 }
 
 /// Handles Antigravity `PreToolUse` JSON hook from `stdin` (`< 1.5 ms`).
-pub fn run_pre_tool_hook(_global_ldb_opt: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run_pre_tool_hook(global_ldb_opt: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
     let mut raw = String::new();
     let _ = io::stdin().read_to_string(&mut raw);
     let payload: Value = serde_json::from_str(raw.trim()).unwrap_or_else(|_| json!({}));
@@ -138,7 +151,43 @@ pub fn run_pre_tool_hook(_global_ldb_opt: Option<&Path>) -> Result<(), Box<dyn s
         || args.get("ReplacementChunks").is_some();
 
     if is_write_or_edit {
+        let global_db_ro = open_global_ldb_if_exists(global_ldb_opt);
+        let proj_db_ro = if target_file != "<tool_input>" {
+            find_workspace_root(Path::new(target_file)).and_then(|root| {
+                if crate::security::is_workspace_memory_trusted(global_db_ro.as_deref(), &root) {
+                    let ldb_p = root.join(".agents").join("memory.ldb");
+                    ldb_p.is_file().then(|| LibreDb::open(&ldb_p).ok()).flatten()
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+
+        if target_file != "<tool_input>" {
+            let custom_protected = crate::security::load_config_list(
+                global_db_ro.as_deref(),
+                proj_db_ro.as_ref(),
+                "guardrail:protected_paths",
+            );
+            if let Some(reason) =
+                crate::security::check_tool_write_path_policy(target_file, &custom_protected)
+            {
+                emit_json(&json!({
+                    "decision": "deny",
+                    "reason": format!("LibreDB Control-Plane Guardrail Blocked Write: {reason}")
+                }))?;
+                return Ok(());
+            }
+        }
+
         if !is_test_or_scratch_path(target_file) {
+            let custom_prefixes = crate::security::load_config_list(
+                global_db_ro.as_deref(),
+                proj_db_ro.as_ref(),
+                "guardrail:secret_prefixes",
+            );
             let mut texts_to_check: Vec<&str> = Vec::new();
             for k in [
                 "Content",
@@ -168,7 +217,12 @@ pub fn run_pre_tool_hook(_global_ldb_opt: Option<&Path>) -> Result<(), Box<dyn s
             let is_full_file = matches!(tool_name, "write_file" | "write_to_file")
                 && args.get("Append").and_then(Value::as_bool) != Some(true);
             for txt in texts_to_check {
-                let violations = check_text_guardrails_with_mode(txt, target_file, is_full_file);
+                let violations = check_text_guardrails_with_options(
+                    txt,
+                    target_file,
+                    is_full_file,
+                    &custom_prefixes,
+                );
                 if let Some(first_crit) = violations.into_iter().find(|v| v.severity == "CRITICAL")
                 {
                     emit_json(&json!({
@@ -185,7 +239,7 @@ pub fn run_pre_tool_hook(_global_ldb_opt: Option<&Path>) -> Result<(), Box<dyn s
 
         if target_file != "<tool_input>" && !is_test_or_scratch_path(target_file) {
             let target_path = Path::new(target_file);
-            let _ = record_working_set_edit(target_path);
+            let _ = record_working_set_edit(target_path, global_db_ro.as_deref());
         }
     }
 
@@ -233,6 +287,17 @@ pub fn run_pre_invocation_hook(
     if !mem_ldb_path.exists() && !mem_db_sibling.exists() {
         emit_json(&json!({ "injectSteps": [] }))?;
         return Ok(());
+    }
+
+    // Cryptographic workspace trust check BEFORE opening `.ldb` or migrating any C SQLite `.db` file!
+    // Prevents cloned repositories carrying poisoned `.agents/memory.*` payloads from injecting
+    // `<SYSTEM_MESSAGE>` prompt overrides or triggering untrusted SQLite deserialization.
+    if let Some(ref root) = ws_root {
+        let global_db_ro = open_global_ldb_if_exists(global_ldb_opt);
+        if !crate::security::is_workspace_memory_trusted(global_db_ro.as_deref(), root) {
+            emit_json(&json!({ "injectSteps": [] }))?;
+            return Ok(());
+        }
     }
 
     let Ok((proj_db, _did_migrate)) = open_project_ldb_silent(&mem_ldb_path) else {
@@ -293,6 +358,7 @@ pub fn run_pre_invocation_hook(
             if !is_protected_profile_dir(root) {
                 if let Some(name) = root.file_name().and_then(|n| n.to_str()) {
                     if let Ok(global_db) = open_global_ldb(global_ldb_opt) {
+                        let _ = crate::security::seal_workspace_memory(&global_db, &proj_db, root);
                         let ws_cfg_key = format!("workspace:{name}");
                         let root_str = root.to_string_lossy().into_owned();
                         let already_same = global_db
@@ -479,13 +545,16 @@ fn collect_git_telemetry_line(root: &Path) -> Option<String> {
     let head_trimmed = head_raw.trim();
     if let Some(ref_rel) = head_trimmed.strip_prefix("ref: ") {
         let ref_rel = ref_rel.trim();
-        let branch = ref_rel
-            .strip_prefix("refs/heads/")
-            .unwrap_or(ref_rel)
-            .to_owned();
+        let raw_branch = ref_rel.strip_prefix("refs/heads/").unwrap_or(ref_rel);
+        let branch = crate::security::sanitize_git_ref_for_prompt(raw_branch);
         let ref_file = git_dir.join(ref_rel);
         let short_hash = if let Ok(hash_raw) = std::fs::read_to_string(&ref_file) {
-            hash_raw.trim().chars().take(7).collect::<String>()
+            hash_raw
+                .trim()
+                .chars()
+                .filter(char::is_ascii_hexdigit)
+                .take(7)
+                .collect::<String>()
         } else if let Ok(packed) = std::fs::read_to_string(git_dir.join("packed-refs")) {
             packed
                 .lines()
@@ -498,7 +567,12 @@ fn collect_git_telemetry_line(root: &Path) -> Option<String> {
                     let h = parts.next()?;
                     let r = parts.next()?;
                     if r == ref_rel {
-                        Some(h.chars().take(7).collect::<String>())
+                        Some(
+                            h.chars()
+                                .filter(char::is_ascii_hexdigit)
+                                .take(7)
+                                .collect::<String>(),
+                        )
                     } else {
                         None
                     }
@@ -507,9 +581,18 @@ fn collect_git_telemetry_line(root: &Path) -> Option<String> {
         } else {
             "unborn".to_owned()
         };
-        Some(format!("Git Telemetry: branch '{branch}' @ {short_hash}"))
+        let safe_hash = if short_hash.is_empty() {
+            "unborn"
+        } else {
+            &short_hash
+        };
+        Some(format!("Git Telemetry: branch '{branch}' @ {safe_hash}"))
     } else {
-        let short_hash: String = head_trimmed.chars().take(7).collect();
+        let short_hash: String = head_trimmed
+            .chars()
+            .filter(char::is_ascii_hexdigit)
+            .take(7)
+            .collect();
         if short_hash.is_empty() {
             None
         } else {
@@ -518,13 +601,16 @@ fn collect_git_telemetry_line(root: &Path) -> Option<String> {
     }
 }
 
-fn record_working_set_edit(target_file: &Path) -> Result<(), String> {
+fn record_working_set_edit(target_file: &Path, global_db: Option<&LibreDb>) -> Result<(), String> {
     let Some(root) = find_workspace_root(target_file) else {
         return Ok(());
     };
     let ldb_path = root.join(".agents").join("memory.ldb");
     let db_sibling = ldb_path.with_extension("db");
     if !ldb_path.exists() && !db_sibling.exists() {
+        return Ok(());
+    }
+    if !crate::security::is_workspace_memory_trusted(global_db, &root) {
         return Ok(());
     }
     let (proj_db, _) = open_project_ldb_silent(&ldb_path)?;

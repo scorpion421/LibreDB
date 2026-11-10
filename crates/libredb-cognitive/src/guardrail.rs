@@ -34,7 +34,7 @@ impl GuardrailAuditReport {
 
 /// Checks full-file text content for formatting and scripting guardrail violations.
 pub fn check_text_guardrails(text: &str, filename: &str) -> Vec<GuardrailViolation> {
-    check_text_guardrails_with_mode(text, filename, true)
+    check_text_guardrails_with_options(text, filename, true, &[])
 }
 
 /// Checks text content (either a full file when `is_full_file == true`, or a partial `edit_file`
@@ -43,6 +43,16 @@ pub fn check_text_guardrails_with_mode(
     text: &str,
     filename: &str,
     is_full_file: bool,
+) -> Vec<GuardrailViolation> {
+    check_text_guardrails_with_options(text, filename, is_full_file, &[])
+}
+
+/// Checks text content with optional user-configured dynamic secret prefixes (`guardrail:secret_prefixes`).
+pub fn check_text_guardrails_with_options(
+    text: &str,
+    filename: &str,
+    is_full_file: bool,
+    custom_secret_prefixes: &[String],
 ) -> Vec<GuardrailViolation> {
     let mut out = Vec::new();
     let low_name = filename.to_ascii_lowercase().replace('\\', "/");
@@ -92,7 +102,7 @@ pub fn check_text_guardrails_with_mode(
             });
         }
 
-        if let Some(secret_kind) = detect_secret_leak(line) {
+        if let Some(secret_kind) = detect_secret_leak(line, custom_secret_prefixes) {
             out.push(GuardrailViolation {
                 rule: "no-hardcoded-secrets".to_owned(),
                 severity: "CRITICAL".to_owned(),
@@ -264,6 +274,18 @@ pub fn check_command_guardrails(cmd_line: &str) -> Option<GuardrailViolation> {
         });
     }
 
+    // 4. Block obfuscated PowerShell Base64 command execution (`-EncodedCommand` / `-enc`)
+    if contains_obfuscated_encoded_command(trimmed) {
+        return Some(GuardrailViolation {
+            rule: "no-obfuscated-encoded-command".to_owned(),
+            severity: "CRITICAL".to_owned(),
+            file: "<command>".to_owned(),
+            line: 1,
+            message: "Obfuscated PowerShell -EncodedCommand execution is forbidden by transparent SOC administration rules; execute readable commands directly.".to_owned(),
+            snippet: truncate_ascii_safe(trimmed, 100),
+        });
+    }
+
     None
 }
 
@@ -271,6 +293,15 @@ pub fn check_command_guardrails(cmd_line: &str) -> Option<GuardrailViolation> {
 pub fn audit_workspace_guardrails(
     project_dir: &Path,
     staged_only: bool,
+) -> std::io::Result<GuardrailAuditReport> {
+    audit_workspace_guardrails_with_prefixes(project_dir, staged_only, &[])
+}
+
+/// Audits a workspace directory with optional custom secret prefixes loaded from `LibreDb` configuration.
+pub fn audit_workspace_guardrails_with_prefixes(
+    project_dir: &Path,
+    staged_only: bool,
+    custom_secret_prefixes: &[String],
 ) -> std::io::Result<GuardrailAuditReport> {
     let candidate_files = if staged_only {
         collect_git_staged_files(project_dir)?
@@ -311,13 +342,68 @@ pub fn audit_workspace_guardrails(
             .unwrap_or(&path)
             .to_string_lossy()
             .replace('\\', "/");
-        violations.extend(check_text_guardrails(text, &rel));
+        violations.extend(check_text_guardrails_with_options(
+            text,
+            &rel,
+            true,
+            custom_secret_prefixes,
+        ));
     }
 
     Ok(GuardrailAuditReport {
         files_checked,
         violations,
     })
+}
+
+/// Checks whether a Git-staged relative file path represents local agent memory, private keys,
+/// certificates, or secret `.env` files that must never be pushed via `git-sync` unless explicitly
+/// permitted in `allowed_patterns` (`guardrail:allow_staged_files`).
+pub fn is_sensitive_staged_file(rel_path: &str, allowed_patterns: &[String]) -> Option<&'static str> {
+    let norm = rel_path.trim().replace('\\', "/");
+    let low = norm.to_ascii_lowercase();
+    for pat in allowed_patterns {
+        let p = pat.trim().replace('\\', "/").to_ascii_lowercase();
+        if !p.is_empty() && (low == p || low.ends_with(&format!("/{p}")) || low.starts_with(&p)) {
+            return None;
+        }
+    }
+
+    if low == ".agents" || low.starts_with(".agents/") || low.contains("/.agents/") {
+        return Some("local agent memory directory (.agents/)");
+    }
+    let fname = low.rsplit('/').next().unwrap_or(&low);
+    if fname.ends_with(".tmp.ldb") || fname.ends_with(".bench.ldb") {
+        return Some("ephemeral LibreDB database artifact");
+    }
+    if fname.ends_with(".credential.xml") {
+        return Some("Windows DPAPI credential XML file");
+    }
+    if matches!(fname, ".netrc" | "_netrc" | ".git-credentials" | "id_rsa" | "id_ed25519" | "id_ecdsa" | "id_dsa") {
+        return Some("SSH private key or Git/Netrc credential store");
+    }
+    if fname == ".env"
+        || (fname.starts_with(".env.")
+            && !fname.ends_with(".example")
+            && !fname.ends_with(".sample")
+            && !fname.ends_with(".template")
+            && !fname.ends_with(".dist"))
+    {
+        return Some("dotenv environment secret file (.env)");
+    }
+    for (ext, reason) in [
+        (".pfx", "PKCS#12 certificate/private key archive (.pfx)"),
+        (".p12", "PKCS#12 certificate/private key archive (.p12)"),
+        (".pem", "PEM key/certificate file (.pem)"),
+        (".key", "private key file (.key)"),
+        (".jks", "Java keystore (.jks)"),
+        (".keystore", "signing keystore (.keystore)"),
+    ] {
+        if fname.ends_with(ext) {
+            return Some(reason);
+        }
+    }
+    None
 }
 
 pub fn is_test_or_scratch_path(path_str: &str) -> bool {
@@ -356,17 +442,26 @@ fn is_valid_changelog_date_suffix(after_bracket: &str) -> bool {
         && bytes[8..10].iter().all(u8::is_ascii_digit)
 }
 
-fn detect_secret_leak(line: &str) -> Option<&'static str> {
+fn detect_secret_leak(line: &str, custom_prefixes: &[String]) -> Option<String> {
     let t = line.trim();
     if t.starts_with("-----BEGIN ") && t.ends_with("PRIVATE KEY-----") {
-        return Some("PEM private key");
+        return Some("PEM private key".to_owned());
     }
     for (prefix, label, min_tail) in [
         ("ghp_", "GitHub Personal Access Token", 28usize),
         ("github_pat_", "GitHub Fine-Grained PAT", 28usize),
+        ("gho_", "GitHub OAuth Token", 28usize),
+        ("ghs_", "GitHub App Installation Token", 28usize),
+        ("glpat-", "GitLab Personal Access Token", 20usize),
         ("sk-proj-", "OpenAI API Key", 24usize),
         ("sk-ant-", "Anthropic API Key", 24usize),
+        ("sk_live_", "Stripe Live Secret Key", 20usize),
+        ("rk_live_", "Stripe Live Restricted Key", 20usize),
+        ("xoxb-", "Slack Bot Token", 20usize),
+        ("xoxp-", "Slack User Token", 20usize),
+        ("AIza", "Google Cloud / Gemini API Key", 31usize),
         ("AKIA", "AWS Access Key ID", 16usize),
+        ("ASIA", "AWS Temporary Access Key ID", 16usize),
     ] {
         if let Some(pos) = line.find(prefix) {
             let tail = &line[pos + prefix.len()..];
@@ -375,11 +470,84 @@ fn detect_secret_leak(line: &str) -> Option<&'static str> {
                 .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
                 .count();
             if alnum_len >= min_tail {
-                return Some(label);
+                return Some(label.to_owned());
             }
         }
     }
+
+    // Check user-configured dynamic token prefixes (`guardrail:secret_prefixes`)
+    for raw_pref in custom_prefixes {
+        let pref = raw_pref.trim();
+        if pref.len() < 3 {
+            continue;
+        }
+        if let Some(pos) = line.find(pref) {
+            let tail = &line[pos + pref.len()..];
+            let alnum_len = tail
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+                .count();
+            if alnum_len >= 16 {
+                return Some(format!("custom secret prefix '{pref}'"));
+            }
+        }
+    }
+
+    // Structural URL-embedded Basic Auth credentials (`https://user:secret@host`)
+    for scheme in ["https://", "http://"] {
+        if let Some(s_pos) = line.find(scheme) {
+            let after = &line[s_pos + scheme.len()..];
+            let authority_end = after
+                .find(['/', '"', '\'', ' ', ')', '>', '`'])
+                .unwrap_or(after.len());
+            let authority = &after[..authority_end];
+            if let Some((userinfo, host)) = authority.rsplit_once('@') {
+                if let Some((usr, pwd)) = userinfo.split_once(':') {
+                    let pwd_low = pwd.to_ascii_lowercase();
+                    let is_placeholder = usr.is_empty()
+                        || pwd.len() < 8
+                        || usr.contains('{')
+                        || pwd.contains('{')
+                        || pwd.contains('$')
+                        || pwd.contains('%')
+                        || pwd.contains('<')
+                        || matches!(
+                            pwd_low.as_str(),
+                            "password" | "pass" | "secret" | "token" | "changeme" | "example"
+                        )
+                        || host.contains("example.");
+                    if !is_placeholder && !host.is_empty() {
+                        return Some("URL-embedded Basic Auth credential".to_owned());
+                    }
+                }
+            }
+        }
+    }
+
     None
+}
+
+fn contains_obfuscated_encoded_command(cmd: &str) -> bool {
+    let words: Vec<&str> = cmd.split_whitespace().collect();
+    for (idx, w) in words.iter().enumerate() {
+        let low = w.to_ascii_lowercase();
+        if matches!(
+            low.as_str(),
+            "-encodedcommand" | "-enc" | "-ec" | "/encodedcommand" | "/enc"
+        ) {
+            if let Some(next_w) = words.get(idx + 1) {
+                let clean = next_w.trim_matches(['"', '\'']);
+                if clean.len() >= 16
+                    && clean
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '='))
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn detect_hardcoded_internal_unc(line: &str) -> Option<&'static str> {
@@ -561,5 +729,22 @@ mod tests {
         let partial_cl = "## [0.3.0] - 2026-11-10\n\n### Fixed\n\n- Fixed partial edit check.\n";
         assert!(check_text_guardrails_with_mode(partial_cl, "CHANGELOG.md", false).is_empty());
         assert!(!check_text_guardrails_with_mode(partial_cl, "CHANGELOG.md", true).is_empty());
+
+        // Obfuscated PowerShell -EncodedCommand, URL credentials, custom secret prefixes, and staged file policy:
+        assert!(check_command_guardrails("pwsh -NoProfile -EncodedCommand UwB0AGEAcgB0AC0AUAByAG8AYwBlAHMAcwA=").is_some());
+        let custom_v = check_text_guardrails_with_options(
+            "token = \"corp_tok_9876543210abcdef987654\"",
+            "config.toml",
+            true,
+            &["corp_tok_".to_owned()],
+        );
+        assert!(custom_v.iter().any(|x| x.rule == "no-hardcoded-secrets"));
+        let synth_url = format!("remote = \"{}admin:{}@git.corp.net/repo.git\"", "https://", "SuperSecret99!");
+        let url_v = check_text_guardrails(&synth_url, "cfg.toml");
+        assert!(url_v.iter().any(|x| x.rule == "no-hardcoded-secrets"));
+        assert!(is_sensitive_staged_file(".agents/memory.ldb", &[]).is_some());
+        assert!(is_sensitive_staged_file(".env.production", &[]).is_some());
+        assert!(is_sensitive_staged_file(".env.example", &[]).is_none());
+        assert!(is_sensitive_staged_file("certs/test.pem", &["certs/test.pem".to_owned()]).is_none());
     }
 }

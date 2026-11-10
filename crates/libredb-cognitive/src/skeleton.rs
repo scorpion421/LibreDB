@@ -11,8 +11,8 @@ use std::path::Path;
 
 pub const SKELETON_KEY_PREFIX: &str = "skeleton::";
 /// Content-hash seed bumped whenever `FileSkeleton` extraction semantics upgrade (e.g. `container`
-/// qualification and `[T; N]` array-return brace parsing in v0.8.6) so stale cached skeletons refresh once.
-pub const SKELETON_HASH_SEED: u8 = 106;
+/// qualification, `[T; N]` array-return brace parsing, and PowerShell/Shell quote/escape rules in v0.8.7).
+pub const SKELETON_HASH_SEED: u8 = 107;
 
 /// Section boundary (e.g., `# SECTION: skillsdb.core.db` or `mod ...`) inside a source file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1267,8 +1267,10 @@ fn find_matching_brace_end(
     let mut bracket_depth: i32 = 0;
     let mut seen_open = false;
     let mut in_block_comment = false;
+    let mut in_ps_block_comment = false;
     let mut in_double_quote = false;
     let mut raw_str_hashes: Option<usize> = None;
+    let is_hash_comment_lang = matches!(lang, "powershell" | "shell" | "ruby");
 
     for (idx, &line) in lines.iter().enumerate().skip(start_idx) {
         let chars: Vec<char> = line.chars().collect();
@@ -1279,6 +1281,15 @@ fn find_matching_brace_end(
             if in_block_comment {
                 if i + 1 < n && chars[i] == '*' && chars[i + 1] == '/' {
                     in_block_comment = false;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            if in_ps_block_comment {
+                if i + 1 < n && chars[i] == '#' && chars[i + 1] == '>' {
+                    in_ps_block_comment = false;
                     i += 2;
                 } else {
                     i += 1;
@@ -1304,8 +1315,18 @@ fn find_matching_brace_end(
                 continue;
             }
             if in_double_quote {
-                if chars[i] == '\\' {
-                    i += 2;
+                if lang == "powershell" {
+                    // PowerShell uses backtick (`` ` ``) as escape character; `\` is a literal path separator!
+                    if chars[i] == '`' {
+                        i = (i + 2).min(n);
+                    } else if chars[i] == '"' {
+                        in_double_quote = false;
+                        i += 1;
+                    } else {
+                        i += 1;
+                    }
+                } else if chars[i] == '\\' {
+                    i = (i + 2).min(n);
                 } else if chars[i] == '"' {
                     in_double_quote = false;
                     i += 1;
@@ -1316,13 +1337,24 @@ fn find_matching_brace_end(
             }
 
             let ch = chars[i];
-            if ch == '/' && i + 1 < n && chars[i + 1] == '/' {
-                break;
-            }
-            if ch == '/' && i + 1 < n && chars[i + 1] == '*' {
-                in_block_comment = true;
-                i += 2;
-                continue;
+            if is_hash_comment_lang {
+                if lang == "powershell" && ch == '<' && i + 1 < n && chars[i + 1] == '#' {
+                    in_ps_block_comment = true;
+                    i += 2;
+                    continue;
+                }
+                if ch == '#' {
+                    break;
+                }
+            } else {
+                if ch == '/' && i + 1 < n && chars[i + 1] == '/' {
+                    break;
+                }
+                if ch == '/' && i + 1 < n && chars[i + 1] == '*' {
+                    in_block_comment = true;
+                    i += 2;
+                    continue;
+                }
             }
             if lang == "rust" && ch == 'r' {
                 let prev_ident = i > 0 && (chars[i - 1].is_ascii_alphanumeric() || chars[i - 1] == '_');
@@ -1344,46 +1376,68 @@ fn find_matching_brace_end(
                 continue;
             }
             if ch == '\'' {
-                if i + 1 < n && chars[i + 1] == '\\' {
-                    let mut j = i + 2;
-                    while j < n && j <= i + 10 {
-                        if chars[j] == '\'' {
-                            i = j + 1;
-                            break;
+                if lang == "rust" {
+                    // Rust has character literals (`'x'`, `'\n'`, `'\x7f'`, `'\u{10ffff}'`) and lifetimes (`'a`).
+                    if i + 1 < n && chars[i + 1] == '\\' {
+                        let limit = n.min(i + 13);
+                        let mut close_idx = None;
+                        for (pos, &c) in chars.iter().enumerate().take(limit).skip(i + 2) {
+                            if c == '\'' {
+                                close_idx = Some(pos);
+                                break;
+                            }
                         }
-                        j += 1;
+                        if let Some(pos) = close_idx {
+                            i = pos + 1;
+                        } else {
+                            i += 1;
+                        }
+                        continue;
+                    } else if i + 2 < n && chars[i + 2] == '\'' {
+                        i += 3;
+                        continue;
                     }
-                    if i <= j && j <= i + 10 {
-                        i = j.min(n);
-                    }
+                    // Rust lifetime (`'a`, `'static`, `'_`) or loop label: advance strictly by 1!
+                    i += 1;
                     continue;
-                } else if i + 2 < n && chars[i + 2] == '\'' {
-                    // Single-character literal such as `'{'`, `'}'`, or `';'`
-                    i += 3;
-                    continue;
-                } else if lang != "rust" {
-                    // Single-quoted string in JS/TS/PowerShell/Shell
+                } else {
+                    // Single-quoted string or char literal in PowerShell, Shell, JS/TS, C/C++/Java/C#, etc.
                     let mut j = i + 1;
                     let mut found_end = None;
                     while j < n {
-                        if chars[j] == '\\' {
-                            j += 2;
-                            continue;
+                        if matches!(lang, "powershell" | "sql") {
+                            // Doubled `''` escapes a single quote; `\` is literal!
+                            if chars[j] == '\'' {
+                                if j + 1 < n && chars[j + 1] == '\'' {
+                                    j += 2;
+                                    continue;
+                                }
+                                found_end = Some(j + 1);
+                                break;
+                            }
+                            j += 1;
+                        } else if lang == "shell" {
+                            // POSIX shell single quotes have no escape sequences at all.
+                            if chars[j] == '\'' {
+                                found_end = Some(j + 1);
+                                break;
+                            }
+                            j += 1;
+                        } else {
+                            if chars[j] == '\\' {
+                                j = (j + 2).min(n);
+                                continue;
+                            }
+                            if chars[j] == '\'' {
+                                found_end = Some(j + 1);
+                                break;
+                            }
+                            j += 1;
                         }
-                        if chars[j] == '\'' {
-                            found_end = Some(j + 1);
-                            break;
-                        }
-                        j += 1;
                     }
-                    if let Some(next_i) = found_end {
-                        i = next_i;
-                        continue;
-                    }
+                    i = found_end.unwrap_or(i + 1);
+                    continue;
                 }
-                // Otherwise it is a Rust lifetime (`'a`, `'static`, `'_`) or label: advance 1 char!
-                i += 1;
-                continue;
             }
 
             match ch {
@@ -1401,7 +1455,7 @@ fn find_matching_brace_end(
                         return idx + 1;
                     }
                 }
-                ';' if !seen_open && paren_depth == 0 && bracket_depth == 0 => {
+                ';' if !seen_open && paren_depth == 0 && bracket_depth == 0 && !is_hash_comment_lang => {
                     return idx + 1;
                 }
                 _ => {}
@@ -1521,5 +1575,26 @@ impl Drop for Inode {
             .find(|s| s.qualified_name() == "Inode::drop")
             .expect("impl Drop for Inode must attach container Inode, not Drop");
         assert_eq!(drop_fn.container.as_deref(), Some("Inode"));
+    }
+
+    #[test]
+    fn powershell_regex_backslashes_and_windows_paths_never_hang_or_misbalance_braces() {
+        let ps_src = r#"function Test-SafeBinaryAcl([string]$Path) {
+    $dir = "$env:USERPROFILE\bin\"
+    # Comment with unbalanced { brace
+    if ($id -notmatch '\\(BUILTIN\\Administrators|NT AUTHORITY\\SYSTEM)$') {
+        return $false
+    }
+    return $true
+}
+"#;
+        let sk = FileSkeleton::extract("deploy_plugin.ps1", ps_src);
+        let fn_sym = sk
+            .symbols
+            .iter()
+            .find(|s| s.name == "Test-SafeBinaryAcl")
+            .expect("Test-SafeBinaryAcl extracted");
+        assert_eq!(fn_sym.start_line, 1);
+        assert_eq!(fn_sym.end_line, 8);
     }
 }

@@ -86,9 +86,10 @@ impl FimSliceBundle {
 /// Incrementally indexes all non-binary source files under `root` into `db`, wiring both
 /// code call-graph synapses (`Calls`) and causal architecture synapses (`Decision <-> Symbol`).
 pub fn index_workspace(db: &LibreDb, root: &Path, force: bool) -> Result<WorkspaceIndexReport> {
+    let scan_cfg = WorkspaceScanConfig::from_db_and_root(db, root);
     let mut source_files = Vec::new();
     let mut binary_skipped = 0usize;
-    collect_source_files(root, root, &mut source_files, &mut binary_skipped)?;
+    collect_source_files(root, root, &scan_cfg, &mut source_files, &mut binary_skipped)?;
 
     let mut unchanged = 0usize;
     let mut reindexed = 0usize;
@@ -106,6 +107,9 @@ pub fn index_workspace(db: &LibreDb, root: &Path, force: bool) -> Result<Workspa
             Ok(b) => b,
             Err(_) => continue,
         };
+        if raw_bytes.len() > scan_cfg.max_file_bytes {
+            continue;
+        }
         // Universal binary file guard: any file containing a NUL byte in its first 2 KB is binary!
         let probe_len = raw_bytes.len().min(2048);
         if raw_bytes[..probe_len].contains(&0u8) {
@@ -219,13 +223,15 @@ pub fn index_workspace(db: &LibreDb, root: &Path, force: bool) -> Result<Workspa
         db.commit_batch(&prepared)?;
     }
 
-    // Build lookup of all active `NodeKind::Symbol` nodes:
-    // - `by_qualified_name`: `Type::method -> Vec<(node_id, full_key)>` (exact qualified match)
-    // - `by_short_name`: `short_name -> Vec<(node_id, full_key)>` (excluding trivial stopwords)
+    // Build structural lookup tables of all active `NodeKind::Symbol` nodes (zero hardcoded stopwords):
+    // - `by_qualified_name`: `Type::method -> Vec<(node_id, full_key)>` (exact container-qualified match)
+    // - `by_method_name`: `method -> Vec<(node_id, full_key)>` (container member methods only)
+    // - `by_free_name`: `name -> Vec<(node_id, full_key)>` (top-level free functions, types, tables)
     let sym_inodes = db.list_inodes(Some(NodeKind::Symbol), false);
     let symbols_indexed = sym_inodes.len();
     let mut by_qualified_name: HashMap<String, Vec<(u64, String)>> = HashMap::new();
-    let mut by_short_name: HashMap<String, Vec<(u64, String)>> = HashMap::new();
+    let mut by_method_name: HashMap<String, Vec<(u64, String)>> = HashMap::new();
+    let mut by_free_name: HashMap<String, Vec<(u64, String)>> = HashMap::new();
     let mut by_full_key: HashMap<String, u64> = HashMap::new();
     let mut active_sym_ids: Vec<u64> = Vec::with_capacity(sym_inodes.len());
 
@@ -235,22 +241,44 @@ pub fn index_workspace(db: &LibreDb, root: &Path, force: bool) -> Result<Workspa
             by_full_key.insert(full_k.clone(), ino.node_id);
             if let Some((_, sym_part)) = full_k.split_once("::") {
                 let clean_sym = sym_part.split('@').next().unwrap_or(sym_part);
-                if clean_sym.contains("::") {
+                if let Some((_, method_short)) = clean_sym.rsplit_once("::") {
                     by_qualified_name
                         .entry(clean_sym.to_owned())
                         .or_default()
                         .push((ino.node_id, full_k.clone()));
-                }
-                let short = clean_sym
-                    .rsplit_once("::")
-                    .map_or(clean_sym, |(_, s)| s);
-                if short.len() >= 3 && !is_trivial_call_stopword(short) {
-                    by_short_name
-                        .entry(short.to_owned())
+                    if method_short.len() >= 3 {
+                        by_method_name
+                            .entry(method_short.to_owned())
+                            .or_default()
+                            .push((ino.node_id, full_k.clone()));
+                    }
+                } else if clean_sym.len() >= 3 {
+                    by_free_name
+                        .entry(clean_sym.to_owned())
                         .or_default()
                         .push((ino.node_id, full_k.clone()));
                 }
             }
+        }
+    }
+
+    // Compute unsupervised corpus Document Frequency (`DF`) across workspace files so ubiquitous
+    // stdlib/utility identifiers in ANY programming or human language attenuate automatically
+    // without a single hardcoded stopword!
+    let mut receiver_call_df: HashMap<String, usize> = HashMap::new();
+    let mut bare_call_df: HashMap<String, usize> = HashMap::new();
+    let mut prose_token_df: HashMap<String, usize> = HashMap::new();
+    for (_, _, text_opt) in &all_skeletons {
+        let Some(ref text) = text_opt else { continue };
+        let file_sites = extract_call_sites(text, None);
+        for m in file_sites.receiver_methods {
+            *receiver_call_df.entry(m).or_insert(0) += 1;
+        }
+        for b in file_sites.bare_calls_and_types {
+            *bare_call_df.entry(b).or_insert(0) += 1;
+        }
+        for tok in extract_code_identifiers(text) {
+            *prose_token_df.entry(tok).or_insert(0) += 1;
         }
     }
 
@@ -302,9 +330,10 @@ pub fn index_workspace(db: &LibreDb, root: &Path, force: bool) -> Result<Workspa
                     .join("\n");
                 let mut seen_targets: HashSet<u64> = HashSet::new();
                 let own_qname = sym.qualified_name();
+                let sites = extract_call_sites(&body_slice, sym.container.as_deref());
 
                 // Stage A: Exact qualified calls (`Type::method`, `Type.method`, `Self::method`, `self.method(`)
-                for qcall in extract_qualified_calls(&body_slice, sym.container.as_deref()) {
+                for qcall in sites.qualified_calls {
                     if qcall == own_qname {
                         continue;
                     }
@@ -318,15 +347,48 @@ pub fn index_workspace(db: &LibreDb, root: &Path, force: bool) -> Result<Workspa
                     }
                 }
 
-                // Stage B: Unqualified symbol identifiers (filtered by `is_trivial_call_stopword` and ambiguity cap)
-                for ident in extract_code_identifiers(&body_slice) {
-                    if ident == sym.name || ident == own_qname || is_trivial_call_stopword(&ident) {
+                // Stage B1: Dynamic receiver method calls (`expr.method(`) - resolved when unambiguous in the
+                // workspace (`targets.len() == 1`) and salient by corpus Document Frequency (`<= 25%` of files).
+                for mcall in sites.receiver_methods {
+                    if mcall == sym.name {
                         continue;
                     }
-                    if let Some(targets) = by_short_name.get(&ident) {
-                        // If a bare identifier appears in > 3 files, prefer same-file symbol definitions
-                        // instead of wiring an N x M cross-product across the entire workspace.
-                        let file_prefix = format!("{rel_path}::");
+                    if let Some(targets) = by_method_name.get(&mcall) {
+                        let df = receiver_call_df.get(&mcall).copied().unwrap_or(0);
+                        let is_salient = files_scanned < 6 || df.saturating_mul(4) <= files_scanned;
+                        if targets.len() == 1 && is_salient {
+                            let (dst_id, _) = targets[0];
+                            if dst_id != src_id && seen_targets.insert(dst_id) {
+                                edges.push((src_id, EdgeKind::Calls, dst_id, 205));
+                                call_edges += 1;
+                            }
+                        }
+                    }
+                }
+
+                // Stage B2: Bare calls (`func(`, `macro!(`), `UpperCamel` type references, and same-container calls.
+                let file_prefix = format!("{rel_path}::");
+                for ident in sites.bare_calls_and_types {
+                    if ident == sym.name || ident == own_qname {
+                        continue;
+                    }
+                    // Implicit `this` / same-container call in OO languages (C++, Java, C#, Kotlin)
+                    if let Some(ref cont) = sym.container {
+                        let same_cont_q = format!("{cont}::{ident}");
+                        if let Some(targets) = by_qualified_name.get(&same_cont_q) {
+                            for &(dst_id, _) in targets {
+                                if dst_id != src_id && seen_targets.insert(dst_id) {
+                                    edges.push((src_id, EdgeKind::Calls, dst_id, 210));
+                                    call_edges += 1;
+                                }
+                            }
+                        }
+                    }
+                    if let Some(targets) = by_free_name.get(&ident) {
+                        let df = bare_call_df.get(&ident).copied().unwrap_or(0);
+                        if files_scanned >= 6 && targets.len() > 1 && df.saturating_mul(2) > files_scanned {
+                            continue;
+                        }
                         let has_same_file = targets.iter().any(|(_, fk)| fk.starts_with(&file_prefix));
                         if targets.len() > 3 && !has_same_file {
                             continue;
@@ -359,7 +421,7 @@ pub fn index_workspace(db: &LibreDb, root: &Path, force: bool) -> Result<Workspa
         for rec in gov_recs {
             let text = String::from_utf8_lossy(&rec.payload);
             let mut seen_gov_syms: HashSet<u64> = HashSet::new();
-            for qcall in extract_qualified_calls(&text, None) {
+            for qcall in extract_call_sites(&text, None).qualified_calls {
                 if let Some(targets) = by_qualified_name.get(&qcall) {
                     for &(sym_id, _) in targets {
                         if seen_gov_syms.insert(sym_id) {
@@ -374,12 +436,28 @@ pub fn index_workspace(db: &LibreDb, root: &Path, force: bool) -> Result<Workspa
                 if ident.len() < 4 {
                     continue;
                 }
-                if let Some(targets) = by_short_name.get(&ident) {
-                    for &(sym_id, _) in targets {
-                        if seen_gov_syms.insert(sym_id) {
-                            edges.push((rec.node_id, EdgeKind::Governs, sym_id, 240));
-                            edges.push((sym_id, EdgeKind::CausedBy, rec.node_id, 230));
-                            gov_edges += 2;
+                let df = prose_token_df.get(&ident).copied().unwrap_or(0);
+                let is_salient = files_scanned < 6 || df.saturating_mul(3) <= files_scanned;
+                if let Some(targets) = by_free_name.get(&ident) {
+                    if targets.len() <= 3 && (targets.len() == 1 || is_salient) {
+                        for &(sym_id, _) in targets {
+                            if seen_gov_syms.insert(sym_id) {
+                                edges.push((rec.node_id, EdgeKind::Governs, sym_id, 240));
+                                edges.push((sym_id, EdgeKind::CausedBy, rec.node_id, 230));
+                                gov_edges += 2;
+                            }
+                        }
+                    }
+                }
+                if is_salient {
+                    if let Some(mtargets) = by_method_name.get(&ident) {
+                        if mtargets.len() == 1 {
+                            let (sym_id, _) = mtargets[0];
+                            if seen_gov_syms.insert(sym_id) {
+                                edges.push((rec.node_id, EdgeKind::Governs, sym_id, 238));
+                                edges.push((sym_id, EdgeKind::CausedBy, rec.node_id, 228));
+                                gov_edges += 2;
+                            }
                         }
                     }
                 }
@@ -576,9 +654,85 @@ pub fn extract_fim_slice(
     })
 }
 
+struct WorkspaceScanConfig {
+    extra_extensions: Vec<String>,
+    ignore_dirs: HashSet<String>,
+    max_file_bytes: usize,
+}
+
+impl WorkspaceScanConfig {
+    fn from_db_and_root(db: &LibreDb, root: &Path) -> Self {
+        let mut ignore_dirs: HashSet<String> = [
+            ".git",
+            ".agents",
+            "target",
+            "node_modules",
+            ".venv",
+            "venv",
+            "dist",
+            "build",
+            "out",
+            "__pycache__",
+            ".pytest_cache",
+            ".idea",
+            ".vscode",
+        ]
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect();
+
+        // Autonomously learn directory ignore rules from the workspace's own `.gitignore`!
+        if let Ok(gitignore) = std::fs::read_to_string(root.join(".gitignore")) {
+            for line in gitignore.lines() {
+                let t = line.trim();
+                if t.is_empty() || t.starts_with('#') || t.starts_with('!') || t.contains('*') {
+                    continue;
+                }
+                let clean = t.trim_matches('/');
+                if !clean.is_empty() && !clean.contains('/') && (t.ends_with('/') || root.join(clean).is_dir()) {
+                    ignore_dirs.insert(clean.to_ascii_lowercase());
+                }
+            }
+        }
+
+        // Apply runtime-configurable overrides from `NodeKind::Config` (`index:ignore_dirs`, `index:extra_extensions`, `index:max_file_bytes`).
+        if let Ok(rec) = db.get_by_key(NodeKind::Config, "index:ignore_dirs") {
+            for item in String::from_utf8_lossy(&rec.payload).split([',', ';', '\n']) {
+                let d = item.trim().trim_matches('/').to_ascii_lowercase();
+                if !d.is_empty() {
+                    ignore_dirs.insert(d);
+                }
+            }
+        }
+
+        let mut extra_extensions = Vec::new();
+        if let Ok(rec) = db.get_by_key(NodeKind::Config, "index:extra_extensions") {
+            for item in String::from_utf8_lossy(&rec.payload).split([',', ';', ' ', '\n']) {
+                let e = item.trim().to_ascii_lowercase();
+                if !e.is_empty() {
+                    extra_extensions.push(if e.starts_with('.') { e } else { format!(".{e}") });
+                }
+            }
+        }
+
+        let max_file_bytes = db
+            .get_by_key(NodeKind::Config, "index:max_file_bytes")
+            .ok()
+            .and_then(|r| String::from_utf8_lossy(&r.payload).trim().parse::<usize>().ok())
+            .unwrap_or(4 * 1024 * 1024);
+
+        Self {
+            extra_extensions,
+            ignore_dirs,
+            max_file_bytes,
+        }
+    }
+}
+
 fn collect_source_files(
     root: &Path,
     curr: &Path,
+    cfg: &WorkspaceScanConfig,
     out: &mut Vec<(PathBuf, String)>,
     binary_skipped: &mut usize,
 ) -> Result<()> {
@@ -593,27 +747,14 @@ fn collect_source_files(
         let low = name.to_ascii_lowercase();
 
         if p.is_dir() {
-            if matches!(
-                low.as_str(),
-                ".git"
-                    | ".agents"
-                    | "target"
-                    | "node_modules"
-                    | ".venv"
-                    | "venv"
-                    | "dist"
-                    | "build"
-                    | "out"
-                    | "__pycache__"
-                    | ".pytest_cache"
-                    | ".idea"
-                    | ".vscode"
-            ) {
+            if cfg.ignore_dirs.contains(&low) {
                 continue;
             }
-            collect_source_files(root, &p, out, binary_skipped)?;
+            collect_source_files(root, &p, cfg, out, binary_skipped)?;
         } else if p.is_file() {
-            if is_known_source_extension(&low) {
+            if is_known_source_extension(&low)
+                || cfg.extra_extensions.iter().any(|ext| low.ends_with(ext))
+            {
                 let rel = p
                     .strip_prefix(root)
                     .unwrap_or(&p)
@@ -629,11 +770,16 @@ fn collect_source_files(
 }
 
 fn is_known_source_extension(low: &str) -> bool {
+    if low.ends_with(".min.js") || low.ends_with(".min.css") {
+        return false;
+    }
     [
-        ".rs", ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".dart", ".go", ".c", ".h",
-        ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".cs", ".java", ".kt", ".kts", ".swift", ".smali",
-        ".asm", ".s", ".inc", ".dis", ".ps1", ".psm1", ".sql", ".sh", ".bash", ".zsh", ".rb",
-        ".php", ".lua", ".zig", ".scala", ".groovy", ".gradle", ".proto",
+        ".rs", ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".svelte", ".astro",
+        ".dart", ".go", ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".cs", ".java", ".kt",
+        ".kts", ".swift", ".smali", ".asm", ".s", ".inc", ".dis", ".ps1", ".psm1", ".sql", ".sh",
+        ".bash", ".zsh", ".rb", ".php", ".lua", ".zig", ".scala", ".groovy", ".gradle", ".proto",
+        ".ex", ".exs", ".erl", ".gleam", ".nim", ".jl", ".r", ".tf", ".hcl", ".nix", ".cmake",
+        ".wgsl", ".glsl", ".hlsl",
     ]
     .iter()
     .any(|ext| low.ends_with(ext))
@@ -727,12 +873,55 @@ fn compute_file_symbol_keys(rel_path: &str, skel: &FileSkeleton) -> Vec<(usize, 
     out
 }
 
-fn extract_qualified_calls(text: &str, self_container: Option<&str>) -> HashSet<String> {
-    let mut out = HashSet::new();
+struct CallSiteBuckets {
+    qualified_calls: HashSet<String>,
+    receiver_methods: HashSet<String>,
+    bare_calls_and_types: HashSet<String>,
+}
+
+/// Language-agnostic syntactic call-site classifier with zero hardcoded stopwords:
+/// 1. `qualified_calls`: `UpperType::method`, `UpperType.method`, `Self::method`, `self.method(`, `this.method(`
+///    (never leaked into unqualified buckets, so `Vec::new()` or `File::open()` never collide with user methods).
+/// 2. `receiver_methods`: `expr.method(` on runtime variables or chained expressions.
+/// 3. `bare_calls_and_types`: standalone `func(`, `macro!(`, or `UpperCamel` type references not preceded by `.` or `::`.
+fn extract_call_sites(text: &str, self_container: Option<&str>) -> CallSiteBuckets {
+    let mut qualified_calls = HashSet::new();
+    let mut receiver_methods = HashSet::new();
+    let mut bare_calls_and_types = HashSet::new();
+
     let bytes = text.as_bytes();
     let n = bytes.len();
     let mut i = 0usize;
+
     while i < n {
+        // Skip line comments (`//`) so prose words inside comments never synthesize call edges!
+        if i + 1 < n && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+            while i < n && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // Skip string literals (`"..."`) so error strings and SQL/JSON text do not synthesize call edges!
+        if bytes[i] == b'"' {
+            i += 1;
+            while i < n {
+                if bytes[i] == b'\\' {
+                    i = (i + 2).min(n);
+                    continue;
+                }
+                if bytes[i] == b'"' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        let preceded_by_access = (i >= 1 && bytes[i - 1] == b'.')
+            || (i >= 2 && bytes[i - 2] == b':' && bytes[i - 1] == b':')
+            || (i >= 2 && bytes[i - 2] == b'-' && bytes[i - 1] == b'>');
+
         if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
             let s1 = i;
             i += 1;
@@ -740,131 +929,119 @@ fn extract_qualified_calls(text: &str, self_container: Option<&str>) -> HashSet<
                 i += 1;
             }
             let lhs = &text[s1..i];
-            let resolved_lhs: Option<(&str, bool)> = if lhs == "Self" {
-                self_container.map(|c| (c, false))
-            } else if matches!(lhs, "self" | "this") {
-                self_container.map(|c| (c, true))
-            } else if lhs.len() >= 2 && lhs.as_bytes()[0].is_ascii_uppercase() {
-                Some((lhs, false))
+
+            // Check if `lhs` is followed by `::`, `.`, or `->`
+            let sep_info: Option<(usize, u8)> = if i + 1 < n && bytes[i] == b':' && bytes[i + 1] == b':' {
+                Some((i + 2, b':'))
+            } else if i + 1 < n && bytes[i] == b'-' && bytes[i + 1] == b'>' {
+                Some((i + 2, b'.'))
+            } else if i < n && bytes[i] == b'.' {
+                Some((i + 1, b'.'))
             } else {
                 None
             };
 
-            if let Some((owner_type, require_call_paren)) = resolved_lhs {
-                if i + 1 < n && bytes[i] == b':' && bytes[i + 1] == b':' {
-                    let sep_end = i + 2;
-                    if sep_end < n && (bytes[sep_end].is_ascii_alphabetic() || bytes[sep_end] == b'_') {
-                        let mut j = sep_end + 1;
-                        while j < n && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
-                            j += 1;
+            if let Some((sep_end, sep_kind)) = sep_info {
+                if sep_end < n && (bytes[sep_end].is_ascii_alphabetic() || bytes[sep_end] == b'_') {
+                    let mut j = sep_end + 1;
+                    while j < n && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                        j += 1;
+                    }
+                    let rhs = &text[sep_end..j];
+                    let has_call_paren = has_following_call_paren(bytes, j);
+
+                    let resolved_owner: Option<(&str, bool)> = if lhs == "Self" {
+                        self_container.map(|c| (c, false))
+                    } else if matches!(lhs, "self" | "this") {
+                        self_container.map(|c| (c, true))
+                    } else if lhs.len() >= 2 && lhs.as_bytes()[0].is_ascii_uppercase() {
+                        Some((lhs, false))
+                    } else {
+                        None
+                    };
+
+                    if let Some((owner_type, req_paren)) = resolved_owner {
+                        if owner_type.len() >= 3 && !preceded_by_access {
+                            bare_calls_and_types.insert(owner_type.to_owned());
                         }
-                        let rhs = &text[sep_end..j];
-                        if rhs.len() >= 2 {
-                            out.insert(format!("{owner_type}::{rhs}"));
+                        if rhs.len() >= 2 && (!req_paren || has_call_paren) {
+                            qualified_calls.insert(format!("{owner_type}::{rhs}"));
                         }
-                        i = sep_end;
+                        // Advance to `sep_end` ONLY if `rhs` itself chains another `::` or `.` (e.g. `Mod::Type::method`);
+                        // otherwise advance completely past `rhs` (`j`) so `rhs` is NEVER re-scanned as a bare identifier!
+                        if j < n && (bytes[j] == b'.' || (j + 1 < n && bytes[j] == b':' && bytes[j + 1] == b':')) {
+                            i = sep_end;
+                        } else {
+                            i = j;
+                        }
+                        continue;
+                    } else if sep_kind == b'.' && has_call_paren && rhs.len() >= 3 {
+                        // Lowercase receiver call (`var.method(`): record in `receiver_methods`!
+                        receiver_methods.insert(rhs.to_owned());
+                        if j < n && bytes[j] == b'.' {
+                            i = sep_end;
+                        } else {
+                            i = j;
+                        }
                         continue;
                     }
-                } else if i < n && bytes[i] == b'.' {
-                    let sep_end = i + 1;
-                    if sep_end < n && (bytes[sep_end].is_ascii_alphabetic() || bytes[sep_end] == b'_') {
-                        let mut j = sep_end + 1;
-                        while j < n && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
-                            j += 1;
-                        }
-                        let rhs = &text[sep_end..j];
-                        let has_paren = j < n && (bytes[j] == b'(' || text[j..].starts_with("::<"));
-                        if rhs.len() >= 2 && (!require_call_paren || has_paren) {
-                            out.insert(format!("{owner_type}::{rhs}"));
-                        }
-                        i = sep_end;
-                        continue;
+                }
+            }
+
+            // Chained method call after `).method(` or `?.method(` where `preceded_by_access` is true:
+            if preceded_by_access {
+                if i >= 1 && lhs.len() >= 3 && has_following_call_paren(bytes, i) {
+                    // Only treat `.method(` as a receiver method, not `mod::func(` (which is a module-qualified free call!)
+                    let is_dot_or_arrow = (s1 >= 1 && bytes[s1 - 1] == b'.')
+                        || (s1 >= 2 && bytes[s1 - 2] == b'-' && bytes[s1 - 1] == b'>');
+                    if is_dot_or_arrow {
+                        receiver_methods.insert(lhs.to_owned());
+                    } else {
+                        bare_calls_and_types.insert(lhs.to_owned());
                     }
+                }
+                continue;
+            }
+
+            // Standalone identifier (not preceded by `.` or `::`):
+            if lhs.len() >= 3 {
+                let is_upper_type = lhs.as_bytes()[0].is_ascii_uppercase()
+                    && lhs.bytes().any(|b| b.is_ascii_lowercase());
+                let is_call = has_following_call_paren(bytes, i);
+                if is_call || is_upper_type {
+                    bare_calls_and_types.insert(lhs.to_owned());
                 }
             }
         } else {
             i += 1;
         }
     }
-    out
+
+    CallSiteBuckets {
+        qualified_calls,
+        receiver_methods,
+        bare_calls_and_types,
+    }
 }
 
-fn is_trivial_call_stopword(ident: &str) -> bool {
-    matches!(
-        ident,
-        "new"
-            | "default"
-            | "clone"
-            | "from"
-            | "into"
-            | "try_from"
-            | "try_into"
-            | "as_ref"
-            | "as_mut"
-            | "as_str"
-            | "as_bytes"
-            | "to_str"
-            | "to_owned"
-            | "to_string"
-            | "into_owned"
-            | "deref"
-            | "drop"
-            | "fmt"
-            | "eq"
-            | "ne"
-            | "cmp"
-            | "partial_cmp"
-            | "hash"
-            | "get"
-            | "get_mut"
-            | "set"
-            | "put"
-            | "insert"
-            | "remove"
-            | "len"
-            | "is_empty"
-            | "iter"
-            | "next"
-            | "read"
-            | "write"
-            | "flush"
-            | "open"
-            | "close"
-            | "init"
-            | "run"
-            | "parse"
-            | "build"
-            | "load"
-            | "save"
-            | "path"
-            | "name"
-            | "kind"
-            | "key"
-            | "val"
-            | "value"
-            | "error"
-            | "result"
-            | "main"
-            | "test"
-            | "tests"
-            | "some"
-            | "none"
-            | "ok"
-            | "err"
-            | "unwrap"
-            | "expect"
-            | "map"
-            | "filter"
-            | "collect"
-            | "push"
-            | "extend"
-            | "join"
-            | "trim"
-            | "lines"
-            | "split"
-            | "contains"
-            | "starts_with"
-            | "ends_with"
-            | "format"
-    )
+#[inline]
+fn has_following_call_paren(bytes: &[u8], mut idx: usize) -> bool {
+    let n = bytes.len();
+    while idx < n && (bytes[idx] == b' ' || bytes[idx] == b'\t') {
+        idx += 1;
+    }
+    if idx >= n {
+        return false;
+    }
+    if bytes[idx] == b'(' {
+        return true;
+    }
+    if bytes[idx] == b'!' && idx + 1 < n && (bytes[idx + 1] == b'(' || bytes[idx + 1] == b'[') {
+        return true;
+    }
+    // Turbofish / generic call: `foo::<T>(` or `foo<T>(`
+    if idx + 2 < n && bytes[idx] == b':' && bytes[idx + 1] == b':' && bytes[idx + 2] == b'<' {
+        return true;
+    }
+    false
 }

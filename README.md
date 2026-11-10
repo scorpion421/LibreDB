@@ -1,11 +1,11 @@
 # LibreDB
 
-[![Version](https://img.shields.io/badge/version-0.8.6-blue.svg)](CHANGELOG.md)
-[![Tests](https://img.shields.io/badge/tests-passing%20(31%20suites%20%2B%2010k%20crash%20sims)-brightgreen.svg)](crates/libredb-bridge/tests/)
+[![Version](https://img.shields.io/badge/version-0.8.7-blue.svg)](CHANGELOG.md)
+[![Tests](https://img.shields.io/badge/tests-passing%20(36%20suites%20%2B%2010k%20crash%20sims)-brightgreen.svg)](crates/libredb-bridge/tests/)
 [![Tech Stack](https://img.shields.io/badge/rust-1.99%2B%20%7C%20PyO3%20abi3%20%7C%20MCP-orange.svg)](Cargo.toml)
 [![License](https://img.shields.io/badge/license-AGPLv3%20%2B%20Commons%20Clause-purple.svg)](LICENSE)
 
-`LibreDB` is a local-first, zero-configuration, single-file cognitive database, lifecycle hook engine, dynamic multi-remote Git/Gitea automation suite, and multi-workspace `MCP` memory substrate (`*.ldb`) built in Rust specifically for `Antigravity` and `LLMs`. It replaces `SQLite` + Python memory overhead with zero-I/O RAM-first `Zero-Repeat Delta` deduplication, silent zero-amnesia background porting of existing `customizations.db` and `.agents/memory.db` files, `< 2 ms` compiled `PreInvocation`/`PreToolUse` hooks, 14+ language polyglot causal code-graph `FIM` slicing, and provider-aware Git/Gitea/GitHub release automation.
+`LibreDB` is a local-first, zero-configuration, single-file cognitive database, lifecycle hook engine, dynamic multi-remote Git/Gitea automation suite, and multi-workspace `MCP` memory substrate (`*.ldb`) built in Rust specifically for `Antigravity` and `LLMs`. It replaces `SQLite` + Python memory overhead with zero-I/O RAM-first `Zero-Repeat Delta` deduplication, cryptographic workspace trust anchors (`libredb trust`), OS-vault `DPAPI` secret protection, `< 2 ms` compiled `PreInvocation`/`PreToolUse` hooks, 14+ language zero-hardcode causal code-graph `FIM` slicing, and provider-aware Git/Gitea/GitHub release automation.
 
 ## Table of contents
 
@@ -17,13 +17,13 @@
 
 ## Executive summary and impact
 
-| Dimension | Legacy Python + `SQLite` (`SkillsDB`) | `LibreDB v0.8.6` (Pure `Rust` + `MCP` + `PyO3`) |
+| Dimension | Legacy Python + `SQLite` (`SkillsDB`) | `LibreDB v0.8.7` (Pure `Rust` + `MCP` + `PyO3`) |
 | :--- | :--- | :--- |
 | **Lifecycle hook latency** | `350-500 ms` Python startup + `SQLite` WAL per edit/turn | **`< 2 ms` native compiled `hook-pre-tool` & `hook-pre-invocation`** |
 | **Turn 2+ recall & I/O** | `300-1500 ms` subprocess + repeated full text output | **`0` disk I/O reads (`~3 ms` `MCP` / `PyO3`) via RAM-first `Zero-Repeat Delta`** |
-| **Existing project migration** | Locked inside `.agents/memory.db` & `customizations.db` | **Silent zero-amnesia auto-port on first touch (`19` tables + temporal lineage)** |
-| **Source inspection & edits** | Full `read_file` scans + separate `symbol_index` / `decisions` | **Unified `1.6 ms` 14-language `fim`, `impact` & batched `skeleton`** (`.rs`, `.py`, `.smali`, `.asm`, `.md`, `.cpp`, `.sql`, `.ps1`) |
-| **Language & concept recall** | Hardcoded stopword & bilingual synonym dictionaries | **100% language-agnostic `IDF` Unicode `n-grams` + persistent Hebbian learning** |
+| **Workspace trust & secrets** | Plaintext DB tokens & unverified `.agents/memory.db` loads | **Windows `DPAPI` OS vault + cryptographic `sys::trust_seals` (`libredb trust`)** |
+| **Source inspection & edits** | Full `read_file` scans + separate `symbol_index` / `decisions` | **Unified `1.5 ms` 14-language `fim`, `impact` & batched `skeleton`** (`.rs`, `.py`, `.smali`, `.asm`, `.md`, `.cpp`, `.sql`, `.ps1`) |
+| **Universal zero-hardcode design** | Hardcoded stopword & bilingual synonym dictionaries | **100% language-agnostic corpus-`IDF` call-graph & `n-gram` recall + `libredb config`** |
 | **Guardrails & Git/Gitea DevOps** | `15,492`-line Python script + forced `origin` rewrites | **Binary-safe `< 0.5 ms` Rust guardrails + dynamic multi-remote Git/Gitea/GitHub sync** |
 
 ## Installation and quickstart
@@ -49,7 +49,8 @@ pwsh -ExecutionPolicy Bypass -File .\scripts\deploy_plugin.ps1
 | `libredb_pulse` (`MCP`) / `libredb pulse` | Dual-layer associative recall with hands-free `/compact` sync & zero-I/O `Zero-Repeat Delta` |
 | `libredb_code` (`MCP`) / `skeleton`, `impact`, `fim`, `index-workspace` | Binary-safe code graph joining `[Lstart-Lend]` slices, callers, and governing `Decisions` |
 | `libredb_memorize` (`MCP`) / `batch`, `learn-assoc`, `learn-reflex` | Atomic multi-capsule commits, tasks, language-agnostic Hebbian learning, and pitfall reflexes |
-| `libredb hook-pre-invocation` / `hook-pre-tool` / `guardrail check` | Sub-2ms Antigravity lifecycle hooks & binary-safe formatting/SemVer/SOC guardrail scanner |
+| `libredb hook-pre-invocation` / `hook-pre-tool` / `guardrail check` | Sub-2ms Antigravity lifecycle hooks, control-plane path protection & guardrail scanner |
+| `libredb trust` / `libredb config` | Cryptographic workspace trust anchors (`sys::trust_seals`) & dynamic zero-hardcode settings |
 | `libredb git-init` / `git-sync` / `git-release` (aliases: `gitea-*`) | Provider-aware multi-remote Git, Keep a Changelog release, and binary asset automation |
 | `libredb import-sqlite` / `export-sqlite` / `verify-roundtrip` | Lossless `19`-table + `5`-`FTS5` `SQLite <-> LibreDB` migration and parity verification |
 
@@ -58,7 +59,7 @@ pwsh -ExecutionPolicy Bypass -File .\scripts\deploy_plugin.ps1
 ```text
 LibreDB/
 |-- Cargo.toml                                     # Rust workspace (6 modular crates)
-|-- VERSION                                        # Semantic Version (0.8.6)
+|-- VERSION                                        # Semantic Version (0.8.7)
 |-- CHANGELOG.md                                   # Keep a Changelog 1.1.0 release history
 |-- LICENSE                                        # AGPLv3 + Commons Clause license
 |-- README.md                                      # 9-block standardized documentation

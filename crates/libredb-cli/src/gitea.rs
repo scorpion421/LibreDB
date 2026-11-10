@@ -6,7 +6,11 @@
 //! and strict SemVer 2.0.0 + Keep a Changelog 1.1.0 + `[GITEA REPOSITORY COLLISION]` guardrails.
 
 use crate::hooks::open_global_ldb;
-use libredb_cognitive::{audit_workspace_guardrails, index_workspace, CognitiveEngine};
+use crate::security::{base64_encode, protect_secret, unprotect_secret};
+use libredb_cognitive::{
+    audit_workspace_guardrails_with_prefixes, index_workspace, is_sensitive_staged_file,
+    CognitiveEngine,
+};
 use libredb_core::{LibreDb, NodeKind, WriteRequest};
 use serde_json::{json, Value};
 use std::env;
@@ -24,6 +28,7 @@ pub struct GiteaConfig {
     pub user: String,
     pub token: String,
     pub service_name: String,
+    pub allow_insecure_http: bool,
 }
 
 impl GiteaConfig {
@@ -49,11 +54,30 @@ impl GiteaConfig {
             .or_else(|| get_cfg("gitea_user"))
             .unwrap_or_default();
 
-        let token = env::var("SKILLSDB_GITEA_TOKEN")
+        let token = if let Some(env_tok) = env::var("SKILLSDB_GITEA_TOKEN")
             .ok()
             .filter(|s| !s.trim().is_empty())
-            .or_else(|| get_cfg("gitea_token"))
-            .unwrap_or_default();
+        {
+            env_tok.trim().to_owned()
+        } else if let Some(raw_stored) = get_cfg("gitea_token") {
+            match unprotect_secret(&raw_stored) {
+                Ok((plain, needs_upgrade)) => {
+                    if needs_upgrade && !plain.is_empty() {
+                        if let Ok(encrypted) = protect_secret(&plain) {
+                            let _ = ldb.put(
+                                WriteRequest::new(NodeKind::Config, encrypted.into_bytes())
+                                    .with_key("gitea_token")
+                                    .with_importance(190),
+                            );
+                        }
+                    }
+                    plain
+                }
+                Err(_) => String::new(),
+            }
+        } else {
+            String::new()
+        };
 
         let service_name = env::var("SKILLSDB_GITEA_SERVICE")
             .ok()
@@ -61,28 +85,57 @@ impl GiteaConfig {
             .or_else(|| get_cfg("gitea_service"))
             .unwrap_or_else(|| "gitea".to_owned());
 
+        let allow_insecure_http = env::var("SKILLSDB_GITEA_ALLOW_INSECURE_HTTP")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| get_cfg("gitea_allow_insecure_http"))
+            .map(|v| {
+                let low = v.trim().to_ascii_lowercase();
+                matches!(low.as_str(), "1" | "true" | "yes" | "on")
+            })
+            .unwrap_or(false);
+
         Self {
             url,
             user,
             token,
             service_name,
+            allow_insecure_http,
         }
     }
 
     pub fn is_gitea_remote_url(&self, remote_url: &str) -> bool {
-        let low = remote_url.trim().to_ascii_lowercase();
+        let low = remote_url.trim().trim_end_matches('/').to_ascii_lowercase();
         let cfg_low = self.url.trim().trim_end_matches('/').to_ascii_lowercase();
-        (!cfg_low.is_empty() && low.starts_with(&cfg_low))
-            || low.starts_with("http://127.0.0.1:3000")
-            || low.starts_with("http://localhost:3000")
+        if !cfg_low.is_empty() && (low == cfg_low || low.starts_with(&format!("{cfg_low}/"))) {
+            return true;
+        }
+        if is_loopback_http_url(&cfg_low) && is_loopback_http_url(&low) {
+            return extract_url_port(&cfg_low) == extract_url_port(&low);
+        }
+        false
+    }
+
+    pub fn allows_credentials_for_url(&self, target_url: &str) -> bool {
+        if !self.is_gitea_remote_url(target_url) {
+            return false;
+        }
+        let low = target_url.trim().to_ascii_lowercase();
+        if low.starts_with("https://") {
+            true
+        } else if low.starts_with("http://") {
+            is_loopback_http_url(&low) || self.allow_insecure_http
+        } else {
+            false
+        }
     }
 
     /// Injects transient Basic Auth (and Windows Schannel TLS backend for `https://` Gitea hosts)
     /// exclusively via child-process `GIT_CONFIG_*` environment variables when `remote_url` matches
-    /// the configured Gitea server. Credentials NEVER appear on process command lines (Event 4688 /
-    /// Sysmon Event ID 1), are NEVER written to `.git/config`, and are NEVER sent to GitHub/GitLab.
+    /// the configured Gitea server and satisfies transport security policy (`https://`, loopback `http://`,
+    /// or explicit `gitea_allow_insecure_http=true`).
     pub fn configure_git_command_for_remote(&self, cmd: &mut Command, remote_url: &str) {
-        if !self.is_gitea_remote_url(remote_url) {
+        if !self.allows_credentials_for_url(remote_url) {
             return;
         }
         let mut pairs: Vec<(&str, String)> = Vec::new();
@@ -103,6 +156,67 @@ impl GiteaConfig {
     }
 }
 
+pub fn is_loopback_http_url(url: &str) -> bool {
+    let low = url.trim().to_ascii_lowercase();
+    let Some(rest) = low.strip_prefix("http://") else {
+        return false;
+    };
+    let host_port = rest.split('/').next().unwrap_or("");
+    let host = if let Some(bracketed) = host_port.strip_prefix('[') {
+        bracketed.split(']').next().unwrap_or("")
+    } else {
+        host_port.split(':').next().unwrap_or("")
+    };
+    matches!(host, "127.0.0.1" | "localhost" | "::1")
+}
+
+fn extract_url_port(url: &str) -> u16 {
+    let low = url.trim().to_ascii_lowercase();
+    let default_port = if low.starts_with("https://") { 443 } else { 80 };
+    let rest = low
+        .strip_prefix("https://")
+        .or_else(|| low.strip_prefix("http://"))
+        .unwrap_or(&low);
+    let host_port = rest.split('/').next().unwrap_or("");
+    if let Some(after_bracket) = host_port.strip_prefix('[') {
+        if let Some((_, tail)) = after_bracket.split_once(']') {
+            if let Some(p_str) = tail.strip_prefix(':') {
+                if let Ok(p) = p_str.parse::<u16>() {
+                    return p;
+                }
+            }
+        }
+        return default_port;
+    }
+    if let Some((_, p_str)) = host_port.rsplit_once(':') {
+        if let Ok(p) = p_str.parse::<u16>() {
+            return p;
+        }
+    }
+    default_port
+}
+
+fn should_supply_git_credentials(cfg: &GiteaConfig, git_stdin: &str) -> bool {
+    let mut proto = "";
+    let mut host = "";
+    for line in git_stdin.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some(p) = trimmed.strip_prefix("protocol=") {
+            proto = p.trim();
+        } else if let Some(h) = trimmed.strip_prefix("host=") {
+            host = h.trim();
+        }
+    }
+    if proto.is_empty() || host.is_empty() {
+        return false;
+    }
+    let candidate = format!("{proto}://{host}");
+    cfg.allows_credentials_for_url(&candidate)
+}
+
 #[derive(Debug, Clone)]
 pub struct ChangelogEntry {
     pub version: String,
@@ -115,12 +229,17 @@ pub fn cmd_gitea_credential_helper(
     action: &str,
     global_opt: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let mut stdin_buf = String::new();
+    let _ = std::io::stdin().read_to_string(&mut stdin_buf);
     if action != "get" {
         return Ok(());
     }
     let ldb = open_global_ldb(global_opt)?;
     let cfg = GiteaConfig::load(&ldb);
-    if !cfg.user.is_empty() && !cfg.token.is_empty() {
+    if !cfg.user.is_empty()
+        && !cfg.token.is_empty()
+        && should_supply_git_credentials(&cfg, &stdin_buf)
+    {
         let mut out = std::io::stdout().lock();
         write!(out, "username={}\npassword={}\n\n", cfg.user, cfg.token)?;
         out.flush()?;
@@ -133,6 +252,7 @@ pub fn cmd_gitea_config(
     url: Option<&str>,
     user: Option<&str>,
     token: Option<&str>,
+    allow_insecure_http: Option<bool>,
     register_helper: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let ldb = open_global_ldb(global_opt)?;
@@ -151,9 +271,23 @@ pub fn cmd_gitea_config(
         )?;
     }
     if let Some(tok) = token {
+        let trimmed_tok = tok.trim();
+        if trimmed_tok.is_empty() {
+            let _ = ldb.deprecate_key(NodeKind::Config, "gitea_token");
+        } else {
+            let encrypted = protect_secret(trimmed_tok)?;
+            ldb.put(
+                WriteRequest::new(NodeKind::Config, encrypted.into_bytes())
+                    .with_key("gitea_token")
+                    .with_importance(190),
+            )?;
+        }
+    }
+    if let Some(allow_http) = allow_insecure_http {
+        let val = if allow_http { "true" } else { "false" };
         ldb.put(
-            WriteRequest::new(NodeKind::Config, tok.trim().as_bytes().to_vec())
-                .with_key("gitea_token")
+            WriteRequest::new(NodeKind::Config, val.as_bytes().to_vec())
+                .with_key("gitea_allow_insecure_http")
                 .with_importance(190),
         )?;
     }
@@ -163,7 +297,21 @@ pub fn cmd_gitea_config(
         if let Ok(exe) = env::current_exe() {
             let exe_fwd = exe.to_string_lossy().replace('\\', "/");
             let helper_cmd = format!("!\"{exe_fwd}\" gitea-credential-helper");
-            for ep in ["http://127.0.0.1:3000", "http://localhost:3000", cfg.url.as_str()] {
+            let mut endpoints = vec![cfg.url.clone()];
+            if is_loopback_http_url(&cfg.url) {
+                let port = extract_url_port(&cfg.url);
+                for host in ["127.0.0.1", "localhost"] {
+                    let ep = if port == 80 {
+                        format!("http://{host}")
+                    } else {
+                        format!("http://{host}:{port}")
+                    };
+                    if !endpoints.iter().any(|x| x.eq_ignore_ascii_case(&ep)) {
+                        endpoints.push(ep);
+                    }
+                }
+            }
+            for ep in endpoints {
                 let _ = Command::new("git")
                     .args(["config", "--global", &format!("credential.{ep}.helper"), &helper_cmd])
                     .output();
@@ -172,9 +320,13 @@ pub fn cmd_gitea_config(
     }
 
     let masked = if cfg.token.len() > 10 {
-        format!("{}...{}", &cfg.token[..6], &cfg.token[cfg.token.len() - 4..])
+        format!(
+            "{}...{} (OS vault encrypted)",
+            &cfg.token[..4],
+            &cfg.token[cfg.token.len() - 4..]
+        )
     } else if !cfg.token.is_empty() {
-        "(set)".to_owned()
+        "(set, OS vault encrypted)".to_owned()
     } else {
         "(not set)".to_owned()
     };
@@ -186,6 +338,7 @@ pub fn cmd_gitea_config(
     println!("Repository Owner:   {}", if cfg.user.is_empty() { "(not set)" } else { &cfg.user });
     println!("API Token:          {masked}");
     println!("Service Name:       {}", cfg.service_name);
+    println!("Allow Remote HTTP:  {}", cfg.allow_insecure_http);
     println!("============================================================");
     Ok(())
 }
@@ -259,6 +412,7 @@ pub fn cmd_gitea_init(
                     "DELETE",
                     &format!("{}/api/v1/repos/{}/{}", cfg.url, cfg.user, repo_name),
                     &cfg.token,
+                    cfg.allow_insecure_http,
                     None,
                     None,
                 );
@@ -266,7 +420,7 @@ pub fn cmd_gitea_init(
         }
     }
 
-    ensure_local_git_initialized(&clean_root)?;
+    ensure_local_git_initialized(&clean_root, Some(&ldb))?;
 
     let clone_url = ensure_remote_repo_created(&cfg, &repo_name)?;
     let remotes = list_git_remotes(&clean_root);
@@ -301,6 +455,12 @@ pub fn cmd_gitea_init(
     }
 
     record_learned_workspace(&ldb, &clean_root);
+    let proj_ldb_path = clean_root.join(".agents").join("memory.ldb");
+    if proj_ldb_path.is_file() {
+        if let Ok(pdb) = LibreDb::open(&proj_ldb_path) {
+            let _ = crate::security::seal_workspace_memory(&ldb, &pdb, &clean_root);
+        }
+    }
     println!(
         "[OK] Initialized Git & linked remote '{linked_remote_name}' ('{}') -> {}/{}/{}",
         clean_root.display(),
@@ -334,29 +494,78 @@ pub fn cmd_gitea_sync(
     let ldb = open_global_ldb(global_opt)?;
     let cfg = GiteaConfig::load(&ldb);
 
-    ensure_local_git_initialized(&clean_root)?;
-    record_learned_workspace(&ldb, &clean_root);
+    ensure_local_git_initialized(&clean_root, Some(&ldb))?;
 
+    let mut proj_db_opt: Option<Arc<LibreDb>> = None;
     let proj_ldb_path = clean_root.join(".agents").join("memory.ldb");
-    if proj_ldb_path.is_file() {
+    if proj_ldb_path.is_file()
+        && crate::security::is_workspace_memory_trusted(Some(&ldb), &clean_root)
+    {
         if let Ok(pdb) = LibreDb::open(&proj_ldb_path) {
             let pdb = Arc::new(pdb);
+            let _ = crate::security::seal_workspace_memory(&ldb, &pdb, &clean_root);
             if let Ok(rep) = index_workspace(&pdb, &clean_root, false) {
                 if rep.files_reindexed > 0 {
-                    if let Ok(mut cog) = CognitiveEngine::open_db(pdb) {
+                    if let Ok(mut cog) = CognitiveEngine::open_db(Arc::clone(&pdb)) {
                         let _ = cog.save_index_snapshot();
                     }
                 }
             }
+            proj_db_opt = Some(pdb);
         }
     }
+    record_learned_workspace(&ldb, &clean_root);
+
+    let custom_prefixes = crate::security::load_config_list(
+        Some(&ldb),
+        proj_db_opt.as_deref(),
+        "guardrail:secret_prefixes",
+    );
+    let allowed_staged = crate::security::load_config_list(
+        Some(&ldb),
+        proj_db_opt.as_deref(),
+        "guardrail:allow_staged_files",
+    );
 
     let _ = Command::new("git")
-        .args(["add", "-A"])
+        .args(["-c", "core.fsmonitor=false", "add", "-A"])
         .current_dir(&clean_root)
         .output()?;
 
-    let audit = audit_workspace_guardrails(&clean_root, true)?;
+    // Sensitive Staged-File Firewall: prevent `.agents/*`, `.env`, private keys, or DPAPI
+    // `.credential.xml` files from ever being committed or pushed to Gitea/GitHub.
+    let staged_out = Command::new("git")
+        .args(["-c", "core.fsmonitor=false", "diff", "--cached", "--name-only"])
+        .current_dir(&clean_root)
+        .output()?;
+    if staged_out.status.success() {
+        for raw_line in String::from_utf8_lossy(&staged_out.stdout).lines() {
+            let rel = raw_line.trim();
+            if rel.is_empty() {
+                continue;
+            }
+            if let Some(reason) = is_sensitive_staged_file(rel, &allowed_staged) {
+                let norm_rel = rel.replace('\\', "/");
+                if norm_rel == ".agents" || norm_rel.starts_with(".agents/") {
+                    let _ = Command::new("git")
+                        .args(["-c", "core.fsmonitor=false", "rm", "-r", "--cached", "--quiet", "--", rel])
+                        .current_dir(&clean_root)
+                        .output();
+                    continue;
+                }
+                return Err(format!(
+                    "[SENSITIVE FILE STAGED]: Refusing to commit or push sensitive file '{}' ({reason}). Unstage/ignore it, or if it is an intentional non-secret fixture, authorize it via: libredb config set guardrail:allow_staged_files \"{}\" --project \"{}\"",
+                    rel,
+                    rel,
+                    clean_root.display()
+                )
+                .into());
+            }
+        }
+    }
+
+    let audit =
+        audit_workspace_guardrails_with_prefixes(&clean_root, true, &custom_prefixes)?;
     if !audit.passed(false) {
         let first = &audit.violations[0];
         return Err(format!(
@@ -367,7 +576,7 @@ pub fn cmd_gitea_sync(
     }
 
     let st_out = Command::new("git")
-        .args(["status", "--porcelain"])
+        .args(["-c", "core.fsmonitor=false", "status", "--porcelain"])
         .current_dir(&clean_root)
         .output()?;
     let changed_cnt = String::from_utf8_lossy(&st_out.stdout)
@@ -600,10 +809,11 @@ fn publish_gitea_release_internal(
         "{}/api/v1/repos/{}/{}/releases?limit=100",
         cfg.url, cfg.user, repo_name
     );
-    let existing_rels: Vec<Value> = match http_request("GET", &rels_url, &cfg.token, None, None) {
-        Ok((200, body)) => serde_json::from_slice(&body).unwrap_or_default(),
-        _ => Vec::new(),
-    };
+    let existing_rels: Vec<Value> =
+        match http_request("GET", &rels_url, &cfg.token, cfg.allow_insecure_http, None, None) {
+            Ok((200, body)) => serde_json::from_slice(&body).unwrap_or_default(),
+            _ => Vec::new(),
+        };
 
     let branch = current_git_branch(project_root);
     let mut synced_tags = Vec::new();
@@ -634,6 +844,7 @@ fn publish_gitea_release_internal(
                 "PATCH",
                 &patch_url,
                 &cfg.token,
+                cfg.allow_insecure_http,
                 Some("application/json"),
                 Some(&payload_bytes),
             ) {
@@ -646,6 +857,7 @@ fn publish_gitea_release_internal(
                 "POST",
                 &post_url,
                 &cfg.token,
+                cfg.allow_insecure_http,
                 Some("application/json"),
                 Some(&payload_bytes),
             ) {
@@ -712,7 +924,14 @@ fn attach_release_assets(
                         "{}/api/v1/repos/{}/{}/releases/{rel_id}/assets/{aid}",
                         cfg.url, cfg.user, repo_name
                     );
-                    let _ = http_request("DELETE", &del_url, &cfg.token, None, None);
+                    let _ = http_request(
+                        "DELETE",
+                        &del_url,
+                        &cfg.token,
+                        cfg.allow_insecure_http,
+                        None,
+                        None,
+                    );
                 }
             }
         }
@@ -741,7 +960,14 @@ fn attach_release_assets(
             percent_encode(fname)
         );
         let mp_hdr = format!("multipart/form-data; boundary={boundary}");
-        if let Ok((st, _)) = http_request("POST", &up_url, &cfg.token, Some(&mp_hdr), Some(&body)) {
+        if let Ok((st, _)) = http_request(
+            "POST",
+            &up_url,
+            &cfg.token,
+            cfg.allow_insecure_http,
+            Some(&mp_hdr),
+            Some(&body),
+        ) {
             if st == 200 || st == 201 {
                 uploaded.push(fname.to_owned());
             }
@@ -844,9 +1070,12 @@ pub fn parse_keep_a_changelog(path: &Path) -> std::io::Result<Vec<ChangelogEntry
     Ok(entries)
 }
 
-fn ensure_local_git_initialized(project_root: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn ensure_local_git_initialized(
+    project_root: &Path,
+    global_db: Option<&LibreDb>,
+) -> Result<(), Box<dyn std::error::Error>> {
     if project_root.join(".git").exists() {
-        ensure_git_safe_dir(project_root);
+        ensure_git_safe_dir(project_root, global_db);
     }
     if !project_root.join(".git").join("HEAD").exists() {
         let init_out = Command::new("git")
@@ -859,8 +1088,9 @@ fn ensure_local_git_initialized(project_root: &Path) -> Result<(), Box<dyn std::
                 .current_dir(project_root)
                 .output()?;
         }
-        ensure_git_safe_dir(project_root);
+        ensure_git_safe_dir(project_root, global_db);
     }
+    ensure_git_info_exclude(project_root);
     let _ = Command::new("git")
         .args(["config", "user.name", "Antigravity"])
         .current_dir(project_root)
@@ -872,9 +1102,38 @@ fn ensure_local_git_initialized(project_root: &Path) -> Result<(), Box<dyn std::
     Ok(())
 }
 
-fn ensure_git_safe_dir(project_root: &Path) {
+fn ensure_git_info_exclude(project_root: &Path) {
+    let info_dir = project_root.join(".git").join("info");
+    if !info_dir.is_dir() && fs::create_dir_all(&info_dir).is_err() {
+        return;
+    }
+    let exclude_path = info_dir.join("exclude");
+    let existing = fs::read_to_string(&exclude_path).unwrap_or_default();
+    let mut missing = Vec::new();
+    for rule in ["/.agents/", "*.tmp.ldb", "*.credential.xml"] {
+        if !existing.lines().any(|l| l.trim() == rule) {
+            missing.push(rule);
+        }
+    }
+    if !missing.is_empty() {
+        let mut updated = existing;
+        if !updated.is_empty() && !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        for rule in missing {
+            updated.push_str(rule);
+            updated.push('\n');
+        }
+        let _ = fs::write(&exclude_path, updated);
+    }
+}
+
+fn ensure_git_safe_dir(project_root: &Path, global_db: Option<&LibreDb>) {
+    if !crate::security::is_safe_auto_git_dir(global_db, project_root) {
+        return;
+    }
     let chk = Command::new("git")
-        .args(["rev-parse", "--git-dir"])
+        .args(["-c", "core.fsmonitor=false", "rev-parse", "--git-dir"])
         .current_dir(project_root)
         .output();
     if let Ok(out) = chk {
@@ -899,7 +1158,7 @@ fn workspace_has_semver_metadata(root: &Path) -> bool {
 
 fn current_git_branch(root: &Path) -> String {
     Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .args(["-c", "core.fsmonitor=false", "rev-parse", "--abbrev-ref", "HEAD"])
         .current_dir(root)
         .output()
         .ok()
@@ -911,7 +1170,7 @@ fn current_git_branch(root: &Path) -> String {
 
 fn resolve_repo_name_from_git_or_dir(root: &Path) -> String {
     if let Ok(out) = Command::new("git")
-        .args(["remote", "get-url", "origin"])
+        .args(["-c", "core.fsmonitor=false", "remote", "get-url", "origin"])
         .current_dir(root)
         .output()
     {
@@ -932,11 +1191,14 @@ fn resolve_repo_name_from_git_or_dir(root: &Path) -> String {
 }
 
 fn get_configured_gitea_url(root: &Path, base_url: &str) -> Option<String> {
+    let base_low = base_url.trim().trim_end_matches('/').to_ascii_lowercase();
     for (rem_name, rem_url) in list_git_remotes(root) {
+        let low = rem_url.trim().to_ascii_lowercase();
         if rem_name == "gitea"
-            || rem_url.contains("localhost:3000")
-            || rem_url.contains("127.0.0.1:3000")
-            || rem_url.starts_with(base_url)
+            || (!base_low.is_empty() && (low == base_low || low.starts_with(&format!("{base_low}/"))))
+            || (is_loopback_http_url(&base_low)
+                && is_loopback_http_url(&low)
+                && extract_url_port(&base_low) == extract_url_port(&low))
         {
             return Some(rem_url.trim_end_matches(".git").to_owned());
         }
@@ -947,7 +1209,7 @@ fn get_configured_gitea_url(root: &Path, base_url: &str) -> Option<String> {
 fn list_git_remotes(root: &Path) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let Ok(rem_out) = Command::new("git")
-        .args(["remote"])
+        .args(["-c", "core.fsmonitor=false", "remote"])
         .current_dir(root)
         .output()
     else {
@@ -962,7 +1224,7 @@ fn list_git_remotes(root: &Path) -> Vec<(String, String)> {
             continue;
         }
         if let Ok(u_out) = Command::new("git")
-            .args(["remote", "get-url", rem])
+            .args(["-c", "core.fsmonitor=false", "remote", "get-url", rem])
             .current_dir(root)
             .output()
         {
@@ -1018,7 +1280,7 @@ fn select_target_remotes(
 
 fn resolve_git_tag_commit(root: &Path, tag: &str) -> Option<String> {
     let out = Command::new("git")
-        .args(["rev-list", "-n", "1", tag])
+        .args(["-c", "core.fsmonitor=false", "rev-list", "-n", "1", tag])
         .current_dir(root)
         .output()
         .ok()?;
@@ -1035,7 +1297,7 @@ fn resolve_git_tag_commit(root: &Path, tag: &str) -> Option<String> {
 
 fn resolve_git_head_commit(root: &Path) -> String {
     Command::new("git")
-        .args(["rev-parse", "HEAD"])
+        .args(["-c", "core.fsmonitor=false", "rev-parse", "HEAD"])
         .current_dir(root)
         .output()
         .ok()
@@ -1104,9 +1366,15 @@ fn record_learned_workspace(ldb: &LibreDb, clean_root: &Path) {
         let key = format!("workspace:{name}");
         let val = clean_root.to_string_lossy().into_owned();
         let _ = ldb.put(
-            WriteRequest::new(NodeKind::Config, val.into_bytes())
+            WriteRequest::new(NodeKind::Config, val.clone().into_bytes())
                 .with_key(key)
                 .with_importance(175),
+        );
+        let norm = crate::security::normalize_workspace_key(clean_root);
+        let _ = ldb.put(
+            WriteRequest::new(NodeKind::Config, val.into_bytes())
+                .with_key(format!("trust:allowed::{norm}"))
+                .with_importance(185),
         );
     }
 }
@@ -1141,7 +1409,8 @@ fn query_service_state(service_name: &str) -> String {
 
 fn check_gitea_version(cfg: &GiteaConfig) -> Option<String> {
     let url = format!("{}/api/v1/version", cfg.url);
-    let (status, body) = http_request("GET", &url, &cfg.token, None, None).ok()?;
+    let (status, body) =
+        http_request("GET", &url, &cfg.token, cfg.allow_insecure_http, None, None).ok()?;
     if status == 200 {
         let v: Value = serde_json::from_slice(&body).ok()?;
         v.get("version").and_then(Value::as_str).map(ToOwned::to_owned)
@@ -1159,7 +1428,9 @@ fn list_remote_repos(cfg: &GiteaConfig) -> Vec<(String, String)> {
     } else {
         format!("{}/api/v1/user/repos?limit=100", cfg.url)
     };
-    let Ok((200, body)) = http_request("GET", &url, &cfg.token, None, None) else {
+    let Ok((200, body)) =
+        http_request("GET", &url, &cfg.token, cfg.allow_insecure_http, None, None)
+    else {
         return Vec::new();
     };
     let Ok(arr) = serde_json::from_slice::<Vec<Value>>(&body) else {
@@ -1182,7 +1453,7 @@ fn inspect_remote_repo(
     repo_name: &str,
 ) -> Option<(bool, bool, String, String)> {
     let url = format!("{}/api/v1/repos/{}/{}", cfg.url, cfg.user, repo_name);
-    match http_request("GET", &url, &cfg.token, None, None) {
+    match http_request("GET", &url, &cfg.token, cfg.allow_insecure_http, None, None) {
         Ok((200, body)) => {
             let v: Value = serde_json::from_slice(&body).ok()?;
             let empty = v.get("empty").and_then(Value::as_bool).unwrap_or(false);
@@ -1225,6 +1496,7 @@ fn ensure_remote_repo_created(
         "POST",
         &post_url,
         &cfg.token,
+        cfg.allow_insecure_http,
         Some("application/json"),
         Some(&payload_bytes),
     )?;
@@ -1237,18 +1509,26 @@ fn ensure_remote_repo_created(
     Ok(format!("{}/{}/{repo_name}.git", cfg.url, cfg.user))
 }
 
-/// Minimal, dependency-free HTTP/1.1 client over `std::net::TcpStream` for `http://` Gitea API calls,
-/// with automatic native OS `curl` (`System32\curl.exe` Schannel / POSIX `curl`) fallback for `https://`
-/// so Enterprise Active Directory reverse-proxy and GPO Root CA certificates work out of the box.
+/// Minimal, dependency-free HTTP/1.1 client over `std::net::TcpStream` for local loopback `http://`
+/// Gitea API calls, with automatic native OS `curl` (`System32\curl.exe` Schannel / POSIX `curl`)
+/// fallback for `https://`. Refuses to transmit tokens over remote cleartext `http://` unless
+/// `allow_insecure_http` is explicitly enabled.
 fn http_request(
     method: &str,
     url: &str,
     token: &str,
+    allow_insecure_http: bool,
     content_type: Option<&str>,
     body: Option<&[u8]>,
 ) -> std::io::Result<(u16, Vec<u8>)> {
     if url.starts_with("https://") {
         return https_request_via_system_curl(method, url, token, content_type, body);
+    }
+    if !token.is_empty() && !is_loopback_http_url(url) && !allow_insecure_http {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "refusing to transmit Gitea API token over unencrypted non-loopback http:// connection; configure an https:// URL or set 'libredb config set gitea_allow_insecure_http true'",
+        ));
     }
     let without_scheme = url
         .strip_prefix("http://")
@@ -1339,6 +1619,19 @@ fn find_double_crlf(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
+fn format_curl_auth_header_line(token: &str) -> String {
+    let sanitized: String = token
+        .chars()
+        .filter(|&c| c != '\r' && c != '\n')
+        .flat_map(|c| match c {
+            '\\' => vec!['\\', '\\'],
+            '"' => vec!['\\', '"'],
+            other => vec![other],
+        })
+        .collect();
+    format!("header = \"Authorization: token {sanitized}\"\n")
+}
+
 struct EphemeralCurlConfig {
     path: PathBuf,
     byte_len: usize,
@@ -1356,20 +1649,16 @@ impl EphemeralCurlConfig {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
         let cfg_path = dir.join(format!(".curl_hdr_{}_{stamp}.cfg", std::process::id()));
-        let sanitized: String = token
-            .chars()
-            .filter(|&c| c != '\r' && c != '\n')
-            .flat_map(|c| match c {
-                '\\' => vec!['\\', '\\'],
-                '"' => vec!['\\', '"'],
-                other => vec![other],
-            })
-            .collect();
-        let content = format!("header = \"Authorization: token {sanitized}\"\n");
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&cfg_path)?;
+        let content = format_curl_auth_header_line(token);
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_ATTRIBUTE_TEMPORARY: u32 = 0x0000_0100;
+            opts.attributes(FILE_ATTRIBUTE_TEMPORARY);
+        }
+        let mut f = opts.open(&cfg_path)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1396,8 +1685,10 @@ impl Drop for EphemeralCurlConfig {
 }
 
 /// Executes an `https://` API call via the OS-native `curl` binary (`C:\Windows\System32\curl.exe` on Windows,
-/// which natively uses Windows Schannel and trusts Active Directory GPO Enterprise Root CAs), passing
-/// `Authorization` headers via an ephemeral RAII-wiped `-K` config file rather than CLI arguments.
+/// which natively uses Windows Schannel and trusts Active Directory GPO Enterprise Root CAs).
+/// Enforces `--proto =https`, disables cross-origin redirect auth leaks (no `--location`), pipes `-K -`
+/// over `stdin` with zero disk writes when `body.is_none()`, and falls back to `FILE_ATTRIBUTE_TEMPORARY`
+/// RAII-wiped `EphemeralCurlConfig` only when `stdin` carries a request body.
 fn https_request_via_system_curl(
     method: &str,
     url: &str,
@@ -1418,7 +1709,8 @@ fn https_request_via_system_curl(
         "curl"
     };
 
-    let auth_cfg_guard = if !token.is_empty() {
+    let pipe_auth_over_stdin = !token.is_empty() && body.is_none();
+    let auth_cfg_guard = if !token.is_empty() && body.is_some() {
         Some(EphemeralCurlConfig::create_with_token(token)?)
     } else {
         None
@@ -1429,7 +1721,8 @@ fn https_request_via_system_curl(
     cmd.args([
         "--silent",
         "--show-error",
-        "--location",
+        "--proto",
+        "=https",
         "--max-time",
         "30",
         "-X",
@@ -1437,7 +1730,9 @@ fn https_request_via_system_curl(
         "-H",
         "User-Agent: LibreDB-GiteaSync/1.0",
     ]);
-    if let Some(ref guard) = auth_cfg_guard {
+    if pipe_auth_over_stdin {
+        cmd.args(["-K", "-"]);
+    } else if let Some(ref guard) = auth_cfg_guard {
         cmd.arg("-K").arg(&guard.path);
     }
     if let Some(ct) = content_type {
@@ -1445,6 +1740,8 @@ fn https_request_via_system_curl(
     }
     if body.is_some() {
         cmd.args(["--data-binary", "@-"]);
+        cmd.stdin(Stdio::piped());
+    } else if pipe_auth_over_stdin {
         cmd.stdin(Stdio::piped());
     } else {
         cmd.stdin(Stdio::null());
@@ -1457,6 +1754,15 @@ fn https_request_via_system_curl(
     if let Some(payload) = body {
         if let Some(mut stdin_pipe) = child.stdin.take() {
             stdin_pipe.write_all(payload)?;
+        }
+    } else if pipe_auth_over_stdin {
+        if let Some(mut stdin_pipe) = child.stdin.take() {
+            let mut line_bytes = format_curl_auth_header_line(token).into_bytes();
+            let write_res = stdin_pipe.write_all(&line_bytes);
+            for b in line_bytes.iter_mut() {
+                *b = 0;
+            }
+            write_res?;
         }
     }
     let out = child.wait_with_output()?;
@@ -1512,30 +1818,6 @@ fn decode_chunked_body(mut src: &[u8]) -> Vec<u8> {
     out
 }
 
-fn base64_encode(input: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
-    for chunk in input.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-        out.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
-        out.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(TABLE[((triple >> 6) & 0x3F) as usize] as char);
-        } else {
-            out.push('=');
-        }
-        if chunk.len() > 2 {
-            out.push(TABLE[(triple & 0x3F) as usize] as char);
-        } else {
-            out.push('=');
-        }
-    }
-    out
-}
-
 fn percent_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -1550,7 +1832,10 @@ fn percent_encode(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_http_response, strip_verbatim_prefix, GiteaConfig};
+    use super::{
+        http_request, parse_http_response, should_supply_git_credentials, strip_verbatim_prefix,
+        GiteaConfig,
+    };
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
@@ -1579,12 +1864,13 @@ mod tests {
     }
 
     #[test]
-    fn git_remote_auth_uses_env_only_never_cli_args_and_never_leaks_to_github() {
+    fn git_remote_auth_uses_env_only_blocks_domain_spoof_and_remote_cleartext_http() {
         let cfg = GiteaConfig {
             url: "https://git.corp.example".to_owned(),
             user: "ci_bot".to_owned(),
             token: "test_placeholder_tok".to_owned(),
             service_name: "gitea".to_owned(),
+            allow_insecure_http: false,
         };
 
         let mut gitea_cmd = Command::new("git");
@@ -1608,10 +1894,38 @@ mod tests {
                 .any(|(k, v)| k.starts_with("GIT_CONFIG_VALUE_") && v == "schannel"));
         }
 
-        let mut gh_cmd = Command::new("git");
-        cfg.configure_git_command_for_remote(&mut gh_cmd, "https://github.com/org/repo.git");
-        assert_eq!(gh_cmd.get_envs().count(), 0);
-        assert_eq!(gh_cmd.get_args().count(), 0);
+        // Subdomain-prefix spoofing (`git.corp.example.evil.org`) and GitHub must receive ZERO auth envs!
+        for untrusted_url in [
+            "https://github.com/org/repo.git",
+            "https://git.corp.example.attacker.example/org/repo.git",
+        ] {
+            let mut ext_cmd = Command::new("git");
+            cfg.configure_git_command_for_remote(&mut ext_cmd, untrusted_url);
+            assert_eq!(ext_cmd.get_envs().count(), 0);
+            assert_eq!(ext_cmd.get_args().count(), 0);
+        }
+
+        // Credential helper must verify stdin `protocol` + `host` and reject empty or non-matching hosts!
+        assert!(!should_supply_git_credentials(&cfg, ""));
+        assert!(!should_supply_git_credentials(
+            &cfg,
+            "protocol=https\nhost=github.com\n\n"
+        ));
+        assert!(should_supply_git_credentials(
+            &cfg,
+            "protocol=https\nhost=git.corp.example\n\n"
+        ));
+
+        // Non-loopback cleartext `http://` must refuse transmitting API tokens unless explicitly opted in!
+        let http_err = http_request(
+            "GET",
+            "http://git.corp.example:3000/api/v1/version",
+            "secret_tok",
+            false,
+            None,
+            None,
+        );
+        assert!(http_err.is_err());
     }
 
     #[test]

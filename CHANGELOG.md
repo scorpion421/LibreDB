@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.7] - 2026-11-10
+
+### Added
+
+- Added zero-dependency OS credential vault (`protect_secret`, `unprotect_secret`, and `is_protected_secret` in `crates/libredb-cli/src/security.rs`) backed by Windows `DPAPI` (`CryptProtectData` / `CryptUnprotectData` + `SystemFunction036` CSPRNG + volatile memory scrubbing) and POSIX `0600` keyfiles, plus `--token-stdin` and `--allow-insecure-http` flags on `libredb gitea-config` with transparent plaintext-to-vault migration in `GiteaConfig::load` and `modernize-global`.
+- Added autonomous cryptographic workspace trust anchors (`is_workspace_memory_trusted`, `seal_workspace_memory`, `revoke_workspace_trust`, and `is_git_index_tracking_agents_db` in `crates/libredb-cli/src/security.rs`) exposed via `libredb trust [<dir>] [--revoke] [--list]`, quarantining unsealed or Git-tracked `.agents/memory.*` databases from automatic `PreInvocation` `<SYSTEM_MESSAGE>` hydration and untrusted C `SQLite` deserialization.
+- Added universal dynamic configuration (`libredb config <get|set|unset|list> [<key>] [<value>] [--project <dir>]` in `crates/libredb-cli/src/main.rs` and `WorkspaceScanConfig::from_db_and_root` in `crates/libredb-cognitive/src/workspace.rs`) supporting root `.gitignore` directory discovery and runtime overrides (`index:ignore_dirs`, `index:extra_extensions`, `index:max_file_bytes`, `guardrail:secret_prefixes`, `guardrail:protected_paths`, `guardrail:allow_staged_files`, and `gitea_allow_insecure_http`).
+
+### Changed
+
+- Replaced the hardcoded 75-word call-graph stopword list in `crates/libredb-cognitive/src/workspace.rs` with a 100% language-agnostic 3-tier syntactic (`Type::method` vs `.method(` vs bare `func(`) and unsupervised corpus Document-Frequency (`IDF`) call-site classifier (`extract_call_sites`), keeping zero hardcoded language or identifier dictionaries across the codebase.
+- Upgraded `scripts/deploy_plugin.ps1` (`Test-SafeBinaryAcl`) to stage non-`%USERPROFILE%` drive hook binaries outside `target\` (`<DriveRoot>\.gemini\libredb\bin\libredb.exe`) only after verifying directory write ACLs exclude broad multi-user principals (`Everyone`, `Users`, `Authenticated Users`, `Domain Users`), preventing both `cargo clean` hook breakage and shared-drive binary hijacking.
+
+### Fixed
+
+- Fixed domain-prefix boundary matching in `GiteaConfig::is_gitea_remote_url` and dynamic loopback port matching (`extract_url_port`) in `crates/libredb-cli/src/gitea.rs` so subdomain prefix lookalikes (`git.corp.example.attacker.example`) never match `git.corp.example` and custom loopback Gitea ports work without hardcoded `:3000` assumptions.
+- Fixed `find_matching_brace_end` in `crates/libredb-cognitive/src/skeleton.rs` (`SKELETON_HASH_SEED = 107`) to enforce strict per-character loop progress on `'\...` sequences longer than 10 characters and honor PowerShell/Shell/SQL quote-escaping and `#` / `<# ... #>` comment rules so PowerShell regexes (`'\\(...)'`) and trailing-backslash Windows paths (`"$env:USERPROFILE\bin\"`) never stall or misbalance function braces.
+
+### Security
+
+- Hardened `crates/libredb-cli/src/gitea.rs` against credential exfiltration and Git repository traps: verified `stdin` `protocol` + `host` in `cmd_gitea_credential_helper`, removed `curl --location` redirect auth forwarding, enforced `--proto =https` and zero-disk `-K -` `stdin` piping on `GET`/`DELETE` requests (`FILE_ATTRIBUTE_TEMPORARY` when `stdin` carries a body), blocked non-loopback cleartext `http://` token transmission by default, enforced `.git/info/exclude` (`/.agents/`, `*.tmp.ldb`, `*.credential.xml`) and `is_sensitive_staged_file` checks + `-c core.fsmonitor=false`, and gated `ensure_git_safe_dir` via `is_safe_auto_git_dir` (`CVE-2022-24765`).
+- Enforced control-plane and credential path policies (`check_tool_write_path_policy` and `check_mcp_read_path_policy` in `crates/libredb-cli/src/security.rs`) across `PreToolUse` (`hooks.json`, `mcp_config.json`, `.git/hooks/*`, `.git/config`, `.ssh/*`, `credentials/*`) and `libredb-mcp` (`skeleton`, `fim`, `index`, blocking `.env` and credential stores), sanitized `.git/HEAD` branch names in `collect_git_telemetry_line`, and added `-EncodedCommand` obfuscation + 14-family secret-prefix + URL Basic-Auth leak detection in `crates/libredb-cognitive/src/guardrail.rs`.
+- Added malformed-file OOM allocation bounds checks in `decode_metadata_frame` (`crates/libredb-core/src/format.rs`) and `read_inode_payload` / `read_coalesced_extents` / `read_overflow_synapses` (`MAX_EXTENT_PAYLOAD_BYTES` + EOF bounds in `crates/libredb-core/src/engine.rs`), plus `PRAGMA trusted_schema = OFF; PRAGMA cell_size_check = ON;` and `validate_safe_ddl_sql` in `crates/libredb-bridge/src/lib.rs`.
+
 ## [0.8.6] - 2026-11-10
 
 ### Added

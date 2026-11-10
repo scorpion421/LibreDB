@@ -93,6 +93,7 @@ pub fn import_sqlite_readonly(
         sqlite_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
+    let _ = conn.execute_batch("PRAGMA trusted_schema = OFF; PRAGMA cell_size_check = ON;");
 
     // 1. Snapshot exact DDL and every row for lossless rollback mirror.
     let bundle = snapshot_sqlite_database(&conn, scope)?;
@@ -221,12 +222,14 @@ pub fn export_sqlite_database(
     let bundle: SqliteMirrorBundle = serde_json::from_slice(&mirror_rec.payload)?;
 
     let mut conn = Connection::open(out_sqlite_path)?;
+    let _ = conn.execute_batch("PRAGMA trusted_schema = OFF; PRAGMA cell_size_check = ON;");
     let tx = conn.transaction()?;
 
     let mut restored_rows = 0usize;
 
     // Step 1: Create and populate all standard relational tables first.
     for tbl in bundle.tables.iter().filter(|t| !t.is_fts5) {
+        validate_safe_ddl_sql(&tbl.create_sql, &tbl.name)?;
         tx.execute_batch(&tbl.create_sql)?;
         if !tbl.rows.is_empty() && !tbl.columns.is_empty() {
             let col_list = tbl
@@ -251,11 +254,13 @@ pub fn export_sqlite_database(
 
     // Step 2: Create all secondary B-Tree indexes.
     for idx_sql in &bundle.indexes_sql {
+        validate_safe_ddl_sql(idx_sql, "<index>")?;
         tx.execute_batch(idx_sql)?;
     }
 
     // Step 3: Create and populate/rebuild all FTS5 virtual tables.
     for tbl in bundle.tables.iter().filter(|t| t.is_fts5) {
+        validate_safe_ddl_sql(&tbl.create_sql, &tbl.name)?;
         tx.execute_batch(&tbl.create_sql)?;
         if tbl.is_external_content_fts5 {
             let rebuild_sql = format!(
@@ -298,10 +303,12 @@ pub fn verify_sqlite_equivalence(
         orig_sqlite,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
+    let _ = conn_a.execute_batch("PRAGMA trusted_schema = OFF; PRAGMA cell_size_check = ON;");
     let conn_b = Connection::open_with_flags(
         reconstructed_sqlite,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
+    let _ = conn_b.execute_batch("PRAGMA trusted_schema = OFF; PRAGMA cell_size_check = ON;");
 
     let snap_a = snapshot_sqlite_database(&conn_a, "verify_a")?;
     let snap_b = snapshot_sqlite_database(&conn_b, "verify_b")?;
@@ -398,6 +405,78 @@ fn rows_semantically_identical(a: &[SqlCell], b: &[SqlCell]) -> bool {
         }
     }
     true
+}
+
+/// Validates that a mirrored SQLite DDL string is a single benign `CREATE TABLE`,
+/// `CREATE VIRTUAL TABLE`, or `CREATE [UNIQUE] INDEX` statement without stacked
+/// `ATTACH DATABASE`, `PRAGMA`, or `INSERT`/`DROP` payloads.
+fn validate_safe_ddl_sql(sql: &str, label: &str) -> Result<()> {
+    let trimmed = sql.trim();
+    if trimmed.is_empty() {
+        return Err(BridgeError::ParityMismatch {
+            table: label.to_owned(),
+            reason: "empty DDL statement in SQLite mirror".to_owned(),
+        });
+    }
+    let upper: String = trimmed
+        .chars()
+        .take(48)
+        .collect::<String>()
+        .to_ascii_uppercase();
+    let norm_prefix: String = upper.split_whitespace().collect::<Vec<_>>().join(" ");
+    let allowed_prefix = norm_prefix.starts_with("CREATE TABLE ")
+        || norm_prefix.starts_with("CREATE TABLE\"")
+        || norm_prefix.starts_with("CREATE TEMP TABLE ")
+        || norm_prefix.starts_with("CREATE VIRTUAL TABLE ")
+        || norm_prefix.starts_with("CREATE INDEX ")
+        || norm_prefix.starts_with("CREATE UNIQUE INDEX ");
+    if !allowed_prefix {
+        return Err(BridgeError::ParityMismatch {
+            table: label.to_owned(),
+            reason: format!("disallowed DDL prefix in SQLite mirror: '{norm_prefix}'"),
+        });
+    }
+
+    // Ensure no unquoted semicolon appears before the optional trailing semicolon (blocks stacked statements).
+    let core = trimmed.trim_end_matches(';').trim_end();
+    let bytes = core.as_bytes();
+    let mut i = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_single {
+            if b == b'\'' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    i += 2;
+                    continue;
+                }
+                in_single = false;
+            }
+        } else if in_double {
+            if b == b'"' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                    i += 2;
+                    continue;
+                }
+                in_double = false;
+            }
+        } else {
+            match b {
+                b'\'' => in_single = true,
+                b'"' => in_double = true,
+                b';' => {
+                    return Err(BridgeError::ParityMismatch {
+                        table: label.to_owned(),
+                        reason: "multi-statement semicolon rejected in SQLite mirror DDL".to_owned(),
+                    });
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    Ok(())
 }
 
 fn snapshot_sqlite_database(conn: &Connection, scope: &str) -> Result<SqliteMirrorBundle> {

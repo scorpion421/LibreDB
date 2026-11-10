@@ -3,17 +3,20 @@
 mod gitea;
 mod hooks;
 mod mcp;
+mod security;
 
 use libredb_bridge::{
     export_sqlite_database, import_sqlite_readonly, open_or_auto_migrate, verify_sqlite_equivalence,
 };
 use libredb_cognitive::{
-    audit_workspace_guardrails, create_subagent_handoff, execute_atomic_batch, extract_fim_slice,
-    index_workspace, query_symbol_impact, sync_transcript_epoch, AtomicBatchSpec, CognitiveEngine,
-    FileSkeleton, OverlayBrain, PulseRequest, ReflexEngine, ReflexRule,
+    audit_workspace_guardrails_with_prefixes, create_subagent_handoff, execute_atomic_batch,
+    extract_fim_slice, index_workspace, query_symbol_impact, sync_transcript_epoch,
+    AtomicBatchSpec, CognitiveEngine, FileSkeleton, OverlayBrain, PulseRequest, ReflexEngine,
+    ReflexRule,
 };
 use libredb_core::{EdgeKind, LibreDb, NodeKind, WriteRequest};
 use std::env;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
@@ -42,12 +45,14 @@ Antigravity Cognitive & Code-Graph Commands:
   libredb modernize-global [--global <customizations.ldb>] [--skill-md <SKILL.md>]
   libredb mcp-serve [<default_project.ldb>] [--global <customizations.ldb>]
 
-Native Antigravity Hooks, Guardrails & Dynamic Git/Gitea Automation:
+Security, Trust & Universal Configuration Commands:
+  libredb trust [<dir>] [--revoke] [--list] [--global <customizations.ldb>]
+  libredb config <get|set|unset|list> [<key>] [<value>] [--project <dir>] [--global <customizations.ldb>]
   libredb guardrail check [--path <dir>] [--staged] [--strict]
   libredb hook-pre-tool [--global <customizations.ldb>]
   libredb hook-pre-invocation [--global <customizations.ldb>]
   libredb gitea-status [--global <customizations.ldb>]
-  libredb gitea-config [--url <u>] [--user <usr>] [--token <tok>] [--register-helper]
+  libredb gitea-config [--url <u>] [--user <usr>] [--token <tok> | --token-stdin] [--allow-insecure-http <bool>] [--register-helper]
   libredb gitea-credential-helper [get]
   libredb git-init | gitea-init [<dir>] [--name <repo>] [--use-existing] [--overwrite]
   libredb git-sync | gitea-sync [-m <msg>] [--project <dir>] [--remote <r>] [--all-remotes] [--github] [--releases] [--allow-unversioned]
@@ -67,7 +72,7 @@ Core Storage & Graph Commands:
   libredb deprecate <db.ldb> <kind> <key>
   libredb trace <db.ldb> <node_id> [--depth <n>]
   libredb recall <db.ldb> <seed_id> [--hops <n>] [--budget <tokens>]
-  libredb compact <db.ldb>
+  libredb compact <db.ldb> [--prune]
   libredb stats <db.ldb> [--json]
   libredb verify <db.ldb>
   libredb bench [--nodes <n>] [--threads <t>]",
@@ -169,7 +174,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     other => return Err(format!("Unknown guardrail flag '{other}'").into()),
                 }
             }
-            let rep = audit_workspace_guardrails(&dir, staged)?;
+            let gdb_opt = hooks::open_global_ldb_if_exists(None);
+            let pdb_opt = if security::is_workspace_memory_trusted(gdb_opt.as_deref(), &dir) {
+                let p = dir.join(".agents").join("memory.ldb");
+                p.is_file().then(|| LibreDb::open(&p).ok()).flatten()
+            } else {
+                None
+            };
+            let custom_prefixes = security::load_config_list(
+                gdb_opt.as_deref(),
+                pdb_opt.as_ref(),
+                "guardrail:secret_prefixes",
+            );
+            let rep = audit_workspace_guardrails_with_prefixes(&dir, staged, &custom_prefixes)?;
             if rep.passed(strict) {
                 println!("=== LIBREDB GUARDRAIL AUDIT REPORT: [PASSED] ===");
                 println!("  Files Checked:      {}", rep.files_checked);
@@ -187,6 +204,171 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 println!("================================================");
                 process::exit(1);
+            }
+        }
+        "trust" => {
+            let mut dir_opt: Option<PathBuf> = None;
+            let mut revoke = false;
+            let mut list = false;
+            let mut global_path: Option<PathBuf> = None;
+            let mut i = 1usize;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--revoke" => {
+                        revoke = true;
+                        i += 1;
+                    }
+                    "--list" => {
+                        list = true;
+                        i += 1;
+                    }
+                    "--global" if i + 1 < args.len() => {
+                        global_path = Some(PathBuf::from(&args[i + 1]));
+                        i += 2;
+                    }
+                    pos if !pos.starts_with('-') && dir_opt.is_none() => {
+                        dir_opt = Some(PathBuf::from(pos));
+                        i += 1;
+                    }
+                    other => return Err(format!("Unknown trust flag '{other}'").into()),
+                }
+            }
+            let gdb = hooks::open_global_ldb(global_path.as_deref())?;
+            if list {
+                let items = security::list_trusted_workspaces(&gdb);
+                println!("=== Trusted Workspaces ({}) ===", items.len());
+                for (_, display_path) in items {
+                    println!("  * {display_path}");
+                }
+            } else {
+                let target_dir = dir_opt.unwrap_or(env::current_dir()?);
+                let abs = std::fs::canonicalize(&target_dir).unwrap_or(target_dir);
+                let clean = gitea::strip_verbatim_prefix(&abs);
+                if revoke {
+                    security::revoke_workspace_trust(&gdb, &clean)?;
+                    println!("[OK] Revoked workspace trust for '{}'", clean.display());
+                } else {
+                    let ldb_path = clean.join(".agents").join("memory.ldb");
+                    let (pdb, _) = hooks::open_project_ldb_silent(&ldb_path)?;
+                    security::seal_workspace_memory(&gdb, &pdb, &clean)?;
+                    println!(
+                        "[OK] Trusted and cryptographically sealed workspace '{}'",
+                        clean.display()
+                    );
+                }
+            }
+        }
+        "config" => {
+            let action = args.get(1).map(String::as_str).unwrap_or("list");
+            let mut positional: Vec<String> = Vec::new();
+            let mut proj_dir: Option<PathBuf> = None;
+            let mut global_path: Option<PathBuf> = None;
+            let mut i = 2usize;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--project" if i + 1 < args.len() => {
+                        proj_dir = Some(PathBuf::from(&args[i + 1]));
+                        i += 2;
+                    }
+                    "--global" if i + 1 < args.len() => {
+                        global_path = Some(PathBuf::from(&args[i + 1]));
+                        i += 2;
+                    }
+                    other if !other.starts_with("--") => {
+                        positional.push(other.to_owned());
+                        i += 1;
+                    }
+                    other => return Err(format!("Unknown config flag '{other}'").into()),
+                }
+            }
+            let db: Arc<LibreDb> = if let Some(ref pdir) = proj_dir {
+                let abs = std::fs::canonicalize(pdir).unwrap_or_else(|_| pdir.clone());
+                let clean = gitea::strip_verbatim_prefix(&abs);
+                let (pdb, _) = hooks::open_project_ldb_silent(&clean.join(".agents").join("memory.ldb"))?;
+                pdb
+            } else {
+                hooks::open_global_ldb(global_path.as_deref())?
+            };
+            let is_secret_key = |k: &str| -> bool {
+                let low = k.to_ascii_lowercase();
+                low.ends_with("token")
+                    || low.contains("secret")
+                    || low.contains("password")
+                    || low.contains("api_key")
+            };
+            match action {
+                "set" => {
+                    if positional.len() < 2 {
+                        return Err("Usage: libredb config set <key> <value> [--project <dir>] [--global <g.ldb>]".into());
+                    }
+                    let key = positional[0].trim();
+                    let val = &positional[1];
+                    let stored = if is_secret_key(key) {
+                        security::protect_secret(val.trim())?
+                    } else {
+                        val.clone()
+                    };
+                    db.put(
+                        WriteRequest::new(NodeKind::Config, stored.into_bytes())
+                            .with_key(key)
+                            .with_importance(190),
+                    )?;
+                    println!(
+                        "[OK] Updated config '{}'{}",
+                        key,
+                        if is_secret_key(key) {
+                            " (OS vault encrypted)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+                "get" => {
+                    let key = positional
+                        .first()
+                        .ok_or("Usage: libredb config get <key> [--project <dir>] [--global <g.ldb>]")?;
+                    let rec = db.get_by_key(NodeKind::Config, key)?;
+                    let raw = String::from_utf8_lossy(&rec.payload);
+                    if is_secret_key(key) || security::is_protected_secret(&raw) {
+                        println!("<redacted:encrypted-in-os-vault>");
+                    } else {
+                        println!("{}", raw.trim());
+                    }
+                }
+                "unset" => {
+                    let key = positional
+                        .first()
+                        .ok_or("Usage: libredb config unset <key> [--project <dir>] [--global <g.ldb>]")?;
+                    if db.deprecate_key(NodeKind::Config, key)? {
+                        println!("[OK] Removed config '{key}'");
+                    } else {
+                        println!("Config '{key}' not found");
+                    }
+                }
+                "list" => {
+                    let mut rows: Vec<(String, String)> = Vec::new();
+                    for (ino, k_opt, _) in db.list_inodes(Some(NodeKind::Config), false) {
+                        let Some(k) = k_opt else { continue };
+                        if k == "sys::trust_anchor_secret" {
+                            continue;
+                        }
+                        if let Ok(rec) = db.get(ino.node_id) {
+                            let raw = String::from_utf8_lossy(&rec.payload).trim().to_owned();
+                            let shown = if is_secret_key(&k) || security::is_protected_secret(&raw) {
+                                "<redacted:encrypted-in-os-vault>".to_owned()
+                            } else {
+                                raw.lines().collect::<Vec<_>>().join(", ")
+                            };
+                            rows.push((k, shown));
+                        }
+                    }
+                    rows.sort_by(|a, b| a.0.cmp(&b.0));
+                    println!("=== Active Configuration ({}) ===", rows.len());
+                    for (k, v) in rows {
+                        println!("  * {k} = {v}");
+                    }
+                }
+                other => return Err(format!("Unknown config action '{other}'. Expected get, set, unset, or list.").into()),
             }
         }
         "get-skill" => {
@@ -416,6 +598,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let mut url: Option<String> = None;
             let mut user: Option<String> = None;
             let mut token: Option<String> = None;
+            let mut token_stdin = false;
+            let mut allow_insecure_http: Option<bool> = None;
             let mut global_path: Option<PathBuf> = None;
             let mut reg_helper = false;
             let mut i = 1usize;
@@ -433,6 +617,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         token = Some(args[i + 1].clone());
                         i += 2;
                     }
+                    "--token-stdin" => {
+                        token_stdin = true;
+                        i += 1;
+                    }
+                    "--allow-insecure-http" => {
+                        if i + 1 < args.len() && !args[i + 1].starts_with("--") {
+                            let low = args[i + 1].trim().to_ascii_lowercase();
+                            allow_insecure_http = Some(matches!(low.as_str(), "1" | "true" | "yes" | "on"));
+                            i += 2;
+                        } else {
+                            allow_insecure_http = Some(true);
+                            i += 1;
+                        }
+                    }
                     "--global" if i + 1 < args.len() => {
                         global_path = Some(PathBuf::from(&args[i + 1]));
                         i += 2;
@@ -444,11 +642,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     other => return Err(format!("Unknown gitea-config flag '{other}'").into()),
                 }
             }
+            if token_stdin {
+                let mut stdin_tok = String::new();
+                std::io::stdin().read_to_string(&mut stdin_tok)?;
+                token = Some(stdin_tok.trim_end_matches(['\r', '\n']).to_owned());
+            }
             gitea::cmd_gitea_config(
                 global_path.as_deref(),
                 url.as_deref(),
                 user.as_deref(),
                 token.as_deref(),
+                allow_insecure_http,
                 reg_helper,
             )?;
         }
@@ -1665,17 +1869,46 @@ fn modernize_global_db(
             .with_pinned(true),
     )?;
 
+    // Transparently upgrade any legacy plaintext `gitea_token` to OS vault (`dpapi:v1:` / `vault:v1:`)
+    // BEFORE `--prune` compaction physically purges superseded extents from `customizations.ldb`!
+    let _ = gitea::GiteaConfig::load(gdb);
+
+    // Cryptographically seal all existing locally learned workspaces (`workspace:*`) whose `.agents/memory.ldb`
+    // is not tracked inside `.git/index`.
+    let mut sealed_workspaces = 0usize;
+    for (ino, k_opt, _) in gdb.list_inodes(Some(NodeKind::Config), false) {
+        if let Some(k) = k_opt {
+            if k.starts_with("workspace:") {
+                if let Ok(rec) = gdb.get(ino.node_id) {
+                    let ws_path = PathBuf::from(String::from_utf8_lossy(&rec.payload).trim());
+                    let ldb_p = ws_path.join(".agents").join("memory.ldb");
+                    if ws_path.is_dir()
+                        && ldb_p.is_file()
+                        && !security::is_git_index_tracking_agents_db(&ws_path)
+                    {
+                        if let Ok(pdb) = LibreDb::open(&ldb_p) {
+                            if security::seal_workspace_memory(gdb, &pdb, &ws_path).is_ok() {
+                                sealed_workspaces += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let mut cog = CognitiveEngine::open_db(Arc::clone(gdb))?;
     cog.save_index_snapshot()?;
     let comp = gdb.compact_with_options(true)?;
 
     println!(
-        "[OK] Modernized global LibreDB in {:.2} ms: {} legacy customizations-db capsules deprecated, {} rules updated to libredb, {} libredb skill sections synced, {} reflexes active ({} -> {} bytes)",
+        "[OK] Modernized global LibreDB in {:.2} ms: {} legacy customizations-db capsules deprecated, {} rules updated to libredb, {} libredb skill sections synced, {} reflexes active, {} workspaces sealed ({} -> {} bytes)",
         t0.elapsed().as_secs_f64() * 1000.0,
         deprecated_legacy,
         rules_updated,
         synced_sections,
         core_reflexes.len(),
+        sealed_workspaces,
         comp.bytes_before,
         comp.bytes_after
     );

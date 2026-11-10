@@ -724,6 +724,12 @@ pub fn decode_metadata_frame(
         pos += INODE_SIZE;
     }
 
+    let max_possible_key_ops = (payload_end - pos) / 12;
+    if key_op_count > max_possible_key_ops {
+        return Err(LibreDbError::CorruptFormat(
+            "key mutation count exceeds remaining frame bounds",
+        ));
+    }
     let mut key_ops = Vec::with_capacity(key_op_count);
     for _ in 0..key_op_count {
         if pos + 12 > payload_end {
@@ -762,4 +768,24 @@ pub fn decode_metadata_frame(
 pub const fn align_up(offset: u64, align: u64) -> u64 {
     let mask = align - 1;
     (offset + mask) & !mask
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crafted_metadata_frame_with_huge_key_op_count_fails_without_oom() {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&COMMIT_FRAME_MAGIC);
+        frame.extend_from_slice(&28u32.to_le_bytes()); // total_frame_bytes = 28
+        frame.extend_from_slice(&1u64.to_le_bytes()); // commit_seq = 1
+        frame.extend_from_slice(&0u32.to_le_bytes()); // inode_count = 0
+        frame.extend_from_slice(&u32::MAX.to_le_bytes()); // adversarial key_op_count = 4,294,967,295
+        let crc = crc32(&frame);
+        frame.extend_from_slice(&crc.to_le_bytes());
+
+        let res = decode_metadata_frame(COMMIT_FRAME_MAGIC, &frame);
+        assert!(matches!(res, Err(LibreDbError::CorruptFormat(_))));
+    }
 }

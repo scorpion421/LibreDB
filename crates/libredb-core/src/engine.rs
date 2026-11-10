@@ -2159,7 +2159,31 @@ impl LibreDb {
                 data_crc32,
                 ..
             } => {
-                let mut stored = vec![0u8; stored_len as usize];
+                let raw_usize = raw_len as usize;
+                let stored_usize = stored_len as usize;
+                if raw_usize > MAX_EXTENT_PAYLOAD_BYTES {
+                    return Err(LibreDbError::PayloadTooLarge {
+                        size: raw_usize,
+                        max: MAX_EXTENT_PAYLOAD_BYTES,
+                    });
+                }
+                if stored_usize > MAX_EXTENT_PAYLOAD_BYTES {
+                    return Err(LibreDbError::PayloadTooLarge {
+                        size: stored_usize,
+                        max: MAX_EXTENT_PAYLOAD_BYTES,
+                    });
+                }
+                let file_len = self.backend.len()?;
+                let end_offset = data_offset
+                    .checked_add(stored_len as u64)
+                    .ok_or(LibreDbError::CorruptFormat("extent offset overflow"))?;
+                if end_offset > file_len {
+                    return Err(LibreDbError::Io(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "extent exceeds file length",
+                    )));
+                }
+                let mut stored = vec![0u8; stored_usize];
                 self.backend.read_at(data_offset, &mut stored)?;
                 let actual_crc = crc32(&stored);
                 if actual_crc != data_crc32 {
@@ -2170,7 +2194,7 @@ impl LibreDb {
                     });
                 }
                 if inode.flags.contains(NodeFlags::COMPRESSED_LZ4) {
-                    lz4_flex::block::decompress(&stored, raw_len as usize)
+                    lz4_flex::block::decompress(&stored, raw_usize)
                         .map_err(|e| LibreDbError::Decompression(e.to_string()))
                 } else {
                     Ok(stored)
@@ -2213,6 +2237,18 @@ impl LibreDb {
                     data_crc32,
                     ..
                 } => {
+                    if (raw_len as usize) > MAX_EXTENT_PAYLOAD_BYTES {
+                        return Err(LibreDbError::PayloadTooLarge {
+                            size: raw_len as usize,
+                            max: MAX_EXTENT_PAYLOAD_BYTES,
+                        });
+                    }
+                    if (stored_len as usize) > MAX_EXTENT_PAYLOAD_BYTES {
+                        return Err(LibreDbError::PayloadTooLarge {
+                            size: stored_len as usize,
+                            max: MAX_EXTENT_PAYLOAD_BYTES,
+                        });
+                    }
                     reqs.push(ExtentReq {
                         node_id: nid,
                         offset: data_offset,
@@ -2235,15 +2271,21 @@ impl LibreDb {
         const MAX_GAP_BYTES: u64 = 4096;
         const MAX_COALESCED_WINDOW: u64 = 262_144;
 
+        let file_len = self.backend.len()?;
         let mut io_reads = 0usize;
         let mut i = 0usize;
         while i < reqs.len() {
             let span_start = reqs[i].offset;
-            let mut span_end = reqs[i].offset + (reqs[i].stored_len as u64);
+            let mut span_end = reqs[i]
+                .offset
+                .checked_add(reqs[i].stored_len as u64)
+                .ok_or(LibreDbError::CorruptFormat("extent offset overflow"))?;
             let mut j = i + 1;
             while j < reqs.len() {
                 let next_start = reqs[j].offset;
-                let next_end = next_start + (reqs[j].stored_len as u64);
+                let next_end = next_start
+                    .checked_add(reqs[j].stored_len as u64)
+                    .ok_or(LibreDbError::CorruptFormat("extent offset overflow"))?;
                 if next_start <= span_end + MAX_GAP_BYTES
                     && (next_end - span_start) <= MAX_COALESCED_WINDOW
                 {
@@ -2254,6 +2296,12 @@ impl LibreDb {
                 }
             }
 
+            if span_end > file_len {
+                return Err(LibreDbError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "coalesced extent window exceeds file length",
+                )));
+            }
             let mut window_buf = vec![0u8; (span_end - span_start) as usize];
             self.backend.read_at(span_start, &mut window_buf)?;
             io_reads += 1;
@@ -2330,6 +2378,20 @@ fn read_overflow_synapses(
         .checked_mul(8)
         .and_then(|n| n.checked_add(4))
         .ok_or(LibreDbError::CorruptFormat("overflow synapse length overflow"))?;
+    if byte_len > MAX_EXTENT_PAYLOAD_BYTES {
+        return Err(LibreDbError::PayloadTooLarge {
+            size: byte_len,
+            max: MAX_EXTENT_PAYLOAD_BYTES,
+        });
+    }
+    let end_offset = offset
+        .checked_add(byte_len as u64)
+        .ok_or(LibreDbError::CorruptFormat("overflow synapse offset overflow"))?;
+    if end_offset > backend.len()? {
+        return Err(LibreDbError::CorruptFormat(
+            "overflow synapse extent exceeds file bounds",
+        ));
+    }
     let mut buf = vec![0u8; byte_len];
     backend.read_at(offset, &mut buf)?;
 

@@ -16,9 +16,10 @@ pub mod transcript;
 pub mod workspace;
 
 pub use guardrail::{
-    audit_workspace_guardrails, check_command_guardrails, check_text_guardrails,
-    check_text_guardrails_with_mode, is_test_or_scratch_path, GuardrailAuditReport,
-    GuardrailViolation,
+    audit_workspace_guardrails, audit_workspace_guardrails_with_prefixes,
+    check_command_guardrails, check_text_guardrails, check_text_guardrails_with_mode,
+    check_text_guardrails_with_options, is_sensitive_staged_file, is_test_or_scratch_path,
+    GuardrailAuditReport, GuardrailViolation,
 };
 pub use overlay::OverlayBrain;
 pub use reflex::{detect_workspace_markers, FiredReflex, ReflexEngine, ReflexRule};
