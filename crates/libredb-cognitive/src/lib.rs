@@ -100,7 +100,11 @@ impl PulseResponse {
         ));
 
         for rf in &self.fired_reflexes {
-            lines.push(rf.directive.clone());
+            if rf.directive.starts_with("[REFLEX") {
+                lines.push(rf.directive.clone());
+            } else {
+                lines.push(format!("[REFLEX {}]: {}", rf.id, rf.directive));
+            }
         }
 
         if !self.already_in_context_stubs.is_empty() {

@@ -1311,14 +1311,30 @@ fn sync_skill_markdown(
         if let Some(end_idx) = after_open.find("\n---\n") {
             let fm = &after_open[..end_idx];
             body_start = 4 + end_idx + 5;
+            let mut in_multiline_desc = false;
             for line in fm.lines() {
+                if in_multiline_desc && (line.starts_with(' ') || line.starts_with('\t')) {
+                    let cont = line.trim();
+                    if !cont.is_empty() {
+                        if !desc.is_empty() {
+                            desc.push(' ');
+                        }
+                        desc.push_str(cont);
+                    }
+                    continue;
+                }
+                in_multiline_desc = false;
                 if let Some((k, v)) = line.split_once(':') {
                     let key = k.trim();
                     let val = v.trim().trim_matches('"').trim_matches('\'');
                     if key == "name" && name_opt.is_none() && !val.is_empty() {
                         name_opt = Some(val.to_owned());
-                    } else if key == "description" && !val.is_empty() {
-                        desc = val.to_owned();
+                    } else if key == "description" {
+                        if matches!(val, "" | ">" | ">-" | "|" | "|-") {
+                            in_multiline_desc = true;
+                        } else {
+                            desc = val.to_owned();
+                        }
                     }
                 }
             }
