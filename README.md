@@ -1,6 +1,6 @@
 # LibreDB
 
-[![Version](https://img.shields.io/badge/version-0.5.1-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.5.2-blue.svg)](CHANGELOG.md)
 [![Tests](https://img.shields.io/badge/tests-passing%20(21%20suites%20%2B%2010k%20crash%20sims)-brightgreen.svg)](crates/libredb-bridge/tests/)
 [![Tech Stack](https://img.shields.io/badge/rust-1.99%2B%20%7C%20PyO3%20abi3%20%7C%20MCP-orange.svg)](Cargo.toml)
 [![License](https://img.shields.io/badge/license-AGPLv3%20%2B%20Commons%20Clause-purple.svg)](LICENSE)
@@ -17,7 +17,7 @@
 
 ## Executive summary and impact
 
-| Dimension | Legacy Python + `SQLite` (`SkillsDB`) | `LibreDB v0.5.1` (Pure `Rust` + `MCP` + `PyO3`) |
+| Dimension | Legacy Python + `SQLite` (`SkillsDB`) | `LibreDB v0.5.2` (Pure `Rust` + `MCP` + `PyO3`) |
 | :--- | :--- | :--- |
 | **Lifecycle hook latency** | `350-500 ms` Python startup + `SQLite` WAL per edit/turn | **`< 2 ms` native compiled `hook-pre-tool` & `hook-pre-invocation`** |
 | **Turn 2+ recall & I/O** | `300-1500 ms` subprocess + repeated full text output | **`0` disk I/O reads (`~3 ms` `MCP` / `PyO3`) via RAM-first `Zero-Repeat Delta`** |
@@ -58,7 +58,7 @@ pwsh -ExecutionPolicy Bypass -File .\scripts\deploy_plugin.ps1
 ```text
 LibreDB/
 |-- Cargo.toml                                     # Rust workspace (6 modular crates)
-|-- VERSION                                        # Semantic Version (0.5.1)
+|-- VERSION                                        # Semantic Version (0.5.2)
 |-- CHANGELOG.md                                   # Keep a Changelog 1.1.0 release history
 |-- LICENSE                                        # AGPLv3 + Commons Clause license
 |-- README.md                                      # 9-block standardized documentation

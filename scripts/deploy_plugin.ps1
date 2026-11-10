@@ -73,7 +73,7 @@ if (Test-Path $CentralSqlite) {
     "[REFLEX git-non-acl-safe-dir]: On non-ACL drives, run 'git config --global --add safe.directory <repo>' right after git init." `
     --action "git,gitea-init" --env "dubious ownership" | Out-Null
 & $TargetExe learn-reflex $StagingLdb "windows-hooks-cmd-quoting" `
-    "[REFLEX windows-hooks-cmd-quoting]: In Antigravity hooks.json on Windows, never wrap forward-slash paths in quotes because Go exec.Command('cmd','/C',cmd) escapes quotes as \\\"; use unquoted %USERPROFILE%\\... backslashes." `
+    '[REFLEX windows-hooks-cmd-quoting]: In Antigravity hooks.json on Windows, never wrap forward-slash paths in quotes because Go exec.Command(cmd, /C) escapes quotes with backslashes; use unquoted %USERPROFILE%\... paths.' `
     --stack "hooks.json" --action "hooks.json,deploy_plugin" --env "falsch geschrieben,jsonhook__" | Out-Null
 
 & $TargetExe compact $StagingLdb
@@ -97,7 +97,7 @@ $PluginJson = @'
 {
   "name": "libredb",
   "displayName": "LibreDB Cognitive Memory",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "Full Rust replacement for SQLite SkillsDB: single-file cognitive memory, silent SQLite auto-porter, sub-2ms hooks, guardrails, causal code graph, and local Gitea automation.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
@@ -270,6 +270,6 @@ To switch cleanly to pure single-engine operation, disable `AntiGraviton SkillsD
 '@
 [System.IO.File]::WriteAllText((Join-Path $PluginDir "README.md"), $PluginReadme, $Utf8NoBom)
 
-Write-Output "[OK] Deployed LibreDB v0.5.0 standalone binaries to: $BinDir"
+Write-Output "[OK] Deployed LibreDB v0.5.2 standalone binaries to: $BinDir"
 Write-Output "[OK] Hydrated global 19-table store at: $GlobalLdb"
 Write-Output "[OK] Installed complete Antigravity replacement plugin at: $PluginDir"
