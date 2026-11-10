@@ -85,7 +85,7 @@ $PluginJson = @'
 {
   "name": "libredb",
   "displayName": "LibreDB Cognitive Memory",
-  "version": "0.8.3",
+  "version": "0.8.4",
   "description": "Full Rust replacement for SQLite SkillsDB: single-file cognitive memory, silent SQLite auto-porter, sub-2ms hooks, guardrails, 14-language causal code graph, and dynamic multi-remote Git/Gitea automation.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
@@ -120,7 +120,8 @@ $McpJson = @"
 # hook would abort every tool call. We probe `cmd.exe /c` first and disable hooks automatically if blocked.
 $HookExeCandidates = @(
     "%USERPROFILE%\.gemini\libredb\bin\libredb.exe",
-    "%USERPROFILE%\.gemini\antigravity\bin\libredb.exe"
+    "%USERPROFILE%\.gemini\antigravity\bin\libredb.exe",
+    $ReleaseExe
 )
 $VerifiedHookCmd = $null
 foreach ($CandCmd in $HookExeCandidates) {
@@ -295,7 +296,7 @@ $LogoSvg = @'
 
 # 7. Write user-facing README.md inside plugin bundle
 $PluginReadme = @'
-# LibreDB cognitive memory plugin (v0.8.3)
+# LibreDB cognitive memory plugin (v0.8.4)
 
 Complete standalone Rust replacement for `AntiGraviton SkillsDB` (`customizations-db`):
 - `libredb-mcp`: 3-tool multi-workspace cognitive memory & 14-language causal code-graph server with zero-I/O RAM session delta, `[Zero-Repeat Skeleton]` deduplication, and automatic incremental workspace refresh.
@@ -327,6 +328,6 @@ if (Test-Path $AgyConfigPath) {
     }
 }
 
-Write-Output "[OK] Deployed LibreDB v0.8.3 standalone binaries to: $BinDir"
+Write-Output "[OK] Deployed LibreDB v0.8.4 standalone binaries to: $BinDir"
 Write-Output "[OK] Hydrated and modernized global 19-table store at: $GlobalLdb"
 Write-Output "[OK] Installed complete Antigravity replacement plugin at: $PluginDir"

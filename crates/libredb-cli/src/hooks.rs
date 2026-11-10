@@ -60,19 +60,7 @@ pub fn run_pre_tool_hook(_global_ldb_opt: Option<&Path>) -> Result<(), Box<dyn s
     let _ = io::stdin().read_to_string(&mut raw);
     let payload: Value = serde_json::from_str(raw.trim()).unwrap_or_else(|_| json!({}));
 
-    let tool_name = payload
-        .get("toolName")
-        .or_else(|| payload.get("tool"))
-        .or_else(|| payload.get("name"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-
-    let args = payload
-        .get("toolInput")
-        .or_else(|| payload.get("parameters"))
-        .or_else(|| payload.get("arguments"))
-        .or_else(|| payload.get("args"))
-        .unwrap_or(&payload);
+    let (tool_name, args) = extract_pre_tool_name_and_args(&payload);
 
     // 0. Subagent Model Enforcer (Rule 5 & Rule 7): automatically route read-only `research`
     // subagents to `Model="flash"` so they never burn `Argon High` / `Claude` code-gen quota.
@@ -883,4 +871,68 @@ pub fn user_home_dir() -> PathBuf {
         .or_else(|| env::var_os("HOME"))
         .map(PathBuf::from)
         .unwrap_or_else(env::temp_dir)
+}
+
+fn extract_pre_tool_name_and_args(payload: &Value) -> (&str, &Value) {
+    let tc = payload
+        .get("toolCall")
+        .or_else(|| payload.get("tool_call"))
+        .unwrap_or(payload);
+
+    let tool_name = tc
+        .get("toolName")
+        .or_else(|| tc.get("tool"))
+        .or_else(|| tc.get("name"))
+        .or_else(|| payload.get("toolName"))
+        .or_else(|| payload.get("tool"))
+        .or_else(|| payload.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+
+    let args = tc
+        .get("toolInput")
+        .or_else(|| tc.get("parameters"))
+        .or_else(|| tc.get("arguments"))
+        .or_else(|| tc.get("args"))
+        .or_else(|| payload.get("toolInput"))
+        .or_else(|| payload.get("parameters"))
+        .or_else(|| payload.get("arguments"))
+        .or_else(|| payload.get("args"))
+        .unwrap_or(tc);
+
+    (tool_name, args)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_pre_tool_name_and_args;
+    use serde_json::json;
+
+    #[test]
+    fn extract_pre_tool_unwraps_nested_tool_call_and_flat_payloads() {
+        let nested = json!({
+            "conversationId": "06c3256c-1245-4193-9a93-a7f106e123f4",
+            "toolCall": {
+                "name": "invoke_subagent",
+                "args": {
+                    "TypeName": "research",
+                    "Model": "inherit"
+                }
+            }
+        });
+        let (name_n, args_n) = extract_pre_tool_name_and_args(&nested);
+        assert_eq!(name_n, "invoke_subagent");
+        assert_eq!(args_n.get("TypeName").and_then(|v| v.as_str()), Some("research"));
+
+        let flat = json!({
+            "toolName": "run_command",
+            "toolInput": {
+                "CommandLine": "cargo test",
+                "WaitMsBeforeAsync": 5000
+            }
+        });
+        let (name_f, args_f) = extract_pre_tool_name_and_args(&flat);
+        assert_eq!(name_f, "run_command");
+        assert_eq!(args_f.get("WaitMsBeforeAsync").and_then(|v| v.as_i64()), Some(5000));
+    }
 }

@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.4] - 2026-11-10
+
+### Changed
+
+- Added `$ReleaseExe` (`<workspace>\target\release\libredb.exe`) as the third fallback candidate in `$HookExeCandidates` in `scripts/deploy_plugin.ps1` so `< 2 ms` `PreInvocation` and `PreToolUse` hooks remain active via the project drive (`Q:\...`) even when Enterprise Active Directory `SRP` / `AppLocker` policies block `cmd.exe /c` execution inside `%USERPROFILE%`.
+- Updated `run_pre_tool_hook` (`extract_pre_tool_name_and_args` in `crates/libredb-cli/src/hooks.rs`) to unwrap the Antigravity 2.0 nested `{"toolCall": {"name": "...", "args": {...}}}` wrapper alongside flat hook payloads.
+
 ## [0.8.3] - 2026-11-10
 
 ### Added
