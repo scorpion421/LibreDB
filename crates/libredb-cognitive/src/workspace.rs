@@ -32,6 +32,9 @@ pub struct SymbolImpactReport {
     pub contract: String,
     /// Symbols in the workspace that call or reference this symbol.
     pub callers: Vec<String>,
+    /// Concrete types or methods that implement, extend, or override this interface/trait/method.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub implementors: Vec<String>,
     /// Symbols that this symbol calls or depends on.
     pub callees: Vec<String>,
     /// Architectural `Decision` or `Task` capsules governing why this symbol exists.
@@ -48,6 +51,8 @@ pub struct FimSliceBundle {
     pub total_file_lines: usize,
     pub slice_text: String,
     pub callers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub implementors: Vec<String>,
     pub governing_decisions: Vec<String>,
 }
 
@@ -66,6 +71,12 @@ impl FimSliceBundle {
             out.push_str("Governing Decisions:\n");
             for d in &self.governing_decisions {
                 out.push_str(&format!("  * {d}\n"));
+            }
+        }
+        if !self.implementors.is_empty() {
+            out.push_str(&format!("Implementors ({}):\n", self.implementors.len()));
+            for imp in self.implementors.iter().take(8) {
+                out.push_str(&format!("  <= {imp}\n"));
             }
         }
         if !self.callers.is_empty() {
@@ -268,7 +279,26 @@ pub fn index_workspace(db: &LibreDb, root: &Path, force: bool) -> Result<Workspa
     let mut receiver_call_df: HashMap<String, usize> = HashMap::new();
     let mut bare_call_df: HashMap<String, usize> = HashMap::new();
     let mut prose_token_df: HashMap<String, usize> = HashMap::new();
-    for (_, _, text_opt) in &all_skeletons {
+    let mut type_supertypes: HashMap<String, Vec<String>> = HashMap::new();
+    for (_, skel, text_opt) in &all_skeletons {
+        for sym in &skel.symbols {
+            if !sym.supertypes.is_empty() {
+                let owner_type = if sym.kind == "impl" {
+                    sym.name
+                        .rsplit_once(" for ")
+                        .map(|(_, t)| t.trim().to_owned())
+                        .unwrap_or_else(|| sym.name.clone())
+                } else {
+                    sym.name.clone()
+                };
+                let entry = type_supertypes.entry(owner_type).or_default();
+                for sup in &sym.supertypes {
+                    if !entry.iter().any(|x| x == sup) {
+                        entry.push(sup.clone());
+                    }
+                }
+            }
+        }
         let Some(ref text) = text_opt else { continue };
         let file_sites = extract_call_sites(text, None);
         for m in file_sites.receiver_methods {
@@ -285,22 +315,74 @@ pub fn index_workspace(db: &LibreDb, root: &Path, force: bool) -> Result<Workspa
     let mut edges: Vec<(u64, EdgeKind, u64, u8)> = Vec::new();
     let existing_call_edges: usize = sym_inodes
         .iter()
-        .map(|(_, _, syns)| syns.iter().filter(|s| s.kind == EdgeKind::Calls).count())
+        .map(|(_, _, syns)| {
+            syns.iter()
+                .filter(|s| matches!(s.kind, EdgeKind::Calls | EdgeKind::DependsOn))
+                .count()
+        })
         .sum();
     let need_call_pass =
         force || !changed_files.is_empty() || had_stale_tombstones || existing_call_edges == 0;
     let mut call_edges = 0usize;
 
-    // 1. Wire `CallerSymbol --[Calls]--> CalleeSymbol` across workspace files!
+    // 1. Wire `CallerSymbol --[Calls]--> CalleeSymbol` and DI/Inheritance `Impl --[DependsOn]--> Interface`!
     if need_call_pass {
         for (rel_path, skel, text_opt) in &all_skeletons {
             let Some(ref text) = text_opt else { continue };
+            let file_idents = extract_code_identifiers(text);
             let lines: Vec<&str> = text.lines().collect();
             for (sym_idx, src_key) in compute_file_symbol_keys(rel_path, skel) {
                 let sym = &skel.symbols[sym_idx];
                 let Some(&src_id) = by_full_key.get(&src_key) else {
                     continue;
                 };
+                let mut seen_dep_targets: HashSet<u64> = HashSet::new();
+
+                // 1a. Type-level supertypes / implemented interfaces / traits (`DependsOn`)
+                let empty_sups: Vec<String> = Vec::new();
+                let all_sups = if matches!(
+                    sym.kind.as_str(),
+                    "class" | "struct" | "enum" | "trait" | "interface" | "record" | "protocol" | "object"
+                ) {
+                    type_supertypes.get(&sym.name).unwrap_or(&sym.supertypes)
+                } else {
+                    &empty_sups
+                };
+                for sup in all_sups {
+                    if let Some(sup_targets) =
+                        by_free_name.get(sup).or_else(|| by_qualified_name.get(sup))
+                    {
+                        for &(sup_id, _) in sup_targets {
+                            if sup_id != src_id && seen_dep_targets.insert(sup_id) {
+                                edges.push((src_id, EdgeKind::DependsOn, sup_id, 230));
+                                call_edges += 1;
+                            }
+                        }
+                    }
+                }
+
+                // 1b. Method-level DI / virtual override link (`ImplType::m --[DependsOn]--> Interface::m`)
+                if matches!(
+                    sym.kind.as_str(),
+                    "fn" | "fun" | "func" | "function" | "method" | "def" | "async def"
+                ) {
+                    if let Some(ref cont) = sym.container {
+                        if let Some(sups) = type_supertypes.get(cont) {
+                            for sup in sups {
+                                let sup_method_q = format!("{sup}::{}", sym.name);
+                                if let Some(sup_mtargets) = by_qualified_name.get(&sup_method_q) {
+                                    for &(sup_mid, _) in sup_mtargets {
+                                        if sup_mid != src_id && seen_dep_targets.insert(sup_mid) {
+                                            edges.push((src_id, EdgeKind::DependsOn, sup_mid, 228));
+                                            call_edges += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 let start_i = sym.start_line.saturating_sub(1);
                 let end_i = sym.end_line.min(lines.len());
                 if start_i >= end_i {
@@ -348,9 +430,10 @@ pub fn index_workspace(db: &LibreDb, root: &Path, force: bool) -> Result<Workspa
                 }
 
                 // Stage B1: Dynamic receiver method calls (`expr.method(`) - resolved when unambiguous in the
-                // workspace (`targets.len() == 1`) and salient by corpus Document Frequency (`<= 25%` of files).
+                // workspace (`targets.len() == 1`) OR disambiguated by an injected/imported interface/type name
+                // present in `file_idents` (`@Inject OrderApprovalPort`, `private gateway: PaymentGateway`, etc.).
                 for mcall in sites.receiver_methods {
-                    if mcall == sym.name {
+                    if mcall == sym.name && sym.container.is_none() {
                         continue;
                     }
                     if let Some(targets) = by_method_name.get(&mcall) {
@@ -361,6 +444,30 @@ pub fn index_workspace(db: &LibreDb, root: &Path, force: bool) -> Result<Workspa
                             if dst_id != src_id && seen_targets.insert(dst_id) {
                                 edges.push((src_id, EdgeKind::Calls, dst_id, 205));
                                 call_edges += 1;
+                            }
+                        } else if targets.len() > 1 && targets.len() <= 6 && is_salient {
+                            let di_matched: Vec<u64> = targets
+                                .iter()
+                                .filter_map(|&(dst_id, ref fk)| {
+                                    let (_, sym_part) = fk.split_once("::")?;
+                                    let clean = sym_part.split('@').next().unwrap_or(sym_part);
+                                    let (cont_type, _) = clean.rsplit_once("::")?;
+                                    if sym.container.as_deref() != Some(cont_type)
+                                        && file_idents.contains(cont_type)
+                                    {
+                                        Some(dst_id)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+                            if !di_matched.is_empty() && di_matched.len() <= 2 {
+                                for dst_id in di_matched {
+                                    if dst_id != src_id && seen_targets.insert(dst_id) {
+                                        edges.push((src_id, EdgeKind::Calls, dst_id, 212));
+                                        call_edges += 1;
+                                    }
+                                }
                             }
                         }
                     }
@@ -470,7 +577,12 @@ pub fn index_workspace(db: &LibreDb, root: &Path, force: bool) -> Result<Workspa
     if need_call_pass {
         db.sync_edges_for_kinds(
             &scoped_sources,
-            &[EdgeKind::Calls, EdgeKind::Governs, EdgeKind::CausedBy],
+            &[
+                EdgeKind::Calls,
+                EdgeKind::DependsOn,
+                EdgeKind::Governs,
+                EdgeKind::CausedBy,
+            ],
             &edges,
         )?;
     } else {
@@ -493,25 +605,43 @@ pub fn index_workspace(db: &LibreDb, root: &Path, force: bool) -> Result<Workspa
 }
 
 /// Locates symbols matching `symbol_query` and computes their bidirectional blast-radius (`callers`,
-/// `callees`) plus any governing architectural `Decision`/`Task` capsules in `O(N_symbols)` RAM time.
+/// `implementors`, `callees`) plus governing architectural `Decision`/`Task` capsules in `O(N_symbols)` RAM time.
 pub fn query_symbol_impact(db: &LibreDb, symbol_query: &str) -> Result<Vec<SymbolImpactReport>> {
     let q_low = symbol_query.to_lowercase();
     let sym_inodes = db.list_inodes(Some(NodeKind::Symbol), false);
 
-    // Build reverse `Calls` lookup (`callee_id -> Vec<caller_id>`) from in-memory Inode synapses (`0` disk I/O!).
+    // Build reverse `Calls` and `DependsOn` lookups in-memory (`0` disk I/O!).
     let mut reverse_calls: HashMap<u64, Vec<u64>> = HashMap::new();
+    let mut reverse_deps: HashMap<u64, Vec<u64>> = HashMap::new();
+    let mut exact_qual_ids: Vec<(u64, String)> = Vec::new();
     let mut matched_ids: Vec<(u64, String)> = Vec::new();
+    let bounded_qual = if q_low.contains("::") && !q_low.starts_with("::") {
+        Some(format!("::{q_low}"))
+    } else {
+        None
+    };
 
     for (ino, key_opt, syns) in &sym_inodes {
         let k = key_opt.clone().unwrap_or_default();
-        if k.to_lowercase().contains(&q_low) {
+        let k_low = k.to_lowercase();
+        if let Some(ref bq) = bounded_qual {
+            if k_low.contains(bq) {
+                exact_qual_ids.push((ino.node_id, k.clone()));
+            }
+        }
+        if k_low.contains(&q_low) {
             matched_ids.push((ino.node_id, k));
         }
         for syn in syns {
             if syn.kind == EdgeKind::Calls {
                 reverse_calls.entry(syn.target_id).or_default().push(ino.node_id);
+            } else if syn.kind == EdgeKind::DependsOn {
+                reverse_deps.entry(syn.target_id).or_default().push(ino.node_id);
             }
         }
+    }
+    if !exact_qual_ids.is_empty() {
+        matched_ids = exact_qual_ids;
     }
 
     let mut reports = Vec::new();
@@ -519,9 +649,32 @@ pub fn query_symbol_impact(db: &LibreDb, symbol_query: &str) -> Result<Vec<Symbo
         let rec = db.get(nid)?;
         let contract = String::from_utf8_lossy(&rec.payload).into_owned();
 
-        let caller_ids = reverse_calls.get(&nid).cloned().unwrap_or_default();
+        let mut caller_ids = reverse_calls.get(&nid).cloned().unwrap_or_default();
+        let is_member_method = sym_key.matches("::").count() >= 2;
+        if is_member_method {
+            // Propagate DI callers across implemented interface/trait methods (`Caller -> Interface::m <- Impl::m`)
+            for syn in &rec.synapses {
+                if syn.kind == EdgeKind::DependsOn {
+                    if let Some(iface_callers) = reverse_calls.get(&syn.target_id) {
+                        for &cid in iface_callers {
+                            if cid != nid && !caller_ids.contains(&cid) {
+                                caller_ids.push(cid);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let (caller_recs, _) = db.get_many_coalesced(&caller_ids)?;
         let callers: Vec<String> = caller_recs
+            .into_iter()
+            .map(|r| String::from_utf8_lossy(&r.payload).into_owned())
+            .collect();
+
+        let imp_ids = reverse_deps.get(&nid).cloned().unwrap_or_default();
+        let (imp_recs, _) = db.get_many_coalesced(&imp_ids)?;
+        let implementors: Vec<String> = imp_recs
             .into_iter()
             .map(|r| String::from_utf8_lossy(&r.payload).into_owned())
             .collect();
@@ -560,6 +713,7 @@ pub fn query_symbol_impact(db: &LibreDb, symbol_query: &str) -> Result<Vec<Symbo
             symbol_key: sym_key,
             contract,
             callers,
+            implementors,
             callees,
             governing_decisions,
         });
@@ -626,6 +780,7 @@ pub fn extract_fim_slice(
     }
 
     let mut callers = Vec::new();
+    let mut implementors = Vec::new();
     let mut governing = Vec::new();
     if let Some(ref sname) = matched_sym {
         let scoped_q = format!("::{sname}");
@@ -637,6 +792,7 @@ pub fn extract_fim_slice(
                 .or_else(|| impacts.into_iter().next());
             if let Some(first) = best {
                 callers = first.callers;
+                implementors = first.implementors;
                 governing = first.governing_decisions;
             }
         }
@@ -650,6 +806,7 @@ pub fn extract_fim_slice(
         total_file_lines: total_lines,
         slice_text: numbered,
         callers,
+        implementors,
         governing_decisions: governing,
     })
 }
@@ -1048,4 +1205,137 @@ fn has_following_call_paren(bytes: &[u8], mut idx: usize) -> bool {
         return true;
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enterprise_di_interfaces_and_implementations_wire_bidirectional_impact() {
+        let tmp = std::env::temp_dir().join(format!("libredb_di_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("src")).unwrap();
+
+        // 1. Java / Quarkus DI: Interface + @ApplicationScoped impl + @Inject REST resource
+        std::fs::write(
+            tmp.join("src/OrderApprovalPort.java"),
+            r#"package com.acme.orders;
+public interface OrderApprovalPort {
+    String approveOrder(String orderId);
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.join("src/OrderApprovalService.java"),
+            r#"package com.acme.orders;
+@ApplicationScoped
+public class OrderApprovalService implements OrderApprovalPort {
+    @Override
+    public String approveOrder(String orderId) {
+        return "APPROVED:" + orderId;
+    }
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.join("src/OrderResource.java"),
+            r#"package com.acme.orders;
+public class OrderResource {
+    @Inject OrderApprovalPort approvalPort;
+    public String submitOrder(String id) {
+        return approvalPort.approveOrder(id);
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        // 2. Angular / TypeScript DI: Interface + @Injectable service + @Component consumer
+        std::fs::write(
+            tmp.join("src/payment.gateway.ts"),
+            r#"export interface PaymentGateway {
+    chargeCard(cents: number): Promise<boolean>;
+}
+@Injectable({ providedIn: 'root' })
+export class StripePaymentGateway implements PaymentGateway {
+    async chargeCard(cents: number): Promise<boolean> {
+        return cents > 0;
+    }
+}
+export class CheckoutComponent {
+    constructor(private readonly gateway: PaymentGateway) {}
+    async payNow(total: number): Promise<boolean> {
+        return await this.gateway.chargeCard(total);
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        // 3. C# / .NET Primary Constructor DI: IOrderRepository + SqlOrderRepository
+        std::fs::write(
+            tmp.join("src/OrderRepository.cs"),
+            r#"namespace Acme.Orders;
+public interface IOrderRepository {
+    Task<bool> PersistApprovalAsync(Guid id);
+}
+public sealed class SqlOrderRepository(IDbConnection db) : BaseRepository, IOrderRepository {
+    public async Task<bool> PersistApprovalAsync(Guid id) {
+        return true;
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        let db = LibreDb::open(tmp.join("mem.ldb")).unwrap();
+        let rep = index_workspace(&db, &tmp, true).unwrap();
+        assert_eq!(rep.files_scanned, 5);
+
+        // Verify Java/Quarkus interface impact: shows OrderApprovalService as implementor & OrderResource::submitOrder as caller!
+        let port_method = query_symbol_impact(&db, "OrderApprovalPort::approveOrder").unwrap();
+        assert_eq!(port_method.len(), 1);
+        assert!(port_method[0]
+            .implementors
+            .iter()
+            .any(|s| s.contains("OrderApprovalService::approveOrder")));
+        assert!(port_method[0]
+            .callers
+            .iter()
+            .any(|s| s.contains("OrderResource::submitOrder")));
+
+        // Verify concrete Java implementation inherits DI caller blast-radius (`OrderResource::submitOrder`)!
+        let impl_method = query_symbol_impact(&db, "OrderApprovalService::approveOrder").unwrap();
+        assert_eq!(impl_method.len(), 1);
+        assert!(impl_method[0]
+            .callers
+            .iter()
+            .any(|s| s.contains("OrderResource::submitOrder")));
+
+        // Verify Angular/TypeScript DI interface + concrete implementation impact
+        let ts_iface = query_symbol_impact(&db, "PaymentGateway::chargeCard").unwrap();
+        assert_eq!(ts_iface.len(), 1);
+        assert!(ts_iface[0]
+            .implementors
+            .iter()
+            .any(|s| s.contains("StripePaymentGateway::chargeCard")));
+        assert!(ts_iface[0]
+            .callers
+            .iter()
+            .any(|s| s.contains("CheckoutComponent::payNow")));
+
+        // Verify C#/.NET interface -> implementation resolution
+        let cs_iface = query_symbol_impact(&db, "IOrderRepository::PersistApprovalAsync").unwrap();
+        assert_eq!(cs_iface.len(), 1);
+        assert!(cs_iface[0]
+            .implementors
+            .iter()
+            .any(|s| s.contains("SqlOrderRepository::PersistApprovalAsync")));
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

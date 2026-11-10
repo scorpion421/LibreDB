@@ -11,8 +11,8 @@ use std::path::Path;
 
 pub const SKELETON_KEY_PREFIX: &str = "skeleton::";
 /// Content-hash seed bumped whenever `FileSkeleton` extraction semantics upgrade (e.g. `container`
-/// qualification, `[T; N]` array-return brace parsing, PowerShell/Shell quote rules, and `Makefile` targets in v0.8.8).
-pub const SKELETON_HASH_SEED: u8 = 108;
+/// qualification, `supertypes`, interface/abstract method contracts, and `Makefile` targets in v0.9.0).
+pub const SKELETON_HASH_SEED: u8 = 109;
 
 /// Section boundary (e.g., `# SECTION: skillsdb.core.db` or `mod ...`) inside a source file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +29,8 @@ pub struct SymbolContract {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supertypes: Vec<String>,
     pub signature: String,
     pub doc_summary: String,
     pub start_line: usize,
@@ -417,10 +419,16 @@ fn extract_python_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContr
             active_class = Some((name.clone(), resolved_end, indent));
         }
         let (signature, doc_summary) = packed.split_once("|DOC|").unwrap_or((packed, ""));
+        let supertypes = if kind == "class" {
+            extract_python_supertypes(signature)
+        } else {
+            Vec::new()
+        };
         out.push(SymbolContract {
             kind: kind.clone(),
             name: name.clone(),
             container,
+            supertypes,
             signature: truncate_chars(signature, 115),
             doc_summary: truncate_chars(doc_summary, 85),
             start_line,
@@ -467,11 +475,27 @@ fn extract_smali_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContra
                         kind: "class".to_owned(),
                         name: short,
                         container: None,
+                        supertypes: Vec::new(),
                         signature: truncate_chars(trimmed, 115),
                         doc_summary: String::new(),
                         start_line: idx + 1,
                         end_line: total_lines.max(idx + 1),
                     });
+                }
+            }
+        } else if let Some(rest) = trimmed
+            .strip_prefix(".super ")
+            .or_else(|| trimmed.strip_prefix(".implements "))
+        {
+            if let Some(tok) = rest.split_whitespace().last() {
+                let clean = tok.trim_start_matches('L').trim_end_matches(';');
+                let short = clean.rsplit('/').next().unwrap_or(clean);
+                if !short.is_empty() && short != "Object" {
+                    if let Some(cls_sym) = out.iter_mut().rev().find(|s| s.kind == "class") {
+                        if !cls_sym.supertypes.iter().any(|x| x == short) {
+                            cls_sym.supertypes.push(short.to_owned());
+                        }
+                    }
                 }
             }
         } else if let Some(rest) = trimmed.strip_prefix(".field ") {
@@ -483,6 +507,7 @@ fn extract_smali_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContra
                             kind: "field".to_owned(),
                             name: fname.to_owned(),
                             container: current_class.clone(),
+                            supertypes: Vec::new(),
                             signature: truncate_chars(trimmed, 115),
                             doc_summary: String::new(),
                             start_line: idx + 1,
@@ -506,6 +531,7 @@ fn extract_smali_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContra
                             kind: "method".to_owned(),
                             name: mname.to_owned(),
                             container: current_class.clone(),
+                            supertypes: Vec::new(),
                             signature: truncate_chars(trimmed, 115),
                             doc_summary: String::new(),
                             start_line: idx + 1,
@@ -655,6 +681,7 @@ fn extract_asm_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContract
             kind: kind.clone(),
             name: name.clone(),
             container: None,
+            supertypes: Vec::new(),
             signature: sig.clone(),
             doc_summary: String::new(),
             start_line: start,
@@ -705,6 +732,7 @@ fn extract_markdown_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolCon
             kind: format!("h{level}"),
             name: title.clone(),
             container: None,
+            supertypes: Vec::new(),
             signature: sig.clone(),
             doc_summary: String::new(),
             start_line: start,
@@ -787,6 +815,7 @@ fn extract_makefile_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolCon
             kind: "target".to_owned(),
             name: name.clone(),
             container: None,
+            supertypes: Vec::new(),
             signature: sig.clone(),
             doc_summary: truncate_chars(doc, 85),
             start_line: start,
@@ -865,6 +894,7 @@ fn extract_sql_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContract
             kind: kind_up.to_ascii_lowercase(),
             name: clean_name.to_owned(),
             container: None,
+            supertypes: Vec::new(),
             signature: truncate_chars(&collapse_ws(trimmed), 115),
             doc_summary: String::new(),
             start_line: idx + 1,
@@ -893,10 +923,16 @@ fn extract_powershell_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolC
                 if !short_name.is_empty() {
                     let sig_head = trimmed.split('{').next().unwrap_or(trimmed).trim();
                     let end_line = find_matching_brace_end(lines, idx, total_lines, "powershell");
+                    let supertypes = if kw == "class " {
+                        extract_brace_supertypes(sig_head, &short_name)
+                    } else {
+                        Vec::new()
+                    };
                     out.push(SymbolContract {
                         kind: kw.trim().to_owned(),
                         name: short_name,
                         container: None,
+                        supertypes,
                         signature: truncate_chars(&collapse_ws(sig_head), 115),
                         doc_summary: String::new(),
                         start_line: idx + 1,
@@ -946,6 +982,7 @@ fn extract_shell_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContra
                 kind: "function".to_owned(),
                 name,
                 container: None,
+                supertypes: Vec::new(),
                 signature: truncate_chars(&collapse_ws(sig_head), 115),
                 doc_summary: String::new(),
                 start_line: idx + 1,
@@ -957,10 +994,11 @@ fn extract_shell_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContra
 }
 
 fn extract_brace_symbols(lines: &[&str], total_lines: usize, lang: &str) -> Vec<SymbolContract> {
-    let mut out = Vec::new();
+    let mut out: Vec<SymbolContract> = Vec::new();
     let mut pending_doc = String::new();
-    // Active container stack: `(container_type_name, end_line, indent)`
-    let mut container_stack: Vec<(String, usize, usize)> = Vec::new();
+    // Active container stack: `(container_type_name, container_kind, end_line, indent)`
+    let mut container_stack: Vec<(String, String, usize, usize)> = Vec::new();
+    let mut active_callable_end: usize = 0;
 
     for (idx, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
@@ -974,10 +1012,13 @@ fn extract_brace_symbols(lines: &[&str], total_lines: usize, lang: &str) -> Vec<
             continue;
         }
         if trimmed.starts_with("#[")
+            || trimmed.starts_with("#!")
             || trimmed.starts_with("//")
             || trimmed.starts_with("/*")
             || trimmed.starts_with('*')
             || trimmed.starts_with('@')
+            || (trimmed.starts_with('#')
+                && (!matches!(lang, "javascript" | "typescript") || !trimmed.contains('(')))
         {
             continue;
         }
@@ -988,74 +1029,242 @@ fn extract_brace_symbols(lines: &[&str], total_lines: usize, lang: &str) -> Vec<
 
         let start_line = idx + 1;
         let indent = line.len() - line.trim_start().len();
-        while let Some((_, c_end, c_indent)) = container_stack.last() {
+        while let Some((_, _, c_end, c_indent)) = container_stack.last() {
             if start_line > *c_end || indent <= *c_indent {
                 container_stack.pop();
             } else {
                 break;
             }
         }
+        if start_line > active_callable_end {
+            active_callable_end = 0;
+        }
+
+        if trimmed.starts_with('}')
+            || trimmed.starts_with('{')
+            || trimmed.starts_with("import ")
+            || trimmed.starts_with("package ")
+            || trimmed.starts_with("using ")
+            || matches!(
+                trimmed,
+                "public:"
+                    | "private:"
+                    | "protected:"
+                    | "signals:"
+                    | "slots:"
+                    | "public slots:"
+                    | "private slots:"
+                    | "protected slots:"
+            )
+        {
+            pending_doc.clear();
+            continue;
+        }
 
         if indent <= 12 {
-            if let Some((kind, mut name, explicit_container)) = match_brace_declaration(trimmed) {
-                // Collect multi-line signature up to opening `{` or top-level `;`
+            let in_type_body = !container_stack.is_empty();
+            let in_interface_like = container_stack
+                .last()
+                .is_some_and(|(_, k, _, _)| matches!(k.as_str(), "interface" | "trait" | "protocol"));
+            let outside_callable = start_line > active_callable_end;
+            let valid_decl_lead = trimmed
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || matches!(c, '_' | '~' | '*' | '&' | '#'));
+
+            // Collect multi-line signature up to opening `{` or top-level `;` when outside a method body
+            // (or when a nested keyword declaration begins), avoiding allocations on ordinary body lines.
+            let mut sig_end_idx = idx;
+            let candidate_sig = if valid_decl_lead
+                && (outside_callable || starts_with_decl_keyword(trimmed))
+            {
                 let mut sig = trimmed.to_owned();
                 let mut sig_idx = idx;
                 while !has_top_level_sig_terminator(&sig)
                     && sig_idx + 1 < total_lines
-                    && sig_idx < idx + 8
+                    && sig_idx < idx + 14
                 {
-                    sig_idx += 1;
-                    sig.push(' ');
-                    sig.push_str(lines[sig_idx].trim());
-                }
-                let sig_head = sig.split('{').next().unwrap_or(&sig).trim_end_matches(';').trim();
-                let end_line = find_matching_brace_end(lines, idx, total_lines, lang);
-
-                let mut container = explicit_container.or_else(|| {
-                    container_stack.last().map(|(c, _, _)| c.clone())
-                });
-
-                if kind == "impl" {
-                    if let Some((impl_display, target_type)) = parse_impl_header(sig_head) {
-                        name = impl_display;
-                        container = None;
-                        if end_line > start_line && !target_type.is_empty() {
-                            container_stack.push((target_type, end_line, indent));
-                        }
+                    let next_trim = lines[sig_idx + 1].trim();
+                    if next_trim.starts_with("//") || next_trim.starts_with("/*") {
+                        sig_idx += 1;
+                        continue;
                     }
-                } else if matches!(
-                    kind.as_str(),
-                    "class"
-                        | "struct"
-                        | "trait"
-                        | "interface"
-                        | "object"
-                        | "extension"
-                        | "protocol"
-                        | "record"
-                ) && end_line > start_line
-                {
-                    container_stack.push((name.clone(), end_line, indent));
+                    let unclosed_parens = open_paren_depth(&sig) > 0;
+                    if !unclosed_parens
+                        && (next_trim.is_empty()
+                            || next_trim.starts_with('}')
+                            || next_trim.starts_with("#[")
+                            || next_trim.starts_with('@')
+                            || starts_with_new_member_or_decl(next_trim))
+                    {
+                        break;
+                    }
+                    sig_idx += 1;
+                    sig_end_idx = sig_idx;
+                    sig.push(' ');
+                    sig.push_str(next_trim);
                 }
+                Some(sig)
+            } else {
+                None
+            };
 
-                out.push(SymbolContract {
-                    kind,
-                    name,
-                    container,
-                    signature: truncate_chars(&collapse_ws(sig_head), 115),
-                    doc_summary: truncate_chars(&pending_doc, 85),
-                    start_line,
-                    end_line,
-                });
-                pending_doc.clear();
-                continue;
+            if let Some(ref full_sig) = candidate_sig {
+                if let Some((kind, mut name, explicit_container)) = match_brace_declaration(
+                    trimmed,
+                    full_sig,
+                    in_type_body,
+                    in_interface_like,
+                    outside_callable,
+                ) {
+                    let sig_head = full_sig
+                        .split('{')
+                        .next()
+                        .unwrap_or(full_sig)
+                        .trim_end_matches(';')
+                        .trim();
+                    let end_line = if full_sig.contains('{') {
+                        find_matching_brace_end(lines, idx, total_lines, lang)
+                    } else {
+                        (sig_end_idx + 1).min(total_lines)
+                    };
+
+                    let mut container = explicit_container
+                        .or_else(|| container_stack.last().map(|(c, _, _, _)| c.clone()));
+                    let mut supertypes: Vec<String> = Vec::new();
+
+                    if kind == "impl" {
+                        if let Some((impl_display, target_type, trait_opt)) =
+                            parse_impl_header(sig_head)
+                        {
+                            name = impl_display;
+                            container = None;
+                            if let Some(ref tr) = trait_opt {
+                                supertypes.push(tr.clone());
+                                if let Some(struct_sym) = out.iter_mut().rev().find(|s| {
+                                    s.name == target_type
+                                        && matches!(s.kind.as_str(), "struct" | "enum" | "class")
+                                }) {
+                                    if !struct_sym.supertypes.iter().any(|x| x == tr) {
+                                        struct_sym.supertypes.push(tr.clone());
+                                    }
+                                }
+                            }
+                            if end_line > start_line && !target_type.is_empty() {
+                                container_stack.push((
+                                    target_type,
+                                    "impl".to_owned(),
+                                    end_line,
+                                    indent,
+                                ));
+                            }
+                        }
+                    } else if matches!(
+                        kind.as_str(),
+                        "class"
+                            | "struct"
+                            | "trait"
+                            | "interface"
+                            | "object"
+                            | "extension"
+                            | "protocol"
+                            | "record"
+                    ) {
+                        supertypes = extract_brace_supertypes(sig_head, &name);
+                        if end_line > start_line {
+                            container_stack.push((
+                                name.clone(),
+                                kind.clone(),
+                                end_line,
+                                indent,
+                            ));
+                        }
+                    } else if matches!(
+                        kind.as_str(),
+                        "fn" | "fun" | "func" | "function" | "method"
+                    ) && end_line > start_line
+                    {
+                        active_callable_end = end_line;
+                    }
+
+                    out.push(SymbolContract {
+                        kind,
+                        name,
+                        container,
+                        supertypes,
+                        signature: truncate_chars(&collapse_ws(sig_head), 115),
+                        doc_summary: truncate_chars(&pending_doc, 85),
+                        start_line,
+                        end_line,
+                    });
+                    pending_doc.clear();
+                    continue;
+                }
             }
         }
         pending_doc.clear();
     }
 
     out
+}
+
+fn starts_with_decl_keyword(trimmed: &str) -> bool {
+    let first = trimmed.split_whitespace().next().unwrap_or("");
+    matches!(
+        first,
+        "pub"
+            | "pub(crate)"
+            | "pub(super)"
+            | "fn"
+            | "async"
+            | "unsafe"
+            | "const"
+            | "fun"
+            | "func"
+            | "function"
+            | "struct"
+            | "enum"
+            | "trait"
+            | "impl"
+            | "class"
+            | "interface"
+            | "record"
+            | "protocol"
+            | "type"
+    ) || trimmed.starts_with("impl<")
+}
+
+fn open_paren_depth(sig: &str) -> i32 {
+    let mut paren = 0i32;
+    for ch in sig.chars() {
+        match ch {
+            '(' => paren += 1,
+            ')' => paren = (paren - 1).max(0),
+            _ => {}
+        }
+    }
+    paren
+}
+
+fn starts_with_new_member_or_decl(trimmed: &str) -> bool {
+    if starts_with_decl_keyword(trimmed) {
+        return true;
+    }
+    let first = trimmed.split_whitespace().next().unwrap_or("");
+    matches!(
+        first,
+        "public"
+            | "private"
+            | "protected"
+            | "internal"
+            | "export"
+            | "abstract"
+            | "override"
+            | "virtual"
+            | "static"
+            | "sealed"
+            | "suspend"
+    )
 }
 
 fn has_top_level_sig_terminator(sig: &str) -> bool {
@@ -1075,7 +1284,7 @@ fn has_top_level_sig_terminator(sig: &str) -> bool {
     false
 }
 
-fn parse_impl_header(sig_head: &str) -> Option<(String, String)> {
+fn parse_impl_header(sig_head: &str) -> Option<(String, String, Option<String>)> {
     let mut s = sig_head.trim();
     for prefix in ["pub(crate) ", "pub(super) ", "pub ", "unsafe ", "default ", "const "] {
         if let Some(rest) = s.strip_prefix(prefix) {
@@ -1112,17 +1321,20 @@ fn parse_impl_header(sig_head: &str) -> Option<(String, String)> {
         let target_type = extract_base_type_ident(type_part);
         let trait_short = extract_base_type_ident(trait_part);
         if !target_type.is_empty() {
-            let label = if trait_short.is_empty() {
-                format!("impl {target_type}")
+            let (label, trait_opt) = if trait_short.is_empty() {
+                (format!("impl {target_type}"), None)
             } else {
-                format!("impl {trait_short} for {target_type}")
+                (
+                    format!("impl {trait_short} for {target_type}"),
+                    Some(trait_short),
+                )
             };
-            return Some((label, target_type));
+            return Some((label, target_type, trait_opt));
         }
     } else {
         let target_type = extract_base_type_ident(without_where);
         if !target_type.is_empty() {
-            return Some((format!("impl {target_type}"), target_type));
+            return Some((format!("impl {target_type}"), target_type, None));
         }
     }
     None
@@ -1174,19 +1386,194 @@ fn extract_base_type_ident(type_expr: &str) -> String {
             t = r.trim_start();
             continue;
         }
+        for cpp_mod in ["public ", "protected ", "private ", "virtual "] {
+            if let Some(r) = t.strip_prefix(cpp_mod) {
+                t = r.trim_start();
+            }
+        }
         break;
     }
     let before_gen = t.split(['<', '[', '(', ' ', '{']).next().unwrap_or(t);
-    let last_seg = before_gen.rsplit("::").next().unwrap_or(before_gen);
+    let last_seg = before_gen
+        .rsplit(|c| c == ':' || c == '.' || c == '\\')
+        .next()
+        .unwrap_or(before_gen);
     last_seg
         .chars()
         .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
         .collect()
 }
 
-fn match_brace_declaration(trimmed: &str) -> Option<(String, String, Option<String>)> {
+fn strip_balanced_groups(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut angle = 0i32;
+    let mut paren = 0i32;
+    let mut bracket = 0i32;
+    for ch in input.chars() {
+        match ch {
+            '<' => {
+                if angle == 0 && paren == 0 && bracket == 0 {
+                    out.push(' ');
+                }
+                angle += 1;
+            }
+            '>' if angle > 0 => {
+                angle -= 1;
+                if angle == 0 && paren == 0 && bracket == 0 {
+                    out.push(' ');
+                }
+            }
+            '(' => {
+                if angle == 0 && paren == 0 && bracket == 0 {
+                    out.push(' ');
+                }
+                paren += 1;
+            }
+            ')' if paren > 0 => {
+                paren -= 1;
+                if angle == 0 && paren == 0 && bracket == 0 {
+                    out.push(' ');
+                }
+            }
+            '[' => {
+                if angle == 0 && paren == 0 && bracket == 0 {
+                    out.push(' ');
+                }
+                bracket += 1;
+            }
+            ']' if bracket > 0 => {
+                bracket -= 1;
+                if angle == 0 && paren == 0 && bracket == 0 {
+                    out.push(' ');
+                }
+            }
+            _ if angle == 0 && paren == 0 && bracket == 0 => out.push(ch),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn find_single_colon(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    for i in 0..bytes.len() {
+        if bytes[i] == b':' {
+            let prev_colon = i > 0 && bytes[i - 1] == b':';
+            let next_colon = i + 1 < bytes.len() && bytes[i + 1] == b':';
+            if !prev_colon && !next_colon {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+fn take_qualified_ident(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_alphanumeric() || b == b'_' {
+            i += 1;
+        } else if b == b':' && i + 1 < bytes.len() && bytes[i + 1] == b':' {
+            i += 2;
+        } else {
+            break;
+        }
+    }
+    s[..i].to_owned()
+}
+
+fn extract_brace_supertypes(sig_head: &str, declared_name: &str) -> Vec<String> {
+    if declared_name.is_empty() {
+        return Vec::new();
+    }
+    let stripped = collapse_ws(&strip_balanced_groups(sig_head));
+    let without_where = stripped
+        .split(" where ")
+        .next()
+        .unwrap_or(&stripped)
+        .split(" permits ")
+        .next()
+        .unwrap_or(&stripped);
+
+    let Some(name_pos) = without_where.find(declared_name) else {
+        return Vec::new();
+    };
+    let after_name = without_where[name_pos + declared_name.len()..].trim();
+    if after_name.is_empty() {
+        return Vec::new();
+    }
+
+    let raw_clause = if let Some(colon_idx) = find_single_colon(after_name) {
+        after_name[colon_idx + 1..].to_owned()
+    } else {
+        let padded = format!(" {after_name} ");
+        let first_kw = [" extends ", " implements ", " with "]
+            .iter()
+            .filter_map(|kw| padded.find(kw))
+            .min();
+        match first_kw {
+            Some(pos) => padded[pos..]
+                .replace(" extends ", ",")
+                .replace(" implements ", ",")
+                .replace(" with ", ","),
+            None => return Vec::new(),
+        }
+    };
+
+    let mut out = Vec::new();
+    for part in raw_clause.split([',', '+']) {
+        let ident = extract_base_type_ident(part);
+        if ident.len() >= 2
+            && !matches!(
+                ident.as_str(),
+                "Object" | "Send" | "Sync" | "Sized" | "Copy" | "Clone" | "Debug" | "Unpin"
+            )
+            && !out.iter().any(|x| x == &ident)
+        {
+            out.push(ident);
+        }
+    }
+    out
+}
+
+fn extract_python_supertypes(clean_sig: &str) -> Vec<String> {
+    let Some((_, after_open)) = clean_sig.split_once('(') else {
+        return Vec::new();
+    };
+    let Some((inside, _)) = after_open.rsplit_once(')') else {
+        return Vec::new();
+    };
+    let stripped = strip_balanced_groups(inside);
+    let mut out = Vec::new();
+    for part in stripped.split(',') {
+        let p = part.trim();
+        if p.is_empty() || p.contains('=') {
+            continue;
+        }
+        let ident = extract_base_type_ident(p);
+        if ident.len() >= 2
+            && !matches!(ident.as_str(), "object" | "ABC" | "Protocol" | "Generic")
+            && !out.iter().any(|x| x == &ident)
+        {
+            out.push(ident);
+        }
+    }
+    out
+}
+
+fn match_brace_declaration(
+    first_line: &str,
+    full_sig: &str,
+    in_type_body: bool,
+    in_interface_like: bool,
+    outside_callable: bool,
+) -> Option<(String, String, Option<String>)> {
     // Strip visibility and storage modifiers across Rust, TS/JS, Java, Kotlin, C#, C++, Dart, Swift.
-    let mut s = trimmed;
+    let mut s = first_line;
+    let mut full_stripped = full_sig;
+    let mut had_abstract_mod = false;
     loop {
         let mut stripped_any = false;
         for prefix in [
@@ -1204,6 +1591,7 @@ fn match_brace_declaration(trimmed: &str) -> Option<(String, String, Option<Stri
             "override ",
             "abstract ",
             "final ",
+            "readonly ",
             "inline ",
             "constexpr ",
             "extern ",
@@ -1218,8 +1606,14 @@ fn match_brace_declaration(trimmed: &str) -> Option<(String, String, Option<Stri
             "partial ",
         ] {
             if let Some(rest) = s.strip_prefix(prefix) {
+                if prefix == "abstract " {
+                    had_abstract_mod = true;
+                }
                 s = rest.trim_start();
                 stripped_any = true;
+            }
+            if let Some(rest_f) = full_stripped.strip_prefix(prefix) {
+                full_stripped = rest_f.trim_start();
             }
         }
         if !stripped_any {
@@ -1250,7 +1644,23 @@ fn match_brace_declaration(trimmed: &str) -> Option<(String, String, Option<Stri
             let clean_kw = kw.trim_end_matches('<').trim().to_owned();
             let mut explicit_container: Option<String> = None;
             let target = if kw == "impl<" {
-                rest.split_once('>').map_or(rest, |(_, after)| after.trim_start())
+                full_stripped
+                    .strip_prefix("impl<")
+                    .and_then(|r| {
+                        let mut d = 1i32;
+                        for (i, ch) in r.char_indices() {
+                            if ch == '<' {
+                                d += 1;
+                            } else if ch == '>' {
+                                d -= 1;
+                                if d == 0 {
+                                    return Some(r[i + 1..].trim_start());
+                                }
+                            }
+                        }
+                        None
+                    })
+                    .unwrap_or(rest)
             } else if kw == "func " && rest.starts_with('(') {
                 // Go receiver method: `func (s *Server) Handle(...)`
                 if let Some((recv, after)) = rest[1..].split_once(')') {
@@ -1272,10 +1682,7 @@ fn match_brace_declaration(trimmed: &str) -> Option<(String, String, Option<Stri
             } else {
                 rest
             };
-            let raw_name: String = target
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == ':')
-                .collect();
+            let raw_name = take_qualified_ident(target);
             if explicit_container.is_none() && clean_kw != "impl" {
                 if let Some((qual, _)) = raw_name.rsplit_once("::") {
                     let base = qual.rsplit("::").next().unwrap_or(qual);
@@ -1291,49 +1698,97 @@ fn match_brace_declaration(trimmed: &str) -> Option<(String, String, Option<Stri
         }
     }
 
-    // Typed method / function declaration in C, C++, C#, Java, Kotlin, Dart:
-    // e.g. `void MyClass::onCreate(Bundle* saved) {` or `String formatName(int id) {`
-    if let Some((before_paren, after_paren)) = s.split_once('(') {
-        let head = before_paren.trim();
-        let tail = after_paren.trim();
-        if !head.is_empty()
-            && !head.contains('=')
-            && !head.contains(';')
-            && !head.starts_with('#')
-            && (tail.ends_with('{') || tail.contains(") {") || tail.contains(") const {") || tail.contains(") throws "))
-        {
-            let parts: Vec<&str> = head.split_whitespace().collect();
-            if parts.len() >= 2 && parts.len() <= 5 {
-                let first_low = parts[0].to_ascii_lowercase();
-                if !matches!(
-                    first_low.as_str(),
-                    "if" | "else"
-                        | "for"
-                        | "foreach"
-                        | "while"
-                        | "switch"
-                        | "case"
-                        | "catch"
-                        | "return"
-                        | "throw"
-                        | "new"
-                        | "delete"
-                        | "sizeof"
-                        | "typeof"
-                ) {
-                    let cand = parts.last().copied().unwrap_or("");
-                    let cand_clean = cand.trim_start_matches(['*', '&']);
-                    let explicit_container = cand_clean
-                        .rsplit_once("::")
-                        .and_then(|(q, _)| q.rsplit("::").next())
-                        .filter(|c| !c.is_empty())
-                        .map(ToOwned::to_owned);
-                    let short = cand_clean.rsplit("::").next().unwrap_or(cand_clean);
-                    if !short.is_empty()
-                        && short.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-                        && short.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                    {
-                        return Some(("method".to_owned(), short.to_owned(), explicit_container));
+    // Typed or class/interface method & constructor declarations across Java/Quarkus, C#/.NET,
+    // Angular/TypeScript, C/C++, Kotlin, and Dart (evaluated strictly outside callable bodies).
+    if outside_callable {
+        if let Some((before_paren, _)) = full_stripped.split_once('(') {
+            let head_raw = before_paren.trim();
+            if !head_raw.is_empty()
+                && !head_raw.contains('=')
+                && !head_raw.contains(';')
+                && !head_raw.contains('!')
+                && !head_raw.starts_with('#')
+            {
+                // Find the matching `)` for the opening parameter list `(`
+                let open_idx = full_stripped.find('(').unwrap_or(0);
+                let mut p_depth = 0i32;
+                let mut after_params_opt: Option<&str> = None;
+                for (off, ch) in full_stripped[open_idx..].char_indices() {
+                    if ch == '(' {
+                        p_depth += 1;
+                    } else if ch == ')' {
+                        p_depth -= 1;
+                        if p_depth == 0 {
+                            after_params_opt = Some(full_stripped[open_idx + off + 1..].trim());
+                            break;
+                        }
+                    }
+                }
+
+                if let Some(after_params) = after_params_opt {
+                    let before_brace = after_params.split('{').next().unwrap_or(after_params);
+                    let is_body_def = after_params.contains('{') && !before_brace.contains('=');
+                    let is_abstract_or_iface_sig = (in_interface_like || had_abstract_mod)
+                        && after_params.ends_with(';')
+                        && !after_params.contains('=');
+
+                    if is_body_def || is_abstract_or_iface_sig {
+                        let head_clean = strip_balanced_groups(head_raw);
+                        let parts: Vec<&str> = head_clean.split_whitespace().collect();
+                        let valid_arity = (parts.len() >= 2 && parts.len() <= 5)
+                            || (parts.len() == 1 && in_type_body);
+                        if valid_arity {
+                            let first_low = parts[0].to_ascii_lowercase();
+                            if !matches!(
+                                first_low.as_str(),
+                                "if" | "else"
+                                    | "for"
+                                    | "foreach"
+                                    | "while"
+                                    | "switch"
+                                    | "case"
+                                    | "catch"
+                                    | "return"
+                                    | "throw"
+                                    | "new"
+                                    | "delete"
+                                    | "sizeof"
+                                    | "typeof"
+                                    | "synchronized"
+                                    | "using"
+                                    | "lock"
+                                    | "fixed"
+                                    | "when"
+                                    | "match"
+                                    | "select"
+                                    | "super"
+                                    | "this"
+                            ) {
+                                let cand = parts.last().copied().unwrap_or("");
+                                let cand_clean = cand.trim_start_matches(['*', '&', '~']);
+                                let explicit_container = cand_clean
+                                    .rsplit_once("::")
+                                    .and_then(|(q, _)| q.rsplit("::").next())
+                                    .filter(|c| !c.is_empty())
+                                    .map(ToOwned::to_owned);
+                                let short = cand_clean.rsplit("::").next().unwrap_or(cand_clean);
+                                if !short.is_empty()
+                                    && short
+                                        .chars()
+                                        .next()
+                                        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                                    && short
+                                        .chars()
+                                        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                                {
+                                    return Some((
+                                        "method".to_owned(),
+                                        short.to_owned(),
+                                        explicit_container,
+                                    ));
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1689,5 +2144,69 @@ impl Drop for Inode {
             .expect("Test-SafeBinaryAcl extracted");
         assert_eq!(fn_sym.start_line, 1);
         assert_eq!(fn_sym.end_line, 8);
+    }
+
+    #[test]
+    fn extracts_enterprise_supertypes_and_interface_methods_across_languages() {
+        let java_src = r#"package com.acme.orders;
+public interface OrderPort {
+    boolean approveOrder(String orderId);
+}
+public class OrderService extends BaseService implements OrderPort, Auditable {
+    @Override
+    public boolean approveOrder(String orderId) {
+        return true;
+    }
+}
+"#;
+        let sk_java = FileSkeleton::extract("OrderService.java", java_src);
+        let iface_method = sk_java
+            .symbols
+            .iter()
+            .find(|s| s.qualified_name() == "OrderPort::approveOrder")
+            .expect("Java interface method extracted");
+        assert_eq!(iface_method.start_line, 3);
+        assert_eq!(iface_method.end_line, 3);
+        let svc_cls = sk_java
+            .symbols
+            .iter()
+            .find(|s| s.name == "OrderService" && s.kind == "class")
+            .expect("Java OrderService class extracted");
+        assert_eq!(svc_cls.supertypes, vec!["BaseService", "OrderPort", "Auditable"]);
+
+        let cs_src = r#"namespace Acme.Orders;
+public interface IOrderRepo {
+    Task<bool> SaveAsync(Guid id);
+}
+public sealed class SqlOrderRepo(IDbConnection db) : BaseRepo, IOrderRepo {
+    public async Task<bool> SaveAsync(Guid id) {
+        return true;
+    }
+}
+"#;
+        let sk_cs = FileSkeleton::extract("OrderRepo.cs", cs_src);
+        let cs_cls = sk_cs
+            .symbols
+            .iter()
+            .find(|s| s.name == "SqlOrderRepo" && s.kind == "class")
+            .expect("C# primary-constructor class extracted");
+        assert_eq!(cs_cls.supertypes, vec!["BaseRepo", "IOrderRepo"]);
+        assert!(sk_cs
+            .symbols
+            .iter()
+            .any(|s| s.qualified_name() == "IOrderRepo::SaveAsync"));
+        assert!(sk_cs
+            .symbols
+            .iter()
+            .any(|s| s.qualified_name() == "SqlOrderRepo::SaveAsync"));
+
+        let py_src = "class OrderPort(Protocol):\n    def approve(self, oid: str) -> bool:\n        ...\n\nclass LiveOrderService(BaseService, OrderPort):\n    def approve(self, oid: str) -> bool:\n        return True\n";
+        let sk_py = FileSkeleton::extract("orders.py", py_src);
+        let py_cls = sk_py
+            .symbols
+            .iter()
+            .find(|s| s.name == "LiveOrderService")
+            .expect("Python class extracted");
+        assert_eq!(py_cls.supertypes, vec!["BaseService", "OrderPort"]);
     }
 }

@@ -3,7 +3,7 @@ name = "libredb-py"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-license.workspace = true
+license-file.workspace = true
 repository.workspace = true
 description = "Native PyO3 abi3 Python bindings for LibreDB (Python 3.12 - 3.14+)"
 

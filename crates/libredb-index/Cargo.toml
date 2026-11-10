@@ -3,7 +3,7 @@ name = "libredb-index"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-license.workspace = true
+license-file.workspace = true
 repository.workspace = true
 description = "Language-agnostic information-theoretic BM25, Unicode n-gram, and Hebbian concept-learning index for LibreDB"
 

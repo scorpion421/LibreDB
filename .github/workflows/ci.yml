@@ -13,23 +13,63 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Verify Makefile test, install, and strict guardrails
+      - name: Verify Makefile test, neutral install, benchmarks, and strict guardrails
         run: |
           make test
           make install
+          test ! -f "$HOME/.gemini/config/plugins/libredb/rules/AGENTS.md"
           "$HOME/.local/bin/libredb" --version
           "$HOME/.local/bin/libredb" trust --list
+          make bench
+          python3 -c '
+          import subprocess, statistics, time, os
+          exe = os.path.expanduser("~/.local/bin/libredb")
+          for hook, payload in [
+              ("hook-pre-invocation", b"{\"conversationId\":\"ci-bench\",\"cwd\":\".\"}"),
+              ("hook-pre-tool", b"{\"toolName\":\"run_command\",\"toolArgs\":{\"CommandLine\":\"cargo --version\"}}"),
+          ]:
+              samples = []
+              for _ in range(25):
+                  t0 = time.perf_counter()
+                  subprocess.run([exe, hook], input=payload, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                  samples.append((time.perf_counter() - t0) * 1000.0)
+              samples.sort()
+              print(f"[CI Hook Benchmark] {hook}: min={samples[0]:.2f} ms | median={statistics.median(samples):.2f} ms | p95={samples[int(len(samples)*0.95)]:.2f} ms")
+          '
           make guardrail
 
   windows:
-    name: Windows build, test & guardrails
+    name: Windows build, test, neutral install, benchmarks & guardrails
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Run release tests and strict guardrails
+      - name: Run release tests, neutral install, benchmarks, and strict guardrails
         shell: pwsh
         run: |
           cargo test --release
           cargo build --release
+          pwsh -ExecutionPolicy Bypass -File .\scripts\deploy_plugin.ps1
+          if (Test-Path "$HOME\.gemini\config\plugins\libredb\rules\AGENTS.md") {
+            throw "Default Neutral install must not create personal rules/AGENTS.md"
+          }
+          .\target\release\libredb.exe bench --nodes 2000 --threads 8
+          $exe = (Resolve-Path .\target\release\libredb.exe).Path
+          foreach ($entry in @(
+            @{ Hook = "hook-pre-invocation"; Payload = '{"conversationId":"ci-bench","cwd":"."}' },
+            @{ Hook = "hook-pre-tool"; Payload = '{"toolName":"run_command","toolArgs":{"CommandLine":"cargo --version"}}' }
+          )) {
+            $times = [System.Collections.Generic.List[double]]::new()
+            for ($i = 0; $i -lt 25; $i++) {
+              $sw = [System.Diagnostics.Stopwatch]::StartNew()
+              $entry.Payload | & $exe $entry.Hook *> $null
+              $sw.Stop()
+              $times.Add($sw.Elapsed.TotalMilliseconds)
+            }
+            $sorted = $times | Sort-Object
+            $min = [Math]::Round($sorted[0], 2)
+            $med = [Math]::Round($sorted[[int]($sorted.Count / 2)], 2)
+            $p95 = [Math]::Round($sorted[[int]($sorted.Count * 0.95)], 2)
+            Write-Host "[CI Hook Benchmark] $($entry.Hook): min=$min ms | median=$med ms | p95=$p95 ms"
+          }
           .\target\release\libredb.exe guardrail check --path . --strict

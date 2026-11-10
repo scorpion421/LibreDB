@@ -1,3 +1,9 @@
+param(
+    [ValidateSet("Neutral", "Personal")]
+    [string]$Profile = "Neutral",
+    [switch]$NoHooks
+)
+
 $ErrorActionPreference = "Stop"
 
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
@@ -85,13 +91,13 @@ $PluginJson = @'
 {
   "name": "libredb",
   "displayName": "LibreDB Cognitive Memory",
-  "version": "0.8.8",
-  "description": "Full Rust replacement for SQLite SkillsDB: single-file cognitive memory, silent SQLite auto-porter, sub-2ms hooks, workspace trust anchors, DPAPI credential vault, 15-language zero-hardcode causal code graph, and dynamic multi-remote Git/Gitea automation.",
+  "version": "0.9.0",
+  "description": "Enterprise-ready Rust cognitive memory & MCP code graph: single-file LIBREDB1 storage, silent SQLite auto-porter, sub-2ms hooks, HMAC-SHA256 workspace trust anchors, DPAPI / ChaCha20-Poly1305 credential vault, 20-language DI-aware causal code graph, and multi-remote Git/Gitea/GitHub automation.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
     "Run a LibreDB cognitive pulse on the active workspace to load deduplicated context",
     "Check local Gitea status and run a strict LibreDB guardrail audit on the workspace",
-    "Extract a surgical FIM code slice and blast-radius impact map with libredb_code"
+    "Extract a surgical FIM code slice and DI blast-radius impact map with libredb_code"
   ]
 }
 '@
@@ -148,21 +154,23 @@ $PrimaryHookCandidates = @(
     "%USERPROFILE%\.gemini\antigravity\bin\libredb.exe"
 )
 $VerifiedHookCmd = $null
-foreach ($CandExe in $PrimaryHookCandidates) {
-    $FormattedCmd = if ($CandExe.Contains(' ')) { '"' + $CandExe + '"' } else { $CandExe }
-    try {
-        $ProbeOut = "{}" | & $env:ComSpec /c "$FormattedCmd hook-pre-invocation" 2>$null
-        if ($LASTEXITCODE -eq 0 -and ($ProbeOut -join "") -match "injectSteps") {
-            $VerifiedHookCmd = $FormattedCmd
-            break
+if (-not $NoHooks) {
+    foreach ($CandExe in $PrimaryHookCandidates) {
+        $FormattedCmd = if ($CandExe.Contains(' ')) { '"' + $CandExe + '"' } else { $CandExe }
+        try {
+            $ProbeOut = "{}" | & $env:ComSpec /c "$FormattedCmd hook-pre-invocation" 2>$null
+            if ($LASTEXITCODE -eq 0 -and ($ProbeOut -join "") -match "injectSteps") {
+                $VerifiedHookCmd = $FormattedCmd
+                break
+            }
+        } catch {
         }
-    } catch {
     }
 }
 
 # Fallback for Enterprise AD workstations where `%USERPROFILE%` is SRP-blocked and `$ProjectRoot`
 # resides on an ACL-restricted personal network home share (e.g. `Q:\`): stage outside `target\`!
-if ($null -eq $VerifiedHookCmd) {
+if ((-not $NoHooks) -and ($null -eq $VerifiedHookCmd)) {
     $HomeRoot = [System.IO.Path]::GetPathRoot($UserHome)
     $ProjDriveRoot = [System.IO.Path]::GetPathRoot($ProjectRoot)
     if ($ProjDriveRoot -and (-not $ProjDriveRoot.Equals($HomeRoot, [System.StringComparison]::OrdinalIgnoreCase))) {
@@ -225,11 +233,17 @@ if ($null -ne $VerifiedHookCmd) {
 }
 '@
     [System.IO.File]::WriteAllText((Join-Path $PluginDir "hooks.json"), $DisabledHooksJson, $Utf8NoBom)
-    Write-Output "[WARN] Enterprise GPO/AppLocker blocked cmd.exe /c hook execution; set enabled=false in hooks.json so tool calls are never blocked."
+    if ($NoHooks) {
+        Write-Output "[OK] Installed hooks.json with enabled=false (-NoHooks MCP-only mode)."
+    } else {
+        Write-Output "[WARN] Enterprise GPO/AppLocker blocked cmd.exe /c hook execution; set enabled=false in hooks.json so tool calls are never blocked."
+    }
 }
 
-# 4. Write rules/AGENTS.md (preserving 100% of all 7 global user directives, powered natively by LibreDB)
-$AgentsMd = @'
+# 4. Optional personal rules profile: enterprise-neutral by default (-Profile Neutral never injects personal AGENTS.md)
+$AgentsMdPath = Join-Path $RulesDir "AGENTS.md"
+if ($Profile -eq "Personal") {
+    $AgentsMd = @'
 # Central LibreDB rules directive
 
 All system rules, coding standards, administrative credentials, and skills are maintained in `~/.gemini/libredb/customizations.ldb` (with automatic silent 1:1 background migration from any pre-existing `.db` files). Adhere to these active global rules with HIGHEST PRIORITY:
@@ -268,11 +282,17 @@ All system rules, coding standards, administrative credentials, and skills are m
 7. **Model & concurrency catalog (pure Pull, zero background control plane)**:
    - Supports `ultra` (16 parallel reader lanes) and `pro` (8 lanes) across `Gemini 4 Argon`, `Gemini 4 Carbon`, `Gemini 3.8 Flash`, `Claude Opus 5.5`, `Claude Sonnet 5.5`, and `GPT-OSS 120B`. Keep 100% of code generation on `Gemini 4 Argon`, `Gemini 4 Carbon`, or `Claude 5.5`; route only read-only `research` subagents to `Model="flash"`.
 '@
-$UmlautList = "$([char]0x00E4), $([char]0x00F6), $([char]0x00FC), $([char]0x00DF)"
-$TokenOek = "Token$([char]0x00F6)konomie"
-$TokenOekBad = "Token-$([char]0x00D6)konomie"
-$AgentsMd = $AgentsMd.Replace("__UMLAUT_LIST__", $UmlautList).Replace("__TOKEN_OEKONOMIE__", $TokenOek).Replace("__TOKEN_OEKONOMIE_BAD__", $TokenOekBad)
-[System.IO.File]::WriteAllText((Join-Path $RulesDir "AGENTS.md"), $AgentsMd, $Utf8NoBom)
+    $UmlautList = "$([char]0x00E4), $([char]0x00F6), $([char]0x00FC), $([char]0x00DF)"
+    $TokenOek = "Token$([char]0x00F6)konomie"
+    $TokenOekBad = "Token-$([char]0x00D6)konomie"
+    $AgentsMd = $AgentsMd.Replace("__UMLAUT_LIST__", $UmlautList).Replace("__TOKEN_OEKONOMIE__", $TokenOek).Replace("__TOKEN_OEKONOMIE_BAD__", $TokenOekBad)
+    [System.IO.File]::WriteAllText($AgentsMdPath, $AgentsMd, $Utf8NoBom)
+    Write-Output "[OK] Installed personal AGENTS.md rules directive (-Profile Personal)."
+} elseif (Test-Path $AgentsMdPath) {
+    Write-Output "[INFO] Neutral profile: preserving pre-existing rules/AGENTS.md without modification."
+} else {
+    Write-Output "[OK] Neutral enterprise profile: no personal rules/AGENTS.md installed."
+}
 
 # 5. Write progressive-disclosure SKILL.md
 $SkillMd = @'
@@ -297,8 +317,8 @@ description: >-
 2. **`libredb_code`** (`action`: `"index"` | `"skeleton"` | `"impact"` | `"fim"`, `target`, `files`, `cwd`, `cid`, `force`, `symbol`, `line`, `pad`):
    - `"index"`: Incrementally scans all non-binary source files in `target`, wiring `Calls` and `Decision -> Governs -> Symbol` synapses.
    - `"skeleton"`: Returns a `92-99%` compressed `[Lstart-Lend]` contract map of a single `target` file or a multi-file batch (`files: [...]`) across 14+ languages (including `.smali`, `.asm`, and `.md`) with session-aware `[Zero-Repeat Skeleton]` deduplication (`cid`).
-   - `"impact"`: Returns bidirectional callers, callees, and governing architectural decisions for a symbol.
-   - `"fim"`: Returns a surgical `[Lstart-Lend]` edit slice with blast-radius callers and governing decisions attached.
+   - `"impact"`: Returns bidirectional callers, DI/interface implementors, callees, and governing architectural decisions for a symbol.
+   - `"fim"`: Returns a surgical `[Lstart-Lend]` edit slice with blast-radius callers, implementors, and governing decisions attached.
 3. **`libredb_memorize`** (`cwd`, `cid`, `facts`, `decisions`, `tasks`, `snapshot`, `learn_assoc`, `learn_reflex`, `sync_central_sqlite`):
    - Atomically commits workspace/chat facts, architectural decisions (auto-linked to symbols), tasks, milestone snapshots, language-agnostic Hebbian concept bridges, or situational pitfall reflexes.
 
@@ -324,8 +344,16 @@ description: >-
 $SkillMdPath = Join-Path $SkillDir "SKILL.md"
 [System.IO.File]::WriteAllText($SkillMdPath, $SkillMd, $Utf8NoBom)
 
-# Modernize global DB in-place via LibreDB IPC writer lock (encrypting plaintext tokens via DPAPI + sealing workspaces)
+# Modernize global DB in-place via LibreDB IPC writer lock (encrypting plaintext tokens via DPAPI + HMAC-SHA256 workspace seals)
 & $TargetExe modernize-global --global $GlobalLdb --skill-md $SkillMdPath
+
+if ($Profile -eq "Personal") {
+    & $TargetExe config set "hook:subagent_flash_routing" "true" --global $GlobalLdb | Out-Null
+    & $TargetExe config set "hook:exploratory_firewall" "true" --global $GlobalLdb | Out-Null
+    & $TargetExe config set "guardrail:style_rules" "true" --global $GlobalLdb | Out-Null
+    & $TargetExe config set "git:author_name" "Antigravity" --global $GlobalLdb | Out-Null
+    & $TargetExe config set "git:author_email" "antigravity@local.dev" --global $GlobalLdb | Out-Null
+}
 
 # Incrementally index LibreDB's own workspace into .agents/memory.ldb
 $SelfLdb = Join-Path $ProjectRoot ".agents\memory.ldb"
@@ -352,16 +380,13 @@ $LogoSvg = @'
 
 # 7. Write user-facing README.md inside plugin bundle
 $PluginReadme = @'
-# LibreDB cognitive memory plugin (v0.8.8)
+# LibreDB cognitive memory plugin (v0.9.0)
 
-Complete standalone Rust replacement for `AntiGraviton SkillsDB` (`customizations-db`):
-- `libredb-mcp`: 3-tool multi-workspace cognitive memory & 15-language zero-hardcode causal code-graph server with zero-I/O RAM session delta, `[Zero-Repeat Skeleton]` deduplication, corpus-`IDF` call-graph disambiguation, and automatic incremental workspace refresh.
-- Cryptographic workspace trust anchors (`libredb trust`, `sys::trust_seals`), Windows `DPAPI` (`CryptProtectData`) OS credential vault for `gitea_token`, control-plane path protection (`hooks.json`, `mcp_config.json`, `.git/hooks/*`), and universal `libredb config` customization.
+Enterprise-ready standalone Rust cognitive memory & code-graph engine for `Antigravity`:
+- `libredb-mcp`: 3-tool multi-workspace cognitive memory & 20-language zero-hardcode causal code-graph server with DI interface/implementation resolution (`implementors`), zero-I/O RAM session delta, `[Zero-Repeat Skeleton]` deduplication, and corpus-`IDF` call-graph disambiguation.
+- Standards-compliant security: RFC 2104 `HMAC-SHA256` workspace trust seals (`libredb trust`), Windows `DPAPI` (`CryptProtectData`) and POSIX RFC 8439 `ChaCha20-Poly1305` AEAD OS credential vault, control-plane path protection (`hooks.json`, `mcp_config.json`, `.git/hooks/*`), and universal `libredb config` customization.
+- Enterprise-neutral by default: `deploy_plugin.ps1` (`-Profile Neutral`, default) installs `libredb-mcp` and security guardrails without injecting personal workflow rules or overriding corporate `git config` identity; pass `-Profile Personal` for personal author rules or `-NoHooks` for MCP-only evaluation.
 - Compaction garbage collection (`compact_with_options`, `maybe_auto_compact`) and `INDEX_FORMAT_VERSION = 4` `HybridIndex` with dead-posting garbage collection across superseded Inodes.
-- Silent background 1:1 auto-migration for trusted `.agents/memory.db` in older projects or chats; pure `.ldb` operation for all new projects and chats.
-- Native compiled `< 2 ms` `PreInvocation` (`systemMessage`) and `PreToolUse` guardrail hooks (`hooks.json`) with ACL-verified non-`target\` network-drive staging, post-compaction epoch hydration, multi-product `brain` discovery, and `research -> flash` subagent routing.
-
-To switch cleanly to pure single-engine operation, disable `AntiGraviton SkillsDB` (`customizations-db`) in Customizations and leave `LibreDB Cognitive Memory` (`libredb`) enabled.
 '@
 [System.IO.File]::WriteAllText((Join-Path $PluginDir "README.md"), $PluginReadme, $Utf8NoBom)
 
@@ -384,6 +409,6 @@ if (Test-Path $AgyConfigPath) {
     }
 }
 
-Write-Output "[OK] Deployed LibreDB v0.8.8 standalone binaries to: $BinDir"
+Write-Output "[OK] Deployed LibreDB v0.9.0 standalone binaries to: $BinDir (Profile=$Profile)"
 Write-Output "[OK] Hydrated and modernized global 19-table store at: $GlobalLdb"
-Write-Output "[OK] Installed complete Antigravity replacement plugin at: $PluginDir"
+Write-Output "[OK] Installed complete Antigravity plugin at: $PluginDir"

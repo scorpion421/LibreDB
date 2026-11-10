@@ -3,7 +3,7 @@ name = "libredb-cli"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-license.workspace = true
+license-file.workspace = true
 repository.workspace = true
 description = "Command-line utility, cognitive pulse engine, and lossless SQLite bridge for LibreDB"
 
@@ -12,8 +12,11 @@ name = "libredb"
 path = "src/main.rs"
 
 [dependencies]
+chacha20poly1305.workspace = true
+hmac.workspace = true
 libredb-bridge = { path = "../libredb-bridge" }
 libredb-cognitive = { path = "../libredb-cognitive" }
 libredb-core = { path = "../libredb-core" }
 libredb-index = { path = "../libredb-index" }
 serde_json.workspace = true
+sha2.workspace = true

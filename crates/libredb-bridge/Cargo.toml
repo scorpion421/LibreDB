@@ -3,7 +3,7 @@ name = "libredb-bridge"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-license.workspace = true
+license-file.workspace = true
 repository.workspace = true
 description = "Lossless 1:1 bidirectional SQLite <-> LibreDB migrator and cryptographic round-trip verifier for SkillsDB"
 

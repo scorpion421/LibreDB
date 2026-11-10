@@ -917,13 +917,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             for r in reports {
                 println!("\n* [#{}] {}", r.node_id, r.contract);
                 for g in &r.governing_decisions {
-                    println!("    [Governed by]: {g}");
+                    println!("    [Governed by]:    {g}");
+                }
+                for imp in &r.implementors {
+                    println!("    [Implemented by] <= {imp}");
                 }
                 for c in &r.callers {
-                    println!("    [Called by]  <- {c}");
+                    println!("    [Called by]      <- {c}");
                 }
                 for d in &r.callees {
-                    println!("    [Calls]      -> {d}");
+                    println!("    [Calls/Depends]  -> {d}");
                 }
             }
         }

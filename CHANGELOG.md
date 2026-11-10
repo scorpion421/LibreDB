@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-11-10
+
+### Added
+
+- Added polyglot Dependency Injection (`DI`) and interface/trait inheritance resolution (`SymbolContract.supertypes`, `SKELETON_HASH_SEED = 109`, `extract_brace_supertypes`, `extract_python_supertypes`, `EdgeKind::DependsOn`, and `SymbolImpactReport.implementors`) across Java/Quarkus (`implements`/`extends` + `@Inject` interface calls), Angular/TypeScript (`implements` + constructor `DI`), C#/.NET (`:` base/interface lists + C# 12 primary constructors), Python (`Protocol`/`ABC` base classes), Kotlin, C++, Swift, and Rust (`impl Trait for Type`), propagating interface callers (`OrderResource::submitOrder -> OrderApprovalPort::approveOrder -> OrderApprovalService::approveOrder`) into concrete implementation `impact` and `fim` blast-radius slices.
+- Added enterprise-neutral installation profiles (`-Profile Neutral|Personal` and `-NoHooks` in `scripts/deploy_plugin.ps1`; `--profile neutral|personal`, `--personal-rules`, and `--no-hooks` in `scripts/deploy_plugin.sh`; `install-personal`, `install-mcp-only`, and `bench` targets in `Makefile`), ensuring default installations never create or inject personal `rules/AGENTS.md` workflow directives onto corporate or evaluation workstations.
+- Added automated storage kernel benchmarks (`libredb bench`) and `25`-iteration wall-clock `hook-pre-invocation` / `hook-pre-tool` latency measurements plus neutral-install `AGENTS.md` absence assertions to `.github/workflows/ci.yml` on both `ubuntu-latest` and `windows-latest`.
+
+### Changed
+
+- Made opinionated `PreToolUse` and `git-sync` workflow preferences opt-in via `libredb config` (`hook:subagent_flash_routing`, `hook:exploratory_firewall`, and `guardrail:style_rules` defaulting to `false` on neutral enterprise installs while enabled in `-Profile Personal`), keeping all security, path-protection, and secret-prevention guardrails active unconditionally.
+- Updated `ensure_local_git_initialized` and `cmd_gitea_sync` (`git_has_configured_identity` in `crates/libredb-cli/src/gitea.rs`) to preserve the developer's configured Git `user.name` and `user.email` by default unless `git:author_name` / `git:author_email` overrides are explicitly set in `libredb config`.
+- Aligned `Cargo.toml` and all six workspace crate manifests (`crates/*/Cargo.toml`) with `LICENSE` (`AGPL-3.0 + Commons Clause`) by replacing `license = "AGPL-3.0-only"` with `license-file = "LICENSE"` (`license-file.workspace = true`) and `repository = "https://github.com/scorpion421/LibreDB"`.
+
+### Security
+
+- Replaced all custom POSIX vault and workspace trust-seal primitives in `crates/libredb-cli/src/security.rs` (removing `xor_keystream` and `FNV-1a`/`SplitMix64` MACs) with standards-compliant RFC 8439 `ChaCha20-Poly1305` `AEAD` (`vault:v2:<nonce-hex>:<ciphertext+poly1305-tag-hex>`, cryptographically authenticating the `96-bit` `nonce`, domain-separated `AAD`, and ciphertext with a `128-bit` `Poly1305` tag alongside Windows `DPAPI`) and RFC 2104 `HMAC-SHA256` (`hmac-sha256:v2:<64-hex>`) for `sys::trust_seals`, hardened POSIX `.vault.key` against symlinks and loose permissions (`0600`), and added `1`-bit nonce, ciphertext, and tag tamper rejection unit tests.
+
 ## [0.8.8] - 2026-11-10
 
 ### Added

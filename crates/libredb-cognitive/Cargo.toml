@@ -3,7 +3,7 @@ name = "libredb-cognitive"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-license.workspace = true
+license-file.workspace = true
 repository.workspace = true
 description = "Session zero-repeat delta filter, situational reflex triggers, code contract skeletons, and one-shot cognitive pulse for Antigravity"
 

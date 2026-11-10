@@ -74,9 +74,15 @@ pub fn run_pre_tool_hook(global_ldb_opt: Option<&Path>) -> Result<(), Box<dyn st
     let payload: Value = serde_json::from_str(raw.trim()).unwrap_or_else(|_| json!({}));
 
     let (tool_name, args) = extract_pre_tool_name_and_args(&payload);
+    let mut global_db_cache: Option<Option<Arc<LibreDb>>> = None;
+    let mut get_global_db = || -> Option<Arc<LibreDb>> {
+        global_db_cache
+            .get_or_insert_with(|| open_global_ldb_if_exists(global_ldb_opt))
+            .clone()
+    };
 
-    // 0. Subagent Model Enforcer (Rule 5 & Rule 7): automatically route read-only `research`
-    // subagents to `Model="flash"` so they never burn `Argon High` / `Claude` code-gen quota.
+    // 0. Opt-in Subagent Model Router (`hook:subagent_flash_routing = true`): off by default on
+    // enterprise-neutral installations so corporate agent configurations keep their chosen models.
     if tool_name == "invoke_subagent" {
         let type_name = args
             .get("TypeName")
@@ -91,6 +97,12 @@ pub fn run_pre_tool_hook(global_ldb_opt: Option<&Path>) -> Result<(), Box<dyn st
                 .unwrap_or("inherit");
             if !model_str.eq_ignore_ascii_case("flash")
                 && !model_str.eq_ignore_ascii_case("flash_lite")
+                && crate::security::load_bool_config(
+                    get_global_db().as_deref(),
+                    None,
+                    "hook:subagent_flash_routing",
+                    false,
+                )
             {
                 emit_json(&json!({
                     "decision": "allow",
@@ -101,7 +113,7 @@ pub fn run_pre_tool_hook(global_ldb_opt: Option<&Path>) -> Result<(), Box<dyn st
         }
     }
 
-    // 1. Shell command guardrails + exploratory search streak firewall
+    // 1. Shell command security guardrails + opt-in exploratory search streak firewall
     let cmd_opt = args
         .get("CommandLine")
         .or_else(|| args.get("command"))
@@ -116,8 +128,15 @@ pub fn run_pre_tool_hook(global_ldb_opt: Option<&Path>) -> Result<(), Box<dyn st
             return Ok(());
         }
 
-        // Subagent Firewall: block >= 4 consecutive exploratory shell searches in main context
-        if is_exploratory_search_cmd(cmd_line) {
+        // Opt-in Subagent Firewall (`hook:exploratory_firewall = true`, off by default on neutral installs)
+        if is_exploratory_search_cmd(cmd_line)
+            && crate::security::load_bool_config(
+                get_global_db().as_deref(),
+                None,
+                "hook:exploratory_firewall",
+                false,
+            )
+        {
             if let Some((cid, t_path)) = resolve_cid_and_transcript(&payload) {
                 if !cid.is_empty() && t_path.is_file() && count_recent_exploratory_streak(&t_path) >= 4 {
                     emit_json(&json!({
@@ -151,7 +170,7 @@ pub fn run_pre_tool_hook(global_ldb_opt: Option<&Path>) -> Result<(), Box<dyn st
         || args.get("ReplacementChunks").is_some();
 
     if is_write_or_edit {
-        let global_db_ro = open_global_ldb_if_exists(global_ldb_opt);
+        let global_db_ro = get_global_db();
         let proj_db_ro = if target_file != "<tool_input>" {
             find_workspace_root(Path::new(target_file)).and_then(|root| {
                 if crate::security::is_workspace_memory_trusted(global_db_ro.as_deref(), &root) {
@@ -214,6 +233,12 @@ pub fn run_pre_tool_hook(global_ldb_opt: Option<&Path>) -> Result<(), Box<dyn st
                 }
             }
 
+            let enforce_style = crate::security::load_bool_config(
+                global_db_ro.as_deref(),
+                proj_db_ro.as_ref(),
+                "guardrail:style_rules",
+                false,
+            );
             let is_full_file = matches!(tool_name, "write_file" | "write_to_file")
                 && args.get("Append").and_then(Value::as_bool) != Some(true);
             for txt in texts_to_check {
@@ -223,8 +248,11 @@ pub fn run_pre_tool_hook(global_ldb_opt: Option<&Path>) -> Result<(), Box<dyn st
                     is_full_file,
                     &custom_prefixes,
                 );
-                if let Some(first_crit) = violations.into_iter().find(|v| v.severity == "CRITICAL")
-                {
+                if let Some(first_crit) = violations.into_iter().find(|v| {
+                    v.severity == "CRITICAL"
+                        && (enforce_style
+                            || !matches!(v.rule.as_str(), "no-em-en-dash" | "no-emojis"))
+                }) {
                     emit_json(&json!({
                         "decision": "deny",
                         "reason": format!(

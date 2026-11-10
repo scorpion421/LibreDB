@@ -1,6 +1,34 @@
 #!/bin/sh
-# POSIX / Linux / macOS Antigravity plugin installer for LibreDB (v0.8.8)
+# POSIX / Linux / macOS Antigravity plugin installer for LibreDB (v0.9.0)
+# Enterprise-neutral by default (never installs personal AGENTS.md unless --personal-rules is passed).
 set -eu
+
+PROFILE="neutral"
+NO_HOOKS=0
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --personal-rules|--personal)
+            PROFILE="personal"
+            shift
+            ;;
+        --profile)
+            PROFILE=$(printf '%s' "${2:-neutral}" | tr '[:upper:]' '[:lower:]')
+            shift 2
+            ;;
+        --no-hooks)
+            NO_HOOKS=1
+            shift
+            ;;
+        -h|--help)
+            echo "Usage: ./scripts/deploy_plugin.sh [--personal-rules | --profile neutral|personal] [--no-hooks]"
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            exit 1
+            ;;
+    esac
+done
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PROJECT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
@@ -96,13 +124,13 @@ cat > "$PLUGIN_DIR/plugin.json" <<'EOF'
 {
   "name": "libredb",
   "displayName": "LibreDB Cognitive Memory",
-  "version": "0.8.8",
-  "description": "Full Rust replacement for SQLite SkillsDB: single-file cognitive memory, silent SQLite auto-porter, sub-2ms hooks, workspace trust anchors, OS credential vault, 15-language zero-hardcode causal code graph, and dynamic multi-remote Git/Gitea automation.",
+  "version": "0.9.0",
+  "description": "Enterprise-ready Rust cognitive memory & MCP code graph: single-file LIBREDB1 storage, silent SQLite auto-porter, sub-2ms hooks, HMAC-SHA256 workspace trust anchors, ChaCha20-Poly1305 OS credential vault, 20-language DI-aware causal code graph, and multi-remote Git/Gitea/GitHub automation.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
     "Run a LibreDB cognitive pulse on the active workspace to load deduplicated context",
     "Check local Gitea status and run a strict LibreDB guardrail audit on the workspace",
-    "Extract a surgical FIM code slice and blast-radius impact map with libredb_code"
+    "Extract a surgical FIM code slice and DI blast-radius impact map with libredb_code"
   ]
 }
 EOF
@@ -123,25 +151,27 @@ cat > "$PLUGIN_DIR/mcp_config.json" <<EOF
 }
 EOF
 
-# 3. Probe hook execution via /bin/sh -c and write hooks.json
+# 3. Probe hook execution via /bin/sh -c and write hooks.json (unless --no-hooks was passed)
 VERIFIED_HOOK_CMD=""
-for cand_bin in "$BIN_DIR/libredb" "$GEMINI_DIR/antigravity/bin/libredb"; do
-    cand_dir=$(dirname "$cand_bin")
-    if ! test_safe_binary_dir "$cand_dir"; then
-        continue
-    fi
-    case "$cand_bin" in
-        *" "*) formatted_cmd="\"$cand_bin\"" ;;
-        *) formatted_cmd="$cand_bin" ;;
-    esac
-    probe_out=$(printf '{}' | /bin/sh -c "$formatted_cmd hook-pre-invocation" 2>/dev/null || true)
-    case "$probe_out" in
-        *injectSteps*)
-            VERIFIED_HOOK_CMD="$formatted_cmd"
-            break
-            ;;
-    esac
-done
+if [ "$NO_HOOKS" -eq 0 ]; then
+    for cand_bin in "$BIN_DIR/libredb" "$GEMINI_DIR/antigravity/bin/libredb"; do
+        cand_dir=$(dirname "$cand_bin")
+        if ! test_safe_binary_dir "$cand_dir"; then
+            continue
+        fi
+        case "$cand_bin" in
+            *" "*) formatted_cmd="\"$cand_bin\"" ;;
+            *) formatted_cmd="$cand_bin" ;;
+        esac
+        probe_out=$(printf '{}' | /bin/sh -c "$formatted_cmd hook-pre-invocation" 2>/dev/null || true)
+        case "$probe_out" in
+            *injectSteps*)
+                VERIFIED_HOOK_CMD="$formatted_cmd"
+                break
+                ;;
+        esac
+    done
+fi
 
 if [ -n "$VERIFIED_HOOK_CMD" ]; then
     HOOK_JSON_CMD=$(escape_json_str "$VERIFIED_HOOK_CMD")
@@ -179,24 +209,29 @@ else
   }
 }
 EOF
-    echo "[WARN] Hook execution probe failed (e.g. noexec mount); set enabled=false in hooks.json so tool calls are never blocked."
+    if [ "$NO_HOOKS" -eq 1 ]; then
+        echo "[OK] Installed hooks.json with enabled=false (--no-hooks MCP-only mode)."
+    else
+        echo "[WARN] Hook execution probe failed (e.g. noexec mount); set enabled=false in hooks.json so tool calls are never blocked."
+    fi
 fi
 
-# 4. Write rules/AGENTS.md (constructing UTF-8 umlaut bytes via octal printf to keep this script 100% ASCII)
-UMLAUT_AE=$(printf '\303\244')
-UMLAUT_OE=$(printf '\303\266')
-UMLAUT_UE=$(printf '\303\274')
-UMLAUT_SS=$(printf '\303\237')
-UMLAUT_CAP_OE=$(printf '\303\226')
-UMLAUT_LIST="${UMLAUT_AE}, ${UMLAUT_OE}, ${UMLAUT_UE}, ${UMLAUT_SS}"
-TOKEN_OEK="Token${UMLAUT_OE}konomie"
-TOKEN_OEK_BAD="Token-${UMLAUT_CAP_OE}konomie"
+# 4. Optional personal rules profile: enterprise-neutral by default (never creates personal AGENTS.md unless --personal-rules)
+if [ "$PROFILE" = "personal" ]; then
+    UMLAUT_AE=$(printf '\303\244')
+    UMLAUT_OE=$(printf '\303\266')
+    UMLAUT_UE=$(printf '\303\274')
+    UMLAUT_SS=$(printf '\303\237')
+    UMLAUT_CAP_OE=$(printf '\303\226')
+    UMLAUT_LIST="${UMLAUT_AE}, ${UMLAUT_OE}, ${UMLAUT_UE}, ${UMLAUT_SS}"
+    TOKEN_OEK="Token${UMLAUT_OE}konomie"
+    TOKEN_OEK_BAD="Token-${UMLAUT_CAP_OE}konomie"
 
-sed \
-    -e "s/__UMLAUT_LIST__/$UMLAUT_LIST/g" \
-    -e "s/__TOKEN_OEKONOMIE__/$TOKEN_OEK/g" \
-    -e "s/__TOKEN_OEKONOMIE_BAD__/$TOKEN_OEK_BAD/g" \
-    > "$RULES_DIR/AGENTS.md" <<'EOF'
+    sed \
+        -e "s/__UMLAUT_LIST__/$UMLAUT_LIST/g" \
+        -e "s/__TOKEN_OEKONOMIE__/$TOKEN_OEK/g" \
+        -e "s/__TOKEN_OEKONOMIE_BAD__/$TOKEN_OEK_BAD/g" \
+        > "$RULES_DIR/AGENTS.md" <<'EOF'
 # Central LibreDB rules directive
 
 All system rules, coding standards, administrative credentials, and skills are maintained in `~/.gemini/libredb/customizations.ldb` (with automatic silent 1:1 background migration from any pre-existing `.db` files). Adhere to these active global rules with HIGHEST PRIORITY:
@@ -235,6 +270,12 @@ All system rules, coding standards, administrative credentials, and skills are m
 7. **Model & concurrency catalog (pure Pull, zero background control plane)**:
    - Supports `ultra` (16 parallel reader lanes) and `pro` (8 lanes) across `Gemini 4 Argon`, `Gemini 4 Carbon`, `Gemini 3.8 Flash`, `Claude Opus 5.5`, `Claude Sonnet 5.5`, and `GPT-OSS 120B`. Keep 100% of code generation on `Gemini 4 Argon`, `Gemini 4 Carbon`, or `Claude 5.5`; route only read-only `research` subagents to `Model="flash"`.
 EOF
+    echo "[OK] Installed personal AGENTS.md rules directive (--personal-rules)."
+elif [ -f "$RULES_DIR/AGENTS.md" ]; then
+    echo "[INFO] Neutral profile: preserving pre-existing rules/AGENTS.md without modification."
+else
+    echo "[OK] Neutral enterprise profile: no personal rules/AGENTS.md installed."
+fi
 
 # 5. Write progressive-disclosure SKILL.md
 SKILL_MD_PATH="$SKILL_DIR/SKILL.md"
@@ -260,8 +301,8 @@ description: >-
 2. **`libredb_code`** (`action`: `"index"` | `"skeleton"` | `"impact"` | `"fim"`, `target`, `files`, `cwd`, `cid`, `force`, `symbol`, `line`, `pad`):
    - `"index"`: Incrementally scans all non-binary source files in `target`, wiring `Calls` and `Decision -> Governs -> Symbol` synapses.
    - `"skeleton"`: Returns a `92-99%` compressed `[Lstart-Lend]` contract map of a single `target` file or a multi-file batch (`files: [...]`) across 15+ languages (including `.smali`, `.asm`, `Makefile`, and `.md`) with session-aware `[Zero-Repeat Skeleton]` deduplication (`cid`).
-   - `"impact"`: Returns bidirectional callers, callees, and governing architectural decisions for a symbol.
-   - `"fim"`: Returns a surgical `[Lstart-Lend]` edit slice with blast-radius callers and governing decisions attached.
+   - `"impact"`: Returns bidirectional callers, DI/interface implementors, callees, and governing architectural decisions for a symbol.
+   - `"fim"`: Returns a surgical `[Lstart-Lend]` edit slice with blast-radius callers, implementors, and governing decisions attached.
 3. **`libredb_memorize`** (`cwd`, `cid`, `facts`, `decisions`, `tasks`, `snapshot`, `learn_assoc`, `learn_reflex`, `sync_central_sqlite`):
    - Atomically commits workspace/chat facts, architectural decisions (auto-linked to symbols), tasks, milestone snapshots, language-agnostic Hebbian concept bridges, or situational pitfall reflexes.
 
@@ -285,8 +326,16 @@ description: >-
   - `libredb gitea-config [--url <u>] [--user <usr>] [--token <tok> | --token-stdin] [--allow-insecure-http <bool>] [--register-helper]`
 EOF
 
-# Modernize global DB in-place (encrypting any plaintext tokens + sealing workspaces)
+# Modernize global DB in-place (encrypting any plaintext tokens via ChaCha20-Poly1305 + HMAC-SHA256 workspace seals)
 "$TARGET_EXE" modernize-global --global "$GLOBAL_LDB" --skill-md "$SKILL_MD_PATH"
+
+if [ "$PROFILE" = "personal" ]; then
+    "$TARGET_EXE" config set "hook:subagent_flash_routing" "true" --global "$GLOBAL_LDB" >/dev/null
+    "$TARGET_EXE" config set "hook:exploratory_firewall" "true" --global "$GLOBAL_LDB" >/dev/null
+    "$TARGET_EXE" config set "guardrail:style_rules" "true" --global "$GLOBAL_LDB" >/dev/null
+    "$TARGET_EXE" config set "git:author_name" "Antigravity" --global "$GLOBAL_LDB" >/dev/null
+    "$TARGET_EXE" config set "git:author_email" "antigravity@local.dev" --global "$GLOBAL_LDB" >/dev/null
+fi
 
 # Seal and incrementally index LibreDB's own workspace into .agents/memory.ldb
 SELF_LDB="$PROJECT_ROOT/.agents/memory.ldb"
@@ -308,16 +357,13 @@ EOF
 
 # 7. Write user-facing README.md inside plugin bundle
 cat > "$PLUGIN_DIR/README.md" <<'EOF'
-# LibreDB cognitive memory plugin (v0.8.8)
+# LibreDB cognitive memory plugin (v0.9.0)
 
-Complete standalone Rust replacement for `AntiGraviton SkillsDB` (`customizations-db`):
-- `libredb-mcp`: 3-tool multi-workspace cognitive memory & 15-language zero-hardcode causal code-graph server with zero-I/O RAM session delta, `[Zero-Repeat Skeleton]` deduplication, corpus-`IDF` call-graph disambiguation, and automatic incremental workspace refresh.
-- Cryptographic workspace trust anchors (`libredb trust`, `sys::trust_seals`), OS credential vault (Windows `DPAPI` / POSIX `0600` `.vault.key`), control-plane path protection (`hooks.json`, `mcp_config.json`, `.git/hooks/*`), and universal `libredb config` customization.
+Enterprise-ready standalone Rust cognitive memory & code-graph engine for `Antigravity`:
+- `libredb-mcp`: 3-tool multi-workspace cognitive memory & 20-language zero-hardcode causal code-graph server with DI interface/implementation resolution (`implementors`), zero-I/O RAM session delta, `[Zero-Repeat Skeleton]` deduplication, and corpus-`IDF` call-graph disambiguation.
+- Standards-compliant security: RFC 2104 `HMAC-SHA256` workspace trust seals (`libredb trust`), RFC 8439 `ChaCha20-Poly1305` AEAD OS credential vault (`0600` `.vault.key` with symlink guards), control-plane path protection (`hooks.json`, `mcp_config.json`, `.git/hooks/*`), and universal `libredb config` customization.
+- Enterprise-neutral by default: `deploy_plugin.sh` installs `libredb-mcp` and security guardrails without injecting personal workflow rules or overriding corporate `git config` identity; pass `--personal-rules` for personal author rules or `--no-hooks` for MCP-only evaluation.
 - Compaction garbage collection (`compact_with_options`, `maybe_auto_compact`) and `INDEX_FORMAT_VERSION = 4` `HybridIndex` with dead-posting garbage collection across superseded Inodes.
-- Silent background 1:1 auto-migration for trusted `.agents/memory.db` in older projects or chats; pure `.ldb` operation for all new projects and chats.
-- Native compiled `< 2 ms` `PreInvocation` (`systemMessage`) and `PreToolUse` guardrail hooks (`hooks.json`) with POSIX/ACL permission checks, post-compaction epoch hydration, multi-product `brain` discovery, and `research -> flash` subagent routing.
-
-To switch cleanly to pure single-engine operation, disable `AntiGraviton SkillsDB` (`customizations-db`) in Customizations and leave `LibreDB Cognitive Memory` (`libredb`) enabled.
 EOF
 
 # 8. Enable "libredb" in ~/.gemini/config/config.json if present and python3 or jq is available
@@ -337,6 +383,6 @@ PYEOF
     fi
 fi
 
-echo "[OK] Deployed LibreDB v0.8.8 standalone binary to: $BIN_DIR"
+echo "[OK] Deployed LibreDB v0.9.0 standalone binary to: $BIN_DIR (profile=$PROFILE)"
 echo "[OK] Hydrated and modernized global 19-table store at: $GLOBAL_LDB"
-echo "[OK] Installed complete Antigravity replacement plugin at: $PLUGIN_DIR"
+echo "[OK] Installed complete Antigravity plugin at: $PLUGIN_DIR"

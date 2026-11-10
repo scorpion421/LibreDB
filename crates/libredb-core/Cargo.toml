@@ -3,7 +3,7 @@ name = "libredb-core"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-license.workspace = true
+license-file.workspace = true
 repository.workspace = true
 description = "Single-file chaos-extent-inode cognitive storage kernel for LibreDB"
 

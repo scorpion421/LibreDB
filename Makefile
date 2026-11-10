@@ -6,7 +6,7 @@ CARGO ?= cargo
 SH ?= sh
 BINARY := target/release/libredb
 
-.PHONY: all build build-native test python install uninstall guardrail clean check-deps help
+.PHONY: all build build-native test python install install-personal install-mcp-only bench uninstall guardrail clean check-deps help
 
 all: build
 
@@ -37,9 +37,21 @@ test: check-deps
 python: check-deps
 	PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 $(CARGO) build --release -p libredb-py
 
-## Build and install LibreDB CLI + Antigravity plugin into ~/.gemini and ~/.local/bin
+## Build and install enterprise-neutral LibreDB CLI + Antigravity plugin into ~/.gemini and ~/.local/bin
 install: build
 	$(SH) ./scripts/deploy_plugin.sh
+
+## Build and install LibreDB with the author's personal rules profile (--personal-rules)
+install-personal: build
+	$(SH) ./scripts/deploy_plugin.sh --personal-rules
+
+## Build and install LibreDB MCP server + CLI with lifecycle hooks disabled (--no-hooks)
+install-mcp-only: build
+	$(SH) ./scripts/deploy_plugin.sh --no-hooks
+
+## Run reproducible storage, graph, and recall throughput benchmark
+bench: build
+	./$(BINARY) bench --nodes 2000 --threads 8
 
 ## Run strict workspace guardrail audit using the compiled release binary
 guardrail: build
@@ -61,7 +73,10 @@ help:
 	@echo "  make              Compile optimized release binary (target/release/libredb)"
 	@echo "  make build-native Compile with -C target-cpu=native for maximum local performance"
 	@echo "  make test         Run full release test suite + 10,000 crash simulations"
-	@echo "  make install      Build and deploy LibreDB CLI + Antigravity plugin (~/.gemini)"
+	@echo "  make install          Build and deploy enterprise-neutral LibreDB CLI + MCP plugin"
+	@echo "  make install-mcp-only Deploy MCP server + CLI with hooks disabled (--no-hooks)"
+	@echo "  make install-personal Deploy with personal workflow rules (--personal-rules)"
+	@echo "  make bench            Run storage, recall, and concurrency throughput benchmark"
 	@echo "  make python       Build optional PyO3 Python extension (libredb-py)"
 	@echo "  make guardrail    Run strict LibreDB guardrail check on workspace"
 	@echo "  make uninstall    Remove plugin files while keeping ~/.gemini/libredb databases"

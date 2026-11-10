@@ -1,26 +1,33 @@
-//! Zero-dependency OS secret vault (Windows DPAPI `CryptProtectData` / POSIX `0600` keyfile),
-//! autonomous cryptographic workspace trust anchors (`sys::trust_anchor_secret` & `sys::trust_seals`),
-//! and configurable control-plane / credential path policies.
+//! Standards-compliant OS secret vault (Windows DPAPI `CryptProtectData` / POSIX `0600` keyfile
+//! with RFC 8439 `ChaCha20-Poly1305` AEAD), RFC 2104 `HMAC-SHA256` workspace trust anchors
+//! (`sys::trust_anchor_secret` & `sys::trust_seals`), and configurable control-plane path policies.
 
 use crate::hooks::user_home_dir;
-use libredb_core::crc::hash_key;
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+use hmac::{Hmac, Mac};
 use libredb_core::{LibreDb, NodeKind, WriteRequest};
+use sha2::Sha256;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+type HmacSha256 = Hmac<Sha256>;
+
 const DPAPI_PREFIX: &str = "dpapi:v1:";
-const VAULT_PREFIX: &str = "vault:v1:";
+const VAULT_V2_PREFIX: &str = "vault:v2:";
+const VAULT_AEAD_AAD: &[u8] = b"LibreDB::CredentialVault::v2";
+const SEAL_DOMAIN_SEP: &[u8] = b"LibreDB::WorkspaceTrustSeal::v2\0";
 const TRUST_SECRET_KEY: &str = "sys::trust_anchor_secret";
 const TRUST_SEALS_KEY: &str = "sys::trust_seals";
 
-/// Returns true if `stored` is already encrypted by the OS secret vault.
+/// Returns true if `stored` is already encrypted by the OS secret vault (`dpapi:v1:` or `vault:v2:`).
 pub fn is_protected_secret(stored: &str) -> bool {
     let t = stored.trim();
-    t.starts_with(DPAPI_PREFIX) || t.starts_with(VAULT_PREFIX)
+    t.starts_with(DPAPI_PREFIX) || t.starts_with(VAULT_V2_PREFIX)
 }
 
 /// Encrypts a plaintext secret string using Windows DPAPI (`CryptProtectData` bound to the current
-/// Windows/AD logon user) or a `0600` local vault key on POSIX systems.
+/// Windows/AD logon user) or RFC 8439 `ChaCha20-Poly1305` AEAD backed by a `0600` keyfile on POSIX.
 pub fn protect_secret(plaintext: &str) -> Result<String, String> {
     if plaintext.is_empty() {
         return Ok(String::new());
@@ -37,16 +44,16 @@ pub fn protect_secret(plaintext: &str) -> Result<String, String> {
 
     #[cfg(not(windows))]
     {
-        let key = load_or_create_posix_vault_key()?;
-        let mut nonce = [0u8; 16];
-        fill_csprng(&mut nonce)?;
-        let masked = xor_keystream(&key, &nonce, plaintext.as_bytes());
-        let tag = compute_keyed_mac_hex(&key, &masked);
-        let mut blob = Vec::with_capacity(16 + 16 + masked.len());
-        blob.extend_from_slice(&nonce);
-        blob.extend_from_slice(&hex_decode(&tag[..32]).unwrap_or_default());
-        blob.extend_from_slice(&masked);
-        Ok(format!("{VAULT_PREFIX}{}", base64_encode(&blob)))
+        let mut key = load_or_create_posix_vault_key()?;
+        let mut nonce = [0u8; 12];
+        let nonce_res = fill_csprng(&mut nonce);
+        if let Err(e) = nonce_res {
+            secure_zero(&mut key);
+            return Err(e);
+        }
+        let res = aead_seal_v2(&key, &nonce, plaintext.as_bytes());
+        secure_zero(&mut key);
+        res
     }
 }
 
@@ -68,27 +75,64 @@ pub fn unprotect_secret(stored: &str) -> Result<(String, bool), String> {
     }
 
     #[cfg(not(windows))]
-    if let Some(b64) = trimmed.strip_prefix(VAULT_PREFIX) {
-        let blob = base64_decode(b64).ok_or_else(|| "invalid base64 in vault secret".to_owned())?;
-        if blob.len() < 32 {
-            return Err("truncated vault secret".to_owned());
-        }
-        let key = load_or_create_posix_vault_key()?;
-        let nonce = &blob[0..16];
-        let expected_tag = hex_encode(&blob[16..32]);
-        let masked = &blob[32..];
-        let actual_tag = compute_keyed_mac_hex(&key, masked);
-        if !constant_time_eq(expected_tag.as_bytes(), &actual_tag.as_bytes()[..32]) {
-            return Err("vault secret authentication tag mismatch".to_owned());
-        }
-        let mut plain_bytes = xor_keystream(&key, nonce, masked);
-        let out = String::from_utf8_lossy(&plain_bytes).into_owned();
-        secure_zero(&mut plain_bytes);
-        return Ok((out, false));
+    if let Some(b64) = trimmed.strip_prefix(VAULT_V2_PREFIX) {
+        let mut key = load_or_create_posix_vault_key()?;
+        let res = aead_open_v2(&key, b64);
+        secure_zero(&mut key);
+        return res.map(|out| (out, false));
     }
 
     // Legacy plaintext value: return as-is and signal `needs_upgrade = true` for transparent encryption.
     Ok((trimmed.to_owned(), true))
+}
+
+/// RFC 8439 `ChaCha20-Poly1305` authenticated encryption binding `key`, 96-bit `nonce`, `VAULT_AEAD_AAD`, and `plaintext`.
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn aead_seal_v2(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    plaintext: &[u8],
+) -> Result<String, String> {
+    let cipher = <ChaCha20Poly1305 as KeyInit>::new(Key::from_slice(key));
+    let ciphertext_and_tag = cipher
+        .encrypt(
+            Nonce::from_slice(nonce),
+            Payload {
+                msg: plaintext,
+                aad: VAULT_AEAD_AAD,
+            },
+        )
+        .map_err(|_| "ChaCha20-Poly1305 AEAD encryption failed".to_owned())?;
+    let mut wire = Vec::with_capacity(12 + ciphertext_and_tag.len());
+    wire.extend_from_slice(nonce);
+    wire.extend_from_slice(&ciphertext_and_tag);
+    Ok(format!("{VAULT_V2_PREFIX}{}", base64_encode(&wire)))
+}
+
+/// RFC 8439 `ChaCha20-Poly1305` authenticated decryption; rejects any bit flip in `nonce`, `ciphertext`, `AAD`, or 128-bit `Poly1305` tag.
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn aead_open_v2(key: &[u8; 32], b64_wire: &str) -> Result<String, String> {
+    let blob = base64_decode(b64_wire).ok_or_else(|| "invalid base64 in vault:v2 secret".to_owned())?;
+    if blob.len() < 12 + 16 {
+        return Err("truncated vault:v2 AEAD payload".to_owned());
+    }
+    let (nonce_bytes, ct_and_tag) = blob.split_at(12);
+    let cipher = <ChaCha20Poly1305 as KeyInit>::new(Key::from_slice(key));
+    let mut plain_bytes = cipher
+        .decrypt(
+            Nonce::from_slice(nonce_bytes),
+            Payload {
+                msg: ct_and_tag,
+                aad: VAULT_AEAD_AAD,
+            },
+        )
+        .map_err(|_| {
+            "ChaCha20-Poly1305 AEAD authentication failed (tampered nonce, ciphertext, or tag)"
+                .to_owned()
+        })?;
+    let out = String::from_utf8_lossy(&plain_bytes).into_owned();
+    secure_zero(&mut plain_bytes);
+    Ok(out)
 }
 
 /// Loads comma/newline-separated dynamic configuration values from `global_db` and optional `proj_db`.
@@ -111,6 +155,48 @@ pub fn load_config_list(
         }
     }
     out
+}
+
+/// Resolves a boolean configuration toggle (`proj_db` overrides `global_db`, falling back to `default_val`).
+pub fn load_bool_config(
+    global_db: Option<&LibreDb>,
+    proj_db: Option<&LibreDb>,
+    key: &str,
+    default_val: bool,
+) -> bool {
+    for db_opt in [proj_db, global_db] {
+        if let Some(db) = db_opt {
+            if let Ok(rec) = db.get_by_key(NodeKind::Config, key) {
+                let low = String::from_utf8_lossy(&rec.payload).trim().to_ascii_lowercase();
+                if matches!(low.as_str(), "1" | "true" | "yes" | "on") {
+                    return true;
+                }
+                if matches!(low.as_str(), "0" | "false" | "no" | "off") {
+                    return false;
+                }
+            }
+        }
+    }
+    default_val
+}
+
+/// Resolves a string configuration value (`proj_db` overrides `global_db`).
+pub fn load_string_config(
+    global_db: Option<&LibreDb>,
+    proj_db: Option<&LibreDb>,
+    key: &str,
+) -> Option<String> {
+    for db_opt in [proj_db, global_db] {
+        if let Some(db) = db_opt {
+            if let Ok(rec) = db.get_by_key(NodeKind::Config, key) {
+                let val = String::from_utf8_lossy(&rec.payload).trim().to_owned();
+                if !val.is_empty() {
+                    return Some(val);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Checks whether `ws_root`'s `.git/index` tracks `.agents/memory.ldb` or `.agents/memory.db`
@@ -211,10 +297,11 @@ pub fn is_workspace_memory_trusted(global_db: Option<&LibreDb>, ws_root: &Path) 
         return false;
     }
 
-    let Ok(secret) = ensure_trust_anchor_secret(gdb) else {
+    let Ok(mut secret) = ensure_trust_anchor_secret(gdb) else {
         return false;
     };
     let expected_seal = compute_workspace_seal(&secret, &norm);
+    secure_zero(&mut secret);
     if let Ok(pdb) = LibreDb::open(&ldb_path) {
         if let Ok(rec) = pdb.get_by_key(NodeKind::Config, TRUST_SEALS_KEY) {
             let seals = String::from_utf8_lossy(&rec.payload);
@@ -239,8 +326,9 @@ pub fn seal_workspace_memory(
     ws_root: &Path,
 ) -> Result<(), String> {
     let norm = normalize_workspace_key(ws_root);
-    let secret = ensure_trust_anchor_secret(global_db)?;
+    let mut secret = ensure_trust_anchor_secret(global_db)?;
     let seal = compute_workspace_seal(&secret, &norm);
+    secure_zero(&mut secret);
 
     let mut seals: Vec<String> = proj_db
         .get_by_key(NodeKind::Config, TRUST_SEALS_KEY)
@@ -471,11 +559,12 @@ pub fn is_safe_auto_git_dir(global_db: Option<&LibreDb>, project_root: &Path) ->
 fn ensure_trust_anchor_secret(global_db: &LibreDb) -> Result<[u8; 32], String> {
     if let Ok(rec) = global_db.get_by_key(NodeKind::Config, TRUST_SECRET_KEY) {
         let raw = String::from_utf8_lossy(&rec.payload).into_owned();
-        let (hex_str, needs_upgrade) = unprotect_secret(&raw)?;
-        if let Some(bytes) = hex_decode(hex_str.trim()) {
+        let (mut hex_str, needs_upgrade) = unprotect_secret(&raw)?;
+        if let Some(mut bytes) = hex_decode(hex_str.trim()) {
             if bytes.len() == 32 {
                 let mut arr = [0u8; 32];
                 arr.copy_from_slice(&bytes);
+                secure_zero(&mut bytes);
                 if needs_upgrade {
                     if let Ok(enc) = protect_secret(hex_str.trim()) {
                         let _ = global_db.put(
@@ -485,15 +574,20 @@ fn ensure_trust_anchor_secret(global_db: &LibreDb) -> Result<[u8; 32], String> {
                         );
                     }
                 }
+                secure_zero(unsafe { hex_str.as_bytes_mut() });
                 return Ok(arr);
             }
+            secure_zero(&mut bytes);
         }
+        secure_zero(unsafe { hex_str.as_bytes_mut() });
     }
 
     let mut secret = [0u8; 32];
     fill_csprng(&mut secret)?;
-    let hex_secret = hex_encode(&secret);
-    let protected = protect_secret(&hex_secret)?;
+    let mut hex_secret = hex_encode(&secret);
+    let protected_res = protect_secret(&hex_secret);
+    secure_zero(unsafe { hex_secret.as_bytes_mut() });
+    let protected = protected_res?;
     global_db
         .put(
             WriteRequest::new(NodeKind::Config, protected.into_bytes())
@@ -505,25 +599,12 @@ fn ensure_trust_anchor_secret(global_db: &LibreDb) -> Result<[u8; 32], String> {
 }
 
 fn compute_workspace_seal(secret: &[u8; 32], normalized_ws_key: &str) -> String {
-    compute_keyed_mac_hex(secret, normalized_ws_key.as_bytes())
-}
-
-fn compute_keyed_mac_hex(secret: &[u8; 32], message: &[u8]) -> String {
-    let mut out = String::with_capacity(64);
-    for lane in 0..4u8 {
-        let mut buf = Vec::with_capacity(64 + message.len());
-        buf.push(0xA5 ^ lane);
-        buf.extend_from_slice(secret);
-        buf.extend_from_slice(message);
-        buf.extend_from_slice(&secret[(lane as usize * 8)..((lane as usize + 1) * 8)]);
-        let h1 = hash_key(200 + lane, &buf);
-        buf.extend_from_slice(&h1.to_le_bytes());
-        buf.extend_from_slice(secret);
-        let h2 = hash_key(220 + lane, &buf);
-        let mixed = h1.rotate_left(17) ^ h2.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        out.push_str(&format!("{mixed:016x}"));
-    }
-    out
+    let mut mac =
+        <HmacSha256 as Mac>::new_from_slice(secret).expect("HMAC-SHA256 accepts 256-bit keys");
+    mac.update(SEAL_DOMAIN_SEP);
+    mac.update(normalized_ws_key.as_bytes());
+    let tag = mac.finalize().into_bytes();
+    format!("hmac-sha256:v2:{}", hex_encode(tag.as_slice()))
 }
 
 fn fill_csprng(dest: &mut [u8]) -> Result<(), String> {
@@ -542,56 +623,64 @@ fn fill_csprng(dest: &mut [u8]) -> Result<(), String> {
 #[cfg(not(windows))]
 fn load_or_create_posix_vault_key() -> Result<[u8; 32], String> {
     let dir = user_home_dir().join(".gemini").join("libredb");
-    let _ = fs::create_dir_all(&dir);
-    let key_path = dir.join(".vault.key");
-    if let Ok(raw) = fs::read(&key_path) {
-        if raw.len() == 32 {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&raw);
-            return Ok(arr);
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    if let Ok(dir_meta) = fs::symlink_metadata(&dir) {
+        if dir_meta.file_type().is_symlink() {
+            return Err("Refusing to use symlinked ~/.gemini/libredb directory".to_owned());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
         }
     }
+    let key_path = dir.join(".vault.key");
+    if let Ok(meta) = fs::symlink_metadata(&key_path) {
+        if meta.file_type().is_symlink() {
+            return Err("Refusing to use symlinked POSIX vault keyfile (.vault.key)".to_owned());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if (meta.permissions().mode() & 0o077) != 0 {
+                let _ = fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600));
+            }
+        }
+        if let Ok(mut raw) = fs::read(&key_path) {
+            if raw.len() == 32 {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&raw);
+                secure_zero(&mut raw);
+                return Ok(arr);
+            }
+            secure_zero(&mut raw);
+        }
+    }
+
     let mut key = [0u8; 32];
     fill_csprng(&mut key)?;
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&key_path)
-        .map_err(|e| e.to_string())?;
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(&key_path).map_err(|e| {
+        secure_zero(&mut key);
+        e.to_string()
+    })?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = f.set_permissions(fs::Permissions::from_mode(0o600));
     }
     use std::io::Write;
-    f.write_all(&key).map_err(|e| e.to_string())?;
-    Ok(key)
-}
-
-#[cfg(not(windows))]
-fn xor_keystream(key: &[u8; 32], nonce: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(data.len());
-    let mut block_idx = 0u64;
-    let mut stream_pos = 0usize;
-    let mut block = [0u8; 32];
-    while stream_pos < data.len() {
-        let mut seed = Vec::with_capacity(56);
-        seed.extend_from_slice(key);
-        seed.extend_from_slice(nonce);
-        seed.extend_from_slice(&block_idx.to_le_bytes());
-        let hex = compute_keyed_mac_hex(key, &seed);
-        if let Some(b) = hex_decode(&hex) {
-            block.copy_from_slice(&b[..32]);
-        }
-        let take = (data.len() - stream_pos).min(32);
-        for j in 0..take {
-            out.push(data[stream_pos + j] ^ block[j]);
-        }
-        stream_pos += take;
-        block_idx += 1;
+    if let Err(e) = f.write_all(&key) {
+        secure_zero(&mut key);
+        return Err(e.to_string());
     }
-    out
+    Ok(key)
 }
 
 fn secure_zero(buf: &mut [u8]) {
@@ -908,5 +997,52 @@ mod tests {
         .is_some());
         assert!(check_mcp_read_path_policy(Path::new(r"D:\Repo\.env.production"), &[]).is_some());
         assert!(check_mcp_read_path_policy(Path::new(r"D:\Repo\.env.example"), &[]).is_none());
+    }
+
+    #[test]
+    fn chacha20_poly1305_aead_authenticates_nonce_ciphertext_and_tag() {
+        let key = [0x42u8; 32];
+        let nonce = [0x24u8; 12];
+        let secret = "corp_pat_9876543210abcdef_ultra_sensitive";
+
+        let sealed = aead_seal_v2(&key, &nonce, secret.as_bytes()).unwrap();
+        let b64 = sealed.strip_prefix(VAULT_V2_PREFIX).unwrap();
+        assert_eq!(aead_open_v2(&key, b64).unwrap(), secret);
+
+        let raw_wire = base64_decode(b64).unwrap();
+        assert_eq!(raw_wire.len(), 12 + secret.len() + 16);
+
+        // 1. Flip 1 bit in the 96-bit nonce (index 0): MUST fail authentication!
+        let mut tampered_nonce = raw_wire.clone();
+        tampered_nonce[0] ^= 0x01;
+        assert!(aead_open_v2(&key, &base64_encode(&tampered_nonce)).is_err());
+
+        // 2. Flip 1 bit in the ciphertext body (index 14): MUST fail authentication!
+        let mut tampered_ct = raw_wire.clone();
+        tampered_ct[14] ^= 0x80;
+        assert!(aead_open_v2(&key, &base64_encode(&tampered_ct)).is_err());
+
+        // 3. Flip 1 bit in the 128-bit Poly1305 tag (last byte): MUST fail authentication!
+        let mut tampered_tag = raw_wire.clone();
+        let last = tampered_tag.len() - 1;
+        tampered_tag[last] ^= 0x01;
+        assert!(aead_open_v2(&key, &base64_encode(&tampered_tag)).is_err());
+
+        // 4. Wrong 256-bit key: MUST fail authentication!
+        let wrong_key = [0x99u8; 32];
+        assert!(aead_open_v2(&wrong_key, b64).is_err());
+    }
+
+    #[test]
+    fn hmac_sha256_workspace_seal_is_domain_separated_and_tamper_evident() {
+        let k1 = [0x11u8; 32];
+        let k2 = [0x22u8; 32];
+        let s1 = compute_workspace_seal(&k1, "d:/projects/alpha");
+        let s2 = compute_workspace_seal(&k1, "d:/projects/beta");
+        let s3 = compute_workspace_seal(&k2, "d:/projects/alpha");
+        assert!(s1.starts_with("hmac-sha256:v2:"));
+        assert_eq!(s1.len(), "hmac-sha256:v2:".len() + 64);
+        assert_ne!(s1, s2);
+        assert_ne!(s1, s3);
     }
 }

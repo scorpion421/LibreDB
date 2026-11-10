@@ -573,8 +573,19 @@ pub fn cmd_gitea_sync(
         }
     }
 
-    let audit =
+    let enforce_style = crate::security::load_bool_config(
+        Some(&ldb),
+        proj_db_opt.as_deref(),
+        "guardrail:style_rules",
+        false,
+    );
+    let mut audit =
         audit_workspace_guardrails_with_prefixes(&clean_root, true, &custom_prefixes)?;
+    if !enforce_style {
+        audit
+            .violations
+            .retain(|v| !matches!(v.rule.as_str(), "no-em-en-dash" | "no-emojis"));
+    }
     if !audit.passed(false) {
         let first = &audit.violations[0];
         return Err(format!(
@@ -611,18 +622,36 @@ pub fn cmd_gitea_sync(
     }
 
     if changed_cnt > 0 {
-        let c_out = Command::new("git")
-            .args([
+        let cfg_author_name = crate::security::load_string_config(
+            Some(&ldb),
+            proj_db_opt.as_deref(),
+            "git:author_name",
+        );
+        let cfg_author_email = crate::security::load_string_config(
+            Some(&ldb),
+            proj_db_opt.as_deref(),
+            "git:author_email",
+        );
+
+        let mut commit_cmd = Command::new("git");
+        commit_cmd.current_dir(&clean_root);
+        if let (Some(name), Some(email)) = (cfg_author_name, cfg_author_email) {
+            commit_cmd.args([
                 "-c",
-                "user.name=Antigravity",
+                &format!("user.name={name}"),
                 "-c",
-                "user.email=antigravity@local.dev",
-                "commit",
-                "-m",
-                message,
-            ])
-            .current_dir(&clean_root)
-            .output()?;
+                &format!("user.email={email}"),
+            ]);
+        } else if !git_has_configured_identity(&clean_root) {
+            commit_cmd.args([
+                "-c",
+                "user.name=LibreDB",
+                "-c",
+                "user.email=libredb@localhost",
+            ]);
+        }
+        commit_cmd.args(["commit", "-m", message]);
+        let c_out = commit_cmd.output()?;
         if !c_out.status.success() {
             return Err(format!(
                 "git commit failed: {}",
@@ -1100,15 +1129,40 @@ fn ensure_local_git_initialized(
         ensure_git_safe_dir(project_root, global_db);
     }
     ensure_git_info_exclude(project_root);
-    let _ = Command::new("git")
-        .args(["config", "user.name", "Antigravity"])
-        .current_dir(project_root)
-        .output();
-    let _ = Command::new("git")
-        .args(["config", "user.email", "antigravity@local.dev"])
-        .current_dir(project_root)
-        .output();
+    let cfg_name = crate::security::load_string_config(global_db, None, "git:author_name");
+    let cfg_email = crate::security::load_string_config(global_db, None, "git:author_email");
+    if let (Some(name), Some(email)) = (cfg_name, cfg_email) {
+        let _ = Command::new("git")
+            .args(["config", "user.name", &name])
+            .current_dir(project_root)
+            .output();
+        let _ = Command::new("git")
+            .args(["config", "user.email", &email])
+            .current_dir(project_root)
+            .output();
+    } else if !git_has_configured_identity(project_root) {
+        let _ = Command::new("git")
+            .args(["config", "user.name", "LibreDB"])
+            .current_dir(project_root)
+            .output();
+        let _ = Command::new("git")
+            .args(["config", "user.email", "libredb@localhost"])
+            .current_dir(project_root)
+            .output();
+    }
     Ok(())
+}
+
+fn git_has_configured_identity(root: &Path) -> bool {
+    let has_key = |k: &str| -> bool {
+        Command::new("git")
+            .args(["config", k])
+            .current_dir(root)
+            .output()
+            .map(|o| o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+            .unwrap_or(false)
+    };
+    has_key("user.name") && has_key("user.email")
 }
 
 fn ensure_git_info_exclude(project_root: &Path) {
