@@ -46,7 +46,7 @@ Antigravity Cognitive & Code-Graph Commands:
   libredb mcp-serve [<default_project.ldb>] [--global <customizations.ldb>]
 
 Security, Trust & Universal Configuration Commands:
-  libredb trust [<dir>] [--revoke] [--list] [--migrate-v2] [--if-clean] [--global <customizations.ldb>]
+  libredb trust [<dir>] [--revoke] [--list] [--migrate-v3 [--confirm-metadata]] [--migrate-v2] [--if-clean] [--global <customizations.ldb>]
   libredb config <get|set|unset|list> [<key>] [<value>] [--project <dir>] [--global <customizations.ldb>]
   libredb guardrail check [--path <dir>] [--staged] [--strict]
   libredb hook-pre-tool [--global <customizations.ldb>]
@@ -211,6 +211,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let mut revoke = false;
             let mut list = false;
             let mut migrate_v2 = false;
+            let mut migrate_v3 = false;
+            let mut confirm_metadata = false;
             let mut if_clean = false;
             let mut global_path: Option<PathBuf> = None;
             let mut i = 1usize;
@@ -226,6 +228,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     "--migrate-v2" => {
                         migrate_v2 = true;
+                        i += 1;
+                    }
+                    "--migrate-v3" => {
+                        migrate_v3 = true;
+                        i += 1;
+                    }
+                    "--confirm-metadata" => {
+                        confirm_metadata = true;
                         i += 1;
                     }
                     "--if-clean" => {
@@ -249,6 +259,56 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("=== Trusted Workspaces ({}) ===", items.len());
                 for (_, display_path) in items {
                     println!("  * {display_path}");
+                }
+            } else if migrate_v3 {
+                if let Some(target_dir) = dir_opt {
+                    let abs = std::fs::canonicalize(&target_dir).unwrap_or(target_dir);
+                    let clean = gitea::strip_verbatim_prefix(&abs);
+                    if security::migrate_workspace_seal_v3_to_v4(&gdb, &clean, confirm_metadata)? {
+                        println!(
+                            "[OK] Verified legacy v0.9.3 HMAC + Inode invariants and upgraded workspace '{}' to v4 metadata-bound seal",
+                            clean.display()
+                        );
+                    } else {
+                        println!(
+                            "[OK] Workspace '{}' already carries a valid v4 metadata-bound trust seal",
+                            clean.display()
+                        );
+                    }
+                } else {
+                    let mut migrated = 0usize;
+                    let mut already_valid = 0usize;
+                    let mut rejected = 0usize;
+                    for (_, raw_ws) in security::list_trusted_workspaces(&gdb) {
+                        let ws_path = PathBuf::from(raw_ws.trim());
+                        if !ws_path.is_dir() || !ws_path.join(".agents").join("memory.ldb").is_file() {
+                            continue;
+                        }
+                        match security::migrate_workspace_seal_v3_to_v4(
+                            &gdb,
+                            &ws_path,
+                            confirm_metadata,
+                        ) {
+                            Ok(true) => migrated += 1,
+                            Ok(false) => already_valid += 1,
+                            Err(msg) => {
+                                rejected += 1;
+                                eprintln!(
+                                    "[WARN] Refused v3->v4 seal migration for '{}': {msg}",
+                                    ws_path.display()
+                                );
+                            }
+                        }
+                    }
+                    println!(
+                        "[OK] Workspace v3->v4 seal migration summary: {migrated} upgraded, {already_valid} already v4, {rejected} rejected"
+                    );
+                    if rejected > 0 {
+                        return Err(format!(
+                            "{rejected} workspace(s) require inspection / '--confirm-metadata' or failed v3 HMAC verification and remain quarantined"
+                        )
+                        .into());
+                    }
                 }
             } else if migrate_v2 {
                 if let Some(target_dir) = dir_opt {
@@ -434,7 +494,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let mut rows: Vec<(String, String)> = Vec::new();
                     for (ino, k_opt, _) in db.list_inodes(Some(NodeKind::Config), false) {
                         let Some(k) = k_opt else { continue };
-                        if k == "sys::trust_anchor_secret" || k.starts_with("trust:v3_upgraded::") {
+                        if k == "sys::trust_anchor_secret"
+                            || k.starts_with("trust:v3_upgraded::")
+                            || k.starts_with("trust:v4_upgraded::")
+                        {
                             continue;
                         }
                         if let Ok(rec) = db.get(ino.node_id) {
@@ -2097,12 +2160,20 @@ fn modernize_global_db(
                 verified_workspaces += 1;
             } else {
                 quarantined_workspaces += 1;
-                println!(
-                    "[WARN] Quarantined workspace '{}': .agents/memory.ldb has an unverified, legacy v2, or modified seal (run 'libredb trust --migrate-v2 \"{}\"' for v0.9.0 upgrades or 'libredb trust \"{}\"' after manual inspection).",
-                    ws_path.display(),
-                    ws_path.display(),
-                    ws_path.display()
-                );
+                if security::has_valid_legacy_v3_content_seal(gdb, &ws_path) {
+                    println!(
+                        "[WARN] Quarantined workspace '{}': .agents/memory.ldb carries a valid legacy v0.9.3 content seal (CognitiveContent::v3) without v4 metadata authentication; run 'libredb trust --migrate-v3 \"{}\"' (adding '--confirm-metadata' after reviewing unauthenticated metadata if prompted).",
+                        ws_path.display(),
+                        ws_path.display()
+                    );
+                } else {
+                    println!(
+                        "[WARN] Quarantined workspace '{}': .agents/memory.ldb has an unverified, legacy v2, or modified seal (run 'libredb trust --migrate-v2 \"{}\"' for v0.9.0 upgrades or 'libredb trust \"{}\"' after manual inspection).",
+                        ws_path.display(),
+                        ws_path.display(),
+                        ws_path.display()
+                    );
+                }
             }
         }
     }

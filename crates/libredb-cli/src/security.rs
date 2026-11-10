@@ -7,8 +7,10 @@ use crate::hooks::user_home_dir;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use hmac::{Hmac, Mac};
-use libredb_core::crc::hash_key;
-use libredb_core::{EdgeKind, LibreDb, NodeFlags, NodeKind, WriteRequest};
+use libredb_core::crc::{count_tokens_exact, hash_key};
+use libredb_core::{
+    EdgeKind, LibreDb, NodeFlags, NodeKind, OsFileBackend, StorageBackend, WriteRequest,
+};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -19,9 +21,11 @@ const DPAPI_PREFIX: &str = "dpapi:v1:";
 const VAULT_V1_PREFIX: &str = "vault:v1:";
 const VAULT_V2_PREFIX: &str = "vault:v2:";
 const VAULT_AEAD_AAD: &[u8] = b"LibreDB::CredentialVault::v2";
+const CONTENT_DIGEST_V3_DOMAIN: &[u8] = b"LibreDB::CognitiveContent::v3\0";
 const CONTENT_DIGEST_DOMAIN: &[u8] = b"LibreDB::CognitiveContent::v4\0";
 const SEAL_V2_DOMAIN_SEP: &[u8] = b"LibreDB::WorkspaceTrustSeal::v2\0";
 const SEAL_V3_DOMAIN_SEP: &[u8] = b"LibreDB::WorkspaceTrustSeal::v3\0";
+const SEAL_V4_DOMAIN_SEP: &[u8] = b"LibreDB::WorkspaceTrustSeal::v4\0";
 const TRUST_SECRET_KEY: &str = "sys::trust_anchor_secret";
 const TRUST_SEALS_KEY: &str = "sys::trust_seals";
 
@@ -575,14 +579,131 @@ pub fn compute_cognitive_content_digest(proj_db: &LibreDb) -> Result<([u8; 32], 
     Ok((arr, count))
 }
 
+/// Computes the exact legacy `v0.9.1..v0.9.3` content digest (`LibreDB::CognitiveContent::v3\0` over the
+/// 10 `(kind, key, payload)` tuples) strictly for read-only cross-version signature verification inside
+/// `has_valid_legacy_v3_content_seal` and `migrate_workspace_seal_v3_to_v4`.
+pub(crate) fn compute_legacy_cognitive_content_digest_v3(
+    proj_db: &LibreDb,
+) -> Result<([u8; 32], usize), String> {
+    let mut targets: Vec<(u8, String, u64)> = Vec::new();
+    for (ino, key_opt, _) in proj_db.list_inodes(None, false) {
+        if !ino.flags.is_live_active() {
+            continue;
+        }
+        let include = match ino.kind {
+            NodeKind::Rule
+            | NodeKind::Skill
+            | NodeKind::SkillSection
+            | NodeKind::Decision
+            | NodeKind::Fact
+            | NodeKind::Task
+            | NodeKind::Handoff
+            | NodeKind::Snapshot
+            | NodeKind::CompactionCheckpoint => true,
+            NodeKind::Config => key_opt.as_deref() != Some(TRUST_SEALS_KEY),
+            _ => false,
+        };
+        if include {
+            targets.push((ino.kind as u8, key_opt.unwrap_or_default(), ino.node_id));
+        }
+    }
+
+    let count = targets.len();
+    let mut entries: Vec<(u8, String, Vec<u8>)> = Vec::with_capacity(count);
+    if !targets.is_empty() {
+        let ids: Vec<u64> = targets.iter().map(|(_, _, id)| *id).collect();
+        let (recs, _) = proj_db
+            .get_many_coalesced(&ids)
+            .map_err(|e| e.to_string())?;
+        let mut by_id: std::collections::HashMap<u64, Vec<u8>> =
+            std::collections::HashMap::with_capacity(recs.len());
+        for r in recs {
+            by_id.insert(r.node_id, r.payload);
+        }
+        for (kind_b, k, id) in targets {
+            let payload = by_id.remove(&id).unwrap_or_default();
+            entries.push((kind_b, k, payload));
+        }
+        entries.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.2.cmp(&b.2))
+        });
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(CONTENT_DIGEST_V3_DOMAIN);
+    hasher.update((entries.len() as u64).to_le_bytes());
+    for (kind_b, key_str, payload) in &entries {
+        hasher.update([*kind_b]);
+        hasher.update((key_str.len() as u32).to_le_bytes());
+        hasher.update(key_str.as_bytes());
+        hasher.update((payload.len() as u64).to_le_bytes());
+        hasher.update(payload);
+    }
+    let out = hasher.finalize();
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(out.as_slice());
+    Ok((arr, count))
+}
+
+/// Returns `true` strictly for diagnostic classification when `<ws_root>/.agents/memory.ldb`
+/// has NOT yet been upgraded to `v4` on this host and carries an authentic `v0.9.1..v0.9.3`
+/// `hmac-sha256:v3:` tag over `CognitiveContent::v3`. Never grants runtime trust on its own.
+pub fn has_valid_legacy_v3_content_seal(global_db: &LibreDb, ws_root: &Path) -> bool {
+    let norm = normalize_workspace_key(ws_root);
+    if global_db
+        .get_by_key(NodeKind::Config, &format!("trust:revoked::{norm}"))
+        .is_ok()
+        || global_db
+            .get_by_key(NodeKind::Config, &format!("trust:v4_upgraded::{norm}"))
+            .is_ok()
+    {
+        return false;
+    }
+    if !is_workspace_path_authorized(Some(global_db), ws_root) {
+        return false;
+    }
+    let ldb_path = ws_root.join(".agents").join("memory.ldb");
+    let Ok(pdb) = LibreDb::open(&ldb_path) else {
+        return false;
+    };
+    let Ok(rec) = pdb.get_by_key(NodeKind::Config, TRUST_SEALS_KEY) else {
+        return false;
+    };
+    let Ok((legacy_v3_digest, _)) = compute_legacy_cognitive_content_digest_v3(&pdb) else {
+        return false;
+    };
+    let Ok(mut secret) = ensure_trust_anchor_secret(global_db) else {
+        return false;
+    };
+    let host_tag = compute_host_seal_slot_id(&secret, &norm);
+    let expected_legacy_v3 = compute_workspace_seal_v3(&secret, &norm, &legacy_v3_digest);
+    let expected_slot_v3 = format!("{host_tag}={expected_legacy_v3}");
+    secure_zero(&mut secret);
+
+    let seals_txt = String::from_utf8_lossy(&rec.payload);
+    if seals_txt
+        .lines()
+        .any(|l| l.trim().starts_with(&format!("{host_tag}=hmac-sha256:v4:")))
+    {
+        return false;
+    }
+    seals_txt.lines().any(|line| {
+        let trimmed = line.trim().as_bytes();
+        constant_time_eq(trimmed, expected_legacy_v3.as_bytes())
+            || constant_time_eq(trimmed, expected_slot_v3.as_bytes())
+    })
+}
+
 /// Determines whether `<ws_root>/.agents/memory.ldb` (or `.db`) is trusted AND untampered:
 /// 1. Private Antigravity conversation brain (`~/.gemini/antigravity*/brain/<cid>`) -> `true`.
 /// 2. Explicit revocation (`trust:revoked::<ws>`) -> `false`.
 /// 3. Git-tracked `.agents/memory.*` inside `.git/index` -> `false` unless explicitly sealed via `libredb trust`.
 /// 4. Brand-new workspace where neither `.ldb` nor `.db` exists yet -> `true`.
-/// 5. Existing `.agents/memory.ldb` with cognitive capsules MUST carry a valid `hmac-sha256:v3:` seal
-///    authenticating both `normalized_ws_key` AND `compute_cognitive_content_digest(&pdb)`. Any offline
-///    modification to capsule content or context-selecting metadata invalidates the HMAC immediately.
+/// 5. Existing `.agents/memory.ldb` with cognitive capsules MUST carry a valid `v4`-digest HMAC seal
+///    authenticating both `normalized_ws_key` AND `compute_cognitive_content_digest(&pdb)` (`v4` metadata + synapses).
+///    Legacy `v0.9.3` (`CognitiveContent::v3`) databases fail closed until migrated via `libredb trust --migrate-v3`.
 pub fn is_workspace_memory_trusted(global_db: Option<&LibreDb>, ws_root: &Path) -> bool {
     if is_private_brain_workspace(ws_root) {
         return true;
@@ -615,13 +736,17 @@ pub fn is_workspace_memory_trusted(global_db: Option<&LibreDb>, ws_root: &Path) 
         return true;
     }
 
+    let already_v4_ratcheted = gdb
+        .get_by_key(NodeKind::Config, &format!("trust:v4_upgraded::{norm}"))
+        .is_ok();
     let path_authorized = explicitly_allowed || is_workspace_path_authorized(Some(gdb), ws_root);
     if !ldb_path.is_file() {
-        // Monotonic anti-downgrade guard: if this workspace was already upgraded to `v3` on this host,
-        // deleting `.agents/memory.ldb` and planting a legacy `.agents/memory.db` must NOT bypass `v3` checks.
-        if gdb
-            .get_by_key(NodeKind::Config, &format!("trust:v3_upgraded::{norm}"))
-            .is_ok()
+        // Monotonic anti-downgrade guard: if this workspace was already upgraded to `v3` or `v4` on this host,
+        // deleting `.agents/memory.ldb` and planting a legacy `.agents/memory.db` must NOT bypass seal checks.
+        if already_v4_ratcheted
+            || gdb
+                .get_by_key(NodeKind::Config, &format!("trust:v3_upgraded::{norm}"))
+                .is_ok()
         {
             return false;
         }
@@ -637,14 +762,34 @@ pub fn is_workspace_memory_trusted(global_db: Option<&LibreDb>, ws_root: &Path) 
     let Ok(mut secret) = ensure_trust_anchor_secret(gdb) else {
         return false;
     };
-    let expected_seal = compute_workspace_seal_v3(&secret, &norm, &content_digest);
+    let host_tag = compute_host_seal_slot_id(&secret, &norm);
+    let expected_v4 = compute_workspace_seal_v4(&secret, &norm, &content_digest);
+    let expected_slot_v4 = format!("{host_tag}={expected_v4}");
+    let expected_v3_over_v4 = compute_workspace_seal_v3(&secret, &norm, &content_digest);
+    let expected_slot_v3_over_v4 = format!("{host_tag}={expected_v3_over_v4}");
     secure_zero(&mut secret);
 
     if let Ok(rec) = pdb.get_by_key(NodeKind::Config, TRUST_SEALS_KEY) {
         let seals = String::from_utf8_lossy(&rec.payload);
-        if seals
+        let has_host_v4_slot = seals
             .lines()
-            .any(|line| constant_time_eq(line.trim().as_bytes(), expected_seal.as_bytes()))
+            .any(|l| l.trim().starts_with(&format!("{host_tag}=hmac-sha256:v4:")));
+        if seals.lines().any(|line| {
+            let trimmed = line.trim().as_bytes();
+            constant_time_eq(trimmed, expected_v4.as_bytes())
+                || constant_time_eq(trimmed, expected_slot_v4.as_bytes())
+        }) {
+            return true;
+        }
+        // Seamless compatibility for `v0.9.4`/`v0.9.5` workspaces (which already hashed `CognitiveContent::v4`
+        // under `hmac-sha256:v3:`) prior to their first `v4` ratchet write on this host:
+        if !already_v4_ratcheted
+            && !has_host_v4_slot
+            && seals.lines().any(|line| {
+                let trimmed = line.trim().as_bytes();
+                constant_time_eq(trimmed, expected_v3_over_v4.as_bytes())
+                    || constant_time_eq(trimmed, expected_slot_v3_over_v4.as_bytes())
+            })
         {
             return true;
         }
@@ -656,9 +801,9 @@ pub fn is_workspace_memory_trusted(global_db: Option<&LibreDb>, ws_root: &Path) 
     capsule_count == 0 && path_authorized
 }
 
-/// Cryptographically seals both `ws_root` and the SHA-256 content digest of `proj_db`'s cognitive capsules
-/// via RFC 2104 `HMAC-SHA256` (`hmac-sha256:v3:<64-hex>`), replacing any stale seal for this host's secret
-/// while preserving up to 7 roaming workstation seals on shared drives (`Q:\`).
+/// Cryptographically seals both `ws_root` and the `v4` SHA-256 content+metadata+synapse digest of `proj_db`'s
+/// cognitive capsules via RFC 2104 `HMAC-SHA256` (`hmac-sha256:v4:<64-hex>`), replacing any stale seal for
+/// this host's secret while preserving up to 7 roaming workstation seals on shared drives (`Q:\`).
 pub fn seal_workspace_memory(
     global_db: &LibreDb,
     proj_db: &LibreDb,
@@ -668,11 +813,8 @@ pub fn seal_workspace_memory(
     let (content_digest, _) = compute_cognitive_content_digest(proj_db)?;
     let mut secret = ensure_trust_anchor_secret(global_db)?;
     let host_tag = compute_host_seal_slot_id(&secret, &norm);
-    let seal_line = format!(
-        "{host_tag}={}",
-        compute_workspace_seal_v3(&secret, &norm, &content_digest)
-    );
-    let bare_seal = compute_workspace_seal_v3(&secret, &norm, &content_digest);
+    let bare_seal = compute_workspace_seal_v4(&secret, &norm, &content_digest);
+    let seal_line = format!("{host_tag}={bare_seal}");
     secure_zero(&mut secret);
 
     let mut seals: Vec<String> = proj_db
@@ -686,13 +828,14 @@ pub fn seal_workspace_memory(
                     !s.is_empty()
                         && !s.starts_with(&format!("{host_tag}="))
                         && !s.starts_with("hmac-sha256:v2:")
+                        && !s.starts_with("hmac-sha256:v3:")
+                        && !s.starts_with("hmac-sha256:v4:")
                 })
                 .map(ToOwned::to_owned)
                 .collect()
         })
         .unwrap_or_default();
 
-    seals.retain(|s| s != &bare_seal);
     seals.push(bare_seal);
     seals.push(seal_line);
     if seals.len() > 16 {
@@ -732,15 +875,19 @@ pub fn seal_workspace_memory(
             )
             .map_err(|e| e.to_string())?;
     }
-    let v3_ratchet_key = format!("trust:v3_upgraded::{norm}");
-    if global_db.get_by_key(NodeKind::Config, &v3_ratchet_key).is_err() {
-        global_db
-            .put(
-                WriteRequest::new(NodeKind::Config, b"v3".to_vec())
-                    .with_key(v3_ratchet_key)
-                    .with_importance(180),
-            )
-            .map_err(|e| e.to_string())?;
+    for (ratchet_key, marker) in [
+        (format!("trust:v3_upgraded::{norm}"), b"v3".as_slice()),
+        (format!("trust:v4_upgraded::{norm}"), b"v4".as_slice()),
+    ] {
+        if global_db.get_by_key(NodeKind::Config, &ratchet_key).is_err() {
+            global_db
+                .put(
+                    WriteRequest::new(NodeKind::Config, marker.to_vec())
+                        .with_key(ratchet_key)
+                        .with_importance(180),
+                )
+                .map_err(|e| e.to_string())?;
+        }
     }
     Ok(())
 }
@@ -792,9 +939,17 @@ impl PreMutationSealGuard {
             });
         }
         if !is_workspace_memory_trusted(Some(gdb), ws_root) {
+            if has_valid_legacy_v3_content_seal(gdb, ws_root) {
+                return Err(format!(
+                    "Workspace memory at '{}' carries a valid legacy v0.9.3 content seal (CognitiveContent::v3) that does not yet authenticate v4 metadata/synapses. Run 'libredb trust --migrate-v3 \"{}\"' (with '--confirm-metadata' after reviewing unauthenticated metadata if prompted) before writing to it.",
+                    db_path.display(),
+                    ws_root.display()
+                ));
+            }
             return Err(format!(
-                "Workspace memory at '{}' failed hmac-sha256:v3 content-seal verification (offline modification or legacy seal detected). Inspect the database and run 'libredb trust \"{}\"' (or 'libredb trust --migrate-v2 \"{}\"') before writing to it.",
+                "Workspace memory at '{}' failed workspace content-seal verification (offline modification or legacy seal detected). Inspect the database and run 'libredb trust \"{}\"' (or 'libredb trust --migrate-v3 \"{}\"' / 'libredb trust --migrate-v2 \"{}\"') before writing to it.",
                 db_path.display(),
+                ws_root.display(),
                 ws_root.display(),
                 ws_root.display()
             ));
@@ -822,9 +977,9 @@ impl PreMutationSealGuard {
 }
 
 /// Explicitly migrates a legacy `v0.9.0` path-bound `hmac-sha256:v2:` workspace seal to a
-/// content-bound `hmac-sha256:v3:` seal ONLY after verifying:
+/// metadata-and-content-bound `hmac-sha256:v4:` seal ONLY after verifying:
 /// 1. `ws_root` is authorized in `global_db` and `.agents/memory.*` is not tracked in `.git/index`.
-/// 2. `<ws_root>/.agents/memory.ldb` does NOT already carry a broken/tampered `v3` seal for this host.
+/// 2. `<ws_root>/.agents/memory.ldb` was NOT already upgraded to `v3` or `v4` on this host.
 /// 3. `sys::trust_seals` carries a genuine `hmac-sha256:v2:` tag matching this host's `sys::trust_anchor_secret`.
 pub fn migrate_workspace_seal_v2_to_v3(
     global_db: &LibreDb,
@@ -880,19 +1035,24 @@ pub fn migrate_workspace_seal_v2_to_v3(
     secure_zero(&mut secret);
 
     let seals_txt = String::from_utf8_lossy(&rec.payload);
-    // Monotonic anti-downgrade ratchet: if `global_db` (`customizations.ldb`) already recorded a `v3` seal
-    // for this workspace OR `sys::trust_seals` carries a `v3` slot entry for this host (which failed
-    // `is_workspace_memory_trusted` above), refuse `--migrate-v2` even if an attacker stripped the `v3` line
+    // Monotonic anti-downgrade ratchet: if `global_db` (`customizations.ldb`) already recorded a `v3` or `v4` seal
+    // for this workspace OR `sys::trust_seals` carries a `v3`/`v4` slot entry for this host (which failed
+    // `is_workspace_memory_trusted` above), refuse `--migrate-v2` even if an attacker stripped the slot line
     // from `.agents/memory.ldb` and replayed a captured `v0.9.0` `v2` tag!
-    let already_v3_in_global = global_db
+    let already_upgraded_in_global = global_db
         .get_by_key(NodeKind::Config, &format!("trust:v3_upgraded::{norm}"))
-        .is_ok();
-    let has_failed_host_v3 = seals_txt
-        .lines()
-        .any(|l| l.trim().starts_with(&format!("{host_tag}=hmac-sha256:v3:")));
-    if already_v3_in_global || has_failed_host_v3 {
+        .is_ok()
+        || global_db
+            .get_by_key(NodeKind::Config, &format!("trust:v4_upgraded::{norm}"))
+            .is_ok();
+    let has_failed_host_slot = seals_txt.lines().any(|l| {
+        let t = l.trim();
+        t.starts_with(&format!("{host_tag}=hmac-sha256:v3:"))
+            || t.starts_with(&format!("{host_tag}=hmac-sha256:v4:"))
+    });
+    if already_upgraded_in_global || has_failed_host_slot {
         return Err(format!(
-            "Workspace memory at '{}' was already upgraded to hmac-sha256:v3 on this host (content tampering or v2 replay downgrade detected); refusing v2 migration.",
+            "Workspace memory at '{}' was already upgraded beyond hmac-sha256:v2 on this host (content tampering or v2 replay downgrade detected); refusing v2 migration.",
             ldb_path.display()
         ));
     }
@@ -903,6 +1063,248 @@ pub fn migrate_workspace_seal_v2_to_v3(
     if !has_valid_v2 {
         return Err(format!(
             "Workspace memory at '{}' does not carry a valid hmac-sha256:v2 seal for this host; inspect and run 'libredb trust \"{}\"'.",
+            ldb_path.display(),
+            ws_root.display()
+        ));
+    }
+
+    seal_workspace_memory(global_db, &pdb, ws_root)?;
+    Ok(true)
+}
+
+/// Explicitly migrates a `v0.9.1..v0.9.3` `CognitiveContent::v3` workspace seal (`hmac-sha256:v3:`)
+/// to a `v4` metadata-and-synapse-authenticated seal (`hmac-sha256:v4:`) WITHOUT silent trust laundering:
+/// 1. Rejects revoked, unauthorized, git-tracked, or already-`v4`-upgraded workspaces (anti-downgrade ratchet).
+/// 2. Verifies the existing `hmac-sha256:v3:` tag in constant time against the exact `v0.9.3`
+///    `CognitiveContent::v3` digest (`kind`, `key`, `payload`), rejecting any payload/key tampering.
+/// 3. Enforces hard `Inode` binary consistency invariants across all active cognitive capsules
+///    (`generation >= 1`, `updated_ns >= created_ns`, `token_count == count_tokens_exact(&payload)`,
+///    and `updated_ns == created_ns` on unlinked non-`Decision`/`Task` capsules), unconditionally
+///    blocking raw binary `Inode` timestamp/token tampering even when `confirm_unauthenticated_metadata` is `true`.
+/// 4. Audits metadata & graph elements that `v0.9.3` did NOT authenticate (`SynonymCluster` / `AgentTemplate` /
+///    `TaskVerification` capsules, cognitive-to-cognitive synapses, `PINNED` non-`Rule` capsules, custom
+///    `importance != 128`, or multiple `Fact` / `Decision` capsules whose relative ordering relies on
+///    `updated_ns` / `node_id`). If any such unauthenticated surface exists and `confirm_unauthenticated_metadata`
+///    is `false`, refuses automatic re-sealing and reports the exact counts requiring human confirmation
+///    via `--confirm-metadata`.
+pub fn migrate_workspace_seal_v3_to_v4(
+    global_db: &LibreDb,
+    ws_root: &Path,
+    confirm_unauthenticated_metadata: bool,
+) -> Result<bool, String> {
+    let norm = normalize_workspace_key(ws_root);
+    if global_db
+        .get_by_key(NodeKind::Config, &format!("trust:revoked::{norm}"))
+        .is_ok()
+    {
+        return Err(format!(
+            "Workspace '{}' has been explicitly revoked; run 'libredb trust \"{}\"' to re-authorize.",
+            ws_root.display(),
+            ws_root.display()
+        ));
+    }
+    if !is_workspace_path_authorized(Some(global_db), ws_root) {
+        return Err(format!(
+            "Workspace '{}' is not registered as trusted in customizations.ldb.",
+            ws_root.display()
+        ));
+    }
+    if is_git_index_tracking_agents_db(ws_root)
+        && global_db
+            .get_by_key(NodeKind::Config, &format!("trust:allowed::{norm}"))
+            .is_err()
+    {
+        return Err(format!(
+            "Workspace '{}' tracks .agents/memory.* inside .git/index; refusing v3->v4 seal migration.",
+            ws_root.display()
+        ));
+    }
+
+    let ldb_path = ws_root.join(".agents").join("memory.ldb");
+    if !ldb_path.is_file() {
+        return Ok(false);
+    }
+    let pdb = LibreDb::open(&ldb_path).map_err(|e| e.to_string())?;
+
+    // If the workspace already passes `v4` verification (including `v0.9.4`/`v0.9.5` `v3`-over-`v4` seals),
+    // ensure its `hmac-sha256:v4:` tag and `trust:v4_upgraded` ratchet are recorded cleanly.
+    if is_workspace_memory_trusted(Some(global_db), ws_root) {
+        let already_v4_ratcheted = global_db
+            .get_by_key(NodeKind::Config, &format!("trust:v4_upgraded::{norm}"))
+            .is_ok();
+        if !already_v4_ratcheted {
+            seal_workspace_memory(global_db, &pdb, ws_root)?;
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+
+    let rec = pdb.get_by_key(NodeKind::Config, TRUST_SEALS_KEY).map_err(|_| {
+        format!(
+            "Workspace memory at '{}' has no sys::trust_seals entry; inspect and run 'libredb trust \"{}\"' if trusted.",
+            ldb_path.display(),
+            ws_root.display()
+        )
+    })?;
+
+    let (legacy_v3_digest, v3_capsule_count) = compute_legacy_cognitive_content_digest_v3(&pdb)?;
+    let mut secret = ensure_trust_anchor_secret(global_db)?;
+    let host_tag = compute_host_seal_slot_id(&secret, &norm);
+    let expected_legacy_v3 = compute_workspace_seal_v3(&secret, &norm, &legacy_v3_digest);
+    let expected_slot_v3 = format!("{host_tag}={expected_legacy_v3}");
+    secure_zero(&mut secret);
+
+    let seals_txt = String::from_utf8_lossy(&rec.payload);
+    let already_v4_in_global = global_db
+        .get_by_key(NodeKind::Config, &format!("trust:v4_upgraded::{norm}"))
+        .is_ok();
+    let has_failed_host_v4 = seals_txt
+        .lines()
+        .any(|l| l.trim().starts_with(&format!("{host_tag}=hmac-sha256:v4:")));
+    if already_v4_in_global || has_failed_host_v4 {
+        return Err(format!(
+            "Workspace memory at '{}' was already upgraded to hmac-sha256:v4 on this host (content/metadata tampering or v3 replay downgrade detected); refusing v3->v4 migration.",
+            ldb_path.display()
+        ));
+    }
+
+    let has_valid_legacy_v3 = seals_txt.lines().any(|line| {
+        let trimmed = line.trim().as_bytes();
+        constant_time_eq(trimmed, expected_legacy_v3.as_bytes())
+            || constant_time_eq(trimmed, expected_slot_v3.as_bytes())
+    });
+    if !has_valid_legacy_v3 {
+        return Err(format!(
+            "Workspace memory at '{}' failed legacy v0.9.3 CognitiveContent::v3 HMAC verification (payload tampering or foreign host seal detected); refusing v3->v4 migration.",
+            ldb_path.display()
+        ));
+    }
+
+    // Hard Inode binary consistency checks + audit of metadata/graph surface not covered by `v0.9.3`:
+    let all_inodes = pdb.list_inodes(None, false);
+    let mut active_cognitive_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut cognitive_inodes = Vec::new();
+    for (ino, key_opt, syns) in all_inodes {
+        if !ino.flags.is_live_active() {
+            continue;
+        }
+        let include = match ino.kind {
+            NodeKind::Rule
+            | NodeKind::Skill
+            | NodeKind::SkillSection
+            | NodeKind::SynonymCluster
+            | NodeKind::AgentTemplate
+            | NodeKind::Decision
+            | NodeKind::Fact
+            | NodeKind::Task
+            | NodeKind::TaskVerification
+            | NodeKind::Handoff
+            | NodeKind::Snapshot
+            | NodeKind::CompactionCheckpoint => true,
+            NodeKind::Config => key_opt.as_deref() != Some(TRUST_SEALS_KEY),
+            _ => false,
+        };
+        if include {
+            active_cognitive_ids.insert(ino.node_id);
+            cognitive_inodes.push((ino, key_opt, syns));
+        }
+    }
+
+    let mut newly_covered_kinds = 0usize;
+    let mut cognitive_synapses = 0usize;
+    let mut pinned_non_rules = 0usize;
+    let mut custom_importance = 0usize;
+    let mut fact_count = 0usize;
+    let mut decision_count = 0usize;
+
+    if !cognitive_inodes.is_empty() {
+        let ids: Vec<u64> = cognitive_inodes.iter().map(|(i, _, _)| i.node_id).collect();
+        let (recs, _) = pdb.get_many_coalesced(&ids).map_err(|e| e.to_string())?;
+        let mut payload_by_id: std::collections::HashMap<u64, Vec<u8>> =
+            std::collections::HashMap::with_capacity(recs.len());
+        for r in recs {
+            payload_by_id.insert(r.node_id, r.payload);
+        }
+
+        for (ino, key_opt, syns) in &cognitive_inodes {
+            let label = key_opt
+                .as_deref()
+                .unwrap_or("<unkeyed>");
+            if ino.generation == 0 || ino.updated_ns < ino.created_ns {
+                return Err(format!(
+                    "Workspace memory at '{}' contains corrupted Inode timestamps/generation on node #{} ('{}'); refusing v3->v4 migration.",
+                    ldb_path.display(),
+                    ino.node_id,
+                    label
+                ));
+            }
+            let payload = payload_by_id.get(&ino.node_id).ok_or_else(|| {
+                format!(
+                    "Missing payload record for active cognitive node #{} ('{}')",
+                    ino.node_id, label
+                )
+            })?;
+            let expected_tokens = count_tokens_exact(payload);
+            if ino.token_count != expected_tokens {
+                return Err(format!(
+                    "Workspace memory at '{}' has forged token_count={} (expected {}) on node #{} ('{}'); refusing v3->v4 migration.",
+                    ldb_path.display(),
+                    ino.token_count,
+                    expected_tokens,
+                    ino.node_id,
+                    label
+                ));
+            }
+            let has_non_supersedes_synapse = syns.iter().any(|s| s.kind != EdgeKind::Supersedes);
+            if !matches!(ino.kind, NodeKind::Decision | NodeKind::Task)
+                && !has_non_supersedes_synapse
+                && ino.updated_ns != ino.created_ns
+            {
+                return Err(format!(
+                    "Workspace memory at '{}' has offline-modified updated_ns != created_ns on unlinked {:?} node #{} ('{}'); refusing v3->v4 migration.",
+                    ldb_path.display(),
+                    ino.kind,
+                    ino.node_id,
+                    label
+                ));
+            }
+
+            if matches!(
+                ino.kind,
+                NodeKind::SynonymCluster | NodeKind::AgentTemplate | NodeKind::TaskVerification
+            ) {
+                newly_covered_kinds += 1;
+            }
+            if ino.kind != NodeKind::Rule && (ino.flags.0 & NodeFlags::PINNED) != 0 {
+                pinned_non_rules += 1;
+            }
+            if ino.importance != 128 {
+                custom_importance += 1;
+            }
+            if ino.kind == NodeKind::Fact {
+                fact_count += 1;
+            } else if ino.kind == NodeKind::Decision {
+                decision_count += 1;
+            }
+            cognitive_synapses += syns
+                .iter()
+                .filter(|s| {
+                    s.kind != EdgeKind::Supersedes && active_cognitive_ids.contains(&s.target_id)
+                })
+                .count();
+        }
+    }
+
+    let ordering_sensitive = usize::from(fact_count > 1) + usize::from(decision_count > 1);
+    let has_unauthenticated_surface = newly_covered_kinds > 0
+        || cognitive_synapses > 0
+        || pinned_non_rules > 0
+        || custom_importance > 0
+        || ordering_sensitive > 0;
+
+    if has_unauthenticated_surface && !confirm_unauthenticated_metadata {
+        return Err(format!(
+            "Verified legacy v0.9.3 HMAC over {v3_capsule_count} capsule(s) in '{}', but found metadata/graph fields not authenticated by v0.9.3 (newly_covered_kinds={newly_covered_kinds}, cognitive_synapses={cognitive_synapses}, pinned_non_rules={pinned_non_rules}, custom_importance={custom_importance}, multi_fact_count={fact_count}, multi_decision_count={decision_count}). Inspect the workspace database and re-run 'libredb trust --migrate-v3 \"{}\" --confirm-metadata' to seal with v4.",
             ldb_path.display(),
             ws_root.display()
         ));
@@ -1332,6 +1734,21 @@ pub(crate) fn compute_workspace_seal_v3(
     format!("hmac-sha256:v3:{}", hex_encode(tag.as_slice()))
 }
 
+pub(crate) fn compute_workspace_seal_v4(
+    secret: &[u8; 32],
+    normalized_ws_key: &str,
+    content_digest: &[u8; 32],
+) -> String {
+    let mut mac =
+        <HmacSha256 as Mac>::new_from_slice(secret).expect("HMAC-SHA256 accepts 256-bit keys");
+    mac.update(SEAL_V4_DOMAIN_SEP);
+    mac.update((normalized_ws_key.len() as u32).to_le_bytes().as_slice());
+    mac.update(normalized_ws_key.as_bytes());
+    mac.update(content_digest);
+    let tag = mac.finalize().into_bytes();
+    format!("hmac-sha256:v4:{}", hex_encode(tag.as_slice()))
+}
+
 fn compute_host_seal_slot_id(secret: &[u8; 32], normalized_ws_key: &str) -> String {
     let mut mac =
         <HmacSha256 as Mac>::new_from_slice(secret).expect("HMAC-SHA256 accepts 256-bit keys");
@@ -1383,33 +1800,67 @@ fn read_existing_posix_vault_key(key_path: &Path, meta: &fs::Metadata) -> Result
 }
 
 #[cfg_attr(windows, allow(dead_code))]
-fn read_winner_posix_vault_key_after_race(key_path: &Path) -> Result<[u8; 32], String> {
-    for attempt in 0..6u8 {
-        let meta = fs::symlink_metadata(key_path).map_err(|e| {
-            format!("Cannot inspect POSIX .vault.key metadata after concurrent init: {e}")
-        })?;
-        if meta.len() == 0 && attempt < 5 {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-            continue;
+struct PosixVaultInitLock {
+    backend: OsFileBackend,
+}
+
+#[cfg_attr(windows, allow(dead_code))]
+impl PosixVaultInitLock {
+    fn acquire(lock_path: &Path) -> Result<Self, String> {
+        if let Ok(meta) = fs::symlink_metadata(lock_path) {
+            if meta.file_type().is_symlink() {
+                return Err(
+                    "Refusing to use symlinked POSIX vault lockfile (.vault.key.lock)".to_owned(),
+                );
+            }
         }
-        return read_existing_posix_vault_key(key_path, &meta);
+        let backend = OsFileBackend::open(lock_path)
+            .map_err(|e| format!("Failed to open POSIX .vault.key.lock: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(lock_path, fs::Permissions::from_mode(0o600));
+        }
+        backend
+            .lock_write_region()
+            .map_err(|e| format!("Failed to acquire POSIX .vault.key.lock: {e}"))?;
+        Ok(Self { backend })
     }
-    let meta = fs::symlink_metadata(key_path).map_err(|e| {
-        format!("Cannot inspect POSIX .vault.key metadata after concurrent init: {e}")
-    })?;
-    read_existing_posix_vault_key(key_path, &meta)
+}
+
+impl Drop for PosixVaultInitLock {
+    fn drop(&mut self) {
+        let _ = self.backend.unlock_write_region();
+    }
 }
 
 /// Loads an existing 32-byte `.vault.key` from `dir`, or initializes a new `0600` keyfile
-/// atomically when missing and `create_if_missing == true` by staging a `32`-byte flushed sibling
-/// file and linking it into `.vault.key` via `fs::hard_link` (falling back to `create_new(true)`
-/// on filesystems without hard links, and reading the winning key on `AlreadyExists` races).
-/// Never truncates or overwrites an existing `.vault.key` if it is corrupt, unreadable, or symlinked.
+/// atomically when missing and `create_if_missing == true`.
 #[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn load_or_create_posix_vault_key_at(
     dir: &Path,
     create_if_missing: bool,
 ) -> Result<[u8; 32], String> {
+    load_or_create_posix_vault_key_inner(dir, create_if_missing, false)
+}
+
+/// Internal synchronized `.vault.key` loader/initializer:
+/// - Fast path reads an existing `.vault.key` with zero lock contention.
+/// - Slow initialization path acquires BOTH an intra-process `Mutex` AND a cross-process OS lock
+///   on `.vault.key.lock`, re-checks `.vault.key` inside the lock, writes + `sync_all()`-flushes
+///   all `32` bytes into a unique `0600` sibling `.vault.key.init.<pid>.<nonce>` staging file, and
+///   publishes it atomically via `fs::hard_link` (or via synchronized same-directory `fs::rename`
+///   inside the lock after re-verifying `NotFound` when hard links are unsupported).
+/// - `.vault.key` is NEVER created empty or written in-place, so concurrent readers can never
+///   observe `< 32` bytes and write/sync failures can never leave a partial `.vault.key` behind.
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn load_or_create_posix_vault_key_inner(
+    dir: &Path,
+    create_if_missing: bool,
+    force_no_hardlink: bool,
+) -> Result<[u8; 32], String> {
+    static VAULT_KEY_INIT_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let dir_meta = fs::symlink_metadata(dir).map_err(|e| e.to_string())?;
     if dir_meta.file_type().is_symlink() {
@@ -1423,7 +1874,7 @@ pub(crate) fn load_or_create_posix_vault_key_at(
 
     let key_path = dir.join(".vault.key");
     match fs::symlink_metadata(&key_path) {
-        Ok(meta) => read_existing_posix_vault_key(&key_path, &meta),
+        Ok(meta) => return read_existing_posix_vault_key(&key_path, &meta),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             if !create_if_missing {
                 return Err(
@@ -1431,93 +1882,138 @@ pub(crate) fn load_or_create_posix_vault_key_at(
                         .to_owned(),
                 );
             }
-            let mut key = [0u8; 32];
-            fill_csprng(&mut key)?;
-            let mut rand_tag = [0u8; 8];
-            if let Err(rng_err) = fill_csprng(&mut rand_tag) {
-                secure_zero(&mut key);
-                return Err(rng_err);
-            }
-            let tmp_path = dir.join(format!(
-                ".vault.key.init.{}.{:016x}",
-                std::process::id(),
-                u64::from_le_bytes(rand_tag)
+        }
+        Err(e) => {
+            return Err(format!(
+                "Cannot inspect POSIX .vault.key metadata (refusing to overwrite): {e}"
             ));
+        }
+    }
 
-            let mut tmp_opts = fs::OpenOptions::new();
-            tmp_opts.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                tmp_opts.mode(0o600);
-            }
+    let _proc_guard = VAULT_KEY_INIT_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let lock_path = dir.join(".vault.key.lock");
+    let _ipc_guard = PosixVaultInitLock::acquire(&lock_path)?;
 
-            if let Ok(mut tmp_file) = tmp_opts.open(&tmp_path) {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = tmp_file.set_permissions(fs::Permissions::from_mode(0o600));
-                }
-                use std::io::Write;
-                if let Err(w_err) = tmp_file.write_all(&key).and_then(|()| tmp_file.sync_all()) {
-                    drop(tmp_file);
-                    let _ = fs::remove_file(&tmp_path);
-                    secure_zero(&mut key);
-                    return Err(w_err.to_string());
-                }
-                drop(tmp_file);
+    // Double-check inside the dual intra-process + cross-process lock before generating a new key:
+    match fs::symlink_metadata(&key_path) {
+        Ok(meta) => return read_existing_posix_vault_key(&key_path, &meta),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "Cannot inspect POSIX .vault.key metadata inside lock (refusing to overwrite): {e}"
+            ));
+        }
+    }
 
-                let link_res = fs::hard_link(&tmp_path, &key_path);
+    let mut key = [0u8; 32];
+    fill_csprng(&mut key)?;
+    let mut rand_tag = [0u8; 8];
+    if let Err(rng_err) = fill_csprng(&mut rand_tag) {
+        secure_zero(&mut key);
+        return Err(rng_err);
+    }
+    let tmp_path = dir.join(format!(
+        ".vault.key.init.{}.{:016x}",
+        std::process::id(),
+        u64::from_le_bytes(rand_tag)
+    ));
+
+    let mut tmp_opts = fs::OpenOptions::new();
+    tmp_opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        tmp_opts.mode(0o600);
+    }
+
+    let mut tmp_file = match tmp_opts.open(&tmp_path) {
+        Ok(f) => f,
+        Err(open_err) => {
+            secure_zero(&mut key);
+            return Err(format!(
+                "Failed to create staging keyfile '{}': {open_err}",
+                tmp_path.display()
+            ));
+        }
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = tmp_file.set_permissions(fs::Permissions::from_mode(0o600));
+    }
+    {
+        use std::io::Write;
+        if let Err(w_err) = tmp_file.write_all(&key).and_then(|()| tmp_file.sync_all()) {
+            drop(tmp_file);
+            let _ = fs::remove_file(&tmp_path);
+            secure_zero(&mut key);
+            return Err(format!(
+                "Failed to write and sync 32-byte staging keyfile: {w_err}"
+            ));
+        }
+    }
+    drop(tmp_file);
+
+    if !force_no_hardlink {
+        match fs::hard_link(&tmp_path, &key_path) {
+            Ok(()) => {
                 let _ = fs::remove_file(&tmp_path);
-                match link_res {
-                    Ok(()) => return Ok(key),
-                    Err(link_err) if link_err.kind() == std::io::ErrorKind::AlreadyExists => {
-                        secure_zero(&mut key);
-                        return read_winner_posix_vault_key_after_race(&key_path);
-                    }
-                    Err(_) => {
-                        // Fall through to direct `create_new(true)` for filesystems that disallow hard links.
-                    }
+                #[cfg(unix)]
+                if let Ok(df) = fs::File::open(dir) {
+                    let _ = df.sync_all();
                 }
+                return Ok(key);
             }
-
-            let mut opts = fs::OpenOptions::new();
-            opts.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                opts.mode(0o600);
+            Err(link_err) if link_err.kind() == std::io::ErrorKind::AlreadyExists => {
+                let _ = fs::remove_file(&tmp_path);
+                secure_zero(&mut key);
+                let meta = fs::symlink_metadata(&key_path).map_err(|e| {
+                    format!("Cannot inspect POSIX .vault.key metadata after concurrent link: {e}")
+                })?;
+                return read_existing_posix_vault_key(&key_path, &meta);
             }
-            match opts.open(&key_path) {
-                Ok(mut f) => {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let _ = f.set_permissions(fs::Permissions::from_mode(0o600));
-                    }
-                    use std::io::Write;
-                    if let Err(w_err) = f.write_all(&key).and_then(|()| f.sync_all()) {
-                        secure_zero(&mut key);
-                        return Err(w_err.to_string());
-                    }
-                    Ok(key)
-                }
-                Err(open_err) if open_err.kind() == std::io::ErrorKind::AlreadyExists => {
-                    secure_zero(&mut key);
-                    read_winner_posix_vault_key_after_race(&key_path)
-                }
-                Err(open_err) => {
-                    secure_zero(&mut key);
-                    Err(format!(
-                        "Failed to create new POSIX .vault.key exclusively: {open_err}"
-                    ))
-                }
+            Err(_) => {
+                // Hard links unsupported on this filesystem: fall through to synchronized atomic
+                // `fs::rename` of the already-flushed 32-byte `tmp_path` while still holding both locks.
             }
         }
-        Err(e) => Err(format!(
-            "Cannot inspect POSIX .vault.key metadata (refusing to overwrite): {e}"
-        )),
     }
+
+    // Re-verify `NotFound` inside the lock so `fs::rename` never clobbers an existing `.vault.key`:
+    match fs::symlink_metadata(&key_path) {
+        Ok(meta) => {
+            let _ = fs::remove_file(&tmp_path);
+            secure_zero(&mut key);
+            return read_existing_posix_vault_key(&key_path, &meta);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            let _ = fs::remove_file(&tmp_path);
+            secure_zero(&mut key);
+            return Err(format!(
+                "Cannot inspect POSIX .vault.key metadata before fallback rename: {e}"
+            ));
+        }
+    }
+
+    if let Err(ren_err) = fs::rename(&tmp_path, &key_path) {
+        let _ = fs::remove_file(&tmp_path);
+        secure_zero(&mut key);
+        if let Ok(meta) = fs::symlink_metadata(&key_path) {
+            return read_existing_posix_vault_key(&key_path, &meta);
+        }
+        return Err(format!(
+            "Failed to atomically publish POSIX .vault.key via rename fallback: {ren_err}"
+        ));
+    }
+
+    #[cfg(unix)]
+    if let Ok(df) = fs::File::open(dir) {
+        let _ = df.sync_all();
+    }
+    Ok(key)
 }
 
 fn secure_zero(buf: &mut [u8]) {
@@ -1862,53 +2358,75 @@ mod tests {
 
     #[test]
     fn concurrent_posix_vault_key_first_creation_never_races() {
-        for round in 0..5u32 {
-            let tmp = std::env::temp_dir().join(format!(
-                "libredb_vaultkey_race_{}_{}_{}",
-                std::process::id(),
-                round,
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .subsec_nanos()
-            ));
-            let _ = fs::remove_dir_all(&tmp);
-            fs::create_dir_all(&tmp).unwrap();
+        for &force_no_hardlink in &[false, true] {
+            for round in 0..4u32 {
+                let tmp = std::env::temp_dir().join(format!(
+                    "libredb_vaultkey_race_{}_{}_{}_{}",
+                    std::process::id(),
+                    u8::from(force_no_hardlink),
+                    round,
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .subsec_nanos()
+                ));
+                let _ = fs::remove_dir_all(&tmp);
+                fs::create_dir_all(&tmp).unwrap();
 
-            let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
-            let mut handles = Vec::with_capacity(8);
-            for _ in 0..8 {
-                let dir_clone = tmp.clone();
-                let bar_clone = std::sync::Arc::clone(&barrier);
-                handles.push(std::thread::spawn(move || {
-                    bar_clone.wait();
-                    load_or_create_posix_vault_key_at(&dir_clone, true)
-                }));
-            }
+                let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+                let mut handles = Vec::with_capacity(8);
+                for _ in 0..8 {
+                    let dir_clone = tmp.clone();
+                    let bar_clone = std::sync::Arc::clone(&barrier);
+                    handles.push(std::thread::spawn(move || {
+                        bar_clone.wait();
+                        load_or_create_posix_vault_key_inner(
+                            &dir_clone,
+                            true,
+                            force_no_hardlink,
+                        )
+                    }));
+                }
 
-            let mut keys = Vec::with_capacity(8);
-            for h in handles {
-                let k = h
-                    .join()
-                    .expect("vault key racer thread panicked")
-                    .expect("concurrent load_or_create_posix_vault_key_at must not fail with AlreadyExists");
-                keys.push(k);
+                let mut keys = Vec::with_capacity(8);
+                for h in handles {
+                    let k = h
+                        .join()
+                        .expect("vault key racer thread panicked")
+                        .expect("concurrent load_or_create_posix_vault_key_inner must not race");
+                    keys.push(k);
+                }
+                for k in &keys[1..] {
+                    assert_eq!(
+                        k, &keys[0],
+                        "All concurrent threads must observe the exact same 32-byte .vault.key (force_no_hardlink={force_no_hardlink})"
+                    );
+                }
+                assert_eq!(fs::read(tmp.join(".vault.key")).unwrap(), keys[0]);
+                for entry in fs::read_dir(&tmp).unwrap() {
+                    let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+                    assert!(
+                        matches!(name.as_str(), ".vault.key" | ".vault.key.lock"),
+                        "No temporary .vault.key.init.* files may remain after initialization (found '{name}')"
+                    );
+                }
+
+                // Also verify that even under `force_no_hardlink = true`, a pre-existing corrupt
+                // `.vault.key` is NEVER clobbered by `fs::rename`:
+                let corrupt_dir = tmp.join("corrupt_check");
+                fs::create_dir_all(&corrupt_dir).unwrap();
+                let corrupt_key = corrupt_dir.join(".vault.key");
+                fs::write(&corrupt_key, b"short_corrupt_16").unwrap();
+                assert!(load_or_create_posix_vault_key_inner(
+                    &corrupt_dir,
+                    true,
+                    force_no_hardlink
+                )
+                .is_err());
+                assert_eq!(fs::read(&corrupt_key).unwrap(), b"short_corrupt_16");
+
+                let _ = fs::remove_dir_all(&tmp);
             }
-            for k in &keys[1..] {
-                assert_eq!(
-                    k, &keys[0],
-                    "All concurrent threads must observe the exact same 32-byte .vault.key"
-                );
-            }
-            assert_eq!(fs::read(tmp.join(".vault.key")).unwrap(), keys[0]);
-            for entry in fs::read_dir(&tmp).unwrap() {
-                let name = entry.unwrap().file_name().to_string_lossy().into_owned();
-                assert_eq!(
-                    name, ".vault.key",
-                    "No temporary .vault.key.init.* files may remain after initialization"
-                );
-            }
-            let _ = fs::remove_dir_all(&tmp);
         }
     }
 
@@ -2383,7 +2901,7 @@ mod tests {
         raw[frame_crc_off..base_off + frame_len].copy_from_slice(&frame_crc.to_le_bytes());
         fs::write(&pdb_path, &raw).unwrap();
 
-        // Storage CRC32 integrity is 100% valid and payload is untouched, yet v3 trust rejects it!
+        // Storage CRC32 integrity is 100% valid and payload is untouched, yet v4 trust rejects it!
         let forged_pdb = LibreDb::open(&pdb_path).unwrap();
         forged_pdb.verify_integrity().unwrap();
         assert_eq!(
@@ -2392,10 +2910,331 @@ mod tests {
         );
         assert!(
             !is_workspace_memory_trusted(Some(&gdb), &repo),
-            "Raw on-disk updated_ns mutation with unchanged payload and valid CRC32 must invalidate v3 seal"
+            "Raw on-disk updated_ns mutation with unchanged payload and valid CRC32 must invalidate v4 seal"
         );
 
         drop(forged_pdb);
+        drop(gdb);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn index_workspace_preserves_decision_to_decision_governs_edges_and_v4_trust_seal() {
+        let tmp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join(format!(
+                "test_gov_preserve_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .subsec_nanos()
+            ));
+        let _ = fs::remove_dir_all(&tmp);
+        let repo = tmp.join("cognitive_repo");
+        fs::create_dir_all(repo.join(".agents")).unwrap();
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(
+            repo.join("src").join("lib.rs"),
+            "pub fn enforce_seal_ratchet() -> bool { true }\n",
+        )
+        .unwrap();
+
+        let gdb = LibreDb::open(tmp.join("customizations.ldb")).unwrap();
+        let pdb = LibreDb::open(repo.join(".agents").join("memory.ldb")).unwrap();
+
+        let dec_a = pdb
+            .put(
+                WriteRequest::new(
+                    NodeKind::Decision,
+                    b"Decision A: enforce_seal_ratchet governs downstream migration policy.".to_vec(),
+                )
+                .with_key("dec:parent"),
+            )
+            .unwrap();
+        let dec_b = pdb
+            .put(
+                WriteRequest::new(
+                    NodeKind::Decision,
+                    b"Decision B: child policy governed by Decision A.".to_vec(),
+                )
+                .with_key("dec:child"),
+            )
+            .unwrap();
+        let task_a = pdb
+            .put(
+                WriteRequest::new(
+                    NodeKind::Task,
+                    b"Task A: verify enforce_seal_ratchet.".to_vec(),
+                )
+                .with_key("task:verify"),
+            )
+            .unwrap();
+
+        // Wire learned cognitive `Governs` edges (`Decision A -> Decision B` and `Task A -> Decision B`):
+        pdb.link(dec_a, EdgeKind::Governs, dec_b, 245).unwrap();
+        pdb.link(task_a, EdgeKind::Governs, dec_b, 230).unwrap();
+
+        seal_workspace_memory(&gdb, &pdb, &repo).unwrap();
+        assert!(is_workspace_memory_trusted(Some(&gdb), &repo));
+
+        // Run both forced and incremental `index_workspace` passes:
+        let rep1 = libredb_cognitive::index_workspace(&pdb, &repo, true).unwrap();
+        assert!(rep1.symbols_indexed >= 1);
+        assert!(rep1.governance_synapses_wired >= 2);
+        let _rep2 = libredb_cognitive::index_workspace(&pdb, &repo, false).unwrap();
+
+        // 1. Both cognitive `Governs` edges (`dec_a -> dec_b`, `task_a -> dec_b`) AND code `Governs`
+        //    edges (`dec_a -> Symbol`) MUST coexist intact after `index_workspace`:
+        let sym_inodes = pdb.list_inodes(Some(NodeKind::Symbol), false);
+        let sym_ids: std::collections::HashSet<u64> =
+            sym_inodes.iter().map(|(i, _, _)| i.node_id).collect();
+        assert!(!sym_ids.is_empty());
+
+        let dec_inodes = pdb.list_inodes(Some(NodeKind::Decision), false);
+        let (_, _, dec_a_syns) = dec_inodes
+            .iter()
+            .find(|(i, _, _)| i.node_id == dec_a)
+            .expect("Decision A must remain active");
+        assert!(
+            dec_a_syns
+                .iter()
+                .any(|s| s.kind == EdgeKind::Governs && s.target_id == dec_b),
+            "index_workspace MUST preserve cognitive Decision A --[Governs]--> Decision B synapse!"
+        );
+        assert!(
+            dec_a_syns
+                .iter()
+                .any(|s| s.kind == EdgeKind::Governs && sym_ids.contains(&s.target_id)),
+            "index_workspace must also wire Decision A --[Governs]--> Symbol synapse"
+        );
+
+        let task_inodes = pdb.list_inodes(Some(NodeKind::Task), false);
+        let (_, _, task_a_syns) = task_inodes
+            .iter()
+            .find(|(i, _, _)| i.node_id == task_a)
+            .expect("Task A must remain active");
+        assert!(
+            task_a_syns
+                .iter()
+                .any(|s| s.kind == EdgeKind::Governs && s.target_id == dec_b),
+            "index_workspace MUST preserve cognitive Task A --[Governs]--> Decision B synapse!"
+        );
+
+        // 2. Because cognitive `Governs` synapses remained untouched, the `v4` workspace trust seal
+        //    MUST remain 100% valid WITHOUT requiring a post-index `seal_workspace_memory` call!
+        assert!(
+            is_workspace_memory_trusted(Some(&gdb), &repo),
+            "index_workspace must NOT invalidate the v4 trust seal when Decision -> Decision Governs edges exist"
+        );
+
+        drop(pdb);
+        drop(gdb);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn legacy_v093_seal_is_quarantined_until_verified_migrate_v3_and_blocks_unconfirmed_metadata_or_downgrades()
+    {
+        let tmp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join(format!(
+                "test_v093_mig_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .subsec_nanos()
+            ));
+        let _ = fs::remove_dir_all(&tmp);
+        let gdb = LibreDb::open(tmp.join("customizations.ldb")).unwrap();
+        let secret = ensure_trust_anchor_secret(&gdb).unwrap();
+
+        // Helper that seals `repo` using the EXACT `v0.9.3` wire format (`CognitiveContent::v3` + `trust:v3_upgraded`):
+        let write_authentic_v093_seal = |repo_dir: &Path, pdb_ref: &LibreDb| -> String {
+            let norm = normalize_workspace_key(repo_dir);
+            let (v3_dig, _) = compute_legacy_cognitive_content_digest_v3(pdb_ref).unwrap();
+            let host_tag = compute_host_seal_slot_id(&secret, &norm);
+            let bare_v3 = compute_workspace_seal_v3(&secret, &norm, &v3_dig);
+            let body = format!("{bare_v3}\n{host_tag}={bare_v3}");
+            pdb_ref
+                .put(
+                    WriteRequest::new(NodeKind::Config, body.clone().into_bytes())
+                        .with_key(TRUST_SEALS_KEY)
+                        .with_importance(200),
+                )
+                .unwrap();
+            gdb.put(
+                WriteRequest::new(
+                    NodeKind::Config,
+                    repo_dir.to_string_lossy().into_owned().into_bytes(),
+                )
+                .with_key(format!("trust:allowed::{norm}")),
+            )
+            .unwrap();
+            gdb.put(
+                WriteRequest::new(NodeKind::Config, b"v3".to_vec())
+                    .with_key(format!("trust:v3_upgraded::{norm}")),
+            )
+            .unwrap();
+            body
+        };
+
+        // --- PART 1: Minimal `v0.9.3` workspace (1 default-importance Fact, 0 unauthenticated surface) ---
+        let repo_min = tmp.join("v093_minimal");
+        fs::create_dir_all(repo_min.join(".agents")).unwrap();
+        let pdb_min = LibreDb::open(repo_min.join(".agents").join("memory.ldb")).unwrap();
+        pdb_min
+            .put(
+                WriteRequest::new(NodeKind::Fact, b"single_fact = v093".to_vec())
+                    .with_key("fact:single"),
+            )
+            .unwrap();
+        let captured_v093_seal = write_authentic_v093_seal(&repo_min, &pdb_min);
+
+        // Unmigrated `v0.9.3` workspace MUST fail closed in `is_workspace_memory_trusted`,
+        // MUST be rejected by `--migrate-v2`, and MUST be recognized by `has_valid_legacy_v3_content_seal`:
+        assert!(!is_workspace_memory_trusted(Some(&gdb), &repo_min));
+        assert!(migrate_workspace_seal_v2_to_v3(&gdb, &repo_min).is_err());
+        assert!(has_valid_legacy_v3_content_seal(&gdb, &repo_min));
+        let guard_err = PreMutationSealGuard::verify_before_write(
+            Some(&gdb),
+            &repo_min.join(".agents").join("memory.ldb"),
+        )
+        .err()
+        .expect("unmigrated v0.9.3 DB must block writes until migrated");
+        assert!(guard_err.contains("--migrate-v3"));
+
+        // Explicit `migrate_workspace_seal_v3_to_v4(..., false)` verifies `v3` HMAC + Inode invariants and upgrades to `v4`:
+        assert!(migrate_workspace_seal_v3_to_v4(&gdb, &repo_min, false).unwrap());
+        assert!(is_workspace_memory_trusted(Some(&gdb), &repo_min));
+        assert!(!has_valid_legacy_v3_content_seal(&gdb, &repo_min));
+
+        // Monotonic `v4` anti-downgrade ratchet: tampering with `pdb_min` and replaying the captured `v0.9.3` seal
+        // MUST fail BOTH `is_workspace_memory_trusted` AND `migrate_workspace_seal_v3_to_v4(..., true)`!
+        pdb_min
+            .put(
+                WriteRequest::new(NodeKind::Fact, b"single_fact = v093".to_vec())
+                    .with_key("fact:single")
+                    .with_importance(250),
+            )
+            .unwrap();
+        pdb_min
+            .put(
+                WriteRequest::new(NodeKind::Config, captured_v093_seal.into_bytes())
+                    .with_key(TRUST_SEALS_KEY),
+            )
+            .unwrap();
+        assert!(!is_workspace_memory_trusted(Some(&gdb), &repo_min));
+        assert!(migrate_workspace_seal_v3_to_v4(&gdb, &repo_min, true).is_err());
+
+        // --- PART 2: Rich `v0.9.3` workspace with metadata/synapses/SynonymCluster NOT covered by `v0.9.3` ---
+        let repo_rich = tmp.join("v093_rich");
+        fs::create_dir_all(repo_rich.join(".agents")).unwrap();
+        let pdb_rich_path = repo_rich.join(".agents").join("memory.ldb");
+        let pdb_rich = LibreDb::open(&pdb_rich_path).unwrap();
+        let f1 = pdb_rich
+            .put(
+                WriteRequest::new(NodeKind::Fact, b"f1 = a".to_vec())
+                    .with_key("fact:1")
+                    .with_importance(210),
+            )
+            .unwrap();
+        let d1 = pdb_rich
+            .put(
+                WriteRequest::new(NodeKind::Decision, b"d1 = arch".to_vec()).with_key("dec:1"),
+            )
+            .unwrap();
+        pdb_rich
+            .put(
+                WriteRequest::new(NodeKind::SynonymCluster, b"[\"vault\",\"dpapi\"]".to_vec())
+                    .with_key("syn:vault"),
+            )
+            .unwrap();
+        pdb_rich.link(d1, EdgeKind::RelatedTo, f1, 200).unwrap();
+        write_authentic_v093_seal(&repo_rich, &pdb_rich);
+
+        // Without `--confirm-metadata`, `--migrate-v3` MUST refuse automatic re-sealing and surface counts:
+        let unconfirmed_err = migrate_workspace_seal_v3_to_v4(&gdb, &repo_rich, false)
+            .expect_err("unauthenticated v0.9.3 metadata/synapses must require --confirm-metadata");
+        assert!(unconfirmed_err.contains("newly_covered_kinds=1"));
+        assert!(unconfirmed_err.contains("cognitive_synapses=1"));
+        assert!(unconfirmed_err.contains("--confirm-metadata"));
+        assert!(!is_workspace_memory_trusted(Some(&gdb), &repo_rich));
+
+        // Payload tampering on `repo_rich` MUST fail even WITH `confirm_unauthenticated_metadata = true`:
+        pdb_rich
+            .put(WriteRequest::new(NodeKind::Fact, b"f1 = tampered".to_vec()).with_key("fact:1"))
+            .unwrap();
+        assert!(migrate_workspace_seal_v3_to_v4(&gdb, &repo_rich, true).is_err());
+
+        // Restore authentic `v0.9.3` seal on `repo_rich`, then confirm `--confirm-metadata` upgrades cleanly:
+        write_authentic_v093_seal(&repo_rich, &pdb_rich);
+        assert!(migrate_workspace_seal_v3_to_v4(&gdb, &repo_rich, true).unwrap());
+        assert!(is_workspace_memory_trusted(Some(&gdb), &repo_rich));
+
+        // --- PART 3: Raw binary `updated_ns` tampering on a `v0.9.3` DB MUST be rejected even with `--confirm-metadata` ---
+        let repo_bin = tmp.join("v093_bin_tamper");
+        fs::create_dir_all(repo_bin.join(".agents")).unwrap();
+        let pdb_bin_path = repo_bin.join(".agents").join("memory.ldb");
+        let pdb_bin = LibreDb::open(&pdb_bin_path).unwrap();
+        let f_bin = pdb_bin
+            .put(WriteRequest::new(NodeKind::Fact, b"bin_fact = 1".to_vec()).with_key("fact:bin"))
+            .unwrap();
+        write_authentic_v093_seal(&repo_bin, &pdb_bin);
+        pdb_bin.compact_with_options(true).unwrap();
+        drop(pdb_bin);
+
+        let mut raw = fs::read(&pdb_bin_path).unwrap();
+        let slot_a: &[u8; 4096] = raw[0..4096].try_into().unwrap();
+        let slot_b: &[u8; 4096] = raw[4096..8192].try_into().unwrap();
+        let sb = match (
+            libredb_core::format::Superblock::decode(slot_a),
+            libredb_core::format::Superblock::decode(slot_b),
+        ) {
+            (Ok(a), Ok(b)) => {
+                if b.commit_seq >= a.commit_seq {
+                    b
+                } else {
+                    a
+                }
+            }
+            (Ok(a), Err(_)) => a,
+            (Err(_), Ok(b)) => b,
+            _ => panic!("expected valid superblock"),
+        };
+        let base_off = sb.base_snapshot_offset as usize;
+        let frame_len = u32::from_le_bytes(raw[base_off + 4..base_off + 8].try_into().unwrap()) as usize;
+        let inode_count = u32::from_le_bytes(raw[base_off + 16..base_off + 20].try_into().unwrap()) as usize;
+        for idx in 0..inode_count {
+            let off = base_off + 24 + idx * 128;
+            let nid = u64::from_le_bytes(raw[off..off + 8].try_into().unwrap());
+            if nid == f_bin {
+                let old_upd = u64::from_le_bytes(raw[off + 24..off + 32].try_into().unwrap());
+                raw[off + 24..off + 32].copy_from_slice(&(old_upd + 500_000).to_le_bytes());
+                let ino_crc = libredb_core::crc::crc32(&raw[off..off + 124]);
+                raw[off + 124..off + 128].copy_from_slice(&ino_crc.to_le_bytes());
+                break;
+            }
+        }
+        let frame_crc_off = base_off + frame_len - 4;
+        let frame_crc = libredb_core::crc::crc32(&raw[base_off..frame_crc_off]);
+        raw[frame_crc_off..base_off + frame_len].copy_from_slice(&frame_crc.to_le_bytes());
+        fs::write(&pdb_bin_path, &raw).unwrap();
+
+        // Even though the `v0.9.3` payload HMAC and storage CRC32 are both valid, `migrate_workspace_seal_v3_to_v4`
+        // catches `updated_ns != created_ns` on the unlinked `Fact` Inode and refuses migration!
+        assert!(has_valid_legacy_v3_content_seal(&gdb, &repo_bin));
+        let bin_err = migrate_workspace_seal_v3_to_v4(&gdb, &repo_bin, true)
+            .expect_err("raw binary updated_ns forgery on v0.9.3 Inode must fail migration");
+        assert!(bin_err.contains("updated_ns != created_ns"));
+
+        drop(pdb_min);
+        drop(pdb_rich);
         drop(gdb);
         let _ = fs::remove_dir_all(&tmp);
     }

@@ -582,7 +582,12 @@ pub fn index_workspace(db: &LibreDb, root: &Path, force: bool) -> Result<Workspa
     } else {
         db.sync_edges_for_kinds(&active_sym_ids, &[EdgeKind::CausedBy], &edges)?;
     }
-    db.sync_edges_for_kinds(&active_gov_ids, &[EdgeKind::Governs], &gov_out_edges)?;
+    db.sync_edges_scoped(
+        &active_gov_ids,
+        &[EdgeKind::Governs],
+        Some(&[NodeKind::Symbol]),
+        &gov_out_edges,
+    )?;
 
     Ok(WorkspaceIndexReport {
         files_scanned,

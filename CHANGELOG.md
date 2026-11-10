@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.6] - 2026-11-10
+
+### Added
+
+- Added `LibreDb::sync_edges_scoped` (`managed_target_kinds: Option<&[NodeKind]>`) in `crates/libredb-core/src/engine.rs` and explicit `--migrate-v3` / `--confirm-metadata` workspace seal migration (`migrate_workspace_seal_v3_to_v4`, `has_valid_legacy_v3_content_seal`, and `compute_legacy_cognitive_content_digest_v3` in `crates/libredb-cli/src/security.rs` and `crates/libredb-cli/src/main.rs`).
+
+### Fixed
+
+- Scoped `Decision`/`Task` outgoing `EdgeKind::Governs` reconciliation in `index_workspace` (`crates/libredb-cognitive/src/workspace.rs`) via `db.sync_edges_scoped(&active_gov_ids, &[EdgeKind::Governs], Some(&[NodeKind::Symbol]), &gov_out_edges)` so reindexing workspace source files strictly reconciles `Decision/Task -> Symbol` links while preserving learned cognitive `Decision/Task --[Governs]--> Decision/Task/Rule/Fact` synapses and keeping the `v4` workspace trust seal valid without re-sealing.
+
+### Security
+
+- Added verified cross-version `v0.9.3 -> v0.9.6` workspace seal migration (`libredb trust --migrate-v3 [<dir>] [--confirm-metadata]`) and upgraded current workspace seals to `hmac-sha256:v4:<hex>` with a monotonic `trust:v4_upgraded::<ws>` anti-downgrade ratchet (retaining seamless read compatibility for `v0.9.4`/`v0.9.5` `CognitiveContent::v4` seals): unmigrated `v0.9.3` (`CognitiveContent::v3`) databases remain fail-closed at runtime, are accurately identified by `has_valid_legacy_v3_content_seal` in `modernize-global` and `PreMutationSealGuard`, and must pass constant-time legacy `v3` `HMAC-SHA256` verification, hard `Inode` binary structural checks (`token_count`, `generation`, `updated_ns == created_ns` on unlinked capsules), and an explicit `--confirm-metadata` audit whenever `v0.9.3`-unauthenticated metadata or synapses (`SynonymCluster` / `AgentTemplate` / `TaskVerification`, cognitive synapses, `PINNED` non-rules, custom `importance`, or multi-`Fact`/`Decision` ordering) are present.
+- Eliminated the non-atomic `OpenOptions::create_new(true)` in-place write fallback in `load_or_create_posix_vault_key_at` (`load_or_create_posix_vault_key_inner` and `PosixVaultInitLock` in `crates/libredb-cli/src/security.rs`): slow-path `.vault.key` initialization now serializes contenders across both threads (`Mutex`) and processes (`.vault.key.lock` via `OsFileBackend`), writes and `sync_all()`-flushes all `32` bytes to a `0600` sibling `.vault.key.init.<pid>.<nonce>` staging file, and publishes it exclusively via `fs::hard_link` or synchronized same-directory `fs::rename` after re-verifying `NotFound` inside the lock, guaranteeing that `.vault.key` is never observable with `< 32` bytes and never left truncated on write/sync failure.
+
 ## [0.9.5] - 2026-11-10
 
 ### Fixed

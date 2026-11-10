@@ -934,6 +934,20 @@ impl LibreDb {
         managed_kinds: &[EdgeKind],
         desired_edges: &[(u64, EdgeKind, u64, u8)],
     ) -> Result<usize> {
+        self.sync_edges_scoped(scoped_sources, managed_kinds, None, desired_edges)
+    }
+
+    /// Atomically reconciles outgoing synapses of `managed_kinds` across `scoped_sources`, optionally
+    /// restricting removal/replacement strictly to existing synapses whose target `NodeKind` belongs to
+    /// `managed_target_kinds`. When `managed_target_kinds` is `Some(&[NodeKind::Symbol])`, cognitive
+    /// synapses such as `Decision --[Governs]--> Decision` remain 100% preserved during workspace reindexing.
+    pub fn sync_edges_scoped(
+        &self,
+        scoped_sources: &[u64],
+        managed_kinds: &[EdgeKind],
+        managed_target_kinds: Option<&[NodeKind]>,
+        desired_edges: &[(u64, EdgeKind, u64, u8)],
+    ) -> Result<usize> {
         if scoped_sources.is_empty() && desired_edges.is_empty() {
             return Ok(0);
         }
@@ -992,9 +1006,28 @@ impl LibreDb {
             let mut rebuilt: Vec<Synapse> = old_syns
                 .iter()
                 .copied()
-                .filter(|s| !managed_kinds.contains(&s.kind))
+                .filter(|s| {
+                    if !managed_kinds.contains(&s.kind) {
+                        return true;
+                    }
+                    if let Some(target_kinds) = managed_target_kinds {
+                        if let Some(target_inode) = old_snap.inodes.get(&s.target_id) {
+                            return !target_kinds.contains(&target_inode.kind);
+                        }
+                    }
+                    false
+                })
                 .collect();
-            rebuilt.extend(incoming.iter().copied());
+            for &inc in incoming {
+                if let Some(existing) = rebuilt
+                    .iter_mut()
+                    .find(|s| s.kind == inc.kind && s.target_id == inc.target_id)
+                {
+                    existing.weight = inc.weight;
+                } else {
+                    rebuilt.push(inc);
+                }
+            }
 
             if rebuilt == old_syns {
                 continue;
