@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.5] - 2026-11-10
+
+### Added
+
+- Added transparent `https://` Gitea API support (`https_request_via_system_curl` in `crates/libredb-cli/src/gitea.rs`) delegating TLS requests to OS-native `curl` (`C:\Windows\System32\curl.exe` backed by Windows Schannel and the Active Directory GPO Enterprise Root CA store) while keeping zero-dependency `TcpStream` HTTP/1.1 for local `http://` endpoints.
+- Added two-stage `EdgeKind::Calls` resolution in `crates/libredb-cognitive/src/workspace.rs` (`extract_qualified_calls` for exact `Type::method` / `Type.method` calls plus `is_trivial_call_stopword` and cross-file ambiguity filtering for bare identifiers), eliminating `~80%` of false-positive call edges caused by generic method names (`new`, `open`, `get`, `write`, `from`, `default`).
+
+### Changed
+
+- Upgraded `win_lock::lock_high_byte` in `crates/libredb-core/src/io.rs` from indefinite kernel blocking to `LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY` with bounded exponential backoff (`1,500 ms` on SMB network shares, `3,000 ms` on local disk), ensuring lifecycle hooks fail open (`TimedOut`) instead of stalling if an SMB OpLock/lease on a mapped network drive (`Q:\`) transiently hangs.
+
 ## [0.8.4] - 2026-11-10
 
 ### Changed

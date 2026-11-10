@@ -1227,7 +1227,9 @@ fn ensure_remote_repo_created(
     Ok(format!("{}/{}/{repo_name}.git", cfg.url, cfg.user))
 }
 
-/// Minimal, dependency-free HTTP/1.1 client over `std::net::TcpStream` for local/LAN Gitea API calls.
+/// Minimal, dependency-free HTTP/1.1 client over `std::net::TcpStream` for `http://` Gitea API calls,
+/// with automatic native OS `curl` (`System32\curl.exe` Schannel / POSIX `curl`) fallback for `https://`
+/// so Enterprise Active Directory reverse-proxy and GPO Root CA certificates work out of the box.
 fn http_request(
     method: &str,
     url: &str,
@@ -1235,9 +1237,12 @@ fn http_request(
     content_type: Option<&str>,
     body: Option<&[u8]>,
 ) -> std::io::Result<(u16, Vec<u8>)> {
+    if url.starts_with("https://") {
+        return https_request_via_system_curl(method, url, token, content_type, body);
+    }
     let without_scheme = url
         .strip_prefix("http://")
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "only http:// supported"))?;
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "only http:// or https:// supported"))?;
     let (host_port, path_query) = match without_scheme.find('/') {
         Some(idx) => (&without_scheme[..idx], &without_scheme[idx..]),
         None => (without_scheme, "/"),
@@ -1310,6 +1315,89 @@ fn http_request(
 
 fn find_double_crlf(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+/// Executes an `https://` API call via the OS-native `curl` binary (`C:\Windows\System32\curl.exe` on Windows,
+/// which natively uses Windows Schannel and trusts Active Directory GPO Enterprise Root CAs).
+fn https_request_via_system_curl(
+    method: &str,
+    url: &str,
+    token: &str,
+    content_type: Option<&str>,
+    body: Option<&[u8]>,
+) -> std::io::Result<(u16, Vec<u8>)> {
+    use std::process::Stdio;
+
+    let curl_bin = if cfg!(windows) {
+        let sys_curl = Path::new(r"C:\Windows\System32\curl.exe");
+        if sys_curl.is_file() {
+            r"C:\Windows\System32\curl.exe"
+        } else {
+            "curl.exe"
+        }
+    } else {
+        "curl"
+    };
+
+    let marker = "\n__LIBREDB_HTTP_STATUS__:";
+    let mut cmd = Command::new(curl_bin);
+    cmd.args([
+        "--silent",
+        "--show-error",
+        "--location",
+        "--max-time",
+        "30",
+        "-X",
+        method,
+        "-H",
+        "User-Agent: LibreDB-GiteaSync/1.0",
+    ]);
+    if !token.is_empty() {
+        cmd.args(["-H", &format!("Authorization: token {token}")]);
+    }
+    if let Some(ct) = content_type {
+        cmd.args(["-H", &format!("Content-Type: {ct}")]);
+    }
+    if body.is_some() {
+        cmd.args(["--data-binary", "@-"]);
+        cmd.stdin(Stdio::piped());
+    } else {
+        cmd.stdin(Stdio::null());
+    }
+    cmd.args(["-w", &format!("{marker}%{{http_code}}"), url]);
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let mut child = cmd.spawn()?;
+    if let Some(payload) = body {
+        if let Some(mut stdin_pipe) = child.stdin.take() {
+            stdin_pipe.write_all(payload)?;
+        }
+    }
+    let out = child.wait_with_output()?;
+    if !out.status.success() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!(
+                "curl https request failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+        ));
+    }
+
+    let m_bytes = marker.as_bytes();
+    if let Some(pos) = out
+        .stdout
+        .windows(m_bytes.len())
+        .rposition(|w| w == m_bytes)
+    {
+        let body_part = out.stdout[..pos].to_vec();
+        let code_str = String::from_utf8_lossy(&out.stdout[pos + m_bytes.len()..]);
+        let status = code_str.trim().parse::<u16>().unwrap_or(500);
+        Ok((status, body_part))
+    } else {
+        Ok((200, out.stdout))
+    }
 }
 
 fn decode_chunked_body(mut src: &[u8]) -> Vec<u8> {

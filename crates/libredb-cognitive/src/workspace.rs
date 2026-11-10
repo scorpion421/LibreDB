@@ -177,17 +177,28 @@ pub fn index_workspace(db: &LibreDb, root: &Path, force: bool) -> Result<Workspa
         db.commit_batch(&prepared)?;
     }
 
-    // Build lookup of all active `NodeKind::Symbol` nodes (`short_name -> Vec<(node_id, rel_path)>`).
+    // Build lookup of all active `NodeKind::Symbol` nodes:
+    // - `by_qualified_name`: `Type::method -> Vec<(node_id, full_key)>` (exact qualified match)
+    // - `by_short_name`: `short_name -> Vec<(node_id, full_key)>` (excluding trivial stopwords)
     let sym_inodes = db.list_inodes(Some(NodeKind::Symbol), false);
     let symbols_indexed = sym_inodes.len();
+    let mut by_qualified_name: HashMap<String, Vec<(u64, String)>> = HashMap::new();
     let mut by_short_name: HashMap<String, Vec<(u64, String)>> = HashMap::new();
     let mut by_full_key: HashMap<String, u64> = HashMap::new();
 
     for (ino, key_opt, _) in &sym_inodes {
         if let Some(ref full_k) = key_opt {
             by_full_key.insert(full_k.clone(), ino.node_id);
+            if let Some((_, sym_part)) = full_k.split_once("::") {
+                if sym_part.contains("::") {
+                    by_qualified_name
+                        .entry(sym_part.to_owned())
+                        .or_default()
+                        .push((ino.node_id, full_k.clone()));
+                }
+            }
             if let Some((_, short)) = full_k.rsplit_once("::") {
-                if short.len() >= 3 {
+                if short.len() >= 3 && !is_trivial_call_stopword(short) {
                     by_short_name
                         .entry(short.to_owned())
                         .or_default()
@@ -223,12 +234,39 @@ pub fn index_workspace(db: &LibreDb, root: &Path, force: bool) -> Result<Workspa
                 let body_slice = lines[start_i..end_i].join("\n");
                 let mut seen_targets: HashSet<u64> = HashSet::new();
 
+                // Stage A: Exact qualified calls (`Type::method` or `Type.method`)
+                for qcall in extract_qualified_calls(&body_slice) {
+                    if qcall == sym.name {
+                        continue;
+                    }
+                    if let Some(targets) = by_qualified_name.get(&qcall) {
+                        for &(dst_id, _) in targets {
+                            if dst_id != src_id && seen_targets.insert(dst_id) {
+                                edges.push((src_id, EdgeKind::Calls, dst_id, 220));
+                                call_edges += 1;
+                            }
+                        }
+                    }
+                }
+
+                // Stage B: Unqualified symbol identifiers (filtered by `is_trivial_call_stopword` and ambiguity cap)
+                let short_self = sym.name.rsplit_once("::").map_or(sym.name.as_str(), |(_, s)| s);
                 for ident in extract_code_identifiers(&body_slice) {
-                    if ident == sym.name {
+                    if ident == sym.name || ident == short_self || is_trivial_call_stopword(&ident) {
                         continue;
                     }
                     if let Some(targets) = by_short_name.get(&ident) {
-                        for &(dst_id, _) in targets {
+                        // If a bare identifier appears in > 3 files, prefer same-file symbol definitions
+                        // instead of wiring an N x M cross-product across the entire workspace.
+                        let file_prefix = format!("{rel_path}::");
+                        let has_same_file = targets.iter().any(|(_, fk)| fk.starts_with(&file_prefix));
+                        if targets.len() > 3 && !has_same_file {
+                            continue;
+                        }
+                        for &(dst_id, ref fk) in targets {
+                            if targets.len() > 3 && !fk.starts_with(&file_prefix) {
+                                continue;
+                            }
                             if dst_id != src_id && seen_targets.insert(dst_id) {
                                 edges.push((src_id, EdgeKind::Calls, dst_id, 200));
                                 call_edges += 1;
@@ -554,4 +592,135 @@ fn extract_code_identifiers(text: &str) -> HashSet<String> {
         set.insert(curr);
     }
     set
+}
+
+fn extract_qualified_calls(text: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let bytes = text.as_bytes();
+    let n = bytes.len();
+    let mut i = 0usize;
+    while i < n {
+        if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+            let s1 = i;
+            i += 1;
+            while i < n && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let lhs = &text[s1..i];
+            if lhs.len() >= 2 && lhs.as_bytes()[0].is_ascii_uppercase() {
+                if i + 1 < n && bytes[i] == b':' && bytes[i + 1] == b':' {
+                    let sep_end = i + 2;
+                    if sep_end < n && (bytes[sep_end].is_ascii_alphabetic() || bytes[sep_end] == b'_') {
+                        let mut j = sep_end + 1;
+                        while j < n && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                            j += 1;
+                        }
+                        let rhs = &text[sep_end..j];
+                        if rhs.len() >= 2 {
+                            out.insert(format!("{lhs}::{rhs}"));
+                        }
+                        i = sep_end;
+                        continue;
+                    }
+                } else if i < n && bytes[i] == b'.' {
+                    let sep_end = i + 1;
+                    if sep_end < n && (bytes[sep_end].is_ascii_alphabetic() || bytes[sep_end] == b'_') {
+                        let mut j = sep_end + 1;
+                        while j < n && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                            j += 1;
+                        }
+                        let rhs = &text[sep_end..j];
+                        if rhs.len() >= 2 {
+                            out.insert(format!("{lhs}::{rhs}"));
+                        }
+                        i = sep_end;
+                        continue;
+                    }
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+fn is_trivial_call_stopword(ident: &str) -> bool {
+    matches!(
+        ident,
+        "new"
+            | "default"
+            | "clone"
+            | "from"
+            | "into"
+            | "try_from"
+            | "try_into"
+            | "as_ref"
+            | "as_mut"
+            | "as_str"
+            | "as_bytes"
+            | "to_str"
+            | "to_owned"
+            | "to_string"
+            | "into_owned"
+            | "deref"
+            | "drop"
+            | "fmt"
+            | "eq"
+            | "ne"
+            | "cmp"
+            | "partial_cmp"
+            | "hash"
+            | "get"
+            | "get_mut"
+            | "set"
+            | "put"
+            | "insert"
+            | "remove"
+            | "len"
+            | "is_empty"
+            | "iter"
+            | "next"
+            | "read"
+            | "write"
+            | "flush"
+            | "open"
+            | "close"
+            | "init"
+            | "run"
+            | "parse"
+            | "build"
+            | "load"
+            | "save"
+            | "path"
+            | "name"
+            | "kind"
+            | "key"
+            | "val"
+            | "value"
+            | "error"
+            | "result"
+            | "main"
+            | "test"
+            | "tests"
+            | "some"
+            | "none"
+            | "ok"
+            | "err"
+            | "unwrap"
+            | "expect"
+            | "map"
+            | "filter"
+            | "collect"
+            | "push"
+            | "extend"
+            | "join"
+            | "trim"
+            | "lines"
+            | "split"
+            | "contains"
+            | "starts_with"
+            | "ends_with"
+            | "format"
+    )
 }
