@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.6] - 2026-11-10
+
+### Added
+
+- Added container-aware symbol qualification (`SymbolContract.container` and `SymbolContract::qualified_name()` in `crates/libredb-cognitive/src/skeleton.rs`, `SKELETON_HASH_SEED = 106`) across Rust (`impl Type` and `impl Trait for Type`), C++, Java, Kotlin, C#, Python, Go, and Smali, populating Stage A (`by_qualified_name`) and resolving `Self::method` and `self.method(` calls in `crates/libredb-cognitive/src/workspace.rs`.
+- Added `LibreDb::sync_edges_for_kinds` in `crates/libredb-core/src/engine.rs` and incremental stale-symbol tombstoning in `crates/libredb-cognitive/src/workspace.rs` so deleted or renamed symbols and removed `Calls` / `Governs` / `CausedBy` synapses are cleanly reconciled on incremental re-indexing.
+- Added multi-product `brain` directory discovery (`resolve_brain_conv_dir` across `antigravity`, `antigravity-ide`, and `antigravity-cli`) in `crates/libredb-cli/src/hooks.rs` and `crates/libredb-cli/src/mcp.rs`, space-safe `cmd.exe /c` path quoting in `scripts/deploy_plugin.ps1`, and `Gemini 4 Carbon` to the global model catalog in `AGENTS.md`.
+
+### Changed
+
+- Upgraded `HybridIndex` to `INDEX_FORMAT_VERSION = 4` (`purge_nodes_from_postings` in `crates/libredb-index/src/lib.rs`), purging dead `word_postings` and `ngram_postings` entries whenever Inodes are superseded or updated so `sys::index_snapshot` never accumulates historical posting bloat.
+- Upgraded `PreInvocation` context injection in `crates/libredb-cli/src/hooks.rs` from deprecated `ephemeralMessage` to Antigravity 2.0 `{"systemMessage": {"systemMessage": ...}}`, and removed both `WaitMsBeforeAsync` argument rewrites and destructive pre-edit `CRLF`/UTF-8 BOM stripping from `PreToolUse`.
+
+### Fixed
+
+- Fixed `find_matching_brace_end` in `crates/libredb-cognitive/src/skeleton.rs` to track parentheses, `[T; N]` array-type brackets, Rust lifetimes (`'a`), raw strings (`r#"..."#`), character literals, and comments so Rust functions returning fixed-size arrays (`-> [u8; N]`) are never truncated at the array semicolon, and attached file paths to `std::fs::read` errors in `FileSkeleton` and `extract_fim_slice`.
+- Fixed `PreToolUse` `CHANGELOG.md` snippet validation (`check_text_guardrails_with_mode` in `crates/libredb-cognitive/src/guardrail.rs`) so partial `edit_file` replacements on `CHANGELOG.md` do not falsely require line-1 `# Changelog` unless writing the full file.
+- Fixed a first-touch initialization race in `LibreDb::open_with_backend` (protecting fresh file bootstrap under `IpcWriteGuard` and re-checking `backend.len()`), and hardened `LibreDb::get` and `LibreDb::get_many_coalesced` in `crates/libredb-core/src/engine.rs` to retry via `sync_from_disk_if_changed` on `UnexpectedEof` (`LibreDbError::Io`) without panicking if a cold node was pruned concurrently.
+- Fixed `parse_http_response` in `crates/libredb-cli/src/gitea.rs` to skip interim `HTTP/1.1 100 Continue` header frames before decoding status codes and bodies.
+
+### Security
+
+- Eliminated plaintext token exposure on child process command lines (Windows Event 4688 / Sysmon Event ID 1) in `crates/libredb-cli/src/gitea.rs`: `configure_git_command_for_remote` now passes Gitea Basic Auth headers (plus `http.sslBackend=schannel` on Windows for `https://` Gitea remotes) exclusively via `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_*` / `GIT_CONFIG_VALUE_*` environment variables, and `https_request_via_system_curl` passes `Authorization` headers via a zero-on-drop RAII `-K` config file (`EphemeralCurlConfig`) instead of `-H` CLI arguments.
+
 ## [0.8.5] - 2026-11-10
 
 ### Added

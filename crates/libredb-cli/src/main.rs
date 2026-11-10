@@ -1592,7 +1592,7 @@ fn modernize_global_db(
             stack_any: vec!["windows".to_owned(), "hooks".to_owned(), "json".to_owned()],
             action_any: vec!["hook".to_owned(), "plugin".to_owned(), "deploy".to_owned()],
             env_or_error_any: Vec::new(),
-            directive: "On Windows, hooks.json commands run via cmd.exe /C: use unquoted %USERPROFILE%\\.gemini\\libredb\\bin\\libredb.exe <subcmd> with backslashes.".to_owned(),
+            directive: "On Windows, hooks.json commands run via cmd.exe /C: keep space-free %USERPROFILE%\\.gemini\\libredb\\bin\\libredb.exe unquoted, and wrap executable paths containing spaces in one pair of escaped double quotes (\\\"C:\\\\Path With Spaces\\\\libredb.exe\\\" <subcmd>).".to_owned(),
         },
         ReflexRule {
             id: "gitea-collision-and-github-guard".to_owned(),

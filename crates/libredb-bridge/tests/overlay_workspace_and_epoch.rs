@@ -182,6 +182,89 @@ pub fn commit_records(payload: &[u8]) -> bool {
 }
 
 #[test]
+fn workspace_indexer_qualifies_impl_methods_resolves_stopword_calls_and_reconciles_deleted_edges() {
+    let dir = tempdir().unwrap();
+    let src_dir = dir.path().join("src");
+    std::fs::create_dir_all(&src_dir).unwrap();
+
+    std::fs::write(
+        src_dir.join("kernel.rs"),
+        r#"pub struct KernelStore;
+
+impl KernelStore {
+    pub fn open(path: &str) -> Self {
+        let _ = path;
+        Self
+    }
+
+    pub fn encode(&self) -> [u8; 32] {
+        [0u8; 32]
+    }
+}
+
+pub struct HeaderBlock;
+
+impl HeaderBlock {
+    pub fn encode(&self) -> [u8; 64] {
+        [0u8; 64]
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        src_dir.join("client.rs"),
+        r#"pub fn bootstrap_store() -> [u8; 32] {
+    let ks = KernelStore::open("demo.ldb");
+    ks.encode()
+}
+
+pub fn legacy_helper() -> u32 {
+    7
+}
+"#,
+    )
+    .unwrap();
+
+    let db = LibreDb::open(dir.path().join("qual.ldb")).unwrap();
+    index_workspace(&db, dir.path(), false).unwrap();
+
+    // 1. Both `KernelStore::encode` and `HeaderBlock::encode` coexist without overwriting each other!
+    let enc_impacts = query_symbol_impact(&db, "::encode").unwrap();
+    assert_eq!(enc_impacts.len(), 2);
+
+    // 2. `KernelStore::open` resolves `bootstrap_store` via Stage A despite `open` being a stopword!
+    let open_impacts = query_symbol_impact(&db, "KernelStore::open").unwrap();
+    assert_eq!(open_impacts.len(), 1);
+    assert_eq!(open_impacts[0].callers.len(), 1);
+    assert!(open_impacts[0].callers[0].contains("bootstrap_store"));
+
+    // 3. Remove `KernelStore::open` call from `bootstrap_store` and delete `legacy_helper`:
+    // incremental re-index must tombstone `legacy_helper` AND remove the stale `Calls` synapse!
+    std::fs::write(
+        src_dir.join("client.rs"),
+        r#"pub fn bootstrap_store() -> [u8; 32] {
+    [1u8; 32]
+}
+"#,
+    )
+    .unwrap();
+
+    index_workspace(&db, dir.path(), false).unwrap();
+    assert!(
+        query_symbol_impact(&db, "legacy_helper").unwrap().is_empty(),
+        "deleted symbol must be tombstoned on incremental re-index"
+    );
+    let open_after = query_symbol_impact(&db, "KernelStore::open").unwrap();
+    assert_eq!(open_after.len(), 1);
+    assert!(
+        open_after[0].callers.is_empty(),
+        "removed call edge must be pruned by sync_edges_for_kinds"
+    );
+}
+
+#[test]
 fn transcript_tail_detector_automatically_advances_epoch_on_compaction() {
     let dir = tempdir().unwrap();
     let db = Arc::new(LibreDb::open(dir.path().join("epoch.ldb")).unwrap());

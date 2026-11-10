@@ -3,7 +3,7 @@
 
 use libredb_bridge::open_or_auto_migrate;
 use libredb_cognitive::{
-    check_command_guardrails, check_text_guardrails, has_project_root_marker,
+    check_command_guardrails, check_text_guardrails_with_mode, has_project_root_marker,
     is_compaction_checkpoint_line, is_test_or_scratch_path, sync_transcript_epoch, CognitiveEngine,
 };
 use libredb_core::{LibreDb, NodeKind, WriteRequest};
@@ -88,7 +88,7 @@ pub fn run_pre_tool_hook(_global_ldb_opt: Option<&Path>) -> Result<(), Box<dyn s
         }
     }
 
-    // 1. Shell command guardrails + automatic WaitMsBeforeAsync upgrade to 10000ms
+    // 1. Shell command guardrails + exploratory search streak firewall
     let cmd_opt = args
         .get("CommandLine")
         .or_else(|| args.get("command"))
@@ -112,31 +112,6 @@ pub fn run_pre_tool_hook(_global_ldb_opt: Option<&Path>) -> Result<(), Box<dyn s
                         "reason": "LibreDB Subagent Firewall (Rule 5): 4+ consecutive exploratory shell search commands executed in main context. Delegate open multi-file searching to invoke_subagent(TypeName='research', Model='flash') or use libredb_code(action='skeleton'|'fim'|'impact')."
                     }))?;
                     return Ok(());
-                }
-            }
-        }
-
-        let is_daemon = args.get("IsDaemon").and_then(Value::as_bool).unwrap_or(false);
-        if !is_daemon {
-            if let Some(wait_val) = args.get("WaitMsBeforeAsync") {
-                if let Some(w_i64) = wait_val.as_i64() {
-                    if w_i64 > 0 && w_i64 < 10_000 {
-                        emit_json(&json!({
-                            "decision": "allow",
-                            "overwrite": { "WaitMsBeforeAsync": 10000 }
-                        }))?;
-                        return Ok(());
-                    }
-                } else if let Some(w_str) = wait_val.as_str() {
-                    if let Ok(w_i64) = w_str.parse::<i64>() {
-                        if w_i64 > 0 && w_i64 < 10_000 {
-                            emit_json(&json!({
-                                "decision": "allow",
-                                "overwrite": { "WaitMsBeforeAsync": "10000" }
-                            }))?;
-                            return Ok(());
-                        }
-                    }
                 }
             }
         }
@@ -190,8 +165,10 @@ pub fn run_pre_tool_hook(_global_ldb_opt: Option<&Path>) -> Result<(), Box<dyn s
                 }
             }
 
+            let is_full_file = matches!(tool_name, "write_file" | "write_to_file")
+                && args.get("Append").and_then(Value::as_bool) != Some(true);
             for txt in texts_to_check {
-                let violations = check_text_guardrails(txt, target_file);
+                let violations = check_text_guardrails_with_mode(txt, target_file, is_full_file);
                 if let Some(first_crit) = violations.into_iter().find(|v| v.severity == "CRITICAL")
                 {
                     emit_json(&json!({
@@ -208,12 +185,6 @@ pub fn run_pre_tool_hook(_global_ldb_opt: Option<&Path>) -> Result<(), Box<dyn s
 
         if target_file != "<tool_input>" && !is_test_or_scratch_path(target_file) {
             let target_path = Path::new(target_file);
-            if matches!(
-                tool_name,
-                "edit_file" | "replace_file_content" | "multi_replace_file_content"
-            ) {
-                normalize_file_crlf_and_bom_before_edit(target_path);
-            }
             let _ = record_working_set_edit(target_path);
         }
     }
@@ -239,12 +210,7 @@ pub fn run_pre_invocation_hook(
     let target_ldb: Option<PathBuf> = if let Some(ref root) = ws_root {
         Some(root.join(".agents").join("memory.ldb"))
     } else if let Some(ref cid) = cid_opt {
-        let brain_agents = user_home_dir()
-            .join(".gemini")
-            .join("antigravity")
-            .join("brain")
-            .join(cid)
-            .join(".agents");
+        let brain_agents = resolve_brain_conv_dir(cid).join(".agents");
         let cand_ldb = brain_agents.join("memory.ldb");
         let cand_db = brain_agents.join("memory.db");
         if cand_ldb.exists() || cand_db.exists() {
@@ -352,7 +318,9 @@ pub fn run_pre_invocation_hook(
     } else {
         emit_json(&json!({
             "injectSteps": [{
-                "ephemeralMessage": context_block
+                "systemMessage": {
+                    "systemMessage": context_block
+                }
             }]
         }))?;
     }
@@ -597,30 +565,6 @@ fn record_working_set_edit(target_file: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn normalize_file_crlf_and_bom_before_edit(path: &Path) {
-    if !path.is_file() {
-        return;
-    }
-    let Ok(raw) = std::fs::read(path) else {
-        return;
-    };
-    let probe = raw.len().min(4096);
-    if raw[..probe].contains(&0u8) {
-        return;
-    }
-    let has_bom = raw.starts_with(&[0xEF, 0xBB, 0xBF]);
-    let body = if has_bom { &raw[3..] } else { &raw[..] };
-    let has_crlf = body.windows(2).any(|w| w == b"\r\n");
-    if !has_bom && !has_crlf {
-        return;
-    }
-    let Ok(text) = std::str::from_utf8(body) else {
-        return;
-    };
-    let normalized = text.replace("\r\n", "\n");
-    let _ = std::fs::write(path, normalized.as_bytes());
-}
-
 fn resolve_hook_workspace(payload: &Value, transcript_opt: Option<&Path>) -> Option<PathBuf> {
     if let Some(arr) = payload.get("workspacePaths").and_then(Value::as_array) {
         for item in arr {
@@ -728,10 +672,14 @@ pub fn is_protected_profile_dir(p: &Path) -> bool {
         return true;
     }
 
-    // Allow dedicated Antigravity scratch workspaces (`~/.gemini/antigravity/scratch/<project>`)
-    let scratch_prefix = format!("{home_trim}\\.gemini\\antigravity\\scratch\\");
-    if low.starts_with(&scratch_prefix) && trimmed.len() > scratch_prefix.trim_end_matches('\\').len() {
-        return false;
+    // Allow dedicated Antigravity scratch workspaces (`~/.gemini/antigravity*/scratch/<project>`)
+    for prod in ["antigravity", "antigravity-ide", "antigravity-cli"] {
+        let scratch_prefix = format!("{home_trim}\\.gemini\\{prod}\\scratch\\");
+        if low.starts_with(&scratch_prefix)
+            && trimmed.len() > scratch_prefix.trim_end_matches('\\').len()
+        {
+            return false;
+        }
     }
 
     trimmed == format!("{home_trim}\\appdata")
@@ -749,6 +697,19 @@ pub fn is_protected_profile_dir(p: &Path) -> bool {
         || low.contains("\\program files")
 }
 
+/// Resolves `<appDataDir>/brain/<cid>` across Antigravity 2.0 (`antigravity`),
+/// Antigravity IDE (`antigravity-ide`), and Antigravity CLI (`antigravity-cli`).
+pub fn resolve_brain_conv_dir(cid: &str) -> PathBuf {
+    let gemini = user_home_dir().join(".gemini");
+    for prod in ["antigravity", "antigravity-ide", "antigravity-cli"] {
+        let cand = gemini.join(prod).join("brain").join(cid);
+        if cand.is_dir() {
+            return cand;
+        }
+    }
+    gemini.join("antigravity").join("brain").join(cid)
+}
+
 fn resolve_cid_and_transcript(payload: &Value) -> Option<(String, PathBuf)> {
     let cid = payload
         .get("conversationId")
@@ -764,13 +725,18 @@ fn resolve_cid_and_transcript(payload: &Value) -> Option<(String, PathBuf)> {
     {
         return Some((cid.to_owned(), PathBuf::from(tp_str)));
     }
-    let brain_base = payload
-        .get("brainDir")
+    let conv_dir = payload
+        .get("artifactDirectoryPath")
         .and_then(Value::as_str)
         .map(PathBuf::from)
-        .unwrap_or_else(|| user_home_dir().join(".gemini").join("antigravity").join("brain"));
-    let t_path = brain_base
-        .join(cid)
+        .or_else(|| {
+            payload
+                .get("brainDir")
+                .and_then(Value::as_str)
+                .map(|b| PathBuf::from(b).join(cid))
+        })
+        .unwrap_or_else(|| resolve_brain_conv_dir(cid));
+    let t_path = conv_dir
         .join(".system_generated")
         .join("logs")
         .join("transcript.jsonl");

@@ -85,7 +85,7 @@ $PluginJson = @'
 {
   "name": "libredb",
   "displayName": "LibreDB Cognitive Memory",
-  "version": "0.8.5",
+  "version": "0.8.6",
   "description": "Full Rust replacement for SQLite SkillsDB: single-file cognitive memory, silent SQLite auto-porter, sub-2ms hooks, guardrails, 14-language causal code graph, and dynamic multi-remote Git/Gitea automation.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
@@ -124,11 +124,12 @@ $HookExeCandidates = @(
     $ReleaseExe
 )
 $VerifiedHookCmd = $null
-foreach ($CandCmd in $HookExeCandidates) {
+foreach ($CandExe in $HookExeCandidates) {
+    $FormattedCmd = if ($CandExe.Contains(' ')) { '"' + $CandExe + '"' } else { $CandExe }
     try {
-        $ProbeOut = "{}" | & $env:ComSpec /d /c "$CandCmd hook-pre-invocation" 2>$null
+        $ProbeOut = "{}" | & $env:ComSpec /c "$FormattedCmd hook-pre-invocation" 2>$null
         if ($LASTEXITCODE -eq 0 -and ($ProbeOut -join "") -match "injectSteps") {
-            $VerifiedHookCmd = $CandCmd
+            $VerifiedHookCmd = $FormattedCmd
             break
         }
     } catch {
@@ -136,7 +137,7 @@ foreach ($CandCmd in $HookExeCandidates) {
 }
 
 if ($null -ne $VerifiedHookCmd) {
-    $VerifiedEscaped = $VerifiedHookCmd.Replace('\', '\\')
+    $VerifiedEscaped = $VerifiedHookCmd.Replace('\', '\\').Replace('"', '\"')
     $HooksJson = @"
 {
   "libredb-autonomous-memory": {
@@ -214,7 +215,7 @@ All system rules, coding standards, administrative credentials, and skills are m
    - **Dynamic Git & Gitea sync**: Use `libredb git-init "<dir>"` (`gitea-init`), `libredb git-sync -m "<msg>" --project "<dir>" [--remote <r>] [--all-remotes] [--github] [--releases]` (`gitea-sync`), `libredb git-release [vX.Y.Z] --project "<dir>" [--all-remotes] [--github]` (`gitea-release`), and `libredb gitea-status`. Existing non-Gitea `origin` remotes are never hijacked, and Gitea Basic Auth headers are sent exclusively to the configured Gitea host. Ask confirmation before `--allow-unversioned` ("Soll ich das wirklich ohne Versionierung hochladen?") and pause on `[GITEA REPOSITORY COLLISION]` (`--use-existing`, `--name`, or `--overwrite`). Format Gitea/GitHub URLs as clickable links `[Label](url)`.
 
 7. **Model & concurrency catalog (pure Pull, zero background control plane)**:
-   - Supports `ultra` (16 parallel reader lanes) and `pro` (8 lanes) across `Gemini 4 Argon`, `Gemini 3.8 Flash`, `Claude Opus 5.5`, `Claude Sonnet 5.5`, and `GPT-OSS 120B`. Keep 100% of code generation on `Gemini 4 Argon` or `Claude 5.5`; route only read-only `research` subagents to `Model="flash"`.
+   - Supports `ultra` (16 parallel reader lanes) and `pro` (8 lanes) across `Gemini 4 Argon`, `Gemini 4 Carbon`, `Gemini 3.8 Flash`, `Claude Opus 5.5`, `Claude Sonnet 5.5`, and `GPT-OSS 120B`. Keep 100% of code generation on `Gemini 4 Argon`, `Gemini 4 Carbon`, or `Claude 5.5`; route only read-only `research` subagents to `Model="flash"`.
 '@
 $UmlautList = "$([char]0x00E4), $([char]0x00F6), $([char]0x00FC), $([char]0x00DF)"
 $TokenOek = "Token$([char]0x00F6)konomie"
@@ -296,14 +297,14 @@ $LogoSvg = @'
 
 # 7. Write user-facing README.md inside plugin bundle
 $PluginReadme = @'
-# LibreDB cognitive memory plugin (v0.8.5)
+# LibreDB cognitive memory plugin (v0.8.6)
 
 Complete standalone Rust replacement for `AntiGraviton SkillsDB` (`customizations-db`):
-- `libredb-mcp`: 3-tool multi-workspace cognitive memory & 14-language causal code-graph server with zero-I/O RAM session delta, `[Zero-Repeat Skeleton]` deduplication, and automatic incremental workspace refresh.
-- Compaction garbage collection (`compact_with_options`, `maybe_auto_compact`) and `INDEX_FORMAT_VERSION = 3` selective cognitive `HybridIndex`.
+- `libredb-mcp`: 3-tool multi-workspace cognitive memory & 14-language causal code-graph server with zero-I/O RAM session delta, `[Zero-Repeat Skeleton]` deduplication, qualified `Type::method` symbol resolution, and automatic incremental workspace refresh.
+- Compaction garbage collection (`compact_with_options`, `maybe_auto_compact`) and `INDEX_FORMAT_VERSION = 4` `HybridIndex` with dead-posting garbage collection across superseded Inodes.
 - Silent background 1:1 auto-migration for any pre-existing `.agents/memory.db` in older projects or chats; pure `.ldb` operation for all new projects and chats.
-- Native compiled `< 2 ms` `PreInvocation` and `PreToolUse` guardrail hooks (`hooks.json`) with post-compaction epoch hydration, live `transcript.jsonl` workspace inference, `research -> flash` subagent routing, and `CRLF`/BOM normalization.
-- Global system directives (`rules/AGENTS.md`) and dynamic multi-remote Git/Gitea release automation (`libredb git-sync` / `git-release` & `gitea-sync` / `gitea-release`).
+- Native compiled `< 2 ms` `PreInvocation` (`systemMessage`) and `PreToolUse` guardrail hooks (`hooks.json`) with post-compaction epoch hydration, multi-product `brain` discovery (`antigravity`, `antigravity-ide`, `antigravity-cli`), live `transcript.jsonl` workspace inference, and `research -> flash` subagent routing.
+- Global system directives (`rules/AGENTS.md`) and dynamic multi-remote Git/Gitea release automation (`libredb git-sync` / `git-release` & `gitea-sync` / `gitea-release`) with zero command-line token exposure (`GIT_CONFIG_COUNT` + RAII `curl -K`).
 
 To switch cleanly to pure single-engine operation, disable `AntiGraviton SkillsDB` (`customizations-db`) in Customizations and leave `LibreDB Cognitive Memory` (`libredb`) enabled.
 '@
@@ -328,6 +329,6 @@ if (Test-Path $AgyConfigPath) {
     }
 }
 
-Write-Output "[OK] Deployed LibreDB v0.8.5 standalone binaries to: $BinDir"
+Write-Output "[OK] Deployed LibreDB v0.8.6 standalone binaries to: $BinDir"
 Write-Output "[OK] Hydrated and modernized global 19-table store at: $GlobalLdb"
 Write-Output "[OK] Installed complete Antigravity replacement plugin at: $PluginDir"

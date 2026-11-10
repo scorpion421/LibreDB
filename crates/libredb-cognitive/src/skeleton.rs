@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 pub const SKELETON_KEY_PREFIX: &str = "skeleton::";
+/// Content-hash seed bumped whenever `FileSkeleton` extraction semantics upgrade (e.g. `container`
+/// qualification and `[T; N]` array-return brace parsing in v0.8.6) so stale cached skeletons refresh once.
+pub const SKELETON_HASH_SEED: u8 = 106;
 
 /// Section boundary (e.g., `# SECTION: skillsdb.core.db` or `mod ...`) inside a source file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,10 +27,23 @@ pub struct SectionSpan {
 pub struct SymbolContract {
     pub kind: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<String>,
     pub signature: String,
     pub doc_summary: String,
     pub start_line: usize,
     pub end_line: usize,
+}
+
+impl SymbolContract {
+    /// Returns `Container::name` when enclosed in an `impl`, `class`, `struct`, `trait`, or `interface`,
+    /// or `name` for top-level declarations.
+    pub fn qualified_name(&self) -> String {
+        match self.container.as_deref() {
+            Some(c) if !c.is_empty() => format!("{c}::{}", self.name),
+            _ => self.name.clone(),
+        }
+    }
 }
 
 /// Cached structural map of a source file stored inside `LibreDb` (`NodeKind::WorkingSet`).
@@ -48,7 +64,7 @@ impl FileSkeleton {
     pub fn extract(file_label: impl Into<String>, source: &str) -> Self {
         let label = file_label.into();
         let lang = detect_language(&label);
-        let content_hash = hash_key(99, source.as_bytes());
+        let content_hash = hash_key(SKELETON_HASH_SEED, source.as_bytes());
         let raw_tokens = count_tokens_exact(source.as_bytes());
         let lines: Vec<&str> = source.lines().collect();
         let total_lines = lines.len();
@@ -83,8 +99,13 @@ impl FileSkeleton {
     /// Returns a cached `FileSkeleton` from `db` if the file's 64-bit content hash matches,
     /// or extracts and persists an updated skeleton when the file is new or modified!
     pub fn index_or_get_cached(db: &LibreDb, path: &Path, display_label: Option<&str>) -> Result<(Self, bool)> {
-        let raw_bytes = std::fs::read(path)?;
-        let current_hash = hash_key(99, &raw_bytes);
+        let raw_bytes = std::fs::read(path).map_err(|e| {
+            LibreDbError::Io(std::io::Error::new(
+                e.kind(),
+                format!("{}: {e}", path.display()),
+            ))
+        })?;
+        let current_hash = hash_key(SKELETON_HASH_SEED, &raw_bytes);
         let label = display_label
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| path.to_string_lossy().replace('\\', "/"));
@@ -121,8 +142,13 @@ impl FileSkeleton {
         let mut pending_writes: Vec<libredb_core::PreparedWrite> = Vec::new();
 
         for (idx, &(path, display_label)) in items.iter().enumerate() {
-            let raw_bytes = std::fs::read(path)?;
-            let current_hash = hash_key(99, &raw_bytes);
+            let raw_bytes = std::fs::read(path).map_err(|e| {
+                LibreDbError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("{}: {e}", path.display()),
+                ))
+            })?;
+            let current_hash = hash_key(SKELETON_HASH_SEED, &raw_bytes);
             let label = display_label
                 .map(ToOwned::to_owned)
                 .unwrap_or_else(|| path.to_string_lossy().replace('\\', "/"));
@@ -201,7 +227,14 @@ impl FileSkeleton {
                 continue;
             }
             if let Some(ref flt) = filt_low {
-                let hay = format!("{} {} {}", sym.name, sym.signature, sym.doc_summary).to_ascii_lowercase();
+                let hay = format!(
+                    "{} {} {} {}",
+                    sym.qualified_name(),
+                    sym.name,
+                    sym.signature,
+                    sym.doc_summary
+                )
+                .to_ascii_lowercase();
                 if !hay.contains(flt) {
                     continue;
                 }
@@ -348,6 +381,7 @@ fn extract_python_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContr
     }
 
     let mut out = Vec::with_capacity(raw.len());
+    let mut active_class: Option<(String, usize, usize)> = None;
     for i in 0..raw.len() {
         let (start_line, indent, ref kind, ref name, ref packed) = raw[i];
         // Find end line where a non-empty non-comment line returns to `<= indent`.
@@ -363,14 +397,29 @@ fn extract_python_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContr
             }
             end_line = scan_idx + 1;
         }
+        let resolved_end = end_line.max(start_line);
+        if let Some((_, cls_end, cls_indent)) = active_class.as_ref() {
+            if start_line > *cls_end || indent <= *cls_indent {
+                active_class = None;
+            }
+        }
+        let container = if kind == "class" {
+            None
+        } else {
+            active_class.as_ref().map(|(c, _, _)| c.clone())
+        };
+        if kind == "class" {
+            active_class = Some((name.clone(), resolved_end, indent));
+        }
         let (signature, doc_summary) = packed.split_once("|DOC|").unwrap_or((packed, ""));
         out.push(SymbolContract {
             kind: kind.clone(),
             name: name.clone(),
+            container,
             signature: truncate_chars(signature, 115),
             doc_summary: truncate_chars(doc_summary, 85),
             start_line,
-            end_line: end_line.max(start_line),
+            end_line: resolved_end,
         });
     }
     out
@@ -400,6 +449,7 @@ fn extract_python_docstring(lines: &[&str], body_start_idx: usize) -> String {
 
 fn extract_smali_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContract> {
     let mut out = Vec::new();
+    let mut current_class: Option<String> = None;
     for (idx, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix(".class ") {
@@ -407,9 +457,11 @@ fn extract_smali_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContra
                 let clean = tok.trim_start_matches('L').trim_end_matches(';');
                 let short = clean.rsplit('/').next().unwrap_or(clean).to_owned();
                 if !short.is_empty() {
+                    current_class = Some(short.clone());
                     out.push(SymbolContract {
                         kind: "class".to_owned(),
                         name: short,
+                        container: None,
                         signature: truncate_chars(trimmed, 115),
                         doc_summary: String::new(),
                         start_line: idx + 1,
@@ -425,6 +477,7 @@ fn extract_smali_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContra
                         out.push(SymbolContract {
                             kind: "field".to_owned(),
                             name: fname.to_owned(),
+                            container: current_class.clone(),
                             signature: truncate_chars(trimmed, 115),
                             doc_summary: String::new(),
                             start_line: idx + 1,
@@ -447,6 +500,7 @@ fn extract_smali_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContra
                         out.push(SymbolContract {
                             kind: "method".to_owned(),
                             name: mname.to_owned(),
+                            container: current_class.clone(),
                             signature: truncate_chars(trimmed, 115),
                             doc_summary: String::new(),
                             start_line: idx + 1,
@@ -595,6 +649,7 @@ fn extract_asm_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContract
         out.push(SymbolContract {
             kind: kind.clone(),
             name: name.clone(),
+            container: None,
             signature: sig.clone(),
             doc_summary: String::new(),
             start_line: start,
@@ -644,6 +699,7 @@ fn extract_markdown_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolCon
         out.push(SymbolContract {
             kind: format!("h{level}"),
             name: title.clone(),
+            container: None,
             signature: sig.clone(),
             doc_summary: String::new(),
             start_line: start,
@@ -721,6 +777,7 @@ fn extract_sql_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContract
         out.push(SymbolContract {
             kind: kind_up.to_ascii_lowercase(),
             name: clean_name.to_owned(),
+            container: None,
             signature: truncate_chars(&collapse_ws(trimmed), 115),
             doc_summary: String::new(),
             start_line: idx + 1,
@@ -748,10 +805,11 @@ fn extract_powershell_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolC
                 let short_name = name_raw.rsplit(':').next().unwrap_or(&name_raw).to_owned();
                 if !short_name.is_empty() {
                     let sig_head = trimmed.split('{').next().unwrap_or(trimmed).trim();
-                    let end_line = find_matching_brace_end(lines, idx, total_lines);
+                    let end_line = find_matching_brace_end(lines, idx, total_lines, "powershell");
                     out.push(SymbolContract {
                         kind: kw.trim().to_owned(),
                         name: short_name,
+                        container: None,
                         signature: truncate_chars(&collapse_ws(sig_head), 115),
                         doc_summary: String::new(),
                         start_line: idx + 1,
@@ -796,10 +854,11 @@ fn extract_shell_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContra
 
         if let Some(name) = name_opt.filter(|s| !s.is_empty()) {
             let sig_head = trimmed.split('{').next().unwrap_or(trimmed).trim();
-            let end_line = find_matching_brace_end(lines, idx, total_lines);
+            let end_line = find_matching_brace_end(lines, idx, total_lines, "shell");
             out.push(SymbolContract {
                 kind: "function".to_owned(),
                 name,
+                container: None,
                 signature: truncate_chars(&collapse_ws(sig_head), 115),
                 doc_summary: String::new(),
                 start_line: idx + 1,
@@ -810,9 +869,11 @@ fn extract_shell_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContra
     out
 }
 
-fn extract_brace_symbols(lines: &[&str], total_lines: usize, _lang: &str) -> Vec<SymbolContract> {
+fn extract_brace_symbols(lines: &[&str], total_lines: usize, lang: &str) -> Vec<SymbolContract> {
     let mut out = Vec::new();
     let mut pending_doc = String::new();
+    // Active container stack: `(container_type_name, end_line, indent)`
+    let mut container_stack: Vec<(String, usize, usize)> = Vec::new();
 
     for (idx, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
@@ -838,26 +899,66 @@ fn extract_brace_symbols(lines: &[&str], total_lines: usize, _lang: &str) -> Vec
             continue;
         }
 
+        let start_line = idx + 1;
         let indent = line.len() - line.trim_start().len();
+        while let Some((_, c_end, c_indent)) = container_stack.last() {
+            if start_line > *c_end || indent <= *c_indent {
+                container_stack.pop();
+            } else {
+                break;
+            }
+        }
+
         if indent <= 12 {
-            if let Some((kind, name)) = match_brace_declaration(trimmed) {
-                // Collect signature up to `{` or `;`
+            if let Some((kind, mut name, explicit_container)) = match_brace_declaration(trimmed) {
+                // Collect multi-line signature up to opening `{` or top-level `;`
                 let mut sig = trimmed.to_owned();
                 let mut sig_idx = idx;
-                while !sig.contains('{') && !sig.contains(';') && sig_idx + 1 < total_lines && sig_idx < idx + 6 {
+                while !has_top_level_sig_terminator(&sig)
+                    && sig_idx + 1 < total_lines
+                    && sig_idx < idx + 8
+                {
                     sig_idx += 1;
                     sig.push(' ');
                     sig.push_str(lines[sig_idx].trim());
                 }
                 let sig_head = sig.split('{').next().unwrap_or(&sig).trim_end_matches(';').trim();
-                let end_line = find_matching_brace_end(lines, idx, total_lines);
+                let end_line = find_matching_brace_end(lines, idx, total_lines, lang);
+
+                let mut container = explicit_container.or_else(|| {
+                    container_stack.last().map(|(c, _, _)| c.clone())
+                });
+
+                if kind == "impl" {
+                    if let Some((impl_display, target_type)) = parse_impl_header(sig_head) {
+                        name = impl_display;
+                        container = None;
+                        if end_line > start_line && !target_type.is_empty() {
+                            container_stack.push((target_type, end_line, indent));
+                        }
+                    }
+                } else if matches!(
+                    kind.as_str(),
+                    "class"
+                        | "struct"
+                        | "trait"
+                        | "interface"
+                        | "object"
+                        | "extension"
+                        | "protocol"
+                        | "record"
+                ) && end_line > start_line
+                {
+                    container_stack.push((name.clone(), end_line, indent));
+                }
 
                 out.push(SymbolContract {
                     kind,
                     name,
+                    container,
                     signature: truncate_chars(&collapse_ws(sig_head), 115),
                     doc_summary: truncate_chars(&pending_doc, 85),
-                    start_line: idx + 1,
+                    start_line,
                     end_line,
                 });
                 pending_doc.clear();
@@ -870,7 +971,133 @@ fn extract_brace_symbols(lines: &[&str], total_lines: usize, _lang: &str) -> Vec
     out
 }
 
-fn match_brace_declaration(trimmed: &str) -> Option<(String, String)> {
+fn has_top_level_sig_terminator(sig: &str) -> bool {
+    let mut paren = 0i32;
+    let mut bracket = 0i32;
+    for ch in sig.chars() {
+        match ch {
+            '(' => paren += 1,
+            ')' => paren = (paren - 1).max(0),
+            '[' => bracket += 1,
+            ']' => bracket = (bracket - 1).max(0),
+            '{' if paren == 0 && bracket == 0 => return true,
+            ';' if paren == 0 && bracket == 0 => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn parse_impl_header(sig_head: &str) -> Option<(String, String)> {
+    let mut s = sig_head.trim();
+    for prefix in ["pub(crate) ", "pub(super) ", "pub ", "unsafe ", "default ", "const "] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            s = rest.trim_start();
+        }
+    }
+    let after_impl = s.strip_prefix("impl")?.trim_start();
+    let after_generics = if after_impl.starts_with('<') {
+        let mut depth = 0i32;
+        let mut end_pos = None;
+        for (i, ch) in after_impl.char_indices() {
+            if ch == '<' {
+                depth += 1;
+            } else if ch == '>' {
+                depth -= 1;
+                if depth == 0 {
+                    end_pos = Some(i + ch.len_utf8());
+                    break;
+                }
+            }
+        }
+        match end_pos {
+            Some(pos) => after_impl[pos..].trim_start(),
+            None => after_impl,
+        }
+    } else {
+        after_impl
+    };
+
+    let without_where = split_outside_angles(after_generics, " where ")
+        .map_or(after_generics, |(head, _)| head)
+        .trim();
+    if let Some((trait_part, type_part)) = split_outside_angles(without_where, " for ") {
+        let target_type = extract_base_type_ident(type_part);
+        let trait_short = extract_base_type_ident(trait_part);
+        if !target_type.is_empty() {
+            let label = if trait_short.is_empty() {
+                format!("impl {target_type}")
+            } else {
+                format!("impl {trait_short} for {target_type}")
+            };
+            return Some((label, target_type));
+        }
+    } else {
+        let target_type = extract_base_type_ident(without_where);
+        if !target_type.is_empty() {
+            return Some((format!("impl {target_type}"), target_type));
+        }
+    }
+    None
+}
+
+fn split_outside_angles<'a>(input: &'a str, needle: &str) -> Option<(&'a str, &'a str)> {
+    let mut angle = 0i32;
+    let bytes = input.as_bytes();
+    let n_bytes = needle.as_bytes();
+    if n_bytes.is_empty() || bytes.len() < n_bytes.len() {
+        return None;
+    }
+    let mut i = 0usize;
+    while i + n_bytes.len() <= bytes.len() {
+        let b = bytes[i];
+        if b == b'<' {
+            angle += 1;
+        } else if b == b'>' && angle > 0 {
+            angle -= 1;
+        } else if angle == 0 && &bytes[i..i + n_bytes.len()] == n_bytes {
+            return Some((&input[..i], &input[i + n_bytes.len()..]));
+        }
+        i += 1;
+    }
+    None
+}
+
+fn extract_base_type_ident(type_expr: &str) -> String {
+    let mut t = type_expr.trim();
+    loop {
+        if let Some(r) = t.strip_prefix('&') {
+            t = r.trim_start();
+            if t.starts_with('\'') {
+                t = t
+                    .trim_start_matches('\'')
+                    .trim_start_matches(|c: char| c.is_ascii_alphanumeric() || c == '_')
+                    .trim_start();
+            }
+            if let Some(rm) = t.strip_prefix("mut ") {
+                t = rm.trim_start();
+            }
+            continue;
+        }
+        if let Some(r) = t.strip_prefix("*const ").or_else(|| t.strip_prefix("*mut ")) {
+            t = r.trim_start();
+            continue;
+        }
+        if let Some(r) = t.strip_prefix("dyn ") {
+            t = r.trim_start();
+            continue;
+        }
+        break;
+    }
+    let before_gen = t.split(['<', '[', '(', ' ', '{']).next().unwrap_or(t);
+    let last_seg = before_gen.rsplit("::").next().unwrap_or(before_gen);
+    last_seg
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect()
+}
+
+fn match_brace_declaration(trimmed: &str) -> Option<(String, String, Option<String>)> {
     // Strip visibility and storage modifiers across Rust, TS/JS, Java, Kotlin, C#, C++, Dart, Swift.
     let mut s = trimmed;
     loop {
@@ -934,11 +1161,27 @@ fn match_brace_declaration(trimmed: &str) -> Option<(String, String)> {
     ] {
         if let Some(rest) = s.strip_prefix(kw) {
             let clean_kw = kw.trim_end_matches('<').trim().to_owned();
+            let mut explicit_container: Option<String> = None;
             let target = if kw == "impl<" {
                 rest.split_once('>').map_or(rest, |(_, after)| after.trim_start())
             } else if kw == "func " && rest.starts_with('(') {
                 // Go receiver method: `func (s *Server) Handle(...)`
-                rest.split_once(')').map_or(rest, |(_, after)| after.trim_start())
+                if let Some((recv, after)) = rest[1..].split_once(')') {
+                    let recv_type = recv
+                        .split_whitespace()
+                        .last()
+                        .unwrap_or("")
+                        .trim_start_matches('*')
+                        .split('[')
+                        .next()
+                        .unwrap_or("");
+                    if !recv_type.is_empty() {
+                        explicit_container = Some(recv_type.to_owned());
+                    }
+                    after.trim_start()
+                } else {
+                    rest
+                }
             } else {
                 rest
             };
@@ -946,9 +1189,17 @@ fn match_brace_declaration(trimmed: &str) -> Option<(String, String)> {
                 .chars()
                 .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == ':')
                 .collect();
+            if explicit_container.is_none() && clean_kw != "impl" {
+                if let Some((qual, _)) = raw_name.rsplit_once("::") {
+                    let base = qual.rsplit("::").next().unwrap_or(qual);
+                    if !base.is_empty() {
+                        explicit_container = Some(base.to_owned());
+                    }
+                }
+            }
             let short_name = raw_name.rsplit("::").next().unwrap_or(&raw_name).to_owned();
             if !short_name.is_empty() {
-                return Some((clean_kw, short_name));
+                return Some((clean_kw, short_name, explicit_container));
             }
         }
     }
@@ -985,12 +1236,17 @@ fn match_brace_declaration(trimmed: &str) -> Option<(String, String)> {
                 ) {
                     let cand = parts.last().copied().unwrap_or("");
                     let cand_clean = cand.trim_start_matches(['*', '&']);
+                    let explicit_container = cand_clean
+                        .rsplit_once("::")
+                        .and_then(|(q, _)| q.rsplit("::").next())
+                        .filter(|c| !c.is_empty())
+                        .map(ToOwned::to_owned);
                     let short = cand_clean.rsplit("::").next().unwrap_or(cand_clean);
                     if !short.is_empty()
                         && short.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
                         && short.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
                     {
-                        return Some(("method".to_owned(), short.to_owned()));
+                        return Some(("method".to_owned(), short.to_owned(), explicit_container));
                     }
                 }
             }
@@ -1000,23 +1256,157 @@ fn match_brace_declaration(trimmed: &str) -> Option<(String, String)> {
     None
 }
 
-fn find_matching_brace_end(lines: &[&str], start_idx: usize, total_lines: usize) -> usize {
-    let mut depth: i32 = 0;
+fn find_matching_brace_end(
+    lines: &[&str],
+    start_idx: usize,
+    total_lines: usize,
+    lang: &str,
+) -> usize {
+    let mut brace_depth: i32 = 0;
+    let mut paren_depth: i32 = 0;
+    let mut bracket_depth: i32 = 0;
     let mut seen_open = false;
-    for (idx, line) in lines.iter().enumerate().skip(start_idx) {
-        let code_part = line.split("//").next().unwrap_or(line);
-        for ch in code_part.chars() {
-            if ch == '{' {
-                depth += 1;
-                seen_open = true;
-            } else if ch == '}' {
-                depth -= 1;
-                if seen_open && depth <= 0 {
+    let mut in_block_comment = false;
+    let mut in_double_quote = false;
+    let mut raw_str_hashes: Option<usize> = None;
+
+    for (idx, &line) in lines.iter().enumerate().skip(start_idx) {
+        let chars: Vec<char> = line.chars().collect();
+        let n = chars.len();
+        let mut i = 0usize;
+
+        while i < n {
+            if in_block_comment {
+                if i + 1 < n && chars[i] == '*' && chars[i + 1] == '/' {
+                    in_block_comment = false;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            if let Some(hashes) = raw_str_hashes {
+                if chars[i] == '"' {
+                    let mut matched = true;
+                    for h in 0..hashes {
+                        if i + 1 + h >= n || chars[i + 1 + h] != '#' {
+                            matched = false;
+                            break;
+                        }
+                    }
+                    if matched {
+                        raw_str_hashes = None;
+                        i += 1 + hashes;
+                        continue;
+                    }
+                }
+                i += 1;
+                continue;
+            }
+            if in_double_quote {
+                if chars[i] == '\\' {
+                    i += 2;
+                } else if chars[i] == '"' {
+                    in_double_quote = false;
+                    i += 1;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+
+            let ch = chars[i];
+            if ch == '/' && i + 1 < n && chars[i + 1] == '/' {
+                break;
+            }
+            if ch == '/' && i + 1 < n && chars[i + 1] == '*' {
+                in_block_comment = true;
+                i += 2;
+                continue;
+            }
+            if lang == "rust" && ch == 'r' {
+                let prev_ident = i > 0 && (chars[i - 1].is_ascii_alphanumeric() || chars[i - 1] == '_');
+                if !prev_ident {
+                    let mut h = 0usize;
+                    while i + 1 + h < n && chars[i + 1 + h] == '#' {
+                        h += 1;
+                    }
+                    if i + 1 + h < n && chars[i + 1 + h] == '"' {
+                        raw_str_hashes = Some(h);
+                        i += 2 + h;
+                        continue;
+                    }
+                }
+            }
+            if ch == '"' {
+                in_double_quote = true;
+                i += 1;
+                continue;
+            }
+            if ch == '\'' {
+                if i + 1 < n && chars[i + 1] == '\\' {
+                    let mut j = i + 2;
+                    while j < n && j <= i + 10 {
+                        if chars[j] == '\'' {
+                            i = j + 1;
+                            break;
+                        }
+                        j += 1;
+                    }
+                    if i <= j && j <= i + 10 {
+                        i = j.min(n);
+                    }
+                    continue;
+                } else if i + 2 < n && chars[i + 2] == '\'' {
+                    // Single-character literal such as `'{'`, `'}'`, or `';'`
+                    i += 3;
+                    continue;
+                } else if lang != "rust" {
+                    // Single-quoted string in JS/TS/PowerShell/Shell
+                    let mut j = i + 1;
+                    let mut found_end = None;
+                    while j < n {
+                        if chars[j] == '\\' {
+                            j += 2;
+                            continue;
+                        }
+                        if chars[j] == '\'' {
+                            found_end = Some(j + 1);
+                            break;
+                        }
+                        j += 1;
+                    }
+                    if let Some(next_i) = found_end {
+                        i = next_i;
+                        continue;
+                    }
+                }
+                // Otherwise it is a Rust lifetime (`'a`, `'static`, `'_`) or label: advance 1 char!
+                i += 1;
+                continue;
+            }
+
+            match ch {
+                '(' => paren_depth += 1,
+                ')' => paren_depth = (paren_depth - 1).max(0),
+                '[' => bracket_depth += 1,
+                ']' => bracket_depth = (bracket_depth - 1).max(0),
+                '{' => {
+                    brace_depth += 1;
+                    seen_open = true;
+                }
+                '}' => {
+                    brace_depth -= 1;
+                    if seen_open && brace_depth <= 0 {
+                        return idx + 1;
+                    }
+                }
+                ';' if !seen_open && paren_depth == 0 && bracket_depth == 0 => {
                     return idx + 1;
                 }
-            } else if !seen_open && ch == ';' {
-                return idx + 1;
+                _ => {}
             }
+            i += 1;
         }
     }
     (start_idx + 1).min(total_lines)
@@ -1078,5 +1468,58 @@ mod tests {
         assert_eq!(sk_md.language, "markdown");
         assert_eq!(sk_md.symbols.len(), 4);
         assert!(sk_md.symbols.iter().any(|s| s.kind == "h2" && s.name == "Architecture" && s.start_line == 3 && s.end_line == 8));
+    }
+
+    #[test]
+    fn rust_array_return_types_lifetimes_and_trait_impl_containers_parse_accurately() {
+        let rust_src = r##"pub struct Inode {
+    pub id: u64,
+}
+
+impl Inode {
+    pub fn encode<'a>(&'a self) -> [u8; 64] {
+        let _brace_in_char = '{';
+        let _raw = r#"unbalanced { in raw string"#;
+        [0u8; 64]
+    }
+}
+
+pub struct Superblock {
+    pub seq: u64,
+}
+
+impl Superblock {
+    pub fn encode(&self) -> [u8; 512] {
+        [0u8; 512]
+    }
+}
+
+impl Drop for Inode {
+    fn drop(&mut self) {}
+}
+"##;
+        let sk = FileSkeleton::extract("format.rs", rust_src);
+        let inode_enc = sk
+            .symbols
+            .iter()
+            .find(|s| s.qualified_name() == "Inode::encode")
+            .expect("Inode::encode present");
+        assert_eq!(inode_enc.start_line, 6);
+        assert_eq!(inode_enc.end_line, 10, "[u8; 64] semicolon must not truncate body");
+
+        let sb_enc = sk
+            .symbols
+            .iter()
+            .find(|s| s.qualified_name() == "Superblock::encode")
+            .expect("Superblock::encode present");
+        assert_eq!(sb_enc.start_line, 18);
+        assert_eq!(sb_enc.end_line, 20);
+
+        let drop_fn = sk
+            .symbols
+            .iter()
+            .find(|s| s.qualified_name() == "Inode::drop")
+            .expect("impl Drop for Inode must attach container Inode, not Drop");
+        assert_eq!(drop_fn.container.as_deref(), Some("Inode"));
     }
 }

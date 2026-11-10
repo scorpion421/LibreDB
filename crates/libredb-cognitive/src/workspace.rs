@@ -5,7 +5,7 @@
 //! - Automatic `Governs` / `CausedBy` causal wiring between `Decision`/`Task` nodes and `Symbol` nodes,
 //! - `impact` blast-radius query and surgical `fim_slice` windowing.
 
-use crate::skeleton::{FileSkeleton, SKELETON_KEY_PREFIX};
+use crate::skeleton::{FileSkeleton, SKELETON_HASH_SEED, SKELETON_KEY_PREFIX};
 use libredb_core::crc::hash_key;
 use libredb_core::{EdgeKind, LibreDb, LibreDbError, NodeKind, PreparedWrite, Result, WriteRequest};
 use serde::{Deserialize, Serialize};
@@ -113,7 +113,7 @@ pub fn index_workspace(db: &LibreDb, root: &Path, force: bool) -> Result<Workspa
             continue;
         }
 
-        let current_hash = hash_key(99, &raw_bytes);
+        let current_hash = hash_key(SKELETON_HASH_SEED, &raw_bytes);
         let skel_key = format!("{SKELETON_KEY_PREFIX}{rel_path}");
 
         if !force {
@@ -141,8 +141,19 @@ pub fn index_workspace(db: &LibreDb, root: &Path, force: bool) -> Result<Workspa
 
     let files_scanned = unchanged + reindexed;
 
-    // Prepare batched writes for all modified skeletons and their symbol contracts.
+    let live_rel_paths: HashSet<&str> = all_skeletons
+        .iter()
+        .map(|(rel, _, _)| rel.as_str())
+        .collect();
+    let changed_rel_paths: HashSet<&str> = changed_files
+        .iter()
+        .map(|pf| pf.rel_path.as_str())
+        .collect();
+
+    // Prepare batched writes for all modified skeletons and their qualified symbol contracts.
     let mut prepared: Vec<PreparedWrite> = Vec::new();
+    let mut new_sym_keys_for_changed: HashSet<String> = HashSet::new();
+
     for (idx, pf) in changed_files.iter().enumerate() {
         let skel_bytes = serde_json::to_vec(&pf.skeleton)
             .map_err(|_| LibreDbError::CorruptFormat("skeleton serialize"))?;
@@ -153,17 +164,19 @@ pub fn index_workspace(db: &LibreDb, root: &Path, force: bool) -> Result<Workspa
             idx,
         )?);
 
-        for sym in &pf.skeleton.symbols {
-            let sym_key = format!("{}::{}", pf.rel_path, sym.name);
+        for (sym_idx, sym_key) in compute_file_symbol_keys(&pf.rel_path, &pf.skeleton) {
+            let sym = &pf.skeleton.symbols[sym_idx];
+            let qname = sym.qualified_name();
             let doc_part = if sym.doc_summary.is_empty() {
                 String::new()
             } else {
                 format!(" // {}", sym.doc_summary)
             };
             let body = format!(
-                "{} [L{}-L{}] ({}) {}{}",
-                pf.rel_path, sym.start_line, sym.end_line, sym.kind, sym.signature, doc_part
+                "{} :: {} [L{}-L{}] ({}) {}{}",
+                pf.rel_path, qname, sym.start_line, sym.end_line, sym.kind, sym.signature, doc_part
             );
+            new_sym_keys_for_changed.insert(sym_key.clone());
             prepared.push(db.prepare(
                 WriteRequest::new(NodeKind::Symbol, body.into_bytes())
                     .with_key(sym_key)
@@ -171,6 +184,35 @@ pub fn index_workspace(db: &LibreDb, root: &Path, force: bool) -> Result<Workspa
                 idx,
             )?);
         }
+    }
+
+    // Tombstone stale `Symbol` and `skeleton::*` Inodes from deleted files or renamed/deleted symbols
+    // inside reindexed files so orphan symbols never linger in `list_inodes` or `impact` queries.
+    let mut stale_ids: Vec<u64> = Vec::new();
+    for (ino, key_opt, _) in db.list_inodes(Some(NodeKind::Symbol), false) {
+        if let Some(ref full_k) = key_opt {
+            if let Some((file_part, _)) = full_k.split_once("::") {
+                if !live_rel_paths.contains(file_part)
+                    || (changed_rel_paths.contains(file_part)
+                        && !new_sym_keys_for_changed.contains(full_k))
+                {
+                    stale_ids.push(ino.node_id);
+                }
+            }
+        }
+    }
+    for (ino, key_opt, _) in db.list_inodes(Some(NodeKind::WorkingSet), false) {
+        if let Some(ref k) = key_opt {
+            if let Some(rel) = k.strip_prefix(SKELETON_KEY_PREFIX) {
+                if !live_rel_paths.contains(rel) {
+                    stale_ids.push(ino.node_id);
+                }
+            }
+        }
+    }
+    let had_stale_tombstones = !stale_ids.is_empty();
+    if had_stale_tombstones {
+        db.deprecate_nodes(&stale_ids)?;
     }
 
     if !prepared.is_empty() {
@@ -185,19 +227,23 @@ pub fn index_workspace(db: &LibreDb, root: &Path, force: bool) -> Result<Workspa
     let mut by_qualified_name: HashMap<String, Vec<(u64, String)>> = HashMap::new();
     let mut by_short_name: HashMap<String, Vec<(u64, String)>> = HashMap::new();
     let mut by_full_key: HashMap<String, u64> = HashMap::new();
+    let mut active_sym_ids: Vec<u64> = Vec::with_capacity(sym_inodes.len());
 
     for (ino, key_opt, _) in &sym_inodes {
+        active_sym_ids.push(ino.node_id);
         if let Some(ref full_k) = key_opt {
             by_full_key.insert(full_k.clone(), ino.node_id);
             if let Some((_, sym_part)) = full_k.split_once("::") {
-                if sym_part.contains("::") {
+                let clean_sym = sym_part.split('@').next().unwrap_or(sym_part);
+                if clean_sym.contains("::") {
                     by_qualified_name
-                        .entry(sym_part.to_owned())
+                        .entry(clean_sym.to_owned())
                         .or_default()
                         .push((ino.node_id, full_k.clone()));
                 }
-            }
-            if let Some((_, short)) = full_k.rsplit_once("::") {
+                let short = clean_sym
+                    .rsplit_once("::")
+                    .map_or(clean_sym, |(_, s)| s);
                 if short.len() >= 3 && !is_trivial_call_stopword(short) {
                     by_short_name
                         .entry(short.to_owned())
@@ -213,7 +259,8 @@ pub fn index_workspace(db: &LibreDb, root: &Path, force: bool) -> Result<Workspa
         .iter()
         .map(|(_, _, syns)| syns.iter().filter(|s| s.kind == EdgeKind::Calls).count())
         .sum();
-    let need_call_pass = force || !changed_files.is_empty() || existing_call_edges == 0;
+    let need_call_pass =
+        force || !changed_files.is_empty() || had_stale_tombstones || existing_call_edges == 0;
     let mut call_edges = 0usize;
 
     // 1. Wire `CallerSymbol --[Calls]--> CalleeSymbol` across workspace files!
@@ -221,8 +268,8 @@ pub fn index_workspace(db: &LibreDb, root: &Path, force: bool) -> Result<Workspa
         for (rel_path, skel, text_opt) in &all_skeletons {
             let Some(ref text) = text_opt else { continue };
             let lines: Vec<&str> = text.lines().collect();
-            for sym in &skel.symbols {
-                let src_key = format!("{rel_path}::{}", sym.name);
+            for (sym_idx, src_key) in compute_file_symbol_keys(rel_path, skel) {
+                let sym = &skel.symbols[sym_idx];
                 let Some(&src_id) = by_full_key.get(&src_key) else {
                     continue;
                 };
@@ -231,12 +278,34 @@ pub fn index_workspace(db: &LibreDb, root: &Path, force: bool) -> Result<Workspa
                 if start_i >= end_i {
                     continue;
                 }
-                let body_slice = lines[start_i..end_i].join("\n");
+                // Exclude lines owned by nested child symbols (e.g. methods inside a `class` or `trait`)
+                // so enclosing containers never duplicate the outgoing calls of their member methods.
+                let body_slice: String = lines[start_i..end_i]
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(offset, &ln)| {
+                        let line_no = start_i + offset + 1;
+                        let in_child = skel.symbols.iter().any(|other| {
+                            other.kind != "impl"
+                                && other.start_line > sym.start_line
+                                && other.end_line <= sym.end_line
+                                && line_no >= other.start_line
+                                && line_no <= other.end_line
+                        });
+                        if in_child {
+                            None
+                        } else {
+                            Some(ln)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 let mut seen_targets: HashSet<u64> = HashSet::new();
+                let own_qname = sym.qualified_name();
 
-                // Stage A: Exact qualified calls (`Type::method` or `Type.method`)
-                for qcall in extract_qualified_calls(&body_slice) {
-                    if qcall == sym.name {
+                // Stage A: Exact qualified calls (`Type::method`, `Type.method`, `Self::method`, `self.method(`)
+                for qcall in extract_qualified_calls(&body_slice, sym.container.as_deref()) {
+                    if qcall == own_qname {
                         continue;
                     }
                     if let Some(targets) = by_qualified_name.get(&qcall) {
@@ -250,9 +319,8 @@ pub fn index_workspace(db: &LibreDb, root: &Path, force: bool) -> Result<Workspa
                 }
 
                 // Stage B: Unqualified symbol identifiers (filtered by `is_trivial_call_stopword` and ambiguity cap)
-                let short_self = sym.name.rsplit_once("::").map_or(sym.name.as_str(), |(_, s)| s);
                 for ident in extract_code_identifiers(&body_slice) {
-                    if ident == sym.name || ident == short_self || is_trivial_call_stopword(&ident) {
+                    if ident == sym.name || ident == own_qname || is_trivial_call_stopword(&ident) {
                         continue;
                     }
                     if let Some(targets) = by_short_name.get(&ident) {
@@ -282,29 +350,57 @@ pub fn index_workspace(db: &LibreDb, root: &Path, force: bool) -> Result<Workspa
 
     // 2. Wire `Decision / Task --[Governs]--> Symbol` & `Symbol --[CausedBy]--> Decision` automatically!
     let mut gov_edges = 0usize;
+    let mut active_gov_ids: Vec<u64> = Vec::new();
     for kind in [NodeKind::Decision, NodeKind::Task] {
         let gov_inodes = db.list_inodes(Some(kind), false);
         let gov_ids: Vec<u64> = gov_inodes.iter().map(|(i, _, _)| i.node_id).collect();
+        active_gov_ids.extend_from_slice(&gov_ids);
         let (gov_recs, _) = db.get_many_coalesced(&gov_ids)?;
         for rec in gov_recs {
             let text = String::from_utf8_lossy(&rec.payload);
+            let mut seen_gov_syms: HashSet<u64> = HashSet::new();
+            for qcall in extract_qualified_calls(&text, None) {
+                if let Some(targets) = by_qualified_name.get(&qcall) {
+                    for &(sym_id, _) in targets {
+                        if seen_gov_syms.insert(sym_id) {
+                            edges.push((rec.node_id, EdgeKind::Governs, sym_id, 245));
+                            edges.push((sym_id, EdgeKind::CausedBy, rec.node_id, 235));
+                            gov_edges += 2;
+                        }
+                    }
+                }
+            }
             for ident in extract_code_identifiers(&text) {
                 if ident.len() < 4 {
                     continue;
                 }
                 if let Some(targets) = by_short_name.get(&ident) {
                     for &(sym_id, _) in targets {
-                        edges.push((rec.node_id, EdgeKind::Governs, sym_id, 240));
-                        edges.push((sym_id, EdgeKind::CausedBy, rec.node_id, 230));
-                        gov_edges += 2;
+                        if seen_gov_syms.insert(sym_id) {
+                            edges.push((rec.node_id, EdgeKind::Governs, sym_id, 240));
+                            edges.push((sym_id, EdgeKind::CausedBy, rec.node_id, 230));
+                            gov_edges += 2;
+                        }
                     }
                 }
             }
         }
     }
 
-    if !edges.is_empty() {
-        db.link_batch(&edges)?;
+    let mut scoped_sources = active_sym_ids;
+    scoped_sources.extend_from_slice(&active_gov_ids);
+    if need_call_pass {
+        db.sync_edges_for_kinds(
+            &scoped_sources,
+            &[EdgeKind::Calls, EdgeKind::Governs, EdgeKind::CausedBy],
+            &edges,
+        )?;
+    } else {
+        db.sync_edges_for_kinds(
+            &scoped_sources,
+            &[EdgeKind::Governs, EdgeKind::CausedBy],
+            &edges,
+        )?;
     }
 
     Ok(WorkspaceIndexReport {
@@ -403,7 +499,12 @@ pub fn extract_fim_slice(
     center_line: Option<usize>,
     context_pad: usize,
 ) -> Result<FimSliceBundle> {
-    let raw_bytes = std::fs::read(file_path)?;
+    let raw_bytes = std::fs::read(file_path).map_err(|e| {
+        LibreDbError::Io(std::io::Error::new(
+            e.kind(),
+            format!("{}: {e}", file_path.display()),
+        ))
+    })?;
     let text = String::from_utf8_lossy(&raw_bytes);
     let lines: Vec<&str> = text.lines().collect();
     let total_lines = lines.len();
@@ -416,15 +517,20 @@ pub fn extract_fim_slice(
         let found = skel
             .symbols
             .iter()
-            .find(|s| s.name.to_lowercase() == q_low)
-            .or_else(|| skel.symbols.iter().find(|s| s.name.to_lowercase().contains(&q_low)))
+            .find(|s| s.qualified_name().to_lowercase() == q_low || s.name.to_lowercase() == q_low)
+            .or_else(|| {
+                skel.symbols.iter().find(|s| {
+                    s.qualified_name().to_lowercase().contains(&q_low)
+                        || s.name.to_lowercase().contains(&q_low)
+                })
+            })
             .ok_or_else(|| LibreDbError::KeyNotFound {
                 kind: NodeKind::Symbol,
                 key: sym_q.to_owned(),
             })?;
         let s = found.start_line.saturating_sub(context_pad).max(1);
         let e = (found.end_line + context_pad).min(total_lines.max(1));
-        (s, e, Some(found.name.clone()))
+        (s, e, Some(found.qualified_name()))
     } else if let Some(ln) = center_line {
         let c = ln.clamp(1, total_lines.max(1));
         let s = c.saturating_sub(context_pad).max(1);
@@ -444,8 +550,14 @@ pub fn extract_fim_slice(
     let mut callers = Vec::new();
     let mut governing = Vec::new();
     if let Some(ref sname) = matched_sym {
-        if let Ok(impacts) = query_symbol_impact(db, sname) {
-            if let Some(first) = impacts.into_iter().next() {
+        let scoped_q = format!("::{sname}");
+        if let Ok(impacts) = query_symbol_impact(db, &scoped_q) {
+            let best = impacts
+                .iter()
+                .find(|r| label.ends_with(r.symbol_key.split_once("::").map_or("", |(f, _)| f)))
+                .cloned()
+                .or_else(|| impacts.into_iter().next());
+            if let Some(first) = best {
                 callers = first.callers;
                 governing = first.governing_decisions;
             }
@@ -594,7 +706,28 @@ fn extract_code_identifiers(text: &str) -> HashSet<String> {
     set
 }
 
-fn extract_qualified_calls(text: &str) -> HashSet<String> {
+fn compute_file_symbol_keys(rel_path: &str, skel: &FileSkeleton) -> Vec<(usize, String)> {
+    let mut out = Vec::with_capacity(skel.symbols.len());
+    let mut seen_keys: HashSet<String> = HashSet::with_capacity(skel.symbols.len());
+    for (idx, sym) in skel.symbols.iter().enumerate() {
+        if sym.kind == "impl" {
+            continue;
+        }
+        let qname = sym.qualified_name();
+        let base_key = format!("{rel_path}::{qname}");
+        let unique_key = if seen_keys.insert(base_key.clone()) {
+            base_key
+        } else {
+            let disamb = format!("{base_key}@L{}", sym.start_line);
+            seen_keys.insert(disamb.clone());
+            disamb
+        };
+        out.push((idx, unique_key));
+    }
+    out
+}
+
+fn extract_qualified_calls(text: &str, self_container: Option<&str>) -> HashSet<String> {
     let mut out = HashSet::new();
     let bytes = text.as_bytes();
     let n = bytes.len();
@@ -607,7 +740,17 @@ fn extract_qualified_calls(text: &str) -> HashSet<String> {
                 i += 1;
             }
             let lhs = &text[s1..i];
-            if lhs.len() >= 2 && lhs.as_bytes()[0].is_ascii_uppercase() {
+            let resolved_lhs: Option<(&str, bool)> = if lhs == "Self" {
+                self_container.map(|c| (c, false))
+            } else if matches!(lhs, "self" | "this") {
+                self_container.map(|c| (c, true))
+            } else if lhs.len() >= 2 && lhs.as_bytes()[0].is_ascii_uppercase() {
+                Some((lhs, false))
+            } else {
+                None
+            };
+
+            if let Some((owner_type, require_call_paren)) = resolved_lhs {
                 if i + 1 < n && bytes[i] == b':' && bytes[i + 1] == b':' {
                     let sep_end = i + 2;
                     if sep_end < n && (bytes[sep_end].is_ascii_alphabetic() || bytes[sep_end] == b'_') {
@@ -617,7 +760,7 @@ fn extract_qualified_calls(text: &str) -> HashSet<String> {
                         }
                         let rhs = &text[sep_end..j];
                         if rhs.len() >= 2 {
-                            out.insert(format!("{lhs}::{rhs}"));
+                            out.insert(format!("{owner_type}::{rhs}"));
                         }
                         i = sep_end;
                         continue;
@@ -630,8 +773,9 @@ fn extract_qualified_calls(text: &str) -> HashSet<String> {
                             j += 1;
                         }
                         let rhs = &text[sep_end..j];
-                        if rhs.len() >= 2 {
-                            out.insert(format!("{lhs}::{rhs}"));
+                        let has_paren = j < n && (bytes[j] == b'(' || text[j..].starts_with("::<"));
+                        if rhs.len() >= 2 && (!require_call_paren || has_paren) {
+                            out.insert(format!("{owner_type}::{rhs}"));
                         }
                         i = sep_end;
                         continue;

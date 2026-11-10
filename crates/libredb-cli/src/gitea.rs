@@ -77,18 +77,28 @@ impl GiteaConfig {
             || low.starts_with("http://localhost:3000")
     }
 
-    /// Returns transient Basic Auth args ONLY when `remote_url` matches the configured Gitea host.
-    /// Never attaches local Gitea credentials to GitHub, GitLab, or external Git servers!
-    pub fn git_auth_args_for_remote(&self, remote_url: &str) -> Vec<String> {
-        if self.is_gitea_remote_url(remote_url) && !self.user.is_empty() && !self.token.is_empty()
-        {
+    /// Injects transient Basic Auth (and Windows Schannel TLS backend for `https://` Gitea hosts)
+    /// exclusively via child-process `GIT_CONFIG_*` environment variables when `remote_url` matches
+    /// the configured Gitea server. Credentials NEVER appear on process command lines (Event 4688 /
+    /// Sysmon Event ID 1), are NEVER written to `.git/config`, and are NEVER sent to GitHub/GitLab.
+    pub fn configure_git_command_for_remote(&self, cmd: &mut Command, remote_url: &str) {
+        if !self.is_gitea_remote_url(remote_url) {
+            return;
+        }
+        let mut pairs: Vec<(&str, String)> = Vec::new();
+        if !self.user.is_empty() && !self.token.is_empty() {
             let b64 = base64_encode(format!("{}:{}", self.user, self.token).as_bytes());
-            vec![
-                "-c".to_owned(),
-                format!("http.extraHeader=Authorization: Basic {b64}"),
-            ]
-        } else {
-            Vec::new()
+            pairs.push(("http.extraHeader", format!("Authorization: Basic {b64}")));
+        }
+        if cfg!(windows) && remote_url.trim().to_ascii_lowercase().starts_with("https://") {
+            pairs.push(("http.sslBackend", "schannel".to_owned()));
+        }
+        if !pairs.is_empty() {
+            cmd.env("GIT_CONFIG_COUNT", pairs.len().to_string());
+            for (idx, (k, v)) in pairs.into_iter().enumerate() {
+                cmd.env(format!("GIT_CONFIG_KEY_{idx}"), k);
+                cmd.env(format!("GIT_CONFIG_VALUE_{idx}"), v);
+            }
         }
     }
 }
@@ -440,10 +450,10 @@ pub fn cmd_gitea_sync(
         if cfg.is_gitea_remote_url(rem_url) && !cfg.user.is_empty() && !cfg.token.is_empty() {
             let _ = ensure_remote_repo_created(&cfg, &repo_name);
         }
-        let mut push_args = cfg.git_auth_args_for_remote(rem_url);
-        push_args.extend(["push".to_owned(), "-u".to_owned(), rem_name.clone(), branch.clone()]);
-        let p_out = Command::new("git")
-            .args(&push_args)
+        let mut push_cmd = Command::new("git");
+        cfg.configure_git_command_for_remote(&mut push_cmd, rem_url);
+        let p_out = push_cmd
+            .args(["push", "-u", rem_name, &branch])
             .current_dir(&clean_root)
             .output()?;
         if !p_out.status.success() {
@@ -562,10 +572,10 @@ fn publish_gitea_release_internal(
     }
     if created_any_tag || target_tag_opt.is_some() {
         for (rem_name, rem_url) in target_remotes {
-            let mut tpush = cfg.git_auth_args_for_remote(rem_url);
-            tpush.extend(["push".to_owned(), rem_name.clone(), "--tags".to_owned()]);
-            let _ = Command::new("git")
-                .args(&tpush)
+            let mut tpush_cmd = Command::new("git");
+            cfg.configure_git_command_for_remote(&mut tpush_cmd, rem_url);
+            let _ = tpush_cmd
+                .args(["push", rem_name, "--tags"])
                 .current_dir(project_root)
                 .output();
         }
@@ -1284,41 +1294,110 @@ fn http_request(
 
     let mut raw_resp = Vec::new();
     stream.read_to_end(&mut raw_resp)?;
+    parse_http_response(&raw_resp)
+}
 
-    let Some(hdr_end) = find_double_crlf(&raw_resp) else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "malformed HTTP response headers",
-        ));
-    };
-    let hdr_text = String::from_utf8_lossy(&raw_resp[..hdr_end]);
-    let status_line = hdr_text.lines().next().unwrap_or("");
-    let status_code = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(500);
+fn parse_http_response(mut resp: &[u8]) -> std::io::Result<(u16, Vec<u8>)> {
+    loop {
+        let Some(hdr_end) = find_double_crlf(resp) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "malformed HTTP response headers",
+            ));
+        };
+        let hdr_text = String::from_utf8_lossy(&resp[..hdr_end]);
+        let status_line = hdr_text.lines().next().unwrap_or("");
+        let status_code = status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(500);
 
-    let is_chunked = hdr_text
-        .lines()
-        .any(|l| l.to_ascii_lowercase().starts_with("transfer-encoding:") && l.to_ascii_lowercase().contains("chunked"));
+        // Skip interim `1xx` frames (such as `HTTP/1.1 100 Continue\r\n\r\n` on multipart uploads).
+        if (100..200).contains(&status_code) && status_code != 101 {
+            resp = &resp[hdr_end + 4..];
+            continue;
+        }
 
-    let raw_body = &raw_resp[hdr_end + 4..];
-    let decoded_body = if is_chunked {
-        decode_chunked_body(raw_body)
-    } else {
-        raw_body.to_vec()
-    };
+        let is_chunked = hdr_text.lines().any(|l| {
+            let low = l.to_ascii_lowercase();
+            low.starts_with("transfer-encoding:") && low.contains("chunked")
+        });
 
-    Ok((status_code, decoded_body))
+        let raw_body = &resp[hdr_end + 4..];
+        let decoded_body = if is_chunked {
+            decode_chunked_body(raw_body)
+        } else {
+            raw_body.to_vec()
+        };
+
+        return Ok((status_code, decoded_body));
+    }
 }
 
 fn find_double_crlf(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
+struct EphemeralCurlConfig {
+    path: PathBuf,
+    byte_len: usize,
+}
+
+impl EphemeralCurlConfig {
+    fn create_with_token(token: &str) -> std::io::Result<Self> {
+        let base_dir = crate::hooks::user_home_dir().join(".gemini").join("libredb");
+        let dir = if fs::create_dir_all(&base_dir).is_ok() {
+            base_dir
+        } else {
+            env::temp_dir()
+        };
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let cfg_path = dir.join(format!(".curl_hdr_{}_{stamp}.cfg", std::process::id()));
+        let sanitized: String = token
+            .chars()
+            .filter(|&c| c != '\r' && c != '\n')
+            .flat_map(|c| match c {
+                '\\' => vec!['\\', '\\'],
+                '"' => vec!['\\', '"'],
+                other => vec![other],
+            })
+            .collect();
+        let content = format!("header = \"Authorization: token {sanitized}\"\n");
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&cfg_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = f.set_permissions(fs::Permissions::from_mode(0o600));
+        }
+        f.write_all(content.as_bytes())?;
+        f.flush()?;
+        Ok(Self {
+            path: cfg_path,
+            byte_len: content.len(),
+        })
+    }
+}
+
+impl Drop for EphemeralCurlConfig {
+    fn drop(&mut self) {
+        if let Ok(mut f) = fs::OpenOptions::new().write(true).open(&self.path) {
+            let zeros = vec![0u8; self.byte_len.max(64)];
+            let _ = f.write_all(&zeros);
+            let _ = f.flush();
+        }
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 /// Executes an `https://` API call via the OS-native `curl` binary (`C:\Windows\System32\curl.exe` on Windows,
-/// which natively uses Windows Schannel and trusts Active Directory GPO Enterprise Root CAs).
+/// which natively uses Windows Schannel and trusts Active Directory GPO Enterprise Root CAs), passing
+/// `Authorization` headers via an ephemeral RAII-wiped `-K` config file rather than CLI arguments.
 fn https_request_via_system_curl(
     method: &str,
     url: &str,
@@ -1339,6 +1418,12 @@ fn https_request_via_system_curl(
         "curl"
     };
 
+    let auth_cfg_guard = if !token.is_empty() {
+        Some(EphemeralCurlConfig::create_with_token(token)?)
+    } else {
+        None
+    };
+
     let marker = "\n__LIBREDB_HTTP_STATUS__:";
     let mut cmd = Command::new(curl_bin);
     cmd.args([
@@ -1352,8 +1437,8 @@ fn https_request_via_system_curl(
         "-H",
         "User-Agent: LibreDB-GiteaSync/1.0",
     ]);
-    if !token.is_empty() {
-        cmd.args(["-H", &format!("Authorization: token {token}")]);
+    if let Some(ref guard) = auth_cfg_guard {
+        cmd.arg("-K").arg(&guard.path);
     }
     if let Some(ct) = content_type {
         cmd.args(["-H", &format!("Content-Type: {ct}")]);
@@ -1375,6 +1460,7 @@ fn https_request_via_system_curl(
         }
     }
     let out = child.wait_with_output()?;
+    drop(auth_cfg_guard);
     if !out.status.success() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Other,
@@ -1464,8 +1550,9 @@ fn percent_encode(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_verbatim_prefix;
+    use super::{parse_http_response, strip_verbatim_prefix, GiteaConfig};
     use std::path::{Path, PathBuf};
+    use std::process::Command;
 
     #[test]
     fn strip_verbatim_prefix_preserves_unc_and_drive_paths() {
@@ -1489,5 +1576,49 @@ mod tests {
             strip_verbatim_prefix(Path::new(r"Q:\Antigravity\LibreDB")),
             PathBuf::from(r"Q:\Antigravity\LibreDB")
         );
+    }
+
+    #[test]
+    fn git_remote_auth_uses_env_only_never_cli_args_and_never_leaks_to_github() {
+        let cfg = GiteaConfig {
+            url: "https://git.corp.example".to_owned(),
+            user: "ci_bot".to_owned(),
+            token: "test_placeholder_tok".to_owned(),
+            service_name: "gitea".to_owned(),
+        };
+
+        let mut gitea_cmd = Command::new("git");
+        cfg.configure_git_command_for_remote(&mut gitea_cmd, "https://git.corp.example/org/repo.git");
+        assert_eq!(
+            gitea_cmd.get_args().count(),
+            0,
+            "credentials must never be passed as command-line arguments"
+        );
+        let envs: Vec<(String, String)> = gitea_cmd
+            .get_envs()
+            .filter_map(|(k, v)| Some((k.to_str()?.to_owned(), v?.to_str()?.to_owned())))
+            .collect();
+        assert!(envs.iter().any(|(k, _)| k == "GIT_CONFIG_COUNT"));
+        assert!(envs
+            .iter()
+            .any(|(k, v)| k.starts_with("GIT_CONFIG_KEY_") && v == "http.extraHeader"));
+        if cfg!(windows) {
+            assert!(envs
+                .iter()
+                .any(|(k, v)| k.starts_with("GIT_CONFIG_VALUE_") && v == "schannel"));
+        }
+
+        let mut gh_cmd = Command::new("git");
+        cfg.configure_git_command_for_remote(&mut gh_cmd, "https://github.com/org/repo.git");
+        assert_eq!(gh_cmd.get_envs().count(), 0);
+        assert_eq!(gh_cmd.get_args().count(), 0);
+    }
+
+    #[test]
+    fn parse_http_response_skips_100_continue_frames() {
+        let raw = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 201 Created\r\nContent-Type: application/json\r\n\r\n{\"id\":42}";
+        let (status, body) = parse_http_response(raw).unwrap();
+        assert_eq!(status, 201);
+        assert_eq!(body, b"{\"id\":42}");
     }
 }

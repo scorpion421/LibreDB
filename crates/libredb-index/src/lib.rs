@@ -21,8 +21,9 @@ use std::collections::{HashMap, HashSet};
 pub const HEBBIAN_KEY_PREFIX: &str = "hebbian::";
 pub const INDEX_SNAPSHOT_KEY: &str = "sys::index_snapshot";
 /// Binary schema/filtering version for `sys::index_snapshot`. Bumping this automatically
-/// rebuilds any older bloated snapshot (e.g. v1 with `Symbol`/`QuotaEvent` postings) on open.
-pub const INDEX_FORMAT_VERSION: u32 = 3;
+/// rebuilds any older bloated snapshot (e.g. v1 with `Symbol`/`QuotaEvent` postings or v3 with
+/// retained dead postings from superseded Inodes) on open.
+pub const INDEX_FORMAT_VERSION: u32 = 4;
 
 /// Ranked search hit produced by `HybridIndex::search`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,15 +177,24 @@ impl HybridIndex {
             }
         }
 
-        // Evict any docs from `self.docs` that were superseded or tombstoned since snapshot.
+        // Evict any docs from `self.docs` (and purge their inverted postings) that were
+        // superseded, tombstoned, or modified since the snapshot.
+        let mut purge_ids: HashSet<u64> = HashSet::new();
         self.docs.retain(|nid, meta| {
             let keep = live_ids.contains(nid);
             if !keep {
                 self.total_word_len = self.total_word_len.saturating_sub(meta.word_len as u64);
                 self.total_ngram_len = self.total_ngram_len.saturating_sub(meta.ngram_len as u64);
+                purge_ids.insert(*nid);
             }
             keep
         });
+        for &nid in &to_fetch {
+            if self.docs.contains_key(&nid) {
+                purge_ids.insert(nid);
+            }
+        }
+        self.purge_nodes_from_postings(&purge_ids);
 
         if !to_fetch.is_empty() {
             let (records, _) = db.get_many_coalesced(&to_fetch)?;
@@ -387,13 +397,13 @@ impl HybridIndex {
             word_len += 1;
         }
 
-        let had_prev = if let Some(prev) = self.docs.remove(&node_id) {
+        if let Some(prev) = self.docs.remove(&node_id) {
             self.total_word_len = self.total_word_len.saturating_sub(prev.word_len as u64);
             self.total_ngram_len = self.total_ngram_len.saturating_sub(prev.ngram_len as u64);
-            true
-        } else {
-            false
-        };
+            let mut single = HashSet::with_capacity(1);
+            single.insert(node_id);
+            self.purge_nodes_from_postings(&single);
+        }
 
         self.total_word_len += word_len.max(1) as u64;
         self.total_ngram_len += ngram_len.max(1) as u64;
@@ -410,19 +420,25 @@ impl HybridIndex {
         );
 
         for (w, tf) in word_tf {
-            let list = self.word_postings.entry(w).or_default();
-            if had_prev {
-                list.retain(|&(id, _)| id != node_id);
-            }
-            list.push((node_id, tf));
+            self.word_postings.entry(w).or_default().push((node_id, tf));
         }
         for (ng, tf) in ngram_tf {
-            let list = self.ngram_postings.entry(ng).or_default();
-            if had_prev {
-                list.retain(|&(id, _)| id != node_id);
-            }
-            list.push((node_id, tf));
+            self.ngram_postings.entry(ng).or_default().push((node_id, tf));
         }
+    }
+
+    fn purge_nodes_from_postings(&mut self, dead_ids: &HashSet<u64>) {
+        if dead_ids.is_empty() {
+            return;
+        }
+        self.word_postings.retain(|_, list| {
+            list.retain(|&(id, _)| !dead_ids.contains(&id));
+            !list.is_empty()
+        });
+        self.ngram_postings.retain(|_, list| {
+            list.retain(|&(id, _)| !dead_ids.contains(&id));
+            !list.is_empty()
+        });
     }
 
     /// Executes universal `BM25 (tokens) + IDF-weighted BM25 (Unicode n-grams) + Learned Hebbian Bridges`.
@@ -803,5 +819,60 @@ mod tests {
         let jp_hits = reloaded.search(jp_query, None, 3);
         assert!(!jp_hits.is_empty());
         assert_eq!(jp_hits[0].node_id, smb_id);
+    }
+
+    #[test]
+    fn reconcile_delta_purges_superseded_and_deleted_postings_from_snapshot() {
+        let dir = tempdir().unwrap();
+        let db = LibreDb::open(dir.path().join("purge_postings.ldb")).unwrap();
+
+        let first_id = db
+            .put(
+                WriteRequest::new(
+                    NodeKind::Rule,
+                    b"Enforce xylophonequasar validation on legacy payloads.".to_vec(),
+                )
+                .with_key("rule-alpha"),
+            )
+            .unwrap();
+
+        let mut idx = HybridIndex::load_or_build(&db).unwrap();
+        assert!(idx.word_postings.contains_key("xylophonequasar"));
+        idx.save_snapshot(&db).unwrap();
+
+        // Overwrite `rule-alpha` (superseding `first_id`) with completely different vocabulary:
+        let second_id = db
+            .put(
+                WriteRequest::new(
+                    NodeKind::Rule,
+                    b"Enforce zephyrnebula verification on modern extents.".to_vec(),
+                )
+                .with_key("rule-alpha"),
+            )
+            .unwrap();
+        assert_ne!(first_id, second_id);
+
+        // Incremental `reconcile_delta` must purge `first_id` from both `word_postings` and `ngram_postings`:
+        let mut reconciled = HybridIndex::load_or_build(&db).unwrap();
+        assert!(
+            !reconciled.word_postings.contains_key("xylophonequasar"),
+            "superseded token must be purged from word_postings"
+        );
+        assert!(
+            !reconciled
+                .ngram_postings
+                .values()
+                .any(|plist| plist.iter().any(|&(nid, _)| nid == first_id)),
+            "superseded node_id must be purged from all ngram_postings"
+        );
+        reconciled.save_snapshot(&db).unwrap();
+
+        // Reload persisted v4 snapshot and verify clean search results:
+        let reloaded = HybridIndex::load_or_build(&db).unwrap();
+        assert!(!reloaded.word_postings.contains_key("xylophonequasar"));
+        assert!(reloaded.search("xylophonequasar", None, 5).is_empty());
+        let hits = reloaded.search("zephyrnebula", None, 5);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].node_id, second_id);
     }
 }

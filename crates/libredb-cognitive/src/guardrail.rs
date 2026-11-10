@@ -32,8 +32,18 @@ impl GuardrailAuditReport {
     }
 }
 
-/// Checks text content for formatting and scripting guardrail violations.
+/// Checks full-file text content for formatting and scripting guardrail violations.
 pub fn check_text_guardrails(text: &str, filename: &str) -> Vec<GuardrailViolation> {
+    check_text_guardrails_with_mode(text, filename, true)
+}
+
+/// Checks text content (either a full file when `is_full_file == true`, or a partial `edit_file`
+/// snippet when `is_full_file == false`) for formatting and scripting guardrail violations.
+pub fn check_text_guardrails_with_mode(
+    text: &str,
+    filename: &str,
+    is_full_file: bool,
+) -> Vec<GuardrailViolation> {
     let mut out = Vec::new();
     let low_name = filename.to_ascii_lowercase().replace('\\', "/");
 
@@ -163,7 +173,7 @@ pub fn check_text_guardrails(text: &str, filename: &str) -> Vec<GuardrailViolati
         }
     }
 
-    if is_changelog && !text.trim().is_empty() && !has_changelog_h1 {
+    if is_changelog && is_full_file && !text.trim().is_empty() && !has_changelog_h1 {
         out.push(GuardrailViolation {
             rule: "keep-a-changelog-format".to_owned(),
             severity: "CRITICAL".to_owned(),
@@ -546,5 +556,10 @@ mod tests {
         let dup_cl = "# Changelog\n\n## [0.2.0] - 2026-11-10\n### Added\n- A\n\n## [0.2.0] - 2026-11-09\n### Added\n- B\n";
         let v_cl = check_text_guardrails(dup_cl, "CHANGELOG.md");
         assert!(v_cl.iter().any(|x| x.rule == "changelog-duplicate-version"));
+
+        // Partial `edit_file` snippets on CHANGELOG.md without line 1 `# Changelog` must pass when `is_full_file == false`:
+        let partial_cl = "## [0.3.0] - 2026-11-10\n\n### Fixed\n\n- Fixed partial edit check.\n";
+        assert!(check_text_guardrails_with_mode(partial_cl, "CHANGELOG.md", false).is_empty());
+        assert!(!check_text_guardrails_with_mode(partial_cl, "CHANGELOG.md", true).is_empty());
     }
 }

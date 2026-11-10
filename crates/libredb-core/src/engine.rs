@@ -249,8 +249,14 @@ impl LibreDb {
     /// Opens or initializes a database on any `StorageBackend` (OS file or fault simulator).
     pub fn open_with_backend(backend: Arc<dyn StorageBackend>) -> Result<Self> {
         let file_len = backend.len()?;
-        let snapshot = if file_len == 0 {
-            Self::initialize_fresh(&*backend)?
+        let snapshot = if file_len < DATA_REGION_START {
+            let _ipc_guard = IpcWriteGuard::acquire(&*backend)?;
+            let locked_len = backend.len()?;
+            if locked_len == 0 {
+                Self::initialize_fresh(&*backend)?
+            } else {
+                Self::recover_existing(&*backend, locked_len)?
+            }
         } else {
             Self::recover_existing(&*backend, file_len)?
         };
@@ -918,6 +924,198 @@ impl LibreDb {
         Ok(edges.len())
     }
 
+    /// Atomically reconciles outgoing synapses of `managed_kinds` across `scoped_sources`:
+    /// any existing synapse on a scoped source whose `EdgeKind` is in `managed_kinds` is replaced
+    /// by the exact set in `desired_edges`, while non-managed synapses (e.g. `Supersedes`) remain untouched.
+    /// Writes a `DeltaEnvelope` only for Inodes whose synapse table actually changed.
+    pub fn sync_edges_for_kinds(
+        &self,
+        scoped_sources: &[u64],
+        managed_kinds: &[EdgeKind],
+        desired_edges: &[(u64, EdgeKind, u64, u8)],
+    ) -> Result<usize> {
+        if scoped_sources.is_empty() && desired_edges.is_empty() {
+            return Ok(0);
+        }
+
+        let _guard = self.commit_lock.lock();
+        let _ipc_guard = IpcWriteGuard::acquire(&*self.backend)?;
+        self.sync_from_disk_if_changed()?;
+        let old_snap = Arc::clone(&self.state.read());
+
+        let mut grouped: HashMap<u64, Vec<Synapse>> = HashMap::new();
+        for &src_id in scoped_sources {
+            if old_snap.inodes.contains_key(&src_id) {
+                grouped.entry(src_id).or_default();
+            }
+        }
+        for &(src_id, kind, dst_id, weight) in desired_edges {
+            if !old_snap.inodes.contains_key(&src_id) {
+                return Err(LibreDbError::NodeNotFound(src_id));
+            }
+            if !old_snap.inodes.contains_key(&dst_id) {
+                return Err(LibreDbError::NodeNotFound(dst_id));
+            }
+            let syn = Synapse::new(kind, weight, dst_id)?;
+            let list = grouped.entry(src_id).or_default();
+            if let Some(existing) = list
+                .iter_mut()
+                .find(|s| s.kind == syn.kind && s.target_id == syn.target_id)
+            {
+                existing.weight = syn.weight;
+            } else {
+                list.push(syn);
+            }
+        }
+
+        let mut next_snap = SnapshotState {
+            superblock: old_snap.superblock,
+            inodes: old_snap.inodes.clone(),
+            overflow_synapses: old_snap.overflow_synapses.clone(),
+            key_dir: old_snap.key_dir.clone(),
+            reverse_keys: old_snap.reverse_keys.clone(),
+        };
+
+        let now = now_unix_ns();
+        let env_start = next_snap.superblock.data_tail_offset;
+        let mut envelope_buf: Vec<u8> = vec![0u8; 12];
+        let mut modified_inodes: Vec<Inode> = Vec::new();
+
+        let mut sorted_sources: Vec<u64> = grouped.keys().copied().collect();
+        sorted_sources.sort_unstable();
+
+        for source_id in sorted_sources {
+            let incoming = &grouped[&source_id];
+            let existing_inode = next_snap.inodes[&source_id].clone();
+            let old_syns = collect_node_synapses(&next_snap, &existing_inode);
+
+            let mut rebuilt: Vec<Synapse> = old_syns
+                .iter()
+                .copied()
+                .filter(|s| !managed_kinds.contains(&s.kind))
+                .collect();
+            rebuilt.extend(incoming.iter().copied());
+
+            if rebuilt == old_syns {
+                continue;
+            }
+
+            let mut inline_synapses = [None; INLINE_SYNAPSE_CAP];
+            for (idx, syn) in rebuilt.iter().take(INLINE_SYNAPSE_CAP).enumerate() {
+                inline_synapses[idx] = Some(*syn);
+            }
+            let overflow_slice = if rebuilt.len() > INLINE_SYNAPSE_CAP {
+                &rebuilt[INLINE_SYNAPSE_CAP..]
+            } else {
+                &[]
+            };
+
+            let mut updated_inode = existing_inode;
+            updated_inode.inline_synapses = inline_synapses;
+            updated_inode.updated_ns = now;
+            updated_inode.generation = updated_inode.generation.saturating_add(1);
+            updated_inode.access_count = updated_inode
+                .access_count
+                .saturating_add(self.telemetry.drain_hits(source_id));
+
+            if !overflow_slice.is_empty() {
+                match updated_inode.storage {
+                    InodeStorage::Inline { len, bytes } => {
+                        updated_inode.flags.remove(NodeFlags::INLINE_DATA);
+                        let raw_slice = &bytes[..len as usize];
+                        let data_crc = crc32(raw_slice);
+                        let data_offset = env_start + (envelope_buf.len() as u64);
+                        envelope_buf.extend_from_slice(raw_slice);
+                        let (edge_off, edge_cnt) =
+                            append_overflow_synapses(env_start, &mut envelope_buf, overflow_slice);
+                        updated_inode.storage = InodeStorage::Extent {
+                            data_offset,
+                            raw_len: len as u32,
+                            stored_len: len as u32,
+                            data_crc32: data_crc,
+                            edge_extent_offset: edge_off,
+                            edge_overflow_count: edge_cnt,
+                            vector_reserved: [0u8; 12],
+                        };
+                    }
+                    InodeStorage::Extent {
+                        data_offset,
+                        raw_len,
+                        stored_len,
+                        data_crc32,
+                        vector_reserved,
+                        ..
+                    } => {
+                        let (edge_off, edge_cnt) =
+                            append_overflow_synapses(env_start, &mut envelope_buf, overflow_slice);
+                        updated_inode.storage = InodeStorage::Extent {
+                            data_offset,
+                            raw_len,
+                            stored_len,
+                            data_crc32,
+                            edge_extent_offset: edge_off,
+                            edge_overflow_count: edge_cnt,
+                            vector_reserved,
+                        };
+                    }
+                }
+                next_snap
+                    .overflow_synapses
+                    .insert(source_id, overflow_slice.to_vec());
+            } else {
+                next_snap.overflow_synapses.remove(&source_id);
+                if let InodeStorage::Extent {
+                    data_offset,
+                    raw_len,
+                    stored_len,
+                    data_crc32,
+                    vector_reserved,
+                    ..
+                } = updated_inode.storage
+                {
+                    updated_inode.storage = InodeStorage::Extent {
+                        data_offset,
+                        raw_len,
+                        stored_len,
+                        data_crc32,
+                        edge_extent_offset: 0,
+                        edge_overflow_count: 0,
+                        vector_reserved,
+                    };
+                }
+            }
+
+            next_snap.inodes.insert(source_id, updated_inode.clone());
+            modified_inodes.push(updated_inode);
+        }
+
+        if modified_inodes.is_empty() {
+            return Ok(desired_edges.len());
+        }
+
+        let new_seq = next_snap.superblock.commit_seq + 1;
+        let meta_rel_offset = envelope_buf.len() as u32;
+        let commit_frame =
+            encode_metadata_frame(COMMIT_FRAME_MAGIC, new_seq, &modified_inodes, &[])?;
+        envelope_buf.extend_from_slice(&commit_frame);
+        let total_env_len = envelope_buf.len() as u32;
+
+        envelope_buf[0..4].copy_from_slice(b"LDBE");
+        envelope_buf[4..8].copy_from_slice(&total_env_len.to_le_bytes());
+        envelope_buf[8..12].copy_from_slice(&meta_rel_offset.to_le_bytes());
+
+        self.backend.write_at(env_start, &envelope_buf)?;
+        self.backend.sync_data()?;
+
+        next_snap.superblock.commit_seq = new_seq;
+        next_snap.superblock.data_tail_offset = env_start + (total_env_len as u64);
+        next_snap.superblock.last_commit_ns = now;
+        self.write_superblock_slot(&next_snap.superblock)?;
+
+        *self.state.write() = Arc::new(next_snap);
+        Ok(desired_edges.len())
+    }
+
     /// Tombstones an active keyed node so it no longer appears in active queries while keeping file integrity.
     pub fn deprecate_key(&self, kind: NodeKind, key: &str) -> Result<bool> {
         let _guard = self.commit_lock.lock();
@@ -1077,7 +1275,9 @@ impl LibreDb {
 
         let payload = match self.read_inode_payload(&inode) {
             Ok(p) => p,
-            Err(LibreDbError::ChecksumMismatch { .. }) if self.sync_from_disk_if_changed()? => {
+            Err(LibreDbError::ChecksumMismatch { .. }) | Err(LibreDbError::Io(_))
+                if self.sync_from_disk_if_changed()? =>
+            {
                 let fresh_snap = Arc::clone(&self.state.read());
                 let fresh_ino = fresh_snap
                     .inodes
@@ -1187,15 +1387,20 @@ impl LibreDb {
         }
         let (payload_map, io_reads) = match self.read_coalesced_extents(&snap, &valid_ids) {
             Ok(res) => res,
-            Err(LibreDbError::ChecksumMismatch { .. }) if self.sync_from_disk_if_changed()? => {
+            Err(LibreDbError::ChecksumMismatch { .. }) | Err(LibreDbError::Io(_))
+                if self.sync_from_disk_if_changed()? =>
+            {
                 snap = Arc::clone(&self.state.read());
+                valid_ids.retain(|nid| snap.inodes.contains_key(nid));
                 self.read_coalesced_extents(&snap, &valid_ids)?
             }
             Err(e) => return Err(e),
         };
         let mut records = Vec::with_capacity(valid_ids.len());
         for nid in valid_ids {
-            let inode = &snap.inodes[&nid];
+            let Some(inode) = snap.inodes.get(&nid) else {
+                continue;
+            };
             let synapses = collect_node_synapses(&snap, inode);
             let payload = payload_map.get(&nid).cloned().unwrap_or_default();
             self.telemetry.record_hit(nid);
@@ -1993,7 +2198,10 @@ impl LibreDb {
         let mut reqs: Vec<ExtentReq> = Vec::new();
 
         for &nid in node_ids {
-            let inode = &snap.inodes[&nid];
+            let inode = snap
+                .inodes
+                .get(&nid)
+                .ok_or(LibreDbError::NodeNotFound(nid))?;
             match inode.storage {
                 InodeStorage::Inline { len, bytes } => {
                     out.insert(nid, bytes[..len as usize].to_vec());

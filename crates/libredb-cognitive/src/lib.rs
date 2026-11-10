@@ -17,7 +17,8 @@ pub mod workspace;
 
 pub use guardrail::{
     audit_workspace_guardrails, check_command_guardrails, check_text_guardrails,
-    is_test_or_scratch_path, GuardrailAuditReport, GuardrailViolation,
+    check_text_guardrails_with_mode, is_test_or_scratch_path, GuardrailAuditReport,
+    GuardrailViolation,
 };
 pub use overlay::OverlayBrain;
 pub use reflex::{detect_workspace_markers, FiredReflex, ReflexEngine, ReflexRule};

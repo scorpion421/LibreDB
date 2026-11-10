@@ -9,7 +9,10 @@
 //! 3. **Hands-Free `/compact` Detection:** Automatically locates Antigravity's `transcript.jsonl`
 //!    from `cid` (`~/.gemini/antigravity/brain/<cid>/.system_generated/logs/transcript.jsonl`).
 
-use crate::hooks::{find_workspace_root, is_protected_profile_dir, open_global_ldb, open_project_ldb_silent};
+use crate::hooks::{
+    find_workspace_root, is_protected_profile_dir, open_global_ldb, open_project_ldb_silent,
+    resolve_brain_conv_dir,
+};
 use libredb_bridge::import_sqlite_readonly;
 use libredb_cognitive::{
     create_subagent_handoff, execute_atomic_batch, extract_fim_slice, index_workspace,
@@ -622,11 +625,7 @@ fn infer_chat_memory_ldb_path(cid: &str) -> Option<PathBuf> {
     if cid.trim().is_empty() || cid.contains('/') || cid.contains('\\') {
         return None;
     }
-    let brain_dir = user_home_dir()
-        .join(".gemini")
-        .join("antigravity")
-        .join("brain")
-        .join(cid.trim());
+    let brain_dir = resolve_brain_conv_dir(cid.trim());
     if brain_dir.is_dir() {
         Some(brain_dir.join(".agents").join("memory.ldb"))
     } else {
@@ -639,11 +638,7 @@ fn infer_antigravity_transcript_path(cid: &str) -> Option<PathBuf> {
         return None;
     }
     Some(
-        user_home_dir()
-            .join(".gemini")
-            .join("antigravity")
-            .join("brain")
-            .join(cid)
+        resolve_brain_conv_dir(cid.trim())
             .join(".system_generated")
             .join("logs")
             .join("transcript.jsonl"),
