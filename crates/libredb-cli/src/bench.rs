@@ -1582,19 +1582,32 @@ pub fn run_feature_and_security_audit(
                     emitted_tokens: 120,
                 },
             );
-            let ws_slash = ws_a.to_string_lossy().replace('\\', "/");
+            #[cfg(unix)]
+            let ws_transcript_str = {
+                let alias_p = sbx_root.join("ws_alpha_symlink_alias");
+                let _ = std::os::unix::fs::symlink(&ws_a, &alias_p);
+                ws_a.to_string_lossy().replace('\\', "/")
+            };
+            #[cfg(not(unix))]
+            let ws_transcript_str = ws_a.to_string_lossy().replace('\\', "\\\\");
+
             let jsonl = format!(
-                "{{\"created_at\":\"2026-11-11T10:00:00Z\",\"type\":\"PLANNER_RESPONSE\",\"usageMetadata\":{{\"promptTokenCount\":4200,\"cachedContentTokenCount\":3100,\"candidatesTokenCount\":380}},\"tool_calls\":[{{\"name\":\"mcp_libredb_libredb-mcp_libredb_code\",\"arguments\":{{\"action\":\"fim\",\"cwd\":\"{ws_slash}\"}}}}]}}\n\
+                "{{\"created_at\":\"2026-11-11T10:00:00Z\",\"type\":\"PLANNER_RESPONSE\",\"usageMetadata\":{{\"promptTokenCount\":4200,\"cachedContentTokenCount\":3100,\"candidatesTokenCount\":380}},\"tool_calls\":[{{\"name\":\"mcp_libredb_libredb-mcp_libredb_code\",\"arguments\":{{\"action\":\"fim\",\"cwd\":\"{ws_transcript_str}\"}}}}]}}\n\
                  {{\"created_at\":\"2026-11-11T10:00:01Z\",\"type\":\"TOOL_RESPONSE\",\"content\":\"=== FIM SLICE: src/a.rs :: x [L10-L20 of L200] ===\\nfn x() {{}}\"}}\n"
             );
             fs::write(logs_dir.join("transcript.jsonl"), jsonl).map_err(|e| e.to_string())?;
+
+            #[cfg(unix)]
+            let filter_target = sbx_root.join("ws_alpha_symlink_alias");
+            #[cfg(not(unix))]
+            let filter_target = ws_a.clone();
 
             let rep = crate::telemetry::build_savings_report(
                 &crate::telemetry::SavingsQueryOptions {
                     today_only: false,
                     days: None,
                     cid_filter: None,
-                    project_filter: Some(&ws_a),
+                    project_filter: Some(&filter_target),
                     custom_brain_dir: Some(&brain_dir),
                     custom_telemetry_ldb: Some(&tel_ldb),
                 },
@@ -1797,7 +1810,7 @@ pub fn run_feature_and_security_audit(
     let passed = checks.iter().filter(|c| c.passed).count();
     let failed = checks.len().saturating_sub(passed);
     let report = AuditSuiteReport {
-        suite: "v1.1.1-feature-and-security-audit".to_owned(),
+        suite: format!("v{}-feature-and-security-audit", env!("CARGO_PKG_VERSION")),
         total_checks: checks.len(),
         passed_checks: passed,
         failed_checks: failed,

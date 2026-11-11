@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.2] - 2026-11-11
+
+### Fixed
+
+- Fixed macOS `/var/folders/...` <-> `/private/var/folders/...` (and `/tmp` <-> `/private/tmp`) root-symlink workspace path matching as well as Windows JSON-escaped backslash (`D:\\...`) and `file:///d%3A/...` URI matching in `libredb savings` transcript attribution (`build_workspace_needles`, `lexical_clean_slash`, and `contains_path_boundary_ci` in `crates/libredb-cli/src/telemetry.rs`, plus `A6` in `crates/libredb-cli/src/bench.rs`): `scan_transcripts_by_day` previously matched only `std::fs::canonicalize(p)` (`/private/var/folders/...` on macOS), missing transcripts that recorded the logical workspace path (`/var/folders/...` or `/tmp/...`) before OS firmlink resolution, and now enforces both start and end path-segment boundaries across logical, canonical, verified macOS firmlink, JSON-escaped, and URI-encoded workspace representations (bringing the automated test suite to 105 tests + 9 `A1..A9` audit checks + 10k crash simulations across Linux, macOS, and Windows).
+
 ## [1.1.1] - 2026-11-11
 
 ### Added

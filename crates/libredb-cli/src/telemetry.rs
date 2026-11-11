@@ -738,18 +738,7 @@ fn scan_transcripts_by_day(
         return out;
     }
 
-    let proj_needles: Option<(Vec<u8>, Vec<u8>)> = project_filter.map(|p| {
-        let canon = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-        let raw = canon.to_string_lossy();
-        let clean = raw
-            .strip_prefix(r"\\?\")
-            .unwrap_or(&raw)
-            .replace('\\', "/")
-            .trim_end_matches('/')
-            .to_ascii_lowercase();
-        let bs = clean.replace('/', "\\");
-        (clean.into_bytes(), bs.into_bytes())
-    });
+    let proj_needles: Option<Vec<Vec<u8>>> = project_filter.map(build_workspace_needles);
 
     let Ok(entries) = std::fs::read_dir(&brain_root) else {
         return out;
@@ -802,7 +791,7 @@ fn scan_transcripts_by_day(
         let (matched, bytes_read, hit_budget_cap) = parse_single_transcript(
             &t_path,
             date_window,
-            proj_needles.as_ref(),
+            proj_needles.as_deref(),
             remaining_budget,
             &mut out.by_day,
             &mut out.provider_usage,
@@ -819,10 +808,113 @@ fn scan_transcripts_by_day(
     out
 }
 
-/// Zero-allocation case-insensitive workspace path boundary check (`needle` must not be followed
-/// by an identifier/path-segment continuation byte, preventing `/repo/app` from matching `/repo/app2`).
-fn line_mentions_workspace_bytes(line: &[u8], needle_slash: &[u8], needle_bs: &[u8]) -> bool {
-    contains_path_boundary_ci(line, needle_slash) || contains_path_boundary_ci(line, needle_bs)
+fn lexical_clean_slash(p: &Path) -> String {
+    let abs = if p.is_absolute() || p.has_root() {
+        p.to_path_buf()
+    } else {
+        env::current_dir()
+            .map(|c| c.join(p))
+            .unwrap_or_else(|_| p.to_path_buf())
+    };
+    let raw = abs.to_string_lossy();
+    let s = if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+        format!("//{}", unc.replace('\\', "/"))
+    } else if let Some(win) = raw.strip_prefix(r"\\?\") {
+        win.replace('\\', "/")
+    } else {
+        raw.replace('\\', "/")
+    };
+    let (prefix, rest) = if s.starts_with("//") {
+        ("//", &s[2..])
+    } else if s.starts_with('/') {
+        ("/", &s[1..])
+    } else {
+        ("", s.as_str())
+    };
+    let mut segs: Vec<&str> = Vec::new();
+    for seg in rest.split('/') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if seg == ".." {
+            if segs.last().is_some_and(|last| !last.ends_with(':')) {
+                segs.pop();
+            }
+            continue;
+        }
+        segs.push(seg);
+    }
+    let mut out = String::from(prefix);
+    out.push_str(&segs.join("/"));
+    out.to_ascii_lowercase()
+}
+
+/// Builds verified lowercase byte needles for `p` across both its logical path (preserving OS
+/// root symlinks such as macOS `/var/folders/...` and `/tmp/...`) and its canonical target
+/// (`/private/var/folders/...`, junctions, or symlinked workspace roots), plus Windows JSON-escaped
+/// double-backslash (`d:\\...`) and `file:///d%3a/...` URI representations.
+fn build_workspace_needles(p: &Path) -> Vec<Vec<u8>> {
+    let mut slash_variants: Vec<String> = Vec::with_capacity(3);
+    let push_unique_str = |vec: &mut Vec<String>, s: String| {
+        if !s.is_empty() && s != "/" && s != "//" && !vec.contains(&s) {
+            vec.push(s);
+        }
+    };
+
+    push_unique_str(&mut slash_variants, lexical_clean_slash(p));
+
+    let canon_opt = crate::security::canonicalize_with_missing_tail(p)
+        .or_else(|| std::fs::canonicalize(p).ok());
+    if let Some(ref canon) = canon_opt {
+        push_unique_str(&mut slash_variants, lexical_clean_slash(canon));
+
+        // When `p` was already canonicalized upstream (e.g. `/private/var/...` or `/private/tmp/...`
+        // on macOS), also admit the unprefixed `/var/...` or `/tmp/...` alias iff it resolves back
+        // to the exact same canonical inode path on this host.
+        let canon_slash = canon.to_string_lossy().replace('\\', "/");
+        for firmlink_prefix in ["/private/var/", "/private/tmp/", "/private/etc/"] {
+            if canon_slash.starts_with(firmlink_prefix) {
+                let unprefixed = &canon_slash["/private".len()..];
+                let alt_canon =
+                    crate::security::canonicalize_with_missing_tail(Path::new(unprefixed))
+                        .or_else(|| std::fs::canonicalize(unprefixed).ok());
+                if alt_canon.as_ref() == Some(canon) {
+                    push_unique_str(
+                        &mut slash_variants,
+                        lexical_clean_slash(Path::new(unprefixed)),
+                    );
+                }
+            }
+        }
+    }
+
+    let mut needles: Vec<Vec<u8>> = Vec::with_capacity(slash_variants.len() * 4);
+    let mut push_needle = |bytes: Vec<u8>| {
+        if !bytes.is_empty() && !needles.contains(&bytes) {
+            needles.push(bytes);
+        }
+    };
+
+    for clean in slash_variants {
+        push_needle(clean.as_bytes().to_vec());
+        if clean.as_bytes().get(1) == Some(&b':') {
+            push_needle(clean.replace('/', "\\").into_bytes());
+            push_needle(clean.replace('/', "\\\\").into_bytes());
+            push_needle(format!("{}%3a{}", &clean[..1], &clean[2..]).into_bytes());
+        } else if clean.starts_with("//") {
+            push_needle(clean.replace('/', "\\").into_bytes());
+            push_needle(clean.replace('/', "\\\\").into_bytes());
+        }
+    }
+    needles
+}
+
+/// Zero-allocation case-insensitive workspace path boundary check (`needle` must be bounded on
+/// both start and end so `/repo/app` never matches `/repo/app2` or `/other/repo/app`).
+fn line_mentions_workspace_bytes(line: &[u8], needles: &[Vec<u8>]) -> bool {
+    needles
+        .iter()
+        .any(|needle| contains_path_boundary_ci(line, needle))
 }
 
 fn contains_path_boundary_ci(haystack: &[u8], needle_low: &[u8]) -> bool {
@@ -834,23 +926,38 @@ fn contains_path_boundary_ci(haystack: &[u8], needle_low: &[u8]) -> bool {
         if haystack[start].to_ascii_lowercase() != needle_low[0] {
             continue;
         }
-        if haystack[start..start + needle_low.len()]
+        if !haystack[start..start + needle_low.len()]
             .iter()
             .zip(needle_low.iter())
             .all(|(&h, &n)| h.to_ascii_lowercase() == n)
         {
-            let end = start + needle_low.len();
-            let boundary_ok = if end >= haystack.len() {
-                true
-            } else {
-                matches!(
-                    haystack[end],
-                    b'/' | b'\\' | b'"' | b'\'' | b' ' | b'\t' | b'\r' | b'\n' | b')' | b']' | b'}' | b',' | b';'
-                )
-            };
-            if boundary_ok {
-                return true;
-            }
+            continue;
+        }
+        let start_ok = if start == 0 {
+            true
+        } else {
+            let prev = haystack[start - 1];
+            matches!(
+                prev,
+                b'"' | b'\'' | b' ' | b'\t' | b'\r' | b'\n' | b':' | b'=' | b'(' | b'[' | b'{' | b',' | b';' | b'>'
+            ) || (needle_low[0] != b'/' && prev == b'/')
+                || (start >= 7 && haystack[start - 7..start].eq_ignore_ascii_case(b"file://"))
+                || (start >= 2 && matches!(&haystack[start - 2..start], b"\\n" | b"\\r" | b"\\t"))
+        };
+        if !start_ok {
+            continue;
+        }
+        let end = start + needle_low.len();
+        let end_ok = if end >= haystack.len() {
+            true
+        } else {
+            matches!(
+                haystack[end],
+                b'/' | b'\\' | b'"' | b'\'' | b' ' | b'\t' | b'\r' | b'\n' | b')' | b']' | b'}' | b',' | b';' | b'>'
+            )
+        };
+        if end_ok {
+            return true;
         }
     }
     false
@@ -873,7 +980,7 @@ fn extract_u64_field(obj: &Value, keys: &[&str]) -> Option<u64> {
 fn parse_single_transcript(
     t_path: &Path,
     date_window: Option<&DateWindow>,
-    proj_needles: Option<&(Vec<u8>, Vec<u8>)>,
+    proj_needles: Option<&[Vec<u8>]>,
     max_file_scan_bytes: u64,
     by_day: &mut BTreeMap<String, SavingsMetrics>,
     provider_usage: &mut ProviderReportedUsage,
@@ -910,8 +1017,8 @@ fn parse_single_transcript(
         }
 
         if !touches_proj {
-            if let Some((ref ns, ref nbs)) = proj_needles {
-                if line_mentions_workspace_bytes(&raw_buf, ns, nbs) {
+            if let Some(needles) = proj_needles {
+                if line_mentions_workspace_bytes(&raw_buf, needles) {
                     touches_proj = true;
                 }
             }
@@ -1322,5 +1429,45 @@ mod tests {
         let s2 = read_bounded_jsonl_line(&mut reader, &mut buf, MAX_TRANSCRIPT_LINE_BYTES).unwrap();
         assert!(matches!(s2, BoundedLineStatus::Line(_)));
         assert!(std::str::from_utf8(&buf).unwrap().contains("\"USER_INPUT\""));
+    }
+
+    #[test]
+    fn workspace_needles_match_symlink_firmlink_json_backslash_and_uri_without_prefix_leak() {
+        let win_needles = build_workspace_needles(Path::new(r"\\?\D:\Antigravity\LibreDB\"));
+        assert!(line_mentions_workspace_bytes(
+            br#"{"cwd":"D:\\Antigravity\\LibreDB"}"#,
+            &win_needles
+        ));
+        assert!(line_mentions_workspace_bytes(
+            br#"{"workspaceUris":["file:///d%3A/Antigravity/LibreDB"]}"#,
+            &win_needles
+        ));
+        assert!(line_mentions_workspace_bytes(
+            br#"{"uri":"file:///d:/Antigravity/LibreDB/src/main.rs"}"#,
+            &win_needles
+        ));
+        assert!(!line_mentions_workspace_bytes(
+            br#"{"cwd":"D:\\Antigravity\\LibreDB2"}"#,
+            &win_needles
+        ));
+
+        let macos_logical =
+            build_workspace_needles(Path::new("/var/folders/zz/abc123/T/libredb_test/ws_alpha"));
+        assert!(line_mentions_workspace_bytes(
+            br#"{"content":"Workspace: /var/folders/zz/abc123/T/libredb_test/ws_alpha\n</SYSTEM_MESSAGE>"}"#,
+            &macos_logical
+        ));
+        assert!(line_mentions_workspace_bytes(
+            br#"{"uri":"file:///var/folders/zz/abc123/T/libredb_test/ws_alpha/src/lib.rs"}"#,
+            &macos_logical
+        ));
+        assert!(!line_mentions_workspace_bytes(
+            br#"{"content":"Workspace: /var/folders/zz/abc123/T/libredb_test/ws_alpha_other"}"#,
+            &macos_logical
+        ));
+        assert!(!line_mentions_workspace_bytes(
+            br#"{"content":"Workspace: /other_prefix/var/folders/zz/abc123/T/libredb_test/ws_alpha"}"#,
+            &macos_logical
+        ));
     }
 }
