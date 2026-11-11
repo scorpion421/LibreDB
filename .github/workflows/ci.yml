@@ -29,6 +29,7 @@ jobs:
           "$HOME/.local/bin/libredb" list-rules | grep -F "Active Rules (0)"
           "$HOME/.local/bin/libredb" list-reflexes | grep -F "Active Situational Reflexes (3)"
           "$HOME/.local/bin/libredb" trust --list
+          "$HOME/.local/bin/libredb" bench --suite audit
           make bench
           python3 -c '
           import subprocess, statistics, time, os
@@ -64,6 +65,7 @@ jobs:
           "$HOME/.local/bin/libredb" list-rules | grep -F "Active Rules (0)"
           "$HOME/.local/bin/libredb" list-reflexes | grep -F "Active Situational Reflexes (3)"
           "$HOME/.local/bin/libredb" trust --list
+          "$HOME/.local/bin/libredb" bench --suite audit
           make bench
           python3 -c '
           import subprocess, statistics, time, os
@@ -107,6 +109,7 @@ jobs:
           if ($reflexOut -notmatch "Active Situational Reflexes \(3\)") {
             throw "Default Neutral install must report only 3 technical reflexes, got: $reflexOut"
           }
+          .\target\release\libredb.exe bench --suite audit
           .\target\release\libredb.exe bench --nodes 2000 --threads 8
           $exe = (Resolve-Path .\target\release\libredb.exe).Path
           foreach ($entry in @(

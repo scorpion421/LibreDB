@@ -1,7 +1,11 @@
-//! Native built-in benchmarks (`libredb bench`):
+//! Native built-in benchmarks and security/feature verification suites (`libredb bench`):
 //! 1. Storage kernel concurrency & compaction microbenchmark (`--suite kernel`, default when no workspace/full flag),
 //! 2. End-to-end 6-stage token-economy, latency, and `v4`-seal benchmark (`--suite full` or `--workspace <dir>`),
-//!    reproducing the `C1..C6` methodology natively in compiled Rust without external scripts.
+//!    reproducing the `C1..C6` methodology natively in compiled Rust without external scripts,
+//! 3. Built-in `v1.1.1` security & feature verification routine (`--suite audit`), deterministically
+//!    validating workspace `savings` authorization, DoS bounds, tentative edit promotion, exact Dalvik
+//!    call-graph identity, atomic telemetry, 3-tier token accounting, `BM25` priority hydration,
+//!    `racy-git` restored-timestamp detection, and `hmac-sha256:v4` trust seals (`A1..A9`).
 
 use crate::hooks::{evaluate_pre_invocation_payload, evaluate_pre_tool_payload};
 use crate::mcp::{handle_rpc_method, McpServerState};
@@ -57,6 +61,7 @@ pub struct TaskScoreRow {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FullEconomyBenchReport {
     pub corpus_label: String,
+    pub token_estimation_method: String,
     pub files_count: usize,
     pub total_lines: usize,
     pub total_bytes: u64,
@@ -74,6 +79,25 @@ pub struct FullEconomyBenchReport {
     pub saved_vs_grep_tokens: u64,
     pub saved_vs_grep_percent: f64,
     pub v4_seal_verified_after_bench: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditCheckRow {
+    pub check_id: String,
+    pub title: String,
+    pub passed: bool,
+    pub elapsed_ms: f64,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditSuiteReport {
+    pub suite: String,
+    pub total_checks: usize,
+    pub passed_checks: usize,
+    pub failed_checks: usize,
+    pub total_ms: f64,
+    pub checks: Vec<AuditCheckRow>,
 }
 
 pub struct EconomyBenchOptions<'a> {
@@ -526,20 +550,60 @@ pub fn run_full_economy_bench(
     // Record baseline last-symbol start line in `.agents/memory.ldb` BEFORE any PreToolUse edit:
     let baseline_sym_line: Option<(String, usize)> = {
         let pdb = LibreDb::open(ws_dir.join(".agents/memory.ldb"))?;
-        let sk_key = format!("skeleton::{edit_rel}");
-        pdb.get_by_key(NodeKind::WorkingSet, &sk_key)
-            .ok()
-            .and_then(|r| serde_json::from_slice::<libredb_cognitive::FileSkeleton>(&r.payload).ok())
-            .and_then(|sk| {
-                sk.symbols
-                    .last()
-                    .map(|s| (format!("{edit_rel}::{}", s.qualified_name()), s.start_line))
-            })
+        let sym_prefix = format!("{edit_rel}::");
+        let mut best: Option<(String, usize)> = None;
+        for (ino, k_opt, _) in pdb.list_inodes(Some(NodeKind::Symbol), false) {
+            let Some(k) = k_opt else { continue };
+            if !k.starts_with(&sym_prefix) {
+                continue;
+            }
+            if let Ok(rec) = pdb.get(ino.node_id) {
+                let txt = String::from_utf8_lossy(&rec.payload);
+                if let Some(after_l) = txt.split("[L").nth(1) {
+                    if let Some(start_str) = after_l.split('-').next() {
+                        if let Ok(st_ln) = start_str.parse::<usize>() {
+                            if best.as_ref().map_or(true, |(_, prev)| st_ln > *prev) {
+                                best = Some((k, st_ln));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        best
     };
+    let mut aborted_guard_ok = false;
     let mut shifted_ok = 0usize;
     let t_c5 = Instant::now();
     if let Some(first_nl) = orig_disk.find('\n') {
         let first_line = &orig_disk[..=first_nl];
+        // Step 0: Verify aborted edit never leaves phantom line-shifts in live `Symbol` contracts!
+        let abort_dec = evaluate_pre_tool_payload(
+            &json!({
+                "toolName": "edit_file",
+                "toolArgs": {
+                    "Path": edit_target.to_string_lossy().to_string(),
+                    "Target": first_line,
+                    "Replacement": format!("// aborted_edit_1\n// aborted_edit_2\n{first_line}")
+                }
+            }),
+            Some(&global_ldb),
+        );
+        if abort_dec.get("decision").and_then(Value::as_str) == Some("allow") {
+            let pdb = LibreDb::open(ws_dir.join(".agents/memory.ldb"))?;
+            let _ = libredb_cognitive::reconcile_tentative_edits(&pdb, &ws_dir);
+            aborted_guard_ok = if let Some((ref sym_k, base_start)) = baseline_sym_line {
+                pdb.get_by_key(NodeKind::Symbol, sym_k)
+                    .ok()
+                    .map(|r| {
+                        String::from_utf8_lossy(&r.payload).contains(&format!("[L{base_start}-"))
+                    })
+                    .unwrap_or(false)
+            } else {
+                true
+            };
+        }
+
         let mut cur_disk = orig_disk.clone();
         for edit_i in 1..=10 {
             let replacement = format!("// bench_shift_{edit_i}\n{first_line}");
@@ -555,25 +619,38 @@ pub fn run_full_economy_bench(
                 Some(&global_ldb),
             );
             if dec.get("decision").and_then(Value::as_str) == Some("allow") {
-                // Verify `evaluate_pre_tool_payload` shifted `NodeKind::Symbol` in `.agents/memory.ldb`
-                // purely in RAM BEFORE touching `edit_target` on disk!
                 let disk_after_hook = fs::read_to_string(&edit_target).unwrap_or_default();
-                let db_shifted = if let Some((ref sym_k, base_start)) = baseline_sym_line {
+                let pre_unchanged = if let Some((ref sym_k, base_start)) = baseline_sym_line {
                     let pdb = LibreDb::open(ws_dir.join(".agents/memory.ldb"))?;
                     pdb.get_by_key(NodeKind::Symbol, sym_k)
                         .ok()
                         .map(|r| {
                             String::from_utf8_lossy(&r.payload)
-                                .contains(&format!("[L{}-", base_start + edit_i))
+                                .contains(&format!("[L{}-", base_start + (edit_i - 1)))
                         })
                         .unwrap_or(false)
                 } else {
                     true
                 };
-                if disk_after_hook == cur_disk && db_shifted {
+                if disk_after_hook == cur_disk && pre_unchanged {
                     cur_disk = cur_disk.replacen(first_line, &replacement, 1);
                     fs::write(&edit_target, &cur_disk)?;
-                    shifted_ok += 1;
+                    let pdb = LibreDb::open(ws_dir.join(".agents/memory.ldb"))?;
+                    let _ = libredb_cognitive::reconcile_tentative_edits(&pdb, &ws_dir);
+                    let db_shifted = if let Some((ref sym_k, base_start)) = baseline_sym_line {
+                        pdb.get_by_key(NodeKind::Symbol, sym_k)
+                            .ok()
+                            .map(|r| {
+                                String::from_utf8_lossy(&r.payload)
+                                    .contains(&format!("[L{}-", base_start + edit_i))
+                            })
+                            .unwrap_or(false)
+                    } else {
+                        true
+                    };
+                    if db_shifted {
+                        shifted_ok += 1;
+                    }
                 }
             }
         }
@@ -630,7 +707,7 @@ pub fn run_full_economy_bench(
             naive_without_db_tokens: corpus_raw_tokens,
             grep_without_db_tokens: c1_grep_tokens,
             with_libredb_tokens: c1_tokens,
-            libredb_ms: round2(cold_index_ms),
+            libredb_ms: round2(c1_ms_display(cold_index_ms)),
             verification_note: format!(
                 "{} syms, {} edges (warm {:.2} ms)",
                 c1_rep.symbols_indexed, c1_rep.call_synapses_wired, warm_index_ms
@@ -667,12 +744,14 @@ pub fn run_full_economy_bench(
         },
         TaskScoreRow {
             task_id: "C5".to_owned(),
-            title: "Live PreToolUse symbol line-shift (10 edits)".to_owned(),
+            title: "Verified tentative symbol shift (10 edits)".to_owned(),
             naive_without_db_tokens: c5_reread_without_db,
             grep_without_db_tokens: c5_reread_without_db,
             with_libredb_tokens: 0,
             libredb_ms: round2(c5_ms),
-            verification_note: format!("{shifted_ok}/10 in-RAM shifts, v4_seal={v4_seal_ok}"),
+            verification_note: format!(
+                "abort_safe={aborted_guard_ok}, {shifted_ok}/10 ACID shifts, v4_seal={v4_seal_ok}"
+            ),
         },
         TaskScoreRow {
             task_id: "C6".to_owned(),
@@ -703,6 +782,8 @@ pub fn run_full_economy_bench(
 
     let report = FullEconomyBenchReport {
         corpus_label,
+        token_estimation_method:
+            "observed_utf8_bytes_div_4_vs_modeled_counterfactuals".to_owned(),
         files_count: staged_files.len(),
         total_lines,
         total_bytes,
@@ -730,13 +811,18 @@ pub fn run_full_economy_bench(
     Ok(report)
 }
 
+#[inline]
+fn c1_ms_display(ms: f64) -> f64 {
+    ms
+}
+
 fn print_economy_bench_table(rep: &FullEconomyBenchReport) {
     println!(
         "=== LibreDB Native Token-Economy & Graph Benchmark [{}] ===",
         rep.corpus_label
     );
     println!(
-        "Corpus: {} files | {} lines | {} bytes (~{} raw tokens) | {} symbols | {} call/DI edges",
+        "Corpus: {} files | {} lines | {} bytes (~{} raw UTF-8/4 tokens) | {} symbols | {} call/DI edges",
         rep.files_count,
         rep.total_lines,
         rep.total_bytes,
@@ -745,17 +831,20 @@ fn print_economy_bench_table(rep: &FullEconomyBenchReport) {
         rep.indexed_call_edges
     );
     println!(
+        "Accounting: LibreDB (~UTF-8 B/4 observed payload) vs. Est. Naive / Est. Grep modeled counterfactuals"
+    );
+    println!(
         "Index speed: {:.2} ms cold -> {:.2} ms warm cached | HMAC-SHA256 v4 seal intact: {}\n",
         rep.cold_index_ms, rep.warm_index_ms, rep.v4_seal_verified_after_bench
     );
     println!(
-        "{:<4} {:<44} {:>12} {:>12} {:>12} {:>9}  {}",
-        "ID", "Task", "Naive Tok", "Grep Tok", "LibreDB", "Time", "Verification"
+        "{:<4} {:<44} {:>12} {:>12} {:>14} {:>9}  {}",
+        "ID", "Task", "Est. Naive", "Est. Grep", "LibreDB (~B/4)", "Time", "Verification"
     );
-    println!("{}", "-".repeat(124));
+    println!("{}", "-".repeat(126));
     for r in &rep.tasks {
         println!(
-            "{:<4} {:<44} {:>12} {:>12} {:>12} {:>7.2}ms  {}",
+            "{:<4} {:<44} {:>12} {:>12} {:>14} {:>7.2}ms  {}",
             r.task_id,
             r.title,
             r.naive_without_db_tokens,
@@ -765,9 +854,9 @@ fn print_economy_bench_table(rep: &FullEconomyBenchReport) {
             r.verification_note
         );
     }
-    println!("{}", "-".repeat(124));
+    println!("{}", "-".repeat(126));
     println!(
-        "{:<4} {:<44} {:>12} {:>12} {:>12}",
+        "{:<4} {:<44} {:>12} {:>12} {:>14}",
         "SUM",
         "Total Context Consumption",
         rep.total_naive_without_db_tokens,
@@ -775,11 +864,11 @@ fn print_economy_bench_table(rep: &FullEconomyBenchReport) {
         rep.total_with_libredb_tokens
     );
     println!(
-        "Net Savings vs. Naive Full Reads: {} tokens saved (-{:.2}%)",
+        "Est. Avoided vs. Naive Full Reads: {} tokens (-{:.2}%)",
         rep.saved_vs_naive_tokens, rep.saved_vs_naive_percent
     );
     println!(
-        "Net Savings vs. Manual Grep/Scan: {} tokens saved (-{:.2}%)",
+        "Est. Avoided vs. Manual Grep/Scan: {} tokens (-{:.2}%)",
         rep.saved_vs_grep_tokens, rep.saved_vs_grep_percent
     );
 }
@@ -1098,4 +1187,659 @@ fn extract_mcp_text(val: &Value) -> String {
 #[inline]
 fn round2(v: f64) -> f64 {
     (v * 100.0).round() / 100.0
+}
+
+/// Executes the built-in `v1.1.1` security & feature verification routine (`libredb bench --suite audit`).
+/// Validates all 9 core invariants (`A1..A9`) in an isolated sandbox and returns `Err` on any failure.
+pub fn run_feature_and_security_audit(
+    as_json: bool,
+) -> Result<AuditSuiteReport, Box<dyn std::error::Error>> {
+    crate::telemetry::set_telemetry_suppressed(true);
+    let suite_start = Instant::now();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let sbx_base = crate::hooks::user_home_dir()
+        .join(".cache")
+        .join("libredb_audit");
+    fs::create_dir_all(&sbx_base)?;
+    let sbx_root = sbx_base.join(format!("audit_{}_{}", process::id(), nonce));
+    let _guard = TempSandboxGuard(sbx_root.clone());
+
+    let mut checks: Vec<AuditCheckRow> = Vec::with_capacity(9);
+
+    let mut run_check = |id: &str,
+                         title: &str,
+                         f: &mut dyn FnMut() -> Result<String, String>| {
+        let t0 = Instant::now();
+        match f() {
+            Ok(detail) => checks.push(AuditCheckRow {
+                check_id: id.to_owned(),
+                title: title.to_owned(),
+                passed: true,
+                elapsed_ms: round2(t0.elapsed().as_secs_f64() * 1000.0),
+                detail,
+            }),
+            Err(err) => checks.push(AuditCheckRow {
+                check_id: id.to_owned(),
+                title: title.to_owned(),
+                passed: false,
+                elapsed_ms: round2(t0.elapsed().as_secs_f64() * 1000.0),
+                detail: format!("FAIL: {err}"),
+            }),
+        }
+    };
+
+    let global_ldb = sbx_root.join("customizations.ldb");
+    let ws_a = sbx_root.join("ws_alpha");
+    let ws_b = sbx_root.join("ws_beta");
+    fs::create_dir_all(ws_a.join(".agents"))?;
+    fs::create_dir_all(ws_a.join(".git"))?;
+    fs::create_dir_all(ws_b.join(".agents"))?;
+    fs::create_dir_all(ws_b.join(".git"))?;
+    {
+        let gdb = LibreDb::open(&global_ldb)?;
+        seed_bench_skill(&gdb)?;
+        let pdb_a = LibreDb::open(ws_a.join(".agents/memory.ldb"))?;
+        crate::security::seal_workspace_memory(&gdb, &pdb_a, &ws_a)?;
+    }
+
+    // A1: MCP `savings` workspace authorization & boundary isolation
+    run_check(
+        "A1",
+        "MCP savings workspace authorization & isolation",
+        &mut || {
+            let ws_a_ldb = ws_a.join(".agents/memory.ldb");
+            let mut mcp_a = McpServerState::new_with_workspace_root(
+                Some(&ws_a_ldb),
+                Some(&global_ldb),
+                Some(&ws_a),
+            )?;
+            let cross_res = handle_rpc_method(
+                "tools/call",
+                &json!({
+                    "name": "libredb_code",
+                    "arguments": {
+                        "action": "savings",
+                        "cwd": ws_b.to_string_lossy().to_string()
+                    }
+                }),
+                &mut mcp_a,
+            );
+            if cross_res.is_ok() {
+                return Err("Cross-workspace savings call for ws_beta was not rejected".to_owned());
+            }
+            let wildcard_res = handle_rpc_method(
+                "tools/call",
+                &json!({
+                    "name": "libredb_code",
+                    "arguments": {
+                        "action": "savings",
+                        "cwd": "*"
+                    }
+                }),
+                &mut mcp_a,
+            );
+            if wildcard_res.is_ok() {
+                return Err("Global wildcard cwd='*' savings call was not rejected".to_owned());
+            }
+            let own_res = handle_rpc_method(
+                "tools/call",
+                &json!({
+                    "name": "libredb_code",
+                    "arguments": {
+                        "action": "savings",
+                        "format": "json"
+                    }
+                }),
+                &mut mcp_a,
+            )?;
+            let parsed: Value = serde_json::from_str(&extract_mcp_text(&own_res))
+                .map_err(|e| format!("invalid JSON: {e}"))?;
+            let scope = parsed
+                .get("scope_label")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if !scope.starts_with("project:") || !scope.contains("ws_alpha") {
+                return Err(format!(
+                    "Omitted cwd did not stay scoped to ws_alpha; got scope_label='{scope}'"
+                ));
+            }
+            Ok("ws_beta denied, cwd='*' denied, omitted cwd scoped strictly to ws_alpha".to_owned())
+        },
+    );
+
+    // A2: `savings` resource-exhaustion bounds (`days` cap + streaming `<= 8 MiB` JSONL reader)
+    run_check(
+        "A2",
+        "Savings DoS bounds (days cap & 8 MiB streaming JSONL)",
+        &mut || {
+            let ws_a_ldb = ws_a.join(".agents/memory.ldb");
+            let mut mcp_a = McpServerState::new_with_workspace_root(
+                Some(&ws_a_ldb),
+                Some(&global_ldb),
+                Some(&ws_a),
+            )?;
+            let huge_days = handle_rpc_method(
+                "tools/call",
+                &json!({
+                    "name": "libredb_code",
+                    "arguments": {
+                        "action": "savings",
+                        "days": 1_000_000_000u64
+                    }
+                }),
+                &mut mcp_a,
+            );
+            if huge_days.is_ok() {
+                return Err("days=1_000_000_000 was not rejected".to_owned());
+            }
+
+            let over_len = crate::telemetry::MAX_TRANSCRIPT_LINE_BYTES + 512 * 1024;
+            let mut stream_bytes = vec![b'x'; over_len];
+            stream_bytes.push(b'\n');
+            let valid_tail = b"{\"type\":\"USER_INPUT\",\"content\":\"ok\"}\n";
+            stream_bytes.extend_from_slice(valid_tail);
+
+            let mut reader = std::io::BufReader::with_capacity(64 * 1024, &stream_bytes[..]);
+            let mut line_buf = Vec::new();
+            let first = crate::telemetry::read_bounded_jsonl_line(
+                &mut reader,
+                &mut line_buf,
+                crate::telemetry::MAX_TRANSCRIPT_LINE_BYTES,
+            )
+            .map_err(|e| e.to_string())?;
+            if !matches!(first, crate::telemetry::BoundedLineStatus::OversizedSkipped(_))
+                || !line_buf.is_empty()
+            {
+                return Err(format!("Oversized JSONL line was not drained safely: {first:?}"));
+            }
+            let second = crate::telemetry::read_bounded_jsonl_line(
+                &mut reader,
+                &mut line_buf,
+                crate::telemetry::MAX_TRANSCRIPT_LINE_BYTES,
+            )
+            .map_err(|e| e.to_string())?;
+            if !matches!(second, crate::telemetry::BoundedLineStatus::Line(_))
+                || !std::str::from_utf8(&line_buf)
+                    .unwrap_or("")
+                    .contains("USER_INPUT")
+            {
+                return Err("Valid JSONL line after oversized line was not recovered".to_owned());
+            }
+            Ok(format!(
+                "days>{} rejected; {:.1} MiB newline-less line drained in-place",
+                crate::telemetry::MAX_SAVINGS_DAYS,
+                over_len as f64 / (1024.0 * 1024.0)
+            ))
+        },
+    );
+
+    // A3: Tentative `PreToolUse` edit staging & single-`DeltaEnvelope` ACID promotion
+    run_check(
+        "A3",
+        "Tentative PreToolUse staging & atomic ACID promotion",
+        &mut || {
+            let ws_t = sbx_root.join("ws_tentative");
+            fs::create_dir_all(ws_t.join(".agents")).map_err(|e| e.to_string())?;
+            fs::create_dir_all(ws_t.join(".git")).map_err(|e| e.to_string())?;
+            fs::create_dir_all(ws_t.join("src")).map_err(|e| e.to_string())?;
+            let src_p = ws_t.join("src/lib.rs");
+            let init_src = "pub fn alpha() -> u32 {\n    1\n}\n\npub fn omega() -> u32 {\n    alpha() + 1\n}\n";
+            fs::write(&src_p, init_src).map_err(|e| e.to_string())?;
+            let ldb_t = ws_t.join(".agents/memory.ldb");
+            {
+                let gdb = LibreDb::open(&global_ldb).map_err(|e| e.to_string())?;
+                let pdb = LibreDb::open(&ldb_t).map_err(|e| e.to_string())?;
+                libredb_cognitive::index_workspace(&pdb, &ws_t, true).map_err(|e| e.to_string())?;
+                crate::security::seal_workspace_memory(&gdb, &pdb, &ws_t)?;
+            }
+
+            // 1. Aborted IDE write: PreToolUse runs, disk stays untouched, immediate query keeps [L5-L7].
+            let abort_payload = json!({
+                "toolName": "edit_file",
+                "toolArgs": {
+                    "Path": src_p.to_string_lossy().to_string(),
+                    "Target": "pub fn alpha() -> u32 {\n    1\n}",
+                    "Replacement": "pub fn alpha() -> u32 {\n    let _a = 1;\n    let _b = 2;\n    1\n}"
+                }
+            });
+            let _ = evaluate_pre_tool_payload(&abort_payload, Some(&global_ldb));
+            {
+                let pdb = LibreDb::open(&ldb_t).map_err(|e| e.to_string())?;
+                let pre_sym = pdb
+                    .get_by_key(NodeKind::Symbol, "src/lib.rs::omega")
+                    .map_err(|e| e.to_string())?;
+                if !String::from_utf8_lossy(&pre_sym.payload).contains("[L5-L7]") {
+                    return Err("Live Symbol mutated BEFORE disk write!".to_owned());
+                }
+                let imp =
+                    libredb_cognitive::query_symbol_impact(&pdb, "omega").map_err(|e| e.to_string())?;
+                if imp.is_empty() || !imp[0].contract.contains("[L5-L7]") {
+                    return Err(format!(
+                        "Aborted edit shifted omega contract: {:?}",
+                        imp.first().map(|r| &r.contract)
+                    ));
+                }
+            }
+
+            // 2. Verified IDE write: PreToolUse -> fs::write -> 1-commit_seq ACID promotion to [L7-L9].
+            let _ = evaluate_pre_tool_payload(&abort_payload, Some(&global_ldb));
+            let post_src = "pub fn alpha() -> u32 {\n    let _a = 1;\n    let _b = 2;\n    1\n}\n\npub fn omega() -> u32 {\n    alpha() + 1\n}\n";
+            fs::write(&src_p, post_src).map_err(|e| e.to_string())?;
+            let pdb = LibreDb::open(&ldb_t).map_err(|e| e.to_string())?;
+            let seq_before = pdb.stats().map_err(|e| e.to_string())?.commit_seq;
+            let (promoted, _) =
+                libredb_cognitive::reconcile_tentative_edits(&pdb, &ws_t).map_err(|e| e.to_string())?;
+            let seq_after = pdb.stats().map_err(|e| e.to_string())?.commit_seq;
+            let imp2 =
+                libredb_cognitive::query_symbol_impact(&pdb, "omega").map_err(|e| e.to_string())?;
+            if promoted != 1
+                || seq_after != seq_before + 1
+                || imp2.is_empty()
+                || !imp2[0].contract.contains("[L7-L9]")
+            {
+                return Err(format!(
+                    "Expected promoted=1 in 1 commit_seq to [L7-L9]; got promoted={promoted}, seq {seq_before}->{seq_after}, contract={:?}",
+                    imp2.first().map(|r| &r.contract)
+                ));
+            }
+            Ok("aborted write=0 phantom shift; verified write promoted in 1 ACID commit".to_owned())
+        },
+    );
+
+    // A4: Exact Dalvik/Smali package & method-descriptor call-graph precision & recall
+    run_check(
+        "A4",
+        "Dalvik/Smali exact package & overload call-graph identity",
+        &mut || {
+            let ws_s = sbx_root.join("ws_smali");
+            fs::create_dir_all(ws_s.join("smali/com/alpha"))
+                .and_then(|_| fs::create_dir_all(ws_s.join("smali/com/beta")))
+                .and_then(|_| fs::create_dir_all(ws_s.join("smali/com/app")))
+                .and_then(|_| fs::create_dir_all(ws_s.join(".agents")))
+                .map_err(|e| e.to_string())?;
+            fs::write(
+                ws_s.join("smali/com/alpha/Base.smali"),
+                ".class public Lcom/alpha/Base;\n.super Ljava/lang/Object;\n.method public baseGate()Z\n    .registers 1\n    const/4 v0, 0x1\n    return v0\n.end method\n",
+            )
+            .map_err(|e| e.to_string())?;
+            fs::write(
+                ws_s.join("smali/com/alpha/p0.smali"),
+                ".class public Lcom/alpha/p0;\n.super Lcom/alpha/Base;\n.method public b(I)Z\n    .registers 2\n    const/4 v0, 0x1\n    return v0\n.end method\n.method public b(Ljava/lang/String;)V\n    .registers 2\n    return-void\n.end method\n",
+            )
+            .map_err(|e| e.to_string())?;
+            fs::write(
+                ws_s.join("smali/com/beta/p0.smali"),
+                ".class public Lcom/beta/p0;\n.super Ljava/lang/Object;\n.method public b(I)Z\n    .registers 2\n    const/4 v0, 0x0\n    return v0\n.end method\n",
+            )
+            .map_err(|e| e.to_string())?;
+            fs::write(
+                ws_s.join("smali/com/app/Caller.smali"),
+                ".class public final Lcom/app/Caller;\n.super Ljava/lang/Object;\n.method public static run(Lcom/alpha/p0;)Z\n    .registers 3\n    const/4 v0, 0x7\n    invoke-virtual {p0, v0}, Lcom/alpha/p0;->b(I)Z\n    invoke-virtual {p0}, Lcom/alpha/p0;->baseGate()Z\n    move-result v1\n    return v1\n.end method\n",
+            )
+            .map_err(|e| e.to_string())?;
+
+            let pdb = LibreDb::open(ws_s.join(".agents/memory.ldb")).map_err(|e| e.to_string())?;
+            libredb_cognitive::index_workspace(&pdb, &ws_s, true).map_err(|e| e.to_string())?;
+
+            let alpha_i = libredb_cognitive::query_symbol_impact(&pdb, "Lcom/alpha/p0;->b(I)Z")
+                .map_err(|e| e.to_string())?;
+            let alpha_s = libredb_cognitive::query_symbol_impact(
+                &pdb,
+                "Lcom/alpha/p0;->b(Ljava/lang/String;)V",
+            )
+            .map_err(|e| e.to_string())?;
+            let beta_i = libredb_cognitive::query_symbol_impact(&pdb, "Lcom/beta/p0;->b(I)Z")
+                .map_err(|e| e.to_string())?;
+            let base_g = libredb_cognitive::query_symbol_impact(&pdb, "Lcom/alpha/Base;->baseGate()Z")
+                .map_err(|e| e.to_string())?;
+
+            let c_alpha_i: usize = alpha_i.iter().map(|r| r.total_callers).sum();
+            let c_alpha_s: usize = alpha_s.iter().map(|r| r.total_callers).sum();
+            let c_beta_i: usize = beta_i.iter().map(|r| r.total_callers).sum();
+            let c_base_g: usize = base_g.iter().map(|r| r.total_callers).sum();
+
+            if c_alpha_i != 1 || c_alpha_s != 0 || c_beta_i != 0 || c_base_g != 1 {
+                return Err(format!(
+                    "Precision/recall mismatch: alpha_b(I)={c_alpha_i}, alpha_b(Str)={c_alpha_s}, beta_b(I)={c_beta_i}, baseGate={c_base_g}"
+                ));
+            }
+            Ok("precision=100%, recall=100% (0 cross-pkg or overload collisions)".to_owned())
+        },
+    );
+
+    // A5: Concurrent `telemetry.ldb` `transact_key` integrity (8 threads x 25 increments = 200)
+    run_check(
+        "A5",
+        "Concurrent telemetry.ldb transact_key update integrity",
+        &mut || {
+            let tel_ldb = sbx_root.join("telemetry_concurrent.ldb");
+            let mut handles = Vec::with_capacity(8);
+            for _ in 0..8 {
+                let p = tel_ldb.clone();
+                let ws = ws_a.clone();
+                handles.push(thread::spawn(move || {
+                    for _ in 0..25 {
+                        crate::telemetry::record_workspace_event_at(
+                            &p,
+                            "2026-11-11",
+                            Some(&ws),
+                            crate::telemetry::TelemetryEvent::Fim {
+                                baseline_tokens: 100,
+                                emitted_tokens: 15,
+                            },
+                        );
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().map_err(|_| "worker panicked".to_owned())?;
+            }
+            let rep_ws = crate::telemetry::build_savings_report(
+                &crate::telemetry::SavingsQueryOptions {
+                    today_only: false,
+                    days: None,
+                    cid_filter: None,
+                    project_filter: Some(&ws_a),
+                    custom_brain_dir: Some(&sbx_root.join("empty_brain")),
+                    custom_telemetry_ldb: Some(&tel_ldb),
+                },
+            );
+            let db = LibreDb::open(&tel_ldb).map_err(|e| e.to_string())?;
+            db.verify_integrity().map_err(|e| e.to_string())?;
+            if rep_ws.ledger_only_metrics.fim_calls != 200
+                || rep_ws.ledger_only_metrics.fim_baseline_tokens != 20_000
+                || rep_ws.ledger_only_metrics.fim_emitted_tokens != 3_000
+            {
+                return Err(format!(
+                    "Lost updates detected: fim_calls={} (expected 200)",
+                    rep_ws.ledger_only_metrics.fim_calls
+                ));
+            }
+            Ok("200/200 concurrent increments preserved, 0 lost updates".to_owned())
+        },
+    );
+
+    // A6: 3-tier token reporting & `PLANNER_RESPONSE` provider usage attribution
+    run_check(
+        "A6",
+        "3-tier token accounting & provider usage extraction",
+        &mut || {
+            let brain_dir = sbx_root.join("brain_a6");
+            let logs_dir = brain_dir
+                .join("cid-a6")
+                .join(".system_generated")
+                .join("logs");
+            fs::create_dir_all(&logs_dir).map_err(|e| e.to_string())?;
+            let tel_ldb = sbx_root.join("telemetry_a6.ldb");
+            crate::telemetry::record_workspace_event_at(
+                &tel_ldb,
+                "2026-11-11",
+                Some(&ws_a),
+                crate::telemetry::TelemetryEvent::SkillSlice {
+                    baseline_tokens: 900,
+                    emitted_tokens: 120,
+                },
+            );
+            let ws_slash = ws_a.to_string_lossy().replace('\\', "/");
+            let jsonl = format!(
+                "{{\"created_at\":\"2026-11-11T10:00:00Z\",\"type\":\"PLANNER_RESPONSE\",\"usageMetadata\":{{\"promptTokenCount\":4200,\"cachedContentTokenCount\":3100,\"candidatesTokenCount\":380}},\"tool_calls\":[{{\"name\":\"mcp_libredb_libredb-mcp_libredb_code\",\"arguments\":{{\"action\":\"fim\",\"cwd\":\"{ws_slash}\"}}}}]}}\n\
+                 {{\"created_at\":\"2026-11-11T10:00:01Z\",\"type\":\"TOOL_RESPONSE\",\"content\":\"=== FIM SLICE: src/a.rs :: x [L10-L20 of L200] ===\\nfn x() {{}}\"}}\n"
+            );
+            fs::write(logs_dir.join("transcript.jsonl"), jsonl).map_err(|e| e.to_string())?;
+
+            let rep = crate::telemetry::build_savings_report(
+                &crate::telemetry::SavingsQueryOptions {
+                    today_only: false,
+                    days: None,
+                    cid_filter: None,
+                    project_filter: Some(&ws_a),
+                    custom_brain_dir: Some(&brain_dir),
+                    custom_telemetry_ldb: Some(&tel_ldb),
+                },
+            );
+            if rep.ledger_only_metrics.skill_slice_calls != 1
+                || rep.transcript_only_metrics.fim_calls != 1
+                || rep.provider_reported_usage.planner_steps != 1
+                || rep.provider_reported_usage.input_tokens != 4_200
+                || rep.provider_reported_usage.cache_read_tokens != 3_100
+                || rep.provider_reported_usage.output_tokens != 380
+            {
+                return Err(format!(
+                    "Unexpected 3-tier report: ledger={:?}, transcript={:?}, provider={:?}",
+                    rep.ledger_only_metrics, rep.transcript_only_metrics, rep.provider_reported_usage
+                ));
+            }
+            Ok("ledger_only, transcript_only, max_merge & provider usage separated".to_owned())
+        },
+    );
+
+    // A7: Priority-budgeted `BM25` `Decision` & `Fact` hydration under `> 10 KB` saturation
+    run_check(
+        "A7",
+        "Priority-budgeted BM25 Decision & Fact hydration (<= 1,800 B)",
+        &mut || {
+            let ws_h = sbx_root.join("ws_hydrate");
+            fs::create_dir_all(ws_h.join(".agents")).map_err(|e| e.to_string())?;
+            let pdb = Arc::new(
+                LibreDb::open(ws_h.join(".agents/memory.ldb")).map_err(|e| e.to_string())?,
+            );
+            for t in 1..=8 {
+                pdb.put(
+                    WriteRequest::new(
+                        NodeKind::Task,
+                        format!(
+                            "[Task: task_{t}] | in_progress | high | Detailed task item #{t} with operational notes and padding"
+                        )
+                        .into_bytes(),
+                    )
+                    .with_key(format!("task_{t}")),
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            pdb.put(
+                WriteRequest::new(
+                    NodeKind::Fact,
+                    b"anchor_fact_quorum = Raft lease quorum uses monotonic hardware ticks".to_vec(),
+                )
+                .with_key("anchor_fact_quorum"),
+            )
+            .map_err(|e| e.to_string())?;
+            for i in 2..=30 {
+                pdb.put(
+                    WriteRequest::new(
+                        NodeKind::Fact,
+                        format!(
+                            "filler_fact_{i:02} = Verbose historical observation #{i} padding out naive byte limits across turns"
+                        )
+                        .into_bytes(),
+                    )
+                    .with_key(format!("filler_fact_{i:02}")),
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            pdb.put(
+                WriteRequest::new(
+                    NodeKind::Decision,
+                    b"[Decision: anchor_dec_quorum] Enforce monotonic Raft lease quorum ticks across failover epochs".to_vec(),
+                )
+                .with_key("anchor_dec_quorum"),
+            )
+            .map_err(|e| e.to_string())?;
+            for d in 2..=8 {
+                pdb.put(
+                    WriteRequest::new(
+                        NodeKind::Decision,
+                        format!(
+                            "[Decision: filler_dec_{d}] Long historical narrative #{d}: {}",
+                            "subsystem migration details and rationale ".repeat(10)
+                        )
+                        .into_bytes(),
+                    )
+                    .with_key(format!("filler_dec_{d}")),
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            let mut cog =
+                libredb_cognitive::CognitiveEngine::open_db(Arc::clone(&pdb)).map_err(|e| e.to_string())?;
+            cog.save_index_snapshot().map_err(|e| e.to_string())?;
+            let gdb = LibreDb::open(&global_ldb).map_err(|e| e.to_string())?;
+            crate::security::seal_workspace_memory(&gdb, &pdb, &ws_h)?;
+
+            let out = evaluate_pre_invocation_payload(
+                &json!({
+                    "conversationId": "audit-a7-cid",
+                    "workspacePaths": [ws_h.to_string_lossy().to_string()],
+                    "prompt": "How does monotonic Raft lease quorum failover work?"
+                }),
+                Some(&global_ldb),
+            )
+            .map_err(|e| e.to_string())?;
+            let msg = out["injectSteps"][0]["systemMessage"]["systemMessage"]
+                .as_str()
+                .unwrap_or("");
+            if msg.is_empty()
+                || msg.len() > 1_800
+                || !msg.contains("anchor_fact_quorum")
+                || !msg.contains("anchor_dec_quorum")
+            {
+                return Err(format!(
+                    "BM25 hydration failed invariants (len={}): {msg}",
+                    msg.len()
+                ));
+            }
+            Ok(format!(
+                "{} B <= 1,800 B; both BM25 Decision #1 & Fact #1 retained",
+                msg.len()
+            ))
+        },
+    );
+
+    // A8: `racy-git` same-length & restored-timestamp mutation detection
+    run_check(
+        "A8",
+        "Racy-git same-length & restored-timestamp detection",
+        &mut || {
+            let ws_r = sbx_root.join("ws_racy");
+            fs::create_dir_all(ws_r.join("src")).map_err(|e| e.to_string())?;
+            fs::create_dir_all(ws_r.join(".agents")).map_err(|e| e.to_string())?;
+            let rf = ws_r.join("src/racy.rs");
+            fs::write(&rf, "pub fn gate_a() -> u32 { 1 }\n").map_err(|e| e.to_string())?;
+            let orig_mtime = fs::metadata(&rf)
+                .and_then(|m| m.modified())
+                .map_err(|e| e.to_string())?;
+
+            let pdb = LibreDb::open(ws_r.join(".agents/memory.ldb")).map_err(|e| e.to_string())?;
+            libredb_cognitive::index_workspace(&pdb, &ws_r, false).map_err(|e| e.to_string())?;
+
+            // Case 1: Same byte length + explicitly restored identical `mtime` inside smudged window
+            fs::write(&rf, "pub fn gate_b() -> u32 { 1 }\n").map_err(|e| e.to_string())?;
+            if let Ok(f) = fs::File::options().write(true).open(&rf) {
+                let _ = f.set_modified(orig_mtime);
+            }
+            let rep1 =
+                libredb_cognitive::index_workspace(&pdb, &ws_r, false).map_err(|e| e.to_string())?;
+            let imp_b =
+                libredb_cognitive::query_symbol_impact(&pdb, "gate_b").map_err(|e| e.to_string())?;
+            if rep1.files_reindexed != 1 || imp_b.is_empty() {
+                return Err(format!(
+                    "Smudged same-mtime mutation missed: reindexed={}",
+                    rep1.files_reindexed
+                ));
+            }
+
+            // Case 2: Archive/backup restore to an older historical timestamp (`orig_mtime - 3600s`)
+            fs::write(&rf, "pub fn gate_c() -> u32 { 1 }\n").map_err(|e| e.to_string())?;
+            if let Some(older) = orig_mtime.checked_sub(std::time::Duration::from_secs(3_600)) {
+                if let Ok(f) = fs::File::options().write(true).open(&rf) {
+                    let _ = f.set_modified(older);
+                }
+            }
+            let rep2 =
+                libredb_cognitive::index_workspace(&pdb, &ws_r, false).map_err(|e| e.to_string())?;
+            let imp_c =
+                libredb_cognitive::query_symbol_impact(&pdb, "gate_c").map_err(|e| e.to_string())?;
+            if rep2.files_reindexed != 1 || imp_c.is_empty() {
+                return Err(format!(
+                    "Restored historical mtime mutation missed: reindexed={}",
+                    rep2.files_reindexed
+                ));
+            }
+            Ok("smudged same-mtime & backdated archive-restore edits both detected".to_owned())
+        },
+    );
+
+    // A9: `hmac-sha256:v4` workspace trust seal preservation across index, edits, and pulse
+    run_check(
+        "A9",
+        "HMAC-SHA256 v4 workspace trust seal preservation",
+        &mut || {
+            let gdb = LibreDb::open(&global_ldb).map_err(|e| e.to_string())?;
+            let ok_a = crate::security::is_workspace_memory_trusted(Some(&gdb), &ws_a);
+            let ok_t = crate::security::is_workspace_memory_trusted(
+                Some(&gdb),
+                &sbx_root.join("ws_tentative"),
+            );
+            let ok_h = crate::security::is_workspace_memory_trusted(
+                Some(&gdb),
+                &sbx_root.join("ws_hydrate"),
+            );
+            if !ok_a || !ok_t || !ok_h {
+                return Err(format!(
+                    "v4 seal broken: ws_alpha={ok_a}, ws_tentative={ok_t}, ws_hydrate={ok_h}"
+                ));
+            }
+            Ok("all 3 sealed workspaces verified intact after mutations & queries".to_owned())
+        },
+    );
+
+    let passed = checks.iter().filter(|c| c.passed).count();
+    let failed = checks.len().saturating_sub(passed);
+    let report = AuditSuiteReport {
+        suite: "v1.1.1-feature-and-security-audit".to_owned(),
+        total_checks: checks.len(),
+        passed_checks: passed,
+        failed_checks: failed,
+        total_ms: round2(suite_start.elapsed().as_secs_f64() * 1000.0),
+        checks,
+    };
+
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "=== LibreDB Feature & Security Verification Suite [{}] ===",
+            report.suite
+        );
+        println!(
+            "{:<4} {:<6} {:<52} {:>8}  {}",
+            "ID", "Status", "Verification Check", "Time", "Result"
+        );
+        println!("{}", "-".repeat(122));
+        for c in &report.checks {
+            println!(
+                "{:<4} {:<6} {:<52} {:>6.2}ms  {}",
+                c.check_id,
+                if c.passed { "PASS" } else { "FAIL" },
+                c.title,
+                c.elapsed_ms,
+                c.detail
+            );
+        }
+        println!("{}", "-".repeat(122));
+        println!(
+            "Summary: {}/{} passed, {} failed in {:.2} ms",
+            report.passed_checks, report.total_checks, report.failed_checks, report.total_ms
+        );
+    }
+
+    if failed > 0 {
+        return Err(format!(
+            "Verification suite failed ({failed}/{} checks failed)",
+            report.total_checks
+        )
+        .into());
+    }
+    Ok(report)
 }

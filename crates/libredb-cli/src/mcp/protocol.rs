@@ -365,7 +365,7 @@ pub fn handle_rpc_method(
                 },
                 {
                     "name": "libredb_code",
-                    "description": "Zero-bloat source code graph: 'skeleton' (-95% file map, supports single 'target' or batch 'files'), 'impact' (compact caller/callee blast radius + governing decisions), 'fim' (surgical edit slice + callers + decisions), 'index' (scan workspace), or 'savings' (live token-economy report).",
+                    "description": "Zero-bloat source code graph: 'skeleton' (-95% file map, supports single 'target' or batch 'files'), 'impact' (compact caller/callee blast radius + governing decisions), 'fim' (surgical edit slice + callers + decisions), 'index' (scan workspace), or 'savings' (authorized workspace token-economy report).",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -379,7 +379,7 @@ pub fn handle_rpc_method(
                             "line": { "type": "integer" },
                             "pad": { "type": "integer", "default": 12 },
                             "format": { "type": "string", "enum": ["compact", "json"], "description": "Output format for action='impact' or 'savings' (default: 'compact')" },
-                            "days": { "type": "integer", "description": "Optional lookback window in days for action='savings' (0 = today)" }
+                            "days": { "type": "integer", "description": "Optional lookback window in days for action='savings' (0 = today, max 3660)" }
                         },
                         "required": ["action"]
                     }

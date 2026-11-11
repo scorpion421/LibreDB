@@ -665,10 +665,38 @@ impl LibreDb {
         let _guard = self.commit_lock.lock();
         let _ipc_guard = IpcWriteGuard::acquire(&*self.backend)?;
         self.sync_from_disk_if_changed()?;
-        self.commit_batch_locked(batch)
+        self.commit_batch_locked_ext(batch, &[], &[])
+    }
+
+    /// Atomically commits `batch` upserts (including inline/overflow `Synapse`s) together with
+    /// `deprecate_ids` node tombstones and `deprecate_keys` key tombstones in a **single `DeltaEnvelope`,
+    /// single `fsync`, and single 4-KB ping-pong `Superblock` flip**.
+    pub fn commit_batch_with_tombstones(
+        &self,
+        batch: &[PreparedWrite],
+        deprecate_ids: &[u64],
+        deprecate_keys: &[(NodeKind, &str)],
+    ) -> Result<Vec<u64>> {
+        if batch.is_empty() && deprecate_ids.is_empty() && deprecate_keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let _guard = self.commit_lock.lock();
+        let _ipc_guard = IpcWriteGuard::acquire(&*self.backend)?;
+        self.sync_from_disk_if_changed()?;
+        self.commit_batch_locked_ext(batch, deprecate_ids, deprecate_keys)
     }
 
     fn commit_batch_locked(&self, batch: &[PreparedWrite]) -> Result<Vec<u64>> {
+        self.commit_batch_locked_ext(batch, &[], &[])
+    }
+
+    fn commit_batch_locked_ext(
+        &self,
+        batch: &[PreparedWrite],
+        deprecate_ids: &[u64],
+        deprecate_keys: &[(NodeKind, &str)],
+    ) -> Result<Vec<u64>> {
         let old_snap = Arc::clone(&self.state.read());
         let mut next_snap = SnapshotState {
             superblock: old_snap.superblock,
@@ -682,9 +710,63 @@ impl LibreDb {
         let env_start = next_snap.superblock.data_tail_offset;
         // Reserve 12-byte DeltaEnvelope header (`"LDBE" + total_len:u32 + meta_rel_offset:u32`).
         let mut envelope_buf: Vec<u8> = vec![0u8; 12];
-        let mut modified_inodes: Vec<Inode> = Vec::with_capacity(batch.len() * 2);
+        let mut modified_inodes: Vec<Inode> =
+            Vec::with_capacity(batch.len() * 2 + deprecate_ids.len() + deprecate_keys.len());
         let mut key_mutations: Vec<KeyMutation> = Vec::new();
         let mut assigned_ids: Vec<u64> = Vec::with_capacity(batch.len());
+
+        // Apply explicit node/key tombstones into the same atomic snapshot & commit frame.
+        let mut tombstoned_set: HashSet<u64> = HashSet::new();
+        for &target_id in deprecate_ids {
+            if !tombstoned_set.insert(target_id) {
+                continue;
+            }
+            let Some(inode) = next_snap.inodes.get_mut(&target_id) else {
+                continue;
+            };
+            if inode.flags.contains(NodeFlags::TOMBSTONE) {
+                continue;
+            }
+            if inode.flags.is_live_active() {
+                next_snap.superblock.active_node_count =
+                    next_snap.superblock.active_node_count.saturating_sub(1);
+            }
+            inode.flags.insert(NodeFlags::TOMBSTONE | NodeFlags::SUPERSEDED);
+            inode.updated_ns = now;
+            modified_inodes.push(inode.clone());
+            if let Some((k_kind, k_str)) = next_snap.reverse_keys.remove(&target_id) {
+                next_snap.key_dir.remove(&(k_kind, k_str.clone()));
+                key_mutations.push(KeyMutation::Remove {
+                    kind: k_kind,
+                    key: k_str,
+                });
+            }
+        }
+        for &(k_kind, k_str) in deprecate_keys {
+            let Some(&target_id) = next_snap.key_dir.get(&(k_kind, k_str.to_owned())) else {
+                continue;
+            };
+            if !tombstoned_set.insert(target_id) {
+                continue;
+            }
+            if let Some(inode) = next_snap.inodes.get_mut(&target_id) {
+                if !inode.flags.contains(NodeFlags::TOMBSTONE) {
+                    if inode.flags.is_live_active() {
+                        next_snap.superblock.active_node_count =
+                            next_snap.superblock.active_node_count.saturating_sub(1);
+                    }
+                    inode.flags.insert(NodeFlags::TOMBSTONE | NodeFlags::SUPERSEDED);
+                    inode.updated_ns = now;
+                    modified_inodes.push(inode.clone());
+                }
+            }
+            next_snap.key_dir.remove(&(k_kind, k_str.to_owned()));
+            next_snap.reverse_keys.remove(&target_id);
+            key_mutations.push(KeyMutation::Remove {
+                kind: k_kind,
+                key: k_str.to_owned(),
+            });
+        }
 
         for item in batch {
             let new_id = next_snap.superblock.next_node_id;
@@ -819,6 +901,10 @@ impl LibreDb {
             }
 
             assigned_ids.push(new_id);
+        }
+
+        if modified_inodes.is_empty() && key_mutations.is_empty() {
+            return Ok(assigned_ids);
         }
 
         let new_seq = next_snap.superblock.commit_seq + 1;

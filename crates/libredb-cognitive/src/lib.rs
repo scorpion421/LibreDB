@@ -31,8 +31,9 @@ pub use transcript::{
 };
 pub use workspace::{
     extract_fim_slice, format_impact_compact, has_project_root_marker, index_workspace,
-    index_workspace_with_exclusions, query_symbol_impact, sync_single_file_symbols, FimSliceBundle,
-    SymbolImpactReport, WorkspaceIndexReport,
+    index_workspace_with_exclusions, query_symbol_impact, reconcile_tentative_edits,
+    stage_tentative_file_edit, sync_single_file_symbols, FimSliceBundle, SymbolImpactReport,
+    TentativeFileEdit, WorkspaceIndexReport, TENTATIVE_EDIT_PREFIX,
 };
 
 use libredb_core::{EdgeKind, LibreDb, NodeFlags, NodeKind, Result};

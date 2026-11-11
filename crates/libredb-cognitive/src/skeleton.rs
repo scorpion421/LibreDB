@@ -10,10 +10,9 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 pub const SKELETON_KEY_PREFIX: &str = "skeleton::";
-/// Content-hash seed bumped whenever `FileSkeleton` extraction semantics upgrade (e.g. `container`
-/// qualification, `supertypes`, interface/abstract method contracts, `Makefile`, and `< 5 us`
-/// content-topology dispatch + `end`-block extraction in v1.1.0).
-pub const SKELETON_HASH_SEED: u8 = 110;
+/// Content-hash seed bumped whenever `FileSkeleton` extraction semantics upgrade (full Dalvik
+/// package/class paths and member descriptors in v1.1.1).
+pub const SKELETON_HASH_SEED: u8 = 111;
 /// Hard safety cap (`16 MiB`) for individual source files read by `skeleton` and `fim` so oversized
 /// or special files cannot trigger unbounded memory allocations.
 pub const MAX_SKELETON_FILE_BYTES: u64 = 16 * 1024 * 1024;
@@ -77,6 +76,8 @@ pub struct SymbolContract {
     pub container: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub supertypes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub descriptor: Option<String>,
     pub signature: String,
     pub doc_summary: String,
     pub start_line: usize,
@@ -290,9 +291,10 @@ impl FileSkeleton {
             }
             if let Some(ref flt) = filt_low {
                 let hay = format!(
-                    "{} {} {} {}",
+                    "{} {} {} {} {}",
                     sym.qualified_name(),
                     sym.name,
+                    sym.descriptor.as_deref().unwrap_or(""),
                     sym.signature,
                     sym.doc_summary
                 )
@@ -625,6 +627,7 @@ fn extract_python_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContr
             name: name.clone(),
             container,
             supertypes,
+            descriptor: None,
             signature: truncate_chars(signature, 115),
             doc_summary: truncate_chars(doc_summary, 85),
             start_line,
@@ -664,14 +667,16 @@ fn extract_smali_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContra
         if let Some(rest) = trimmed.strip_prefix(".class ") {
             if let Some(tok) = rest.split_whitespace().last() {
                 let clean = tok.trim_start_matches('L').trim_end_matches(';');
-                let short = clean.rsplit('/').next().unwrap_or(clean).to_owned();
-                if !short.is_empty() {
-                    current_class = Some(short.clone());
+                if !clean.is_empty() {
+                    let cls_full = clean.to_owned();
+                    let cls_desc = format!("L{cls_full};");
+                    current_class = Some(cls_full.clone());
                     out.push(SymbolContract {
                         kind: "class".to_owned(),
-                        name: short,
+                        name: cls_full,
                         container: None,
                         supertypes: Vec::new(),
+                        descriptor: Some(cls_desc),
                         signature: truncate_chars(trimmed, 115),
                         doc_summary: String::new(),
                         start_line: idx + 1,
@@ -685,11 +690,10 @@ fn extract_smali_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContra
         {
             if let Some(tok) = rest.split_whitespace().last() {
                 let clean = tok.trim_start_matches('L').trim_end_matches(';');
-                let short = clean.rsplit('/').next().unwrap_or(clean);
-                if !short.is_empty() && short != "Object" {
+                if !clean.is_empty() && clean != "java/lang/Object" && clean != "Object" {
                     if let Some(cls_sym) = out.iter_mut().rev().find(|s| s.kind == "class") {
-                        if !cls_sym.supertypes.iter().any(|x| x == short) {
-                            cls_sym.supertypes.push(short.to_owned());
+                        if !cls_sym.supertypes.iter().any(|x| x == clean) {
+                            cls_sym.supertypes.push(clean.to_owned());
                         }
                     }
                 }
@@ -697,13 +701,17 @@ fn extract_smali_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContra
         } else if let Some(rest) = trimmed.strip_prefix(".field ") {
             let head = rest.split('=').next().unwrap_or(rest).trim();
             if let Some(tok) = head.split_whitespace().last() {
-                if let Some((fname, _)) = tok.split_once(':') {
-                    if !fname.is_empty() {
+                if let Some((fname, ftype)) = tok.split_once(':') {
+                    if !fname.is_empty() && !ftype.is_empty() {
+                        let desc = current_class
+                            .as_ref()
+                            .map(|cls| format!("L{cls};->{tok}"));
                         out.push(SymbolContract {
                             kind: "field".to_owned(),
                             name: fname.to_owned(),
                             container: current_class.clone(),
                             supertypes: Vec::new(),
+                            descriptor: desc,
                             signature: truncate_chars(trimmed, 115),
                             doc_summary: String::new(),
                             start_line: idx + 1,
@@ -714,8 +722,8 @@ fn extract_smali_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContra
             }
         } else if let Some(rest) = trimmed.strip_prefix(".method ") {
             if let Some(tok) = rest.split_whitespace().last() {
-                if let Some((mname, _)) = tok.split_once('(') {
-                    if !mname.is_empty() {
+                if let Some((mname, msig_tail)) = tok.split_once('(') {
+                    if !mname.is_empty() && !msig_tail.is_empty() {
                         let mut end_line = idx + 1;
                         for (s_idx, s_line) in lines.iter().enumerate().skip(idx + 1) {
                             if s_line.trim().starts_with(".end method") {
@@ -723,11 +731,15 @@ fn extract_smali_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContra
                                 break;
                             }
                         }
+                        let desc = current_class
+                            .as_ref()
+                            .map(|cls| format!("L{cls};->{tok}"));
                         out.push(SymbolContract {
                             kind: "method".to_owned(),
                             name: mname.to_owned(),
                             container: current_class.clone(),
                             supertypes: Vec::new(),
+                            descriptor: desc,
                             signature: truncate_chars(trimmed, 115),
                             doc_summary: String::new(),
                             start_line: idx + 1,
@@ -878,6 +890,7 @@ fn extract_asm_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContract
             name: name.clone(),
             container: None,
             supertypes: Vec::new(),
+            descriptor: None,
             signature: sig.clone(),
             doc_summary: String::new(),
             start_line: start,
@@ -929,6 +942,7 @@ fn extract_markdown_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolCon
             name: title.clone(),
             container: None,
             supertypes: Vec::new(),
+            descriptor: None,
             signature: sig.clone(),
             doc_summary: String::new(),
             start_line: start,
@@ -1012,6 +1026,7 @@ fn extract_makefile_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolCon
             name: name.clone(),
             container: None,
             supertypes: Vec::new(),
+            descriptor: None,
             signature: sig.clone(),
             doc_summary: truncate_chars(doc, 85),
             start_line: start,
@@ -1127,6 +1142,7 @@ fn extract_end_block_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolCo
             kind: kind.to_owned(),
             name: clean_name.to_owned(),
             container,
+            descriptor: None,
             supertypes,
             signature: truncate_chars(trimmed, 115),
             doc_summary: String::new(),
@@ -1207,6 +1223,7 @@ fn extract_sql_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContract
             kind: kind_up.to_ascii_lowercase(),
             name: clean_name.to_owned(),
             container: None,
+            descriptor: None,
             supertypes: Vec::new(),
             signature: truncate_chars(&collapse_ws(trimmed), 115),
             doc_summary: String::new(),
@@ -1245,6 +1262,7 @@ fn extract_powershell_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolC
                         kind: kw.trim().to_owned(),
                         name: short_name,
                         container: None,
+                        descriptor: None,
                         supertypes,
                         signature: truncate_chars(&collapse_ws(sig_head), 115),
                         doc_summary: String::new(),
@@ -1295,6 +1313,7 @@ fn extract_shell_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContra
                 kind: "function".to_owned(),
                 name,
                 container: None,
+                descriptor: None,
                 supertypes: Vec::new(),
                 signature: truncate_chars(&collapse_ws(sig_head), 115),
                 doc_summary: String::new(),
@@ -1504,6 +1523,7 @@ fn extract_brace_symbols(lines: &[&str], total_lines: usize, lang: &str) -> Vec<
                         kind,
                         name,
                         container,
+                        descriptor: None,
                         supertypes,
                         signature: truncate_chars(&collapse_ws(sig_head), 115),
                         doc_summary: truncate_chars(&pending_doc, 85),
@@ -2340,12 +2360,36 @@ mod tests {
 
     #[test]
     fn extracts_polyglot_smali_sql_powershell_and_typed_cpp_java_methods() {
-        let smali_src = ".class public Lcom/example/MainActivity;\n.super Landroid/app/Activity;\n.field private count:I\n.method protected onCreate(Landroid/os/Bundle;)V\n    .locals 1\n    return-void\n.end method\n";
+        let smali_src = ".class public Lcom/example/MainActivity;\n.super Landroid/app/Activity;\n.field private count:I\n.method protected onCreate(Landroid/os/Bundle;)V\n    .locals 1\n    return-void\n.end method\n.method public onCreate(I)Z\n    .locals 1\n    const/4 v0, 0x1\n    return v0\n.end method\n";
         let sk_smali = FileSkeleton::extract("MainActivity.smali", smali_src);
         assert_eq!(sk_smali.language, "smali");
-        assert!(sk_smali.symbols.iter().any(|s| s.kind == "class" && s.name == "MainActivity"));
-        assert!(sk_smali.symbols.iter().any(|s| s.kind == "field" && s.name == "count"));
-        assert!(sk_smali.symbols.iter().any(|s| s.kind == "method" && s.name == "onCreate" && s.start_line == 4 && s.end_line == 7));
+        assert!(sk_smali.symbols.iter().any(|s| {
+            s.kind == "class"
+                && s.name == "com/example/MainActivity"
+                && s.descriptor.as_deref() == Some("Lcom/example/MainActivity;")
+        }));
+        assert!(sk_smali.symbols.iter().any(|s| {
+            s.kind == "field"
+                && s.name == "count"
+                && s.container.as_deref() == Some("com/example/MainActivity")
+                && s.descriptor.as_deref() == Some("Lcom/example/MainActivity;->count:I")
+        }));
+        assert!(sk_smali.symbols.iter().any(|s| {
+            s.kind == "method"
+                && s.name == "onCreate"
+                && s.container.as_deref() == Some("com/example/MainActivity")
+                && s.descriptor.as_deref()
+                    == Some("Lcom/example/MainActivity;->onCreate(Landroid/os/Bundle;)V")
+                && s.start_line == 4
+                && s.end_line == 7
+        }));
+        assert!(sk_smali.symbols.iter().any(|s| {
+            s.kind == "method"
+                && s.name == "onCreate"
+                && s.descriptor.as_deref() == Some("Lcom/example/MainActivity;->onCreate(I)Z")
+                && s.start_line == 8
+                && s.end_line == 12
+        }));
 
         let sql_src = "CREATE TABLE IF NOT EXISTS users (\n  id INTEGER PRIMARY KEY\n);\nCREATE OR REPLACE FUNCTION calc_score(uid INT) RETURNS INT AS $$\nBEGIN\n  RETURN 42;\nEND;\n$$ LANGUAGE plpgsql;\n";
         let sk_sql = FileSkeleton::extract("schema.sql", sql_src);
@@ -2541,7 +2585,10 @@ public sealed class SqlOrderRepo(IDbConnection db) : BaseRepo, IOrderRepo {
         assert!(sk_smali
             .symbols
             .iter()
-            .any(|s| s.qualified_name() == "p1::l" && s.start_line == 3 && s.end_line == 7));
+            .any(|s| s.qualified_name() == "ci/p1::l"
+                && s.descriptor.as_deref() == Some("Lci/p1;->l(I)Z")
+                && s.start_line == 3
+                && s.end_line == 7));
 
         // 3. Lua & Elixir `end`-block topology (both extensionless and `.lua`)
         let lua_src = "local M = {}\nfunction M:dispatch(req)\n    return req\nend\nreturn M\n";

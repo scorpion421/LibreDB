@@ -1,32 +1,42 @@
 //! Built-in token-consumption and savings telemetry (`libredb savings` / `libredb report`).
 //!
-//! Combines two complementary, zero-seal-impact data sources without double-counting:
-//! 1. Live numeric event counters recorded in `~/.gemini/libredb/telemetry.ldb` (strictly numeric,
-//!    never touching `.agents/memory.ldb` or `customizations.ldb` trust seals), and
-//! 2. Bounded read-only inspection of local `Antigravity` conversation transcripts
-//!    (`~/.gemini/antigravity/brain/<cid>/.system_generated/logs/transcript.jsonl`), enabling
-//!    immediate retroactive reporting (`--today`, `--days <n>`, `--cid <id>`, `--project <dir>`).
+//! Combines three clearly separated accounting views without touching cognitive trust seals:
+//! 1. Live numeric event counters recorded atomically in `~/.gemini/libredb/telemetry.ldb` via
+//!    cross-process-locked `LibreDb::transact_key` (`day::<ymd>` + per-workspace `ws_day::<hash>::<ymd>`),
+//! 2. Bounded single-pass streaming inspection of local `Antigravity` conversation transcripts
+//!    (`~/.gemini/antigravity/brain/<cid>/.system_generated/logs/transcript.jsonl`), enforcing
+//!    `MAX_TRANSCRIPT_LINE_BYTES` (`8 MiB`) *during* chunked reading plus scan count/byte budgets, and
+//! 3. Genuine provider-reported billing usage (`input_tokens`, `cache_read_tokens`, `output_tokens`)
+//!    recorded on `PLANNER_RESPONSE` steps when present in transcripts.
 
-use libredb_core::crc::count_tokens_exact;
+use libredb_core::crc::{count_tokens_exact, hash_key};
 use libredb_core::{LibreDb, NodeKind, WriteRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const MAX_TRANSCRIPT_LINE_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum lookback window (`10` years) accepted by `libredb savings --days` and MCP `savings`.
+pub const MAX_SAVINGS_DAYS: u64 = 3_660;
+/// Maximum single JSONL line length (`8 MiB`) buffered in RAM; longer lines are drained in-place.
+pub const MAX_TRANSCRIPT_LINE_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum number of conversation transcripts inspected in a single `savings` invocation.
+pub const MAX_TRANSCRIPTS_SCANNED: usize = 512;
+/// Maximum cumulative transcript bytes read across a single `savings` invocation (`512 MiB`).
+pub const MAX_TOTAL_TRANSCRIPT_SCAN_BYTES: u64 = 512 * 1024 * 1024;
+
 static TELEMETRY_SUPPRESSED: AtomicBool = AtomicBool::new(false);
 
 pub fn set_telemetry_suppressed(suppressed: bool) {
     TELEMETRY_SUPPRESSED.store(suppressed, Ordering::Relaxed);
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SavingsMetrics {
     pub skeleton_calls: u64,
     pub skeleton_zero_repeat_hits: u64,
@@ -180,20 +190,51 @@ impl SavingsMetrics {
     }
 }
 
+/// Genuine LLM provider billing counters extracted from `PLANNER_RESPONSE` transcript steps.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderReportedUsage {
+    pub planner_steps: u64,
+    pub input_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub output_tokens: u64,
+}
+
+impl ProviderReportedUsage {
+    pub fn add_assign(&mut self, rhs: &Self) {
+        self.planner_steps = self.planner_steps.saturating_add(rhs.planner_steps);
+        self.input_tokens = self.input_tokens.saturating_add(rhs.input_tokens);
+        self.cache_read_tokens = self.cache_read_tokens.saturating_add(rhs.cache_read_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(rhs.output_tokens);
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SavingsReport {
     pub scope_label: String,
+    pub token_estimation_method: String,
     pub conversations_analyzed: usize,
+    pub transcripts_scanned: usize,
+    pub scan_truncated: bool,
     pub active_days: usize,
+    /// Backwards-compatible alias for `estimated_counterfactual_tokens`.
     pub without_libredb_tokens: u64,
+    /// Backwards-compatible alias for `observed_libredb_tokens_approx`.
     pub with_libredb_tokens: u64,
+    /// Backwards-compatible alias for `estimated_tokens_avoided`.
     pub net_tokens_saved: u64,
+    pub observed_libredb_tokens_approx: u64,
+    pub estimated_counterfactual_tokens: u64,
+    pub estimated_tokens_avoided: u64,
     pub savings_percent: f64,
     pub compression_factor: f64,
     pub metrics: SavingsMetrics,
+    pub ledger_only_metrics: SavingsMetrics,
+    pub transcript_only_metrics: SavingsMetrics,
+    pub provider_reported_usage: ProviderReportedUsage,
     pub per_day: BTreeMap<String, SavingsMetrics>,
 }
 
+#[derive(Debug, Clone, Copy)]
 pub enum TelemetryEvent {
     Skeleton {
         zero_repeat_hits: u64,
@@ -226,11 +267,88 @@ pub enum TelemetryEvent {
     },
 }
 
+impl TelemetryEvent {
+    fn to_metrics_delta(self) -> SavingsMetrics {
+        let mut delta = SavingsMetrics::default();
+        match self {
+            TelemetryEvent::Skeleton {
+                zero_repeat_hits,
+                baseline_tokens,
+                emitted_tokens,
+            } => {
+                delta.skeleton_calls = 1;
+                delta.skeleton_zero_repeat_hits = zero_repeat_hits;
+                delta.skeleton_baseline_tokens = baseline_tokens.max(emitted_tokens);
+                delta.skeleton_emitted_tokens = emitted_tokens;
+            }
+            TelemetryEvent::Fim {
+                baseline_tokens,
+                emitted_tokens,
+            } => {
+                delta.fim_calls = 1;
+                delta.fim_baseline_tokens = baseline_tokens.max(emitted_tokens);
+                delta.fim_emitted_tokens = emitted_tokens;
+            }
+            TelemetryEvent::Impact {
+                baseline_tokens,
+                emitted_tokens,
+            } => {
+                delta.impact_calls = 1;
+                delta.impact_baseline_tokens = baseline_tokens.max(emitted_tokens);
+                delta.impact_emitted_tokens = emitted_tokens;
+            }
+            TelemetryEvent::Pulse {
+                baseline_tokens,
+                emitted_tokens,
+            } => {
+                delta.pulse_calls = 1;
+                delta.pulse_baseline_tokens = baseline_tokens.max(emitted_tokens);
+                delta.pulse_emitted_tokens = emitted_tokens;
+            }
+            TelemetryEvent::SkillSlice {
+                baseline_tokens,
+                emitted_tokens,
+            } => {
+                delta.skill_slice_calls = 1;
+                delta.skill_baseline_tokens = baseline_tokens.max(emitted_tokens);
+                delta.skill_emitted_tokens = emitted_tokens;
+            }
+            TelemetryEvent::HookHydration {
+                dedup_skipped,
+                baseline_tokens,
+                emitted_tokens,
+            } => {
+                if dedup_skipped {
+                    delta.hook_dedup_skipped_turns = 1;
+                    delta.hook_baseline_tokens = baseline_tokens;
+                } else {
+                    delta.hook_hydrated_turns = 1;
+                    delta.hook_baseline_tokens = baseline_tokens.max(emitted_tokens);
+                    delta.hook_emitted_tokens = emitted_tokens;
+                }
+            }
+            TelemetryEvent::HookSymbolShift {
+                reread_tokens_avoided,
+            } => {
+                delta.hook_symbol_shifts = 1;
+                delta.hook_baseline_tokens = reread_tokens_avoided;
+            }
+        }
+        delta
+    }
+}
+
 fn default_telemetry_ldb_path() -> Option<PathBuf> {
     if TELEMETRY_SUPPRESSED.load(Ordering::Relaxed)
         || env::var_os("LIBREDB_DISABLE_TELEMETRY").is_some()
     {
         return None;
+    }
+    if let Some(custom_p) = env::var_os("LIBREDB_TELEMETRY_PATH") {
+        let pb = PathBuf::from(custom_p);
+        if !pb.as_os_str().is_empty() {
+            return Some(pb);
+        }
     }
     let home = env::var_os("USERPROFILE").or_else(|| env::var_os("HOME"))?;
     let libre_dir = PathBuf::from(home).join(".gemini").join("libredb");
@@ -263,25 +381,46 @@ pub fn unix_secs_to_ymd(secs: i64) -> String {
     format!("{year:04}-{m:02}-{d:02}")
 }
 
-fn allowed_date_set(today_only: bool, days_opt: Option<u32>) -> Option<HashSet<String>> {
-    let now_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64);
-    let span = if today_only {
-        Some(1u32)
-    } else {
-        days_opt
-    }?;
-    let mut out = HashSet::new();
-    // Include +1 day slack for local UTC+1/+2 midnight boundaries when `--today` is used:
-    for back in 0..span.max(1) {
-        let day_secs = now_secs - (back as i64) * 86_400;
-        out.insert(unix_secs_to_ymd(day_secs));
+/// `O(1)` ISO-8601 `YYYY-MM-DD` range filter (zero `HashSet` allocation regardless of `days`).
+#[derive(Debug, Clone)]
+struct DateWindow {
+    min_ymd: String,
+    max_ymd: String,
+}
+
+impl DateWindow {
+    fn from_options(today_only: bool, days_opt: Option<u32>) -> Option<Self> {
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        let span = if today_only { Some(1u32) } else { days_opt }?;
+        let clamped_days = (span.max(1) as u64).min(MAX_SAVINGS_DAYS) as i64;
+        let min_secs = now_secs.saturating_sub((clamped_days - 1) * 86_400);
+        let max_secs = if today_only {
+            now_secs.saturating_add(7_200)
+        } else {
+            now_secs.saturating_add(86_400)
+        };
+        Some(Self {
+            min_ymd: unix_secs_to_ymd(min_secs),
+            max_ymd: unix_secs_to_ymd(max_secs),
+        })
     }
-    if today_only {
-        out.insert(unix_secs_to_ymd(now_secs + 7_200));
+
+    #[inline]
+    fn contains_ymd(&self, ymd: &str) -> bool {
+        ymd.len() == 10
+            && ymd.as_bytes()[4] == b'-'
+            && ymd.as_bytes()[7] == b'-'
+            && ymd >= self.min_ymd.as_str()
+            && ymd <= self.max_ymd.as_str()
     }
-    Some(out)
+}
+
+pub fn workspace_ledger_prefix(ws_root: &Path) -> String {
+    let norm = crate::security::normalize_workspace_key(ws_root);
+    let h = hash_key(173, norm.as_bytes());
+    format!("ws_day::{h:016x}::")
 }
 
 /// Best-effort, non-failing numeric telemetry append into `~/.gemini/libredb/telemetry.ldb`.
@@ -297,92 +436,70 @@ pub fn record_event(ev: TelemetryEvent) {
     record_event_at(&path, &current_utc_date_ymd(), ev);
 }
 
+#[cfg(test)]
+pub fn record_workspace_event(_ws_root: &Path, _ev: TelemetryEvent) {}
+
+#[cfg(not(test))]
+pub fn record_workspace_event(ws_root: &Path, ev: TelemetryEvent) {
+    let Some(path) = default_telemetry_ldb_path() else {
+        return;
+    };
+    record_workspace_event_at(&path, &current_utc_date_ymd(), Some(ws_root), ev);
+}
+
+#[cfg(not(test))]
 pub fn record_event_at(telemetry_ldb: &Path, ymd: &str, ev: TelemetryEvent) {
+    record_workspace_event_at(telemetry_ldb, ymd, None, ev);
+}
+
+/// Cross-process-atomic telemetry counter increment backed by `LibreDb::transact_key`
+/// (`commit_lock` + OS `IpcWriteGuard` + `sync_from_disk_if_changed`), preventing lost updates
+/// when concurrent CLI/hook/MCP processes write to `telemetry.ldb` simultaneously.
+pub fn record_workspace_event_at(
+    telemetry_ldb: &Path,
+    ymd: &str,
+    ws_root: Option<&Path>,
+    ev: TelemetryEvent,
+) {
     let Ok(db) = LibreDb::open(telemetry_ldb) else {
         return;
     };
+    let delta = ev.to_metrics_delta();
     let day_key = format!("day::{ymd}");
-    let mut bucket = db
-        .get_by_key(NodeKind::Generic, &day_key)
-        .ok()
-        .and_then(|r| serde_json::from_slice::<SavingsMetrics>(&r.payload).ok())
-        .unwrap_or_default();
-
-    let mut delta = SavingsMetrics::default();
-    match ev {
-        TelemetryEvent::Skeleton {
-            zero_repeat_hits,
-            baseline_tokens,
-            emitted_tokens,
-        } => {
-            delta.skeleton_calls = 1;
-            delta.skeleton_zero_repeat_hits = zero_repeat_hits;
-            delta.skeleton_baseline_tokens = baseline_tokens.max(emitted_tokens);
-            delta.skeleton_emitted_tokens = emitted_tokens;
-        }
-        TelemetryEvent::Fim {
-            baseline_tokens,
-            emitted_tokens,
-        } => {
-            delta.fim_calls = 1;
-            delta.fim_baseline_tokens = baseline_tokens.max(emitted_tokens);
-            delta.fim_emitted_tokens = emitted_tokens;
-        }
-        TelemetryEvent::Impact {
-            baseline_tokens,
-            emitted_tokens,
-        } => {
-            delta.impact_calls = 1;
-            delta.impact_baseline_tokens = baseline_tokens.max(emitted_tokens);
-            delta.impact_emitted_tokens = emitted_tokens;
-        }
-        TelemetryEvent::Pulse {
-            baseline_tokens,
-            emitted_tokens,
-        } => {
-            delta.pulse_calls = 1;
-            delta.pulse_baseline_tokens = baseline_tokens.max(emitted_tokens);
-            delta.pulse_emitted_tokens = emitted_tokens;
-        }
-        TelemetryEvent::SkillSlice {
-            baseline_tokens,
-            emitted_tokens,
-        } => {
-            delta.skill_slice_calls = 1;
-            delta.skill_baseline_tokens = baseline_tokens.max(emitted_tokens);
-            delta.skill_emitted_tokens = emitted_tokens;
-        }
-        TelemetryEvent::HookHydration {
-            dedup_skipped,
-            baseline_tokens,
-            emitted_tokens,
-        } => {
-            if dedup_skipped {
-                delta.hook_dedup_skipped_turns = 1;
-                delta.hook_baseline_tokens = baseline_tokens;
-            } else {
-                delta.hook_hydrated_turns = 1;
-                delta.hook_baseline_tokens = baseline_tokens.max(emitted_tokens);
-                delta.hook_emitted_tokens = emitted_tokens;
-            }
-        }
-        TelemetryEvent::HookSymbolShift {
-            reread_tokens_avoided,
-        } => {
-            delta.hook_symbol_shifts = 1;
-            delta.hook_baseline_tokens = reread_tokens_avoided;
-        }
-    }
-
-    bucket.add_assign(&delta);
-    if let Ok(bytes) = serde_json::to_vec(&bucket) {
-        let _ = db.put(
+    let _ = db.transact_key(NodeKind::Generic, &day_key, |existing| {
+        let mut bucket = existing
+            .and_then(|rec| serde_json::from_slice::<SavingsMetrics>(&rec.payload).ok())
+            .unwrap_or_default();
+        bucket.add_assign(&delta);
+        let bytes = serde_json::to_vec(&bucket).unwrap_or_default();
+        Ok(Some(
             WriteRequest::new(NodeKind::Generic, bytes)
-                .with_key(day_key)
+                .with_key(day_key.clone())
                 .with_importance(64),
-        );
+        ))
+    });
+
+    if let Some(ws) = ws_root {
+        let ws_key = format!("{}{ymd}", workspace_ledger_prefix(ws));
+        let _ = db.transact_key(NodeKind::Generic, &ws_key, |existing| {
+            let mut bucket = existing
+                .and_then(|rec| serde_json::from_slice::<SavingsMetrics>(&rec.payload).ok())
+                .unwrap_or_default();
+            bucket.add_assign(&delta);
+            let bytes = serde_json::to_vec(&bucket).unwrap_or_default();
+            Ok(Some(
+                WriteRequest::new(NodeKind::Generic, bytes)
+                    .with_key(ws_key.clone())
+                    .with_importance(64),
+            ))
+        });
     }
-    let _ = db.maybe_auto_compact();
+
+    if let Ok(st) = db.stats() {
+        if st.superseded_nodes >= 128 {
+            let _ = db.maybe_auto_compact();
+        }
+    }
 }
 
 pub struct SavingsQueryOptions<'a> {
@@ -395,10 +512,10 @@ pub struct SavingsQueryOptions<'a> {
 }
 
 pub fn build_savings_report(opts: &SavingsQueryOptions<'_>) -> SavingsReport {
-    let allowed_dates = allowed_date_set(opts.today_only, opts.days);
+    let date_window = DateWindow::from_options(opts.today_only, opts.days);
     let mut ledger_by_day: BTreeMap<String, SavingsMetrics> = BTreeMap::new();
 
-    if opts.cid_filter.is_none() && opts.project_filter.is_none() {
+    if opts.cid_filter.is_none() {
         let tel_path_opt = opts
             .custom_telemetry_ldb
             .map(Path::to_path_buf)
@@ -406,11 +523,17 @@ pub fn build_savings_report(opts: &SavingsQueryOptions<'_>) -> SavingsReport {
         if let Some(tel_p) = tel_path_opt {
             if tel_p.is_file() {
                 if let Ok(db) = LibreDb::open(&tel_p) {
+                    let key_prefix = opts
+                        .project_filter
+                        .map(workspace_ledger_prefix)
+                        .unwrap_or_else(|| "day::".to_owned());
                     for (ino, k_opt, _) in db.list_inodes(Some(NodeKind::Generic), false) {
                         let Some(k) = k_opt else { continue };
-                        let Some(ymd) = k.strip_prefix("day::") else { continue };
-                        if let Some(ref set) = allowed_dates {
-                            if !set.contains(ymd) {
+                        let Some(ymd) = k.strip_prefix(&key_prefix) else {
+                            continue;
+                        };
+                        if let Some(ref win) = date_window {
+                            if !win.contains_ymd(ymd) {
                                 continue;
                             }
                         }
@@ -425,20 +548,29 @@ pub fn build_savings_report(opts: &SavingsQueryOptions<'_>) -> SavingsReport {
         }
     }
 
-    let (transcript_by_day, convs_matched) = scan_transcripts_by_day(
+    let scan_out = scan_transcripts_by_day(
         opts.custom_brain_dir,
-        allowed_dates.as_ref(),
+        date_window.as_ref(),
         opts.cid_filter,
         opts.project_filter,
     );
 
+    let mut ledger_only = SavingsMetrics::default();
+    for m in ledger_by_day.values() {
+        ledger_only.add_assign(m);
+    }
+    let mut transcript_only = SavingsMetrics::default();
+    for m in scan_out.by_day.values() {
+        transcript_only.add_assign(m);
+    }
+
     let mut all_days: HashSet<String> = ledger_by_day.keys().cloned().collect();
-    all_days.extend(transcript_by_day.keys().cloned());
+    all_days.extend(scan_out.by_day.keys().cloned());
     let mut per_day: BTreeMap<String, SavingsMetrics> = BTreeMap::new();
     let mut combined = SavingsMetrics::default();
 
     for day in all_days {
-        let merged = match (ledger_by_day.get(&day), transcript_by_day.get(&day)) {
+        let merged = match (ledger_by_day.get(&day), scan_out.by_day.get(&day)) {
             (Some(a), Some(b)) => a.max_merge(b),
             (Some(a), None) => a.clone(),
             (None, Some(b)) => b.clone(),
@@ -448,56 +580,153 @@ pub fn build_savings_report(opts: &SavingsQueryOptions<'_>) -> SavingsReport {
         per_day.insert(day, merged);
     }
 
-    let without_tok = combined.total_baseline_tokens();
-    let with_tok = combined.total_emitted_tokens();
-    let saved = combined.net_tokens_saved();
+    let counterfactual_tok = combined.total_baseline_tokens();
+    let observed_tok = combined.total_emitted_tokens();
+    let avoided_tok = combined.net_tokens_saved();
     let pct = combined.savings_pct();
-    let factor = if with_tok > 0 && without_tok > 0 {
-        without_tok as f64 / with_tok as f64
+    let factor = if observed_tok > 0 && counterfactual_tok > 0 {
+        counterfactual_tok as f64 / observed_tok as f64
     } else {
         1.0
     };
 
     let scope_label = if let Some(cid) = opts.cid_filter {
         format!("conversation:{cid}")
+    } else if let Some(p) = opts.project_filter {
+        if opts.today_only {
+            format!("project:{} (today {})", p.display(), current_utc_date_ymd())
+        } else if let Some(d) = opts.days {
+            format!("project:{} (last {d} days)", p.display())
+        } else {
+            format!("project:{}", p.display())
+        }
     } else if opts.today_only {
         format!("today ({})", current_utc_date_ymd())
     } else if let Some(d) = opts.days {
         format!("last {d} days")
-    } else if let Some(p) = opts.project_filter {
-        format!("project:{}", p.display())
     } else {
         "all recorded sessions".to_owned()
     };
 
     SavingsReport {
         scope_label,
-        conversations_analyzed: convs_matched,
+        token_estimation_method:
+            "observed_utf8_bytes_div_4_vs_modeled_counterfactual_plus_provider_usage".to_owned(),
+        conversations_analyzed: scan_out.convs_matched,
+        transcripts_scanned: scan_out.transcripts_scanned,
+        scan_truncated: scan_out.scan_truncated,
         active_days: per_day.len(),
-        without_libredb_tokens: without_tok,
-        with_libredb_tokens: with_tok,
-        net_tokens_saved: saved,
+        without_libredb_tokens: counterfactual_tok,
+        with_libredb_tokens: observed_tok,
+        net_tokens_saved: avoided_tok,
+        observed_libredb_tokens_approx: observed_tok,
+        estimated_counterfactual_tokens: counterfactual_tok,
+        estimated_tokens_avoided: avoided_tok,
         savings_percent: (pct * 10.0).round() / 10.0,
         compression_factor: (factor * 100.0).round() / 100.0,
         metrics: combined,
+        ledger_only_metrics: ledger_only,
+        transcript_only_metrics: transcript_only,
+        provider_reported_usage: scan_out.provider_usage,
         per_day,
+    }
+}
+
+struct TranscriptScanOutcome {
+    by_day: BTreeMap<String, SavingsMetrics>,
+    provider_usage: ProviderReportedUsage,
+    convs_matched: usize,
+    transcripts_scanned: usize,
+    scan_truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundedLineStatus {
+    Eof,
+    Line(u64),
+    OversizedSkipped(u64),
+}
+
+/// Reads at most `max_bytes` of a single JSONL line using chunked `fill_buf`/`consume`.
+/// If a line exceeds `max_bytes` (e.g., a newline-less multi-hundred-MiB blob), immediately
+/// clears `buf` and drains the remainder of that line in-place with **zero further heap growth**.
+pub fn read_bounded_jsonl_line<R: BufRead>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max_bytes: usize,
+) -> io::Result<BoundedLineStatus> {
+    buf.clear();
+    let mut total_bytes: u64 = 0;
+    let mut oversized = false;
+
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return if total_bytes == 0 {
+                Ok(BoundedLineStatus::Eof)
+            } else if oversized {
+                buf.clear();
+                Ok(BoundedLineStatus::OversizedSkipped(total_bytes))
+            } else {
+                Ok(BoundedLineStatus::Line(total_bytes))
+            };
+        }
+
+        if let Some(nl_pos) = available.iter().position(|&b| b == b'\n') {
+            let consume_len = nl_pos + 1;
+            total_bytes = total_bytes.saturating_add(consume_len as u64);
+            if !oversized {
+                if buf.len().saturating_add(nl_pos) <= max_bytes {
+                    buf.extend_from_slice(&available[..nl_pos]);
+                } else {
+                    oversized = true;
+                    buf.clear();
+                }
+            }
+            reader.consume(consume_len);
+            return if oversized {
+                Ok(BoundedLineStatus::OversizedSkipped(total_bytes))
+            } else {
+                if buf.last() == Some(&b'\r') {
+                    buf.pop();
+                }
+                Ok(BoundedLineStatus::Line(total_bytes))
+            };
+        } else {
+            let chunk_len = available.len();
+            total_bytes = total_bytes.saturating_add(chunk_len as u64);
+            if !oversized {
+                if buf.len().saturating_add(chunk_len) <= max_bytes {
+                    buf.extend_from_slice(available);
+                } else {
+                    oversized = true;
+                    buf.clear();
+                }
+            }
+            reader.consume(chunk_len);
+        }
     }
 }
 
 fn scan_transcripts_by_day(
     custom_brain_dir: Option<&Path>,
-    allowed_dates: Option<&HashSet<String>>,
+    date_window: Option<&DateWindow>,
     cid_filter: Option<&str>,
     project_filter: Option<&Path>,
-) -> (BTreeMap<String, SavingsMetrics>, usize) {
-    let mut by_day: BTreeMap<String, SavingsMetrics> = BTreeMap::new();
-    let mut convs_matched = 0usize;
+) -> TranscriptScanOutcome {
+    let mut out = TranscriptScanOutcome {
+        by_day: BTreeMap::new(),
+        provider_usage: ProviderReportedUsage::default(),
+        convs_matched: 0,
+        transcripts_scanned: 0,
+        scan_truncated: false,
+    };
 
     let brain_root = match custom_brain_dir {
         Some(p) => p.to_path_buf(),
         None => {
             let Some(home) = env::var_os("USERPROFILE").or_else(|| env::var_os("HOME")) else {
-                return (by_day, 0);
+                return out;
             };
             PathBuf::from(home)
                 .join(".gemini")
@@ -506,20 +735,27 @@ fn scan_transcripts_by_day(
         }
     };
     if !brain_root.is_dir() {
-        return (by_day, 0);
+        return out;
     }
 
-    let proj_needle = project_filter.map(|p| {
-        p.to_string_lossy()
+    let proj_needles: Option<(Vec<u8>, Vec<u8>)> = project_filter.map(|p| {
+        let canon = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let raw = canon.to_string_lossy();
+        let clean = raw
+            .strip_prefix(r"\\?\")
+            .unwrap_or(&raw)
             .replace('\\', "/")
             .trim_end_matches('/')
-            .to_ascii_lowercase()
+            .to_ascii_lowercase();
+        let bs = clean.replace('/', "\\");
+        (clean.into_bytes(), bs.into_bytes())
     });
 
     let Ok(entries) = std::fs::read_dir(&brain_root) else {
-        return (by_day, 0);
+        return out;
     };
 
+    let mut candidates: Vec<(u128, PathBuf)> = Vec::new();
     for entry in entries.flatten() {
         let Ok(ft) = entry.file_type() else { continue };
         if ft.is_symlink() || !ft.is_dir() {
@@ -542,72 +778,153 @@ fn scan_transcripts_by_day(
         if meta.file_type().is_symlink() || !meta.is_file() {
             continue;
         }
+        let mtime_ns = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_nanos());
+        candidates.push((mtime_ns, t_path));
+    }
 
-        if parse_single_transcript(&t_path, allowed_dates, proj_needle.as_deref(), &mut by_day) {
-            convs_matched += 1;
+    // Scan newest transcripts first so bounded budgets always prioritize recent activity.
+    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+
+    let mut cumulative_bytes: u64 = 0;
+    for (_, t_path) in candidates {
+        if out.transcripts_scanned >= MAX_TRANSCRIPTS_SCANNED
+            || cumulative_bytes >= MAX_TOTAL_TRANSCRIPT_SCAN_BYTES
+        {
+            out.scan_truncated = true;
+            break;
+        }
+        out.transcripts_scanned += 1;
+        let remaining_budget = MAX_TOTAL_TRANSCRIPT_SCAN_BYTES.saturating_sub(cumulative_bytes);
+        let (matched, bytes_read, hit_budget_cap) = parse_single_transcript(
+            &t_path,
+            date_window,
+            proj_needles.as_ref(),
+            remaining_budget,
+            &mut out.by_day,
+            &mut out.provider_usage,
+        );
+        cumulative_bytes = cumulative_bytes.saturating_add(bytes_read);
+        if hit_budget_cap {
+            out.scan_truncated = true;
+        }
+        if matched {
+            out.convs_matched += 1;
         }
     }
 
-    (by_day, convs_matched)
+    out
+}
+
+/// Zero-allocation case-insensitive workspace path boundary check (`needle` must not be followed
+/// by an identifier/path-segment continuation byte, preventing `/repo/app` from matching `/repo/app2`).
+fn line_mentions_workspace_bytes(line: &[u8], needle_slash: &[u8], needle_bs: &[u8]) -> bool {
+    contains_path_boundary_ci(line, needle_slash) || contains_path_boundary_ci(line, needle_bs)
+}
+
+fn contains_path_boundary_ci(haystack: &[u8], needle_low: &[u8]) -> bool {
+    if needle_low.is_empty() || haystack.len() < needle_low.len() {
+        return false;
+    }
+    let max_start = haystack.len() - needle_low.len();
+    for start in 0..=max_start {
+        if haystack[start].to_ascii_lowercase() != needle_low[0] {
+            continue;
+        }
+        if haystack[start..start + needle_low.len()]
+            .iter()
+            .zip(needle_low.iter())
+            .all(|(&h, &n)| h.to_ascii_lowercase() == n)
+        {
+            let end = start + needle_low.len();
+            let boundary_ok = if end >= haystack.len() {
+                true
+            } else {
+                matches!(
+                    haystack[end],
+                    b'/' | b'\\' | b'"' | b'\'' | b' ' | b'\t' | b'\r' | b'\n' | b')' | b']' | b'}' | b',' | b';'
+                )
+            };
+            if boundary_ok {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn extract_u64_field(obj: &Value, keys: &[&str]) -> Option<u64> {
+    for &k in keys {
+        if let Some(n) = obj.get(k).and_then(Value::as_u64) {
+            return Some(n);
+        }
+        for sub in ["usage", "token_usage", "usageMetadata", "tokenUsage"] {
+            if let Some(n) = obj.get(sub).and_then(|u| u.get(k)).and_then(Value::as_u64) {
+                return Some(n);
+            }
+        }
+    }
+    None
 }
 
 fn parse_single_transcript(
     t_path: &Path,
-    allowed_dates: Option<&HashSet<String>>,
-    proj_needle: Option<&str>,
+    date_window: Option<&DateWindow>,
+    proj_needles: Option<&(Vec<u8>, Vec<u8>)>,
+    max_file_scan_bytes: u64,
     by_day: &mut BTreeMap<String, SavingsMetrics>,
-) -> bool {
+    provider_usage: &mut ProviderReportedUsage,
+) -> (bool, u64, bool) {
     let Ok(file) = File::open(t_path) else {
-        return false;
+        return (false, 0, false);
     };
-    let mut reader = BufReader::new(file);
-    let mut line_buf = String::new();
+    let mut reader = BufReader::with_capacity(64 * 1024, file);
+    let mut raw_buf: Vec<u8> = Vec::with_capacity(16 * 1024);
 
-    // If a `--project` filter is active, check in a fast first pass whether this transcript touches it.
-    if let Some(needle) = proj_needle {
-        let needle_bs = needle.replace('/', "\\");
-        let mut touches_proj = false;
-        loop {
-            line_buf.clear();
-            let Ok(n) = reader.read_line(&mut line_buf) else {
-                break;
-            };
-            if n == 0 {
-                break;
+    let mut touches_proj = proj_needles.is_none();
+    let mut local_by_day: BTreeMap<String, SavingsMetrics> = BTreeMap::new();
+    let mut local_provider = ProviderReportedUsage::default();
+    let mut matched_any_step = false;
+    let mut active_hydration_tok_in_epoch: Option<(String, u64)> = None;
+    let mut bytes_consumed: u64 = 0;
+    let mut hit_budget = false;
+
+    loop {
+        if bytes_consumed >= max_file_scan_bytes {
+            hit_budget = true;
+            break;
+        }
+        match read_bounded_jsonl_line(&mut reader, &mut raw_buf, MAX_TRANSCRIPT_LINE_BYTES) {
+            Ok(BoundedLineStatus::Eof) => break,
+            Ok(BoundedLineStatus::OversizedSkipped(n)) => {
+                bytes_consumed = bytes_consumed.saturating_add(n);
+                continue;
             }
-            if line_buf.len() <= MAX_TRANSCRIPT_LINE_BYTES {
-                let low = line_buf.to_ascii_lowercase();
-                if low.contains(needle) || low.contains(&needle_bs) {
+            Ok(BoundedLineStatus::Line(n)) => {
+                bytes_consumed = bytes_consumed.saturating_add(n);
+            }
+            Err(_) => break,
+        }
+
+        if !touches_proj {
+            if let Some((ref ns, ref nbs)) = proj_needles {
+                if line_mentions_workspace_bytes(&raw_buf, ns, nbs) {
                     touches_proj = true;
-                    break;
                 }
             }
         }
-        if !touches_proj {
-            return false;
-        }
-        let Ok(reopened) = File::open(t_path) else {
-            return false;
-        };
-        reader = BufReader::new(reopened);
-    }
 
-    let mut matched_any_step = false;
-    let mut active_hydration_tok_in_epoch: Option<(String, u64)> = None;
-
-    loop {
-        line_buf.clear();
-        let Ok(n) = reader.read_line(&mut line_buf) else {
-            break;
+        let Ok(line_str) = std::str::from_utf8(&raw_buf) else {
+            continue;
         };
-        if n == 0 {
-            break;
-        }
-        if line_buf.len() > MAX_TRANSCRIPT_LINE_BYTES {
+        let trimmed = line_str.trim();
+        if !trimmed.starts_with('{') {
             continue;
         }
-
-        let Ok(val) = serde_json::from_str::<Value>(line_buf.trim()) else {
+        let Ok(val) = serde_json::from_str::<Value>(trimmed) else {
             continue;
         };
         let created_at = val.get("created_at").and_then(Value::as_str).unwrap_or("");
@@ -616,10 +933,39 @@ fn parse_single_transcript(
         } else {
             continue;
         };
-        let date_in_scope = allowed_dates.map_or(true, |set| set.contains(ymd));
+        let date_in_scope = date_window.map_or(true, |win| win.contains_ymd(ymd));
 
         let step_type = val.get("type").and_then(Value::as_str).unwrap_or("");
         let content = val.get("content").and_then(Value::as_str).unwrap_or("");
+
+        if date_in_scope && step_type == "PLANNER_RESPONSE" {
+            let in_tok = extract_u64_field(&val, &["input_tokens", "prompt_tokens", "promptTokenCount"]);
+            let cache_tok = extract_u64_field(
+                &val,
+                &[
+                    "cache_read_tokens",
+                    "cached_tokens",
+                    "cached_content_token_count",
+                    "cachedContentTokenCount",
+                ],
+            );
+            let out_tok = extract_u64_field(
+                &val,
+                &["output_tokens", "completion_tokens", "candidates_token_count", "candidatesTokenCount"],
+            );
+            if in_tok.is_some() || cache_tok.is_some() || out_tok.is_some() {
+                local_provider.planner_steps += 1;
+                local_provider.input_tokens = local_provider
+                    .input_tokens
+                    .saturating_add(in_tok.unwrap_or(0));
+                local_provider.cache_read_tokens = local_provider
+                    .cache_read_tokens
+                    .saturating_add(cache_tok.unwrap_or(0));
+                local_provider.output_tokens = local_provider
+                    .output_tokens
+                    .saturating_add(out_tok.unwrap_or(0));
+            }
+        }
 
         if content.contains("<CONTEXT_SUMMARY>") {
             active_hydration_tok_in_epoch = None;
@@ -636,7 +982,7 @@ fn parse_single_transcript(
                 active_hydration_tok_in_epoch = Some((ymd.to_owned(), hyd_tok));
                 if date_in_scope {
                     matched_any_step = true;
-                    let bucket = by_day.entry(ymd.to_owned()).or_default();
+                    let bucket = local_by_day.entry(ymd.to_owned()).or_default();
                     bucket.hook_hydrated_turns += 1;
                     bucket.hook_emitted_tokens += hyd_tok;
                     bucket.hook_baseline_tokens += hyd_tok.max(850);
@@ -646,85 +992,99 @@ fn parse_single_transcript(
             if let Some((_, hyd_tok)) = active_hydration_tok_in_epoch {
                 if date_in_scope {
                     matched_any_step = true;
-                    let bucket = by_day.entry(ymd.to_owned()).or_default();
+                    let bucket = local_by_day.entry(ymd.to_owned()).or_default();
                     bucket.hook_dedup_skipped_turns += 1;
                     bucket.hook_baseline_tokens += hyd_tok;
                 }
             }
         }
 
-        if !date_in_scope || content.is_empty() {
+        if !date_in_scope {
             continue;
         }
 
-        // 1. Skeleton headers: `=== SKELETON: <file> (<lang>, L1-L<N>, ~<raw> -> ~<skel> tok`
-        for line in content.lines() {
-            if let Some(rest) = line.strip_prefix("=== SKELETON: ") {
-                if let Some((raw_t, skel_t)) = parse_skeleton_header_tokens(rest) {
+        if !content.is_empty() {
+            for line in content.lines() {
+                if let Some(rest) = line.strip_prefix("=== SKELETON: ") {
+                    if let Some((raw_t, skel_t)) = parse_skeleton_header_tokens(rest) {
+                        matched_any_step = true;
+                        let bucket = local_by_day.entry(ymd.to_owned()).or_default();
+                        bucket.skeleton_calls += 1;
+                        bucket.skeleton_baseline_tokens += raw_t.max(skel_t);
+                        bucket.skeleton_emitted_tokens += skel_t;
+                    }
+                } else if let Some(rest) = line
+                    .strip_prefix("=== [Zero-Repeat Skeleton]: ")
+                    .or_else(|| line.strip_prefix("[Zero-Repeat Skeleton]: "))
+                {
+                    let est_raw = parse_total_lines_marker(rest)
+                        .map(|l| (l.saturating_mul(9)).max(120))
+                        .unwrap_or(1_200);
                     matched_any_step = true;
-                    let bucket = by_day.entry(ymd.to_owned()).or_default();
+                    let bucket = local_by_day.entry(ymd.to_owned()).or_default();
                     bucket.skeleton_calls += 1;
-                    bucket.skeleton_baseline_tokens += raw_t.max(skel_t);
-                    bucket.skeleton_emitted_tokens += skel_t;
-                }
-            } else if let Some(rest) = line.strip_prefix("[Zero-Repeat Skeleton]: ") {
-                let est_raw = parse_total_lines_marker(rest)
-                    .map(|l| (l.saturating_mul(9)).max(120))
-                    .unwrap_or(1_200);
-                matched_any_step = true;
-                let bucket = by_day.entry(ymd.to_owned()).or_default();
-                bucket.skeleton_calls += 1;
-                bucket.skeleton_zero_repeat_hits += 1;
-                bucket.skeleton_baseline_tokens += est_raw;
-                bucket.skeleton_emitted_tokens += 55;
-            } else if let Some(rest) = line.strip_prefix("=== FIM SLICE: ") {
-                let total_lines = rest
-                    .split(" of L")
-                    .nth(1)
-                    .and_then(|s| s.split(']').next())
-                    .and_then(|n| n.parse::<u64>().ok())
-                    .unwrap_or(250);
-                let em_tok = (count_tokens_exact(content.as_bytes()) as u64).max(40);
-                let raw_est = (total_lines.saturating_mul(9)).max(em_tok);
-                matched_any_step = true;
-                let bucket = by_day.entry(ymd.to_owned()).or_default();
-                bucket.fim_calls += 1;
-                bucket.fim_baseline_tokens += raw_est;
-                bucket.fim_emitted_tokens += em_tok;
-            } else if let Some(rest) = line.strip_prefix("=== IMPACT: ") {
-                let _ = rest;
-                let em_tok = (count_tokens_exact(content.as_bytes()) as u64).max(30);
-                matched_any_step = true;
-                let bucket = by_day.entry(ymd.to_owned()).or_default();
-                bucket.impact_calls += 1;
-                bucket.impact_baseline_tokens += (em_tok.saturating_mul(5)).max(2_400);
-                bucket.impact_emitted_tokens += em_tok;
-            } else if let Some(rest) = line.strip_prefix("=== LIBREDB PULSE (") {
-                if let Some((em_t, total_t)) = parse_pulse_header_tokens(rest) {
+                    bucket.skeleton_zero_repeat_hits += 1;
+                    bucket.skeleton_baseline_tokens += est_raw;
+                    bucket.skeleton_emitted_tokens += 55;
+                } else if let Some(rest) = line.strip_prefix("=== FIM SLICE: ") {
+                    let total_lines = rest
+                        .split(" of L")
+                        .nth(1)
+                        .and_then(|s| s.split(']').next())
+                        .and_then(|n| n.parse::<u64>().ok())
+                        .unwrap_or(250);
+                    let em_tok = (count_tokens_exact(content.as_bytes()) as u64).max(40);
+                    let raw_est = (total_lines.saturating_mul(9)).max(em_tok);
                     matched_any_step = true;
-                    let bucket = by_day.entry(ymd.to_owned()).or_default();
-                    bucket.pulse_calls += 1;
-                    bucket.pulse_emitted_tokens += em_t;
-                    bucket.pulse_baseline_tokens += total_t.max(em_t + 350);
+                    let bucket = local_by_day.entry(ymd.to_owned()).or_default();
+                    bucket.fim_calls += 1;
+                    bucket.fim_baseline_tokens += raw_est;
+                    bucket.fim_emitted_tokens += em_tok;
+                } else if let Some(rest) = line.strip_prefix("=== IMPACT: ") {
+                    let _ = rest;
+                    let em_tok = (count_tokens_exact(content.as_bytes()) as u64).max(30);
+                    matched_any_step = true;
+                    let bucket = local_by_day.entry(ymd.to_owned()).or_default();
+                    bucket.impact_calls += 1;
+                    bucket.impact_baseline_tokens += (em_tok.saturating_mul(5)).max(2_400);
+                    bucket.impact_emitted_tokens += em_tok;
+                } else if let Some(rest) = line.strip_prefix("=== LIBREDB PULSE (") {
+                    if let Some((em_t, total_t)) = parse_pulse_header_tokens(rest) {
+                        matched_any_step = true;
+                        let bucket = local_by_day.entry(ymd.to_owned()).or_default();
+                        bucket.pulse_calls += 1;
+                        bucket.pulse_emitted_tokens += em_t;
+                        bucket.pulse_baseline_tokens += total_t.max(em_t + 350);
+                    }
                 }
             }
         }
 
         // CLI `get-skill --section` progressive disclosure calls in `tool_calls`
-        if line_buf.contains("get-skill") && line_buf.contains("--section") {
+        if trimmed.contains("get-skill") && trimmed.contains("--section") {
             matched_any_step = true;
-            let bucket = by_day.entry(ymd.to_owned()).or_default();
+            let bucket = local_by_day.entry(ymd.to_owned()).or_default();
             bucket.skill_slice_calls += 1;
             bucket.skill_baseline_tokens += 2_200;
             bucket.skill_emitted_tokens += 320;
         }
     }
 
-    matched_any_step
+    if !touches_proj {
+        return (false, bytes_consumed, hit_budget);
+    }
+
+    for (day, m) in local_by_day {
+        by_day.entry(day).or_default().add_assign(&m);
+    }
+    if matched_any_step || proj_needles.is_none() || local_provider.planner_steps > 0 {
+        provider_usage.add_assign(&local_provider);
+    }
+
+    (matched_any_step, bytes_consumed, hit_budget)
 }
 
 fn parse_skeleton_header_tokens(rest: &str) -> Option<(u64, u64)> {
-    // Format: `<file> (<lang>, L1-L<N>, ~28931 -> ~496 tok, -98.3%) ===`
     let (_, after_tilde) = rest.split_once(", ~")?;
     let (raw_s, after_arrow) = after_tilde.split_once(" -> ~")?;
     let skel_s = after_arrow.split_whitespace().next()?;
@@ -740,7 +1100,6 @@ fn parse_total_lines_marker(rest: &str) -> Option<u64> {
 }
 
 fn parse_pulse_header_tokens(rest: &str) -> Option<(u64, u64)> {
-    // Format: `420/1180 tok emitted | 760 tok saved via Zero-Repeat Delta | ...`
     let first_tok = rest.split_whitespace().next()?;
     let (em_s, tot_s) = first_tok.split_once('/')?;
     Some((em_s.parse().ok()?, tot_s.parse().ok()?))
@@ -750,18 +1109,24 @@ pub fn format_savings_report(rep: &SavingsReport) -> String {
     let m = &rep.metrics;
     let mut out = String::new();
     out.push_str(&format!(
-        "=== LibreDB Token Consumption & Savings Report [{}] ===\n",
+        "=== LibreDB Token Consumption & Counterfactual Savings Report [{}] ===\n",
         rep.scope_label
     ));
     out.push_str(&format!(
-        "Analyzed scope: {} active day(s), {} conversation transcript(s) + live telemetry ledger\n\n",
-        rep.active_days, rep.conversations_analyzed
+        "Analyzed scope: {} active day(s), {} matched conversation(s) ({} transcript(s) scanned{}) + live telemetry ledger\n",
+        rep.active_days,
+        rep.conversations_analyzed,
+        rep.transcripts_scanned,
+        if rep.scan_truncated { ", bounded cap reached" } else { "" }
     ));
+    out.push_str(
+        "Accounting basis: LibreDB output uses ~UTF-8 bytes/4; baseline is a modeled without-DB counterfactual.\n\n",
+    );
     out.push_str(&format!(
-        "{:<38} {:>8} {:>14} {:>14} {:>14} {:>8}\n",
-        "Subsystem", "Calls", "Without DB", "With LibreDB", "Saved", "Saving"
+        "{:<38} {:>8} {:>15} {:>15} {:>15} {:>8}\n",
+        "Subsystem", "Calls", "Est. Baseline", "LibreDB (~B/4)", "Est. Avoided", "Ratio"
     ));
-    out.push_str(&format!("{}\n", "-".repeat(100)));
+    out.push_str(&format!("{}\n", "-".repeat(104)));
 
     let rows = [
         (
@@ -818,33 +1183,54 @@ pub fn format_savings_report(rep: &SavingsReport) -> String {
             0.0
         };
         out.push_str(&format!(
-            "{:<38} {:>8} {:>10} tok {:>10} tok {:>10} tok {:>6.1}%\n",
+            "{:<38} {:>8} {:>11} tok {:>11} tok {:>11} tok {:>6.1}%\n",
             name, calls, base, em, sav, pct
         ));
     }
 
-    out.push_str(&format!("{}\n", "-".repeat(100)));
+    out.push_str(&format!("{}\n", "-".repeat(104)));
     out.push_str(&format!(
-        "{:<38} {:>8} {:>10} tok {:>10} tok {:>10} tok {:>6.1}% ({:.2}x)\n",
-        "TOTAL",
+        "{:<38} {:>8} {:>11} tok {:>11} tok {:>11} tok {:>6.1}% ({:.2}x)\n",
+        "TOTAL (max-merged per day)",
         "-",
-        rep.without_libredb_tokens,
-        rep.with_libredb_tokens,
-        rep.net_tokens_saved,
+        rep.estimated_counterfactual_tokens,
+        rep.observed_libredb_tokens_approx,
+        rep.estimated_tokens_avoided,
         rep.savings_percent,
         rep.compression_factor
     ));
+    out.push_str(&format!(
+        "Source attribution: ledger={} avoided tok | transcripts={} avoided tok | max-merged={} avoided tok\n",
+        rep.ledger_only_metrics.net_tokens_saved(),
+        rep.transcript_only_metrics.net_tokens_saved(),
+        rep.estimated_tokens_avoided
+    ));
+    let p = &rep.provider_reported_usage;
+    if p.planner_steps > 0 {
+        out.push_str(&format!(
+            "Provider-reported usage ({} planner steps): input={} tok, cache_read={} tok, output={} tok\n",
+            p.planner_steps, p.input_tokens, p.cache_read_tokens, p.output_tokens
+        ));
+    } else {
+        out.push_str("Provider-reported usage: none recorded in scanned transcripts\n");
+    }
     out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     #[test]
-    fn telemetry_ledger_and_transcript_merge_without_double_counting() {
+    fn telemetry_ledger_and_transcript_merge_with_provider_usage_and_workspace_isolation() {
         let tmp = env::temp_dir().join(format!("libredb_tel_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
+        let ws_a = tmp.join("ws_alpha");
+        let ws_b = tmp.join("ws_beta");
+        std::fs::create_dir_all(&ws_a).unwrap();
+        std::fs::create_dir_all(&ws_b).unwrap();
+
         let brain_dir = tmp.join("brain");
         let cid_logs = brain_dir
             .join("cid-1234")
@@ -852,22 +1238,28 @@ mod tests {
             .join("logs");
         std::fs::create_dir_all(&cid_logs).unwrap();
 
+        let ws_a_slash = ws_a.to_string_lossy().replace('\\', "/");
         let transcript = cid_logs.join("transcript.jsonl");
         std::fs::write(
             &transcript,
-            concat!(
-                r#"{"created_at":"2026-11-11T10:00:00Z","type":"USER_INPUT","content":"<SYSTEM_MESSAGE>\n=== PROJECT MEMORY CONTEXT (LibreDB .agents/memory.ldb) ===\nGit Telemetry: branch 'master' @ 833e9fd\n  * active_version = 1.1.0\n</SYSTEM_MESSAGE>"}"#, "\n",
-                r#"{"created_at":"2026-11-11T10:01:00Z","type":"TOOL_RESPONSE","content":"=== SKELETON: src/main.rs (rust, L1-L2600, ~28931 -> ~496 tok, -98.3%) ===\nContracts:\n"}"#, "\n",
-                r#"{"created_at":"2026-11-11T10:02:00Z","type":"TOOL_RESPONSE","content":"[Zero-Repeat Skeleton]: src/main.rs (unchanged in session, hash=abc, L1-L2600, 42 contracts)"}"#, "\n",
-                r#"{"created_at":"2026-11-11T10:03:00Z","type":"USER_INPUT","content":"next turn deduplicated"}"#, "\n"
+            format!(
+                concat!(
+                    r#"{{"created_at":"2026-11-11T10:00:00Z","type":"USER_INPUT","content":"<SYSTEM_MESSAGE>\n=== PROJECT MEMORY CONTEXT (LibreDB .agents/memory.ldb) ===\nGit Telemetry: branch 'master' @ 833e9fd\nWorkspace: {}\n</SYSTEM_MESSAGE>"}}"#, "\n",
+                    r#"{{"created_at":"2026-11-11T10:01:00Z","type":"TOOL_RESPONSE","content":"=== SKELETON: src/main.rs (rust, L1-L2600, ~28931 -> ~496 tok, -98.3%) ===\nContracts:\n"}}"#, "\n",
+                    r#"{{"created_at":"2026-11-11T10:02:00Z","type":"TOOL_RESPONSE","content":"=== [Zero-Repeat Skeleton]: src/main.rs (unchanged in session, hash=abc, L1-L2600, 42 contracts, saved ~28915 tok) ==="}}"#, "\n",
+                    r#"{{"created_at":"2026-11-11T10:02:30Z","type":"PLANNER_RESPONSE","input_tokens":4200,"cache_read_tokens":3100,"output_tokens":380,"content":"ok"}}"#, "\n",
+                    r#"{{"created_at":"2026-11-11T10:03:00Z","type":"USER_INPUT","content":"next turn deduplicated"}}"#, "\n"
+                ),
+                ws_a_slash
             ),
         )
         .unwrap();
 
         let tel_ldb = tmp.join("telemetry.ldb");
-        record_event_at(
+        record_workspace_event_at(
             &tel_ldb,
             "2026-11-11",
+            Some(&ws_a),
             TelemetryEvent::Skeleton {
                 zero_repeat_hits: 0,
                 baseline_tokens: 28_931,
@@ -879,7 +1271,7 @@ mod tests {
             today_only: false,
             days: None,
             cid_filter: None,
-            project_filter: None,
+            project_filter: Some(&ws_a),
             custom_brain_dir: Some(&brain_dir),
             custom_telemetry_ldb: Some(&tel_ldb),
         });
@@ -887,10 +1279,48 @@ mod tests {
         assert_eq!(rep.metrics.skeleton_calls, 2);
         assert_eq!(rep.metrics.skeleton_zero_repeat_hits, 1);
         assert_eq!(rep.metrics.hook_dedup_skipped_turns, 1);
-        assert!(rep.net_tokens_saved > 50_000);
+        assert_eq!(rep.provider_reported_usage.planner_steps, 1);
+        assert_eq!(rep.provider_reported_usage.input_tokens, 4_200);
+        assert_eq!(rep.provider_reported_usage.cache_read_tokens, 3_100);
+        assert_eq!(rep.provider_reported_usage.output_tokens, 380);
+        assert!(rep.estimated_tokens_avoided > 50_000);
+
+        // Querying isolated Workspace B must return 0 leaked metrics from Workspace A!
+        let rep_b = build_savings_report(&SavingsQueryOptions {
+            today_only: false,
+            days: None,
+            cid_filter: None,
+            project_filter: Some(&ws_b),
+            custom_brain_dir: Some(&brain_dir),
+            custom_telemetry_ldb: Some(&tel_ldb),
+        });
+        assert_eq!(rep_b.conversations_analyzed, 0);
+        assert_eq!(rep_b.estimated_tokens_avoided, 0);
+        assert_eq!(rep_b.provider_reported_usage.planner_steps, 0);
+
         let formatted = format_savings_report(&rep);
-        assert!(formatted.contains("TOTAL"));
+        assert!(formatted.contains("Provider-reported usage (1 planner steps)"));
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn bounded_jsonl_reader_skips_oversized_newlineless_line_without_buffer_growth() {
+        let mut stream = Vec::with_capacity(10 * 1024 * 1024 + 512);
+        stream.extend(std::iter::repeat(b'x').take(10 * 1024 * 1024));
+        stream.push(b'\n');
+        stream.extend_from_slice(br#"{"created_at":"2026-11-11T10:00:00Z","type":"USER_INPUT","content":"ok"}"#);
+        stream.push(b'\n');
+
+        let mut reader = BufReader::with_capacity(64 * 1024, Cursor::new(stream));
+        let mut buf = Vec::new();
+        let s1 = read_bounded_jsonl_line(&mut reader, &mut buf, MAX_TRANSCRIPT_LINE_BYTES).unwrap();
+        assert!(matches!(s1, BoundedLineStatus::OversizedSkipped(n) if n > 10 * 1024 * 1024));
+        assert!(buf.is_empty());
+        assert!(buf.capacity() <= MAX_TRANSCRIPT_LINE_BYTES + 64 * 1024);
+
+        let s2 = read_bounded_jsonl_line(&mut reader, &mut buf, MAX_TRANSCRIPT_LINE_BYTES).unwrap();
+        assert!(matches!(s2, BoundedLineStatus::Line(_)));
+        assert!(std::str::from_utf8(&buf).unwrap().contains("\"USER_INPUT\""));
     }
 }

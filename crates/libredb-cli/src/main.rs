@@ -80,7 +80,7 @@ Core Storage & Graph Commands:
   libredb compact <db.ldb> [--prune]
   libredb stats <db.ldb> [--json]
   libredb verify <db.ldb>
-  libredb bench [--suite kernel|full] [--workspace <dir>] [--filter <p1,p2>] [--ext <e1,e2>] [--max-files <n>] [--nodes <n>] [--threads <t>] [--json]",
+  libredb bench [--suite kernel|full|audit] [--workspace <dir>] [--filter <p1,p2>] [--ext <e1,e2>] [--max-files <n>] [--nodes <n>] [--threads <t>] [--json]",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -1748,10 +1748,22 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .switches(&["--today", "--json"])
             .values(&["--days", "--cid", "--project"])
             .parse(sub_args)?;
+            let days_u64 = cli.parse_value::<u64>("--days")?;
+            let days_u32 = match days_u64 {
+                Some(d) if d > telemetry::MAX_SAVINGS_DAYS => {
+                    return Err(format!(
+                        "Invalid --days {d}: exceeds maximum lookback window of {} days",
+                        telemetry::MAX_SAVINGS_DAYS
+                    )
+                    .into());
+                }
+                Some(d) => Some(d as u32),
+                None => None,
+            };
             let proj_filter = cli.path_value("--project");
             let opts = telemetry::SavingsQueryOptions {
                 today_only: cli.has_switch("--today"),
-                days: cli.parse_value::<u32>("--days")?,
+                days: days_u32,
                 cid_filter: cli.value("--cid"),
                 project_filter: proj_filter.as_deref(),
                 custom_brain_dir: None,
@@ -1767,7 +1779,7 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "bench" => {
             let cli = CliSpec::new(
                 "bench",
-                "libredb bench [--suite kernel|full] [--workspace <dir>] [--filter <p1,p2>] [--ext <e1,e2>] [--max-files <n>] [--nodes <n>] [--threads <t>] [--json]",
+                "libredb bench [--suite kernel|full|audit] [--workspace <dir>] [--filter <p1,p2>] [--ext <e1,e2>] [--max-files <n>] [--nodes <n>] [--threads <t>] [--json]",
             )
             .positionals(0, Some(0))
             .allow_global()
@@ -1812,9 +1824,12 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     };
                     bench::run_full_economy_bench(&opts)?;
                 }
+                "audit" | "verify" => {
+                    bench::run_feature_and_security_audit(as_json)?;
+                }
                 other => {
                     return Err(format!(
-                        "Unknown --suite '{other}' in 'bench'; expected 'kernel' or 'full'"
+                        "Unknown --suite '{other}' in 'bench'; expected 'kernel', 'full', or 'audit'"
                     )
                     .into());
                 }
@@ -2603,6 +2618,7 @@ mod tests {
             s(&["bench", "--bogus"]),
             s(&["bench", "--suite", "nonexistent"]),
             s(&["savings", "--days"]),
+            s(&["savings", "--days", "1000000000"]),
             s(&["savings", "--bogus"]),
             s(&["verify", "db.ldb", "extra.ldb"]),
             s(&["batch", "db.ldb"]),

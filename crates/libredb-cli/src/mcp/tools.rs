@@ -6,7 +6,8 @@ use super::authz::{default_libredb_home, infer_antigravity_transcript_path};
 use super::{canonical_brain_cache_key, McpServerState};
 use crate::hooks::{open_global_ldb, user_home_dir};
 use crate::telemetry::{
-    build_savings_report, format_savings_report, record_event, SavingsQueryOptions, TelemetryEvent,
+    build_savings_report, format_savings_report, record_event, record_workspace_event,
+    SavingsQueryOptions, TelemetryEvent, MAX_SAVINGS_DAYS,
 };
 use libredb_bridge::import_sqlite_readonly;
 use libredb_cognitive::skeleton::{
@@ -14,8 +15,8 @@ use libredb_cognitive::skeleton::{
 };
 use libredb_cognitive::{
     create_subagent_handoff, execute_atomic_batch, extract_fim_slice, format_impact_compact,
-    query_symbol_impact, sync_transcript_epoch, AtomicBatchSpec, CognitiveEngine, FileSkeleton,
-    PulseRequest, ReflexEngine, ReflexRule, SessionState,
+    query_symbol_impact, reconcile_tentative_edits, sync_transcript_epoch, AtomicBatchSpec,
+    CognitiveEngine, FileSkeleton, PulseRequest, ReflexEngine, ReflexRule, SessionState,
 };
 use libredb_core::crc::hash_key;
 use libredb_core::{LibreDb, LibreDbError, NodeKind, PreparedWrite, WriteRequest};
@@ -45,6 +46,16 @@ fn execute_skeleton_with_zero_repeat(
     force: bool,
     cid_arg: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    if let Ok((promoted, avoided_tok)) = reconcile_tentative_edits(proj_db, ws_root) {
+        if promoted > 0 {
+            record_workspace_event(
+                ws_root,
+                TelemetryEvent::HookSymbolShift {
+                    reread_tokens_avoided: avoided_tok,
+                },
+            );
+        }
+    }
     let mut skeletons: Vec<FileSkeleton> = Vec::with_capacity(requested_paths.len());
     let mut pending_cache_writes: Vec<PreparedWrite> = Vec::new();
     let mut degraded_write_err: Option<String> = None;
@@ -173,11 +184,14 @@ fn execute_skeleton_with_zero_repeat(
         out_blocks.push(rendered);
     }
 
-    record_event(TelemetryEvent::Skeleton {
-        zero_repeat_hits: zr_hits,
-        baseline_tokens: baseline_raw_tokens.max(emitted_tokens),
-        emitted_tokens,
-    });
+    record_workspace_event(
+        ws_root,
+        TelemetryEvent::Skeleton {
+            zero_repeat_hits: zr_hits,
+            baseline_tokens: baseline_raw_tokens.max(emitted_tokens),
+            emitted_tokens,
+        },
+    );
 
     if session_dirty {
         if let Some((cid, sess)) = session_opt {
@@ -270,24 +284,67 @@ pub(super) fn dispatch_tool(
                 .and_then(Value::as_str)
                 .unwrap_or("skeleton");
             let raw_cwd_arg = args.get("cwd").and_then(Value::as_str);
+            let target_opt = args.get("target").and_then(Value::as_str);
             if action == "savings" {
-                let proj_filter = if let Some(pin) = state.pinned_workspace_root.clone() {
-                    if let Some(raw_c) = raw_cwd_arg.filter(|s| !s.trim().is_empty()) {
-                        if let Some(err) =
-                            crate::security::check_mcp_workspace_containment(Path::new(raw_c), &pin)
-                        {
-                            return Err(err.into());
+                let days_opt: Option<u32> = match args.get("days") {
+                    None | Some(Value::Null) => None,
+                    Some(v) => {
+                        let Some(raw_d) = v.as_u64() else {
+                            return Err(format!(
+                                "Invalid 'days' parameter: expected integer in 0..={MAX_SAVINGS_DAYS}"
+                            )
+                            .into());
+                        };
+                        if raw_d > MAX_SAVINGS_DAYS {
+                            return Err(format!(
+                                "Requested 'days' ({raw_d}) exceeds maximum allowed window ({MAX_SAVINGS_DAYS} days)"
+                            )
+                            .into());
                         }
-                        Some(PathBuf::from(raw_c))
-                    } else {
-                        Some(pin)
+                        Some(raw_d as u32)
                     }
-                } else {
-                    raw_cwd_arg
-                        .filter(|s| !s.trim().is_empty())
-                        .map(PathBuf::from)
                 };
-                let days_opt = args.get("days").and_then(Value::as_u64).map(|d| d as u32);
+
+                // Enforce the exact same server-side workspace authorization boundary as all other
+                // `libredb_code` actions (`resolve_authorized_code_workspace` + quarantine check),
+                // unless an unpinned host explicitly opted into `mcp:allow_global_savings=true` with `cwd="*"`.
+                let proj_filter: Option<PathBuf> = if raw_cwd_arg.map(str::trim) == Some("*") {
+                    state.sync_global_db_or_purge()?;
+                    if state.pinned_workspace_root.is_some()
+                        || !crate::security::load_bool_config(
+                            state.global_db.as_deref(),
+                            None,
+                            "mcp:allow_global_savings",
+                            false,
+                        )
+                    {
+                        return Err(
+                            "LibreDB MCP access denied: global cross-workspace savings ('cwd=\"*\"') is disabled by policy; pass an authorized workspace 'cwd' or use the local 'libredb savings' CLI."
+                                .into(),
+                        );
+                    }
+                    None
+                } else {
+                    let (ws_root, _containment_root) = state.resolve_authorized_code_workspace(
+                        raw_cwd_arg,
+                        target_opt,
+                        true,
+                    )?;
+                    let ws_root_str = ws_root.to_string_lossy().into_owned();
+                    let proj_db = {
+                        let brain = state.resolve_brain_mut(Some(&ws_root_str), cid_arg, false)?;
+                        Arc::clone(brain.project_db())
+                    };
+                    if state.is_quarantined_db(&proj_db) {
+                        return Err(format!(
+                            "LibreDB MCP access denied: workspace '{}' is quarantined; run 'libredb trust' in a terminal first.",
+                            ws_root.display()
+                        )
+                        .into());
+                    }
+                    Some(ws_root)
+                };
+
                 let opts = SavingsQueryOptions {
                     today_only: days_opt == Some(0),
                     days: days_opt.filter(|&d| d > 0),
@@ -307,8 +364,6 @@ pub(super) fn dispatch_tool(
                     Ok(format_savings_report(&rep))
                 };
             }
-
-            let target_opt = args.get("target").and_then(Value::as_str);
             let files_arr: Vec<String> = args
                 .get("files")
                 .and_then(Value::as_array)
@@ -425,10 +480,13 @@ pub(super) fn dispatch_tool(
                         .sum();
                     let baseline_grep_tok =
                         ((total_refs.max(1) * 180).max(rendered.len() / 4)) as u64;
-                    record_event(TelemetryEvent::Impact {
-                        baseline_tokens: baseline_grep_tok.max(emitted_tok),
-                        emitted_tokens: emitted_tok,
-                    });
+                    record_workspace_event(
+                        &ws_root,
+                        TelemetryEvent::Impact {
+                            baseline_tokens: baseline_grep_tok.max(emitted_tok),
+                            emitted_tokens: emitted_tok,
+                        },
+                    );
                     Ok(rendered)
                 }
                 "fim" => {
@@ -451,10 +509,13 @@ pub(super) fn dispatch_tool(
                         .map(|m| (m.len().saturating_add(3)) / 4)
                         .unwrap_or(emitted_tok)
                         .max(emitted_tok);
-                    record_event(TelemetryEvent::Fim {
-                        baseline_tokens: raw_file_tok,
-                        emitted_tokens: emitted_tok,
-                    });
+                    record_workspace_event(
+                        &ws_root,
+                        TelemetryEvent::Fim {
+                            baseline_tokens: raw_file_tok,
+                            emitted_tokens: emitted_tok,
+                        },
+                    );
                     Ok(rendered)
                 }
                 "index" => {
