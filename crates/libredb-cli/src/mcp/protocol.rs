@@ -365,19 +365,21 @@ pub fn handle_rpc_method(
                 },
                 {
                     "name": "libredb_code",
-                    "description": "Zero-bloat source code graph: 'skeleton' (-95% file map, supports single 'target' or batch 'files'), 'impact' (callers + governing decisions), 'fim' (surgical edit slice + callers + decisions), or 'index' (scan workspace).",
+                    "description": "Zero-bloat source code graph: 'skeleton' (-95% file map, supports single 'target' or batch 'files'), 'impact' (compact caller/callee blast radius + governing decisions), 'fim' (surgical edit slice + callers + decisions), 'index' (scan workspace), or 'savings' (live token-economy report).",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "action": { "type": "string", "enum": ["skeleton", "impact", "fim", "index"] },
+                            "action": { "type": "string", "enum": ["skeleton", "impact", "fim", "index", "savings"] },
                             "target": { "type": "string", "description": "File path, workspace directory, or symbol query" },
                             "files": { "type": "array", "items": { "type": "string" }, "description": "Optional batch of file paths for action='skeleton' (single fsync)" },
                             "cwd": { "type": "string" },
-                            "cid": { "type": "string", "description": "Optional conversation ID for Zero-Repeat Skeleton deduplication" },
+                            "cid": { "type": "string", "description": "Optional conversation ID for Zero-Repeat Skeleton deduplication or savings filtering" },
                             "force": { "type": "boolean", "description": "Force full skeleton emission even if unchanged in session" },
                             "symbol": { "type": "string", "description": "Symbol filter or FIM target" },
                             "line": { "type": "integer" },
-                            "pad": { "type": "integer", "default": 12 }
+                            "pad": { "type": "integer", "default": 12 },
+                            "format": { "type": "string", "enum": ["compact", "json"], "description": "Output format for action='impact' or 'savings' (default: 'compact')" },
+                            "days": { "type": "integer", "description": "Optional lookback window in days for action='savings' (0 = today)" }
                         },
                         "required": ["action"]
                     }

@@ -1,10 +1,12 @@
 //! Command-line interface, lifecycle hooks, Gitea automation, and native MCP server for `LibreDB`.
 
+mod bench;
 mod cli_args;
 mod gitea;
 mod hooks;
 mod mcp;
 mod security;
+mod telemetry;
 
 use cli_args::CliSpec;
 
@@ -23,7 +25,6 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
-use std::thread;
 use std::time::Instant;
 
 fn print_usage() {
@@ -47,6 +48,7 @@ Antigravity Cognitive & Code-Graph Commands:
   libredb list-reflexes [--global <customizations.ldb>]
   libredb modernize-global [--global <customizations.ldb>] [--skill-md <SKILL.md>] [--profile neutral|personal] [--migrate-legacy]
   libredb mcp-serve [<default_project.ldb>] [--global <customizations.ldb>] [--workspace-root <dir>]
+  libredb savings | report [--today] [--days <n>] [--cid <id>] [--project <dir>] [--json]
 
 Security, Trust & Universal Configuration Commands:
   libredb trust [<dir>] [--revoke] [--list] [--reinit-lost] [--accept-rollback] [--migrate-v3 [--confirm-metadata]] [--migrate-v2] [--if-clean] [--global <customizations.ldb>]
@@ -78,7 +80,7 @@ Core Storage & Graph Commands:
   libredb compact <db.ldb> [--prune]
   libredb stats <db.ldb> [--json]
   libredb verify <db.ldb>
-  libredb bench [--nodes <n>] [--threads <t>]",
+  libredb bench [--suite kernel|full] [--workspace <dir>] [--filter <p1,p2>] [--ext <e1,e2>] [--max-files <n>] [--nodes <n>] [--threads <t>] [--json]",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -612,9 +614,19 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let skill_name = &cli.positionals[0];
             let gdb = hooks::open_global_ldb(cli.global_deref())?;
             if let Some(sec_title) = cli.value("--section") {
+                let full_baseline_tok = gdb
+                    .get_by_key(NodeKind::Generic, &format!("skill_full::{skill_name}"))
+                    .map(|r| ((r.payload.len() + 3) / 4) as u64)
+                    .unwrap_or(0);
                 let exact_key = format!("{skill_name}::{sec_title}");
                 if let Ok(rec) = gdb.get_by_key(NodeKind::SkillSection, &exact_key) {
-                    println!("{}", String::from_utf8_lossy(&rec.payload));
+                    let body = String::from_utf8_lossy(&rec.payload);
+                    let emitted_tok = ((body.len() + 3) / 4) as u64;
+                    telemetry::record_event(telemetry::TelemetryEvent::SkillSlice {
+                        baseline_tokens: full_baseline_tok.max(emitted_tok),
+                        emitted_tokens: emitted_tok,
+                    });
+                    println!("{body}");
                 } else {
                     let prefix = format!("{skill_name}::").to_ascii_lowercase();
                     let sub_low = sec_title.to_ascii_lowercase();
@@ -630,7 +642,13 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     }
                     if let Some(nid) = matched_id {
                         let rec = gdb.get(nid)?;
-                        println!("{}", String::from_utf8_lossy(&rec.payload));
+                        let body = String::from_utf8_lossy(&rec.payload);
+                        let emitted_tok = ((body.len() + 3) / 4) as u64;
+                        telemetry::record_event(telemetry::TelemetryEvent::SkillSlice {
+                            baseline_tokens: full_baseline_tok.max(emitted_tok),
+                            emitted_tokens: emitted_tok,
+                        });
+                        println!("{body}");
                     } else {
                         return Err(format!("Section '{sec_title}' not found in skill '{skill_name}'").into());
                     }
@@ -1721,14 +1739,86 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 st.commit_seq
             );
         }
+        cmd @ ("savings" | "report") => {
+            let cli = CliSpec::new(
+                cmd,
+                "libredb savings [--today] [--days <n>] [--cid <id>] [--project <dir>] [--json]",
+            )
+            .positionals(0, Some(0))
+            .switches(&["--today", "--json"])
+            .values(&["--days", "--cid", "--project"])
+            .parse(sub_args)?;
+            let proj_filter = cli.path_value("--project");
+            let opts = telemetry::SavingsQueryOptions {
+                today_only: cli.has_switch("--today"),
+                days: cli.parse_value::<u32>("--days")?,
+                cid_filter: cli.value("--cid"),
+                project_filter: proj_filter.as_deref(),
+                custom_brain_dir: None,
+                custom_telemetry_ldb: None,
+            };
+            let rep = telemetry::build_savings_report(&opts);
+            if cli.has_switch("--json") {
+                println!("{}", serde_json::to_string_pretty(&rep)?);
+            } else {
+                print!("{}", telemetry::format_savings_report(&rep));
+            }
+        }
         "bench" => {
-            let cli = CliSpec::new("bench", "libredb bench [--nodes <n>] [--threads <t>]")
-                .positionals(0, Some(0))
-                .values(&["--nodes", "--threads"])
-                .parse(sub_args)?;
-            let total_nodes = cli.parse_value::<usize>("--nodes")?.unwrap_or(10_000);
-            let threads = cli.parse_value::<usize>("--threads")?.unwrap_or(16);
-            run_microbench(total_nodes, threads.max(1))?;
+            let cli = CliSpec::new(
+                "bench",
+                "libredb bench [--suite kernel|full] [--workspace <dir>] [--filter <p1,p2>] [--ext <e1,e2>] [--max-files <n>] [--nodes <n>] [--threads <t>] [--json]",
+            )
+            .positionals(0, Some(0))
+            .allow_global()
+            .switches(&["--json"])
+            .values(&[
+                "--suite",
+                "--workspace",
+                "--filter",
+                "--ext",
+                "--max-files",
+                "--nodes",
+                "--threads",
+            ])
+            .parse(sub_args)?;
+            let as_json = cli.has_switch("--json");
+            let ws_opt = cli.path_value("--workspace");
+            let suite_raw = cli
+                .value("--suite")
+                .unwrap_or(if ws_opt.is_some() { "full" } else { "kernel" })
+                .trim()
+                .to_ascii_lowercase();
+            let split_csv = |opt: Option<&str>| -> Vec<String> {
+                opt.unwrap_or("")
+                    .split(',')
+                    .map(|s| s.trim().to_owned())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            };
+            match suite_raw.as_str() {
+                "kernel" => {
+                    let total_nodes = cli.parse_value::<usize>("--nodes")?.unwrap_or(10_000);
+                    let threads = cli.parse_value::<usize>("--threads")?.unwrap_or(16).max(1);
+                    bench::run_kernel_microbench(total_nodes, threads, as_json)?;
+                }
+                "full" | "economy" => {
+                    let opts = bench::EconomyBenchOptions {
+                        workspace_source: ws_opt.as_deref(),
+                        path_filters: split_csv(cli.value("--filter")),
+                        ext_filters: split_csv(cli.value("--ext")),
+                        max_files: cli.parse_value::<usize>("--max-files")?.unwrap_or(250).max(1),
+                        as_json,
+                    };
+                    bench::run_full_economy_bench(&opts)?;
+                }
+                other => {
+                    return Err(format!(
+                        "Unknown --suite '{other}' in 'bench'; expected 'kernel' or 'full'"
+                    )
+                    .into());
+                }
+            }
         }
         other => {
             return Err(format!("Unknown subcommand '{other}'. Run 'libredb --help'.").into());
@@ -1759,93 +1849,6 @@ fn print_record(rec: &libredb_core::NodeRecord) {
         rec.payload.len(),
         String::from_utf8_lossy(&rec.payload)
     );
-}
-
-fn run_microbench(total_nodes: usize, threads: usize) -> Result<(), Box<dyn std::error::Error>> {
-    let tmp_path: PathBuf =
-        env::temp_dir().join(format!("libredb_bench_{}.tmp.ldb", process::id()));
-    let _ = std::fs::remove_file(&tmp_path);
-
-    let db = Arc::new(LibreDb::open(&tmp_path)?);
-    let per_thread = total_nodes / threads;
-
-    let t_prep = Instant::now();
-    let mut handles = Vec::with_capacity(threads);
-    for tid in 0..threads {
-        let db_ref = Arc::clone(&db);
-        handles.push(thread::spawn(move || {
-            let mut batch = Vec::with_capacity(per_thread);
-            for j in 0..per_thread {
-                let idx = tid * per_thread + j;
-                let text = format!(
-                    "## Skill section #{idx}\nDeterministic architectural guidance for concurrent worker lane {tid} item {j} with repeatable compressible tokens."
-                );
-                let req = WriteRequest::new(NodeKind::SkillSection, text.into_bytes())
-                    .with_key(format!("sec_{idx}"));
-                batch.push(db_ref.prepare(req, tid).expect("prepare succeeded"));
-            }
-            batch
-        }));
-    }
-
-    let mut all_prepared = Vec::with_capacity(per_thread * threads);
-    for h in handles {
-        all_prepared.extend(h.join().expect("worker joined"));
-    }
-    let prep_ms = t_prep.elapsed().as_secs_f64() * 1000.0;
-
-    let t_commit = Instant::now();
-    let ids = db.commit_batch(&all_prepared)?;
-    let commit_ms = t_commit.elapsed().as_secs_f64() * 1000.0;
-
-    let ids_arc = Arc::new(ids);
-    let t_read = Instant::now();
-    let mut r_handles = Vec::with_capacity(threads);
-    for tid in 0..threads {
-        let db_ref = Arc::clone(&db);
-        let ids_ref = Arc::clone(&ids_arc);
-        r_handles.push(thread::spawn(move || {
-            let start = tid * per_thread;
-            for &nid in &ids_ref[start..start + per_thread] {
-                let rec = db_ref.get(nid).expect("read succeeded");
-                assert!(!rec.payload.is_empty());
-            }
-        }));
-    }
-    for rh in r_handles {
-        rh.join().expect("reader joined");
-    }
-    let read_ms = t_read.elapsed().as_secs_f64() * 1000.0;
-
-    let t_comp = Instant::now();
-    let comp = db.compact_with_gravity()?;
-    let comp_ms = t_comp.elapsed().as_secs_f64() * 1000.0;
-
-    let st = db.verify_integrity()?;
-    let _ = std::fs::remove_file(&tmp_path);
-
-    let actual_n = ids_arc.len();
-    println!("=== LibreDB Kernel Benchmark ({actual_n} nodes across {threads} threads) ===");
-    println!(
-        "  Parallel prepare ({threads} lanes): {:>8.2} ms ({:.0} nodes/sec)",
-        prep_ms,
-        (actual_n as f64) / (prep_ms / 1000.0)
-    );
-    println!(
-        "  Atomic batch commit + fsync:   {:>8.2} ms ({:.0} nodes/sec)",
-        commit_ms,
-        (actual_n as f64) / (commit_ms / 1000.0)
-    );
-    println!(
-        "  Concurrent {threads}-thread reads:  {:>8.2} ms ({:.0} reads/sec)",
-        read_ms,
-        (actual_n as f64) / (read_ms / 1000.0)
-    );
-    println!(
-        "  Gravity compaction + verify:   {:>8.2} ms ({} -> {} bytes)",
-        comp_ms, comp.bytes_before, st.file_bytes
-    );
-    Ok(())
 }
 
 fn sync_skill_markdown(
@@ -2004,6 +2007,19 @@ fn modernize_global_db(
         deprecated_legacy += 1;
     }
     if gdb.deprecate_key(NodeKind::Generic, "sqlite_mirror::central")? {
+        deprecated_legacy += 1;
+    }
+    if gdb.deprecate_key(
+        NodeKind::Rule,
+        "rule:global::adaptive-model-concurrency-quota-routing",
+    )? {
+        deprecated_legacy += 1;
+    }
+    if gdb
+        .get_by_key(NodeKind::Rule, "rule:stack:flutter::flutter-hot_reload")
+        .is_ok()
+        && gdb.deprecate_key(NodeKind::Rule, "flutter-hot_reload")?
+    {
         deprecated_legacy += 1;
     }
     for (_, k_opt, _) in gdb.list_inodes(Some(NodeKind::SkillSection), false) {
@@ -2585,6 +2601,9 @@ mod tests {
             s(&["hook-pre-tool", "--bogus"]),
             s(&["bench", "--nodes"]),
             s(&["bench", "--bogus"]),
+            s(&["bench", "--suite", "nonexistent"]),
+            s(&["savings", "--days"]),
+            s(&["savings", "--bogus"]),
             s(&["verify", "db.ldb", "extra.ldb"]),
             s(&["batch", "db.ldb"]),
             s(&["batch", "db.ldb", "--fact", "missing_equals"]),

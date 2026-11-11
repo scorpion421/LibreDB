@@ -437,7 +437,8 @@ pub(crate) fn evaluate_pre_tool_payload(payload: &Value, global_ldb_opt: Option<
 
         if target_file != "<tool_input>" && !is_test_or_scratch_path(target_file) {
             let target_path = Path::new(target_file);
-            let _ = record_working_set_edit(target_path, global_db_ro.as_deref());
+            let _ =
+                record_working_set_edit(target_path, tool_name, &args, global_db_ro.as_deref());
         }
     }
 
@@ -599,6 +600,13 @@ pub(crate) fn evaluate_pre_invocation_payload(
             if let Ok(cur_json) = serde_json::from_slice::<Value>(&cur_rec.payload) {
                 if cur_json.get("dedup_token").and_then(Value::as_str) == Some(dedup_token.as_str())
                 {
+                    crate::telemetry::record_event(
+                        crate::telemetry::TelemetryEvent::HookHydration {
+                            dedup_skipped: true,
+                            baseline_tokens: 420,
+                            emitted_tokens: 0,
+                        },
+                    );
                     return Ok(json!({ "injectSteps": [] }));
                 }
             }
@@ -643,10 +651,19 @@ pub(crate) fn evaluate_pre_invocation_payload(
         }
     }
 
-    let context_block = build_project_memory_hydration(&proj_db, ws_root.as_deref());
+    let prompt_hint = extract_prompt_hint(payload, transcript_opt.as_deref());
+    let (context_block, naive_baseline_bytes) =
+        build_project_memory_hydration(&proj_db, ws_root.as_deref(), prompt_hint.as_deref());
     if context_block.is_empty() {
         Ok(json!({ "injectSteps": [] }))
     } else {
+        let emitted_tok = ((context_block.len() + 3) / 4) as u64;
+        let baseline_tok = ((naive_baseline_bytes + 3) / 4) as u64;
+        crate::telemetry::record_event(crate::telemetry::TelemetryEvent::HookHydration {
+            dedup_skipped: false,
+            baseline_tokens: baseline_tok.max(emitted_tok),
+            emitted_tokens: emitted_tok,
+        });
         Ok(json!({
             "injectSteps": [{
                 "systemMessage": {
@@ -657,11 +674,78 @@ pub(crate) fn evaluate_pre_invocation_payload(
     }
 }
 
-fn build_project_memory_hydration(proj_db: &LibreDb, ws_root: Option<&Path>) -> String {
+const MAX_PRE_INVOCATION_BYTES: usize = 1_800;
+
+fn truncate_utf8_clean(s: &str, max_chars: usize) -> (&str, bool) {
+    match s.char_indices().nth(max_chars) {
+        Some((byte_idx, _)) => (s[..byte_idx].trim_end(), true),
+        None => (s, false),
+    }
+}
+
+fn extract_prompt_hint(payload: &Value, transcript_opt: Option<&Path>) -> Option<String> {
+    for key in [
+        "prompt",
+        "userPrompt",
+        "userMessage",
+        "query",
+        "message",
+        "input",
+    ] {
+        if let Some(raw) = payload.get(key).and_then(Value::as_str) {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                let (head, _) = truncate_utf8_clean(trimmed, 512);
+                return Some(head.to_owned());
+            }
+        }
+    }
+    let tp = transcript_opt?;
+    use std::io::{Seek, SeekFrom};
+    let mut f = std::fs::File::open(tp).ok()?;
+    let len = f.metadata().ok()?.len();
+    if len == 0 {
+        return None;
+    }
+    let read_len = len.min(16_384);
+    f.seek(SeekFrom::Start(len - read_len)).ok()?;
+    let mut buf = vec![0u8; read_len as usize];
+    f.read_exact(&mut buf).ok()?;
+    let tail = String::from_utf8_lossy(&buf);
+    for line in tail.lines().rev().take(16) {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('{') || !trimmed.contains("USER_INPUT") {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+            if v.get("type").and_then(Value::as_str) == Some("USER_INPUT") {
+                if let Some(c) = v.get("content").and_then(Value::as_str) {
+                    let clean = c.trim();
+                    if !clean.is_empty() {
+                        let (head, _) = truncate_utf8_clean(clean, 512);
+                        return Some(head.to_owned());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Builds a compact (`<= 450`-token / `1,800`-byte), `BM25`-assisted `<SYSTEM_MESSAGE>` strictly
+/// from `hmac-sha256:v4`-sealed cognitive capsules (`Task`, `Handoff`, `Fact`, `Decision`,
+/// `Snapshot`, `CompactionCheckpoint`). Unsealed `WorkingSet` and `Symbol` nodes are NEVER read here.
+fn build_project_memory_hydration(
+    proj_db: &LibreDb,
+    ws_root: Option<&Path>,
+    prompt_hint: Option<&str>,
+) -> (String, usize) {
     let mut lines: Vec<String> = Vec::new();
+    let mut naive_baseline_bytes = 64usize;
 
     if let Some(root) = ws_root {
         if let Some(git_line) = collect_git_telemetry_line(root) {
+            naive_baseline_bytes += git_line.len() + 1;
             lines.push(git_line);
         }
     }
@@ -677,15 +761,37 @@ fn build_project_memory_hydration(proj_db: &LibreDb, ws_root: Option<&Path>) -> 
             continue;
         }
         match ino.kind {
-            NodeKind::Task => task_ids.push(ino.node_id),
-            NodeKind::Handoff => handoff_ids.push(ino.node_id),
-            NodeKind::Decision => decision_ids.push(ino.node_id),
-            NodeKind::Fact => fact_ids.push((ino.updated_ns, ino.node_id)),
+            NodeKind::Task => {
+                naive_baseline_bytes += (ino.token_count as usize) * 4;
+                task_ids.push(ino.node_id);
+            }
+            NodeKind::Handoff => {
+                naive_baseline_bytes += (ino.token_count as usize) * 4;
+                handoff_ids.push(ino.node_id);
+            }
+            NodeKind::Decision => {
+                naive_baseline_bytes += (ino.token_count as usize) * 4;
+                decision_ids.push(ino.node_id);
+            }
+            NodeKind::Fact => {
+                naive_baseline_bytes += (ino.token_count as usize) * 4;
+                fact_ids.push((ino.updated_ns, ino.node_id));
+            }
+            // Security invariant: NEVER hydrate WorkingSet, Symbol, Generic, or TranscriptCursor.
             _ => {}
         }
     }
 
-    // Open tasks (skip completed/done/closed/cancelled)
+    let bm25_opt = prompt_hint
+        .map(str::trim)
+        .filter(|q| !q.is_empty() && (fact_ids.len() > 4 || decision_ids.len() > 2))
+        .and_then(|q| {
+            libredb_index::HybridIndex::load_or_build(proj_db)
+                .ok()
+                .map(|idx| (q, idx))
+        });
+
+    // Open tasks (skip completed/done/closed/cancelled, up to 4 concise lines)
     if !task_ids.is_empty() {
         task_ids.sort_unstable();
         if let Ok((recs, _)) = proj_db.get_many_coalesced(&task_ids) {
@@ -700,7 +806,7 @@ fn build_project_memory_hydration(proj_db: &LibreDb, ws_root: Option<&Path>) -> 
                         && !low.contains("| closed |")
                         && !low.contains("| cancelled |")
                 })
-                .take(5)
+                .take(4)
                 .collect();
             if !open_tasks.is_empty() {
                 if !lines.is_empty() {
@@ -708,21 +814,22 @@ fn build_project_memory_hydration(proj_db: &LibreDb, ws_root: Option<&Path>) -> 
                 }
                 lines.push("Active Task Board:".to_owned());
                 for t in open_tasks {
-                    let first = t.lines().next().unwrap_or(&t);
-                    lines.push(format!("  * {first}"));
+                    let first = t.lines().next().unwrap_or(&t).trim();
+                    let (short, cut) = truncate_utf8_clean(first, 140);
+                    lines.push(format!("  * {short}{}", if cut { "..." } else { "" }));
                 }
             }
         }
     }
 
-    // Pending handoffs
+    // Pending handoffs (up to 2)
     if !handoff_ids.is_empty() {
         if let Ok((recs, _)) = proj_db.get_many_coalesced(&handoff_ids) {
             let pending: Vec<String> = recs
                 .into_iter()
                 .map(|r| String::from_utf8_lossy(&r.payload).into_owned())
                 .filter(|h| h.contains("(pending)"))
-                .take(3)
+                .take(2)
                 .collect();
             if !pending.is_empty() {
                 if !lines.is_empty() {
@@ -730,77 +837,177 @@ fn build_project_memory_hydration(proj_db: &LibreDb, ws_root: Option<&Path>) -> 
                 }
                 lines.push("Pending Subagent Handoffs:".to_owned());
                 for h in pending {
-                    let first = h.lines().next().unwrap_or(&h);
-                    lines.push(format!("  * {first}"));
+                    let first = h.lines().next().unwrap_or(&h).trim();
+                    let (short, cut) = truncate_utf8_clean(first, 140);
+                    lines.push(format!("  * {short}{}", if cut { "..." } else { "" }));
                 }
             }
         }
     }
 
-    // Most recent 12 active facts
+    // Compact Facts: up to 4 newest + up to 3 BM25-relevant facts (or 6 newest without query)
     if !fact_ids.is_empty() {
+        let total_facts = fact_ids.len();
         fact_ids.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
-        let top_fids: Vec<u64> = fact_ids.into_iter().take(12).map(|(_, id)| id).collect();
-        if let Ok((recs, _)) = proj_db.get_many_coalesced(&top_fids) {
+        let live_fact_set: std::collections::HashSet<u64> =
+            fact_ids.iter().map(|&(_, id)| id).collect();
+        let mut selected_fids: Vec<u64> = Vec::with_capacity(7);
+        if let Some((q, ref idx)) = bm25_opt {
+            for hit in idx.search(q, Some(&[NodeKind::Fact]), 4) {
+                if live_fact_set.contains(&hit.node_id) && !selected_fids.contains(&hit.node_id) {
+                    selected_fids.push(hit.node_id);
+                    if selected_fids.len() >= 3 {
+                        break;
+                    }
+                }
+            }
+        }
+        let target_fact_cap = if selected_fids.is_empty() { 5 } else { 6 };
+        for &(_, id) in &fact_ids {
+            if selected_fids.len() >= target_fact_cap {
+                break;
+            }
+            if !selected_fids.contains(&id) {
+                selected_fids.push(id);
+            }
+        }
+        if let Ok((recs, _)) = proj_db.get_many_coalesced(&selected_fids) {
             if !recs.is_empty() {
                 if !lines.is_empty() {
                     lines.push(String::new());
                 }
-                lines.push("Project Facts (.agents/memory.ldb):".to_owned());
-                for r in recs {
-                    let txt = String::from_utf8_lossy(&r.payload);
-                    lines.push(format!("  * {}", txt.trim()));
+                if total_facts > recs.len() {
+                    lines.push(format!(
+                        "Project Facts ({} of {total_facts} active; full via libredb_pulse):",
+                        recs.len()
+                    ));
+                } else {
+                    lines.push("Project Facts (.agents/memory.ldb):".to_owned());
+                }
+                // Preserve `selected_fids` order (BM25 matches first, then newest):
+                let rec_map: std::collections::HashMap<u64, _> =
+                    recs.into_iter().map(|r| (r.node_id, r)).collect();
+                for fid in selected_fids {
+                    if let Some(r) = rec_map.get(&fid) {
+                        let txt = String::from_utf8_lossy(&r.payload);
+                        let flat = txt.lines().collect::<Vec<_>>().join(" ");
+                        let (short, cut) = truncate_utf8_clean(flat.trim(), 150);
+                        if cut {
+                            lines.push(format!("  * {short}... [#{}]", r.node_id));
+                        } else {
+                            lines.push(format!("  * {short}"));
+                        }
+                    }
                 }
             }
         }
     }
 
-    // Active architectural decisions (up to 5)
+    // Compact Architectural Decisions: up to 1 BM25 match + 2 newest (summary-capped at 170 chars)
     if !decision_ids.is_empty() {
+        let total_decs = decision_ids.len();
         decision_ids.sort_by(|a, b| b.cmp(a));
-        decision_ids.truncate(5);
-        if let Ok((recs, _)) = proj_db.get_many_coalesced(&decision_ids) {
+        let live_dec_set: std::collections::HashSet<u64> = decision_ids.iter().copied().collect();
+        let mut selected_dids: Vec<u64> = Vec::with_capacity(3);
+        if let Some((q, ref idx)) = bm25_opt {
+            for hit in idx.search(q, Some(&[NodeKind::Decision]), 3) {
+                if live_dec_set.contains(&hit.node_id) && !selected_dids.contains(&hit.node_id) {
+                    selected_dids.push(hit.node_id);
+                    break;
+                }
+            }
+        }
+        for &did in &decision_ids {
+            if selected_dids.len() >= 2 + usize::from(!selected_dids.is_empty()).min(1) {
+                break;
+            }
+            if !selected_dids.contains(&did) {
+                selected_dids.push(did);
+            }
+        }
+        selected_dids.truncate(3);
+        if let Ok((recs, _)) = proj_db.get_many_coalesced(&selected_dids) {
             if !recs.is_empty() {
                 if !lines.is_empty() {
                     lines.push(String::new());
                 }
-                lines.push("Active Architectural Decisions:".to_owned());
-                for r in recs {
-                    let txt = String::from_utf8_lossy(&r.payload);
-                    let flat = txt.lines().collect::<Vec<_>>().join(" ");
-                    lines.push(format!("  * {}", flat.trim()));
+                if total_decs > recs.len() {
+                    lines.push(format!(
+                        "Active Architectural Decisions ({} of {total_decs}; full via libredb_pulse):",
+                        recs.len()
+                    ));
+                } else {
+                    lines.push("Active Architectural Decisions:".to_owned());
+                }
+                let rec_map: std::collections::HashMap<u64, _> =
+                    recs.into_iter().map(|r| (r.node_id, r)).collect();
+                for did in selected_dids {
+                    if let Some(r) = rec_map.get(&did) {
+                        let txt = String::from_utf8_lossy(&r.payload);
+                        let flat = txt.lines().collect::<Vec<_>>().join(" ");
+                        let (short, cut) = truncate_utf8_clean(flat.trim(), 170);
+                        if cut {
+                            lines.push(format!(
+                                "  * {short}... [#{} via libredb_pulse]",
+                                r.node_id
+                            ));
+                        } else {
+                            lines.push(format!("  * {short}"));
+                        }
+                    }
                 }
             }
         }
     }
 
-    // Latest snapshot or compaction checkpoint
+    // Latest snapshot or compaction checkpoint (concise 3-line summary)
     if let Ok(snap) = proj_db.get_by_key(NodeKind::Snapshot, "latest_snapshot") {
+        naive_baseline_bytes += snap.payload.len();
         if !lines.is_empty() {
             lines.push(String::new());
         }
         lines.push("Latest Milestone Snapshot:".to_owned());
-        for sl in String::from_utf8_lossy(&snap.payload).lines().take(5) {
-            lines.push(format!("  {sl}"));
+        for sl in String::from_utf8_lossy(&snap.payload).lines().take(3) {
+            let (short, cut) = truncate_utf8_clean(sl.trim(), 150);
+            lines.push(format!("  {short}{}", if cut { "..." } else { "" }));
         }
     } else if let Ok(cp) = proj_db.get_by_key(NodeKind::CompactionCheckpoint, "latest_compaction") {
+        naive_baseline_bytes += cp.payload.len();
         if !lines.is_empty() {
             lines.push(String::new());
         }
         lines.push("Latest Compaction Checkpoint:".to_owned());
         for cl in String::from_utf8_lossy(&cp.payload).lines().take(3) {
-            lines.push(format!("  {cl}"));
+            let (short, cut) = truncate_utf8_clean(cl.trim(), 150);
+            lines.push(format!("  {short}{}", if cut { "..." } else { "" }));
         }
     }
 
     if lines.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "=== PROJECT MEMORY CONTEXT (LibreDB .agents/memory.ldb) ===\n{}",
-            lines.join("\n")
-        )
+        return (String::new(), 0);
     }
+
+    let header = "=== PROJECT MEMORY CONTEXT (LibreDB .agents/memory.ldb) ===";
+    let footer_notice = "  ... [capped at 450 tok; query details via libredb_pulse]";
+    let mut out = String::with_capacity(MAX_PRE_INVOCATION_BYTES.min(2048));
+    out.push_str(header);
+
+    let mut omitted = false;
+    for line in &lines {
+        let needed = 1 + line.len();
+        if out.len() + needed + 1 + footer_notice.len() > MAX_PRE_INVOCATION_BYTES {
+            omitted = true;
+            break;
+        }
+        out.push('\n');
+        out.push_str(line);
+    }
+    if omitted && out.len() + 1 + footer_notice.len() <= MAX_PRE_INVOCATION_BYTES {
+        out.push('\n');
+        out.push_str(footer_notice);
+    }
+
+    (out, naive_baseline_bytes.max(128))
 }
 
 fn collect_git_telemetry_line(root: &Path) -> Option<String> {
@@ -890,7 +1097,254 @@ fn collect_git_telemetry_line(root: &Path) -> Option<String> {
     }
 }
 
-fn record_working_set_edit(target_file: &Path, global_db: Option<&LibreDb>) -> Result<(), String> {
+const MAX_SIMULATED_SOURCE_BYTES: u64 = 4 * 1024 * 1024;
+
+fn apply_in_ram_replacement(
+    cur: &str,
+    file_uses_crlf: bool,
+    target_raw: &str,
+    repl_raw: &str,
+    replace_all: bool,
+    start_line: Option<usize>,
+    end_line: Option<usize>,
+) -> Option<String> {
+    if target_raw.is_empty() {
+        return None;
+    }
+    let (target_eff, repl_eff) = if cur.contains(target_raw) {
+        (target_raw.to_owned(), repl_raw.to_owned())
+    } else if file_uses_crlf && !target_raw.contains("\r\n") && target_raw.contains('\n') {
+        let t = target_raw.replace('\n', "\r\n");
+        let r = if repl_raw.contains("\r\n") {
+            repl_raw.to_owned()
+        } else {
+            repl_raw.replace('\n', "\r\n")
+        };
+        (t, r)
+    } else if !file_uses_crlf && target_raw.contains("\r\n") {
+        (
+            target_raw.replace("\r\n", "\n"),
+            repl_raw.replace("\r\n", "\n"),
+        )
+    } else {
+        return None;
+    };
+
+    if let (Some(sl), Some(el)) = (start_line, end_line) {
+        if sl >= 1 && el >= sl {
+            let mut cur_line = 1usize;
+            let mut span_start: Option<usize> = if sl == 1 { Some(0) } else { None };
+            let mut span_end: Option<usize> = None;
+            for (idx, b) in cur.bytes().enumerate() {
+                if b == b'\n' {
+                    if cur_line == el && span_end.is_none() {
+                        span_end = Some(idx + 1);
+                        break;
+                    }
+                    cur_line += 1;
+                    if cur_line == sl && span_start.is_none() {
+                        span_start = Some(idx + 1);
+                    }
+                }
+            }
+            let s_idx = span_start.unwrap_or(0);
+            let e_idx = span_end.unwrap_or(cur.len()).max(s_idx);
+            let window = &cur[s_idx..e_idx];
+            if window.contains(&target_eff) {
+                let updated_win = if replace_all {
+                    window.replace(&target_eff, &repl_eff)
+                } else {
+                    if window.matches(&target_eff).count() != 1 {
+                        return None;
+                    }
+                    window.replacen(&target_eff, &repl_eff, 1)
+                };
+                let mut rebuilt = String::with_capacity(
+                    cur.len().saturating_sub(window.len()) + updated_win.len(),
+                );
+                rebuilt.push_str(&cur[..s_idx]);
+                rebuilt.push_str(&updated_win);
+                rebuilt.push_str(&cur[e_idx..]);
+                return Some(rebuilt);
+            }
+        }
+    }
+
+    let count = cur.matches(&target_eff).count();
+    if count == 0 {
+        return None;
+    }
+    if replace_all {
+        Some(cur.replace(&target_eff, &repl_eff))
+    } else if count == 1 {
+        Some(cur.replacen(&target_eff, &repl_eff, 1))
+    } else {
+        None
+    }
+}
+
+/// Pure in-RAM simulation of a pending IDE write/edit tool call.
+/// Never touches `target_file` on disk and preserves native `CRLF`/`LF` line endings so
+/// `FNV-1a` (`SKELETON_HASH_SEED`) matches the exact bytes the IDE tool writes to disk.
+fn simulate_post_edit_bytes(
+    target_file: &Path,
+    tool_name: &str,
+    args: &Value,
+) -> Option<(Vec<u8>, u64)> {
+    match tool_name {
+        "write_file" | "write_to_file" => {
+            let content = args
+                .get("Content")
+                .or_else(|| args.get("CodeContent"))
+                .or_else(|| args.get("content"))
+                .and_then(Value::as_str)?;
+            if content.len() as u64 > MAX_SIMULATED_SOURCE_BYTES {
+                return None;
+            }
+            let is_append = args
+                .get("Append")
+                .or_else(|| args.get("append"))
+                .and_then(Value::as_bool)
+                == Some(true);
+            if is_append {
+                if let Ok(meta) = std::fs::symlink_metadata(target_file) {
+                    if meta.file_type().is_symlink()
+                        || !meta.is_file()
+                        || meta.len().saturating_add(content.len() as u64)
+                            > MAX_SIMULATED_SOURCE_BYTES
+                    {
+                        return None;
+                    }
+                    let mut buf = std::fs::read(target_file).ok()?;
+                    buf.extend_from_slice(content.as_bytes());
+                    let raw_tok = ((buf.len() + 3) / 4) as u64;
+                    return Some((buf, raw_tok));
+                }
+            }
+            let bytes = content.as_bytes().to_vec();
+            let raw_tok = ((bytes.len() + 3) / 4) as u64;
+            Some((bytes, raw_tok))
+        }
+        "edit_file" | "replace_file_content" => {
+            let meta = std::fs::symlink_metadata(target_file).ok()?;
+            if meta.file_type().is_symlink()
+                || !meta.is_file()
+                || meta.len() > MAX_SIMULATED_SOURCE_BYTES
+            {
+                return None;
+            }
+            let raw_bytes = std::fs::read(target_file).ok()?;
+            let cur = std::str::from_utf8(&raw_bytes).ok()?;
+            let file_uses_crlf = cur.contains("\r\n");
+            let target_str = args
+                .get("Target")
+                .or_else(|| args.get("TargetContent"))
+                .or_else(|| args.get("old_string"))
+                .or_else(|| args.get("target"))
+                .and_then(Value::as_str)?;
+            let repl_str = args
+                .get("Replacement")
+                .or_else(|| args.get("ReplacementContent"))
+                .or_else(|| args.get("new_string"))
+                .or_else(|| args.get("replacement"))
+                .and_then(Value::as_str)?;
+            let replace_all = tool_name == "edit_file"
+                || args
+                    .get("AllowMultiple")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+            let start_line = args
+                .get("StartLine")
+                .and_then(Value::as_u64)
+                .map(|n| n as usize);
+            let end_line = args
+                .get("EndLine")
+                .and_then(Value::as_u64)
+                .map(|n| n as usize);
+            let updated = apply_in_ram_replacement(
+                cur,
+                file_uses_crlf,
+                target_str,
+                repl_str,
+                replace_all,
+                start_line,
+                end_line,
+            )?;
+            let post_bytes = updated.into_bytes();
+            let raw_tok = ((post_bytes.len() + 3) / 4) as u64;
+            Some((post_bytes, raw_tok))
+        }
+        "multi_replace_file_content" => {
+            let meta = std::fs::symlink_metadata(target_file).ok()?;
+            if meta.file_type().is_symlink()
+                || !meta.is_file()
+                || meta.len() > MAX_SIMULATED_SOURCE_BYTES
+            {
+                return None;
+            }
+            let raw_bytes = std::fs::read(target_file).ok()?;
+            let mut cur = std::str::from_utf8(&raw_bytes).ok()?.to_owned();
+            let file_uses_crlf = cur.contains("\r\n");
+            let chunks = args.get("ReplacementChunks")?.as_array()?;
+            if chunks.is_empty() {
+                return None;
+            }
+            let mut ordered: Vec<&Value> = chunks.iter().collect();
+            if ordered
+                .iter()
+                .all(|c| c.get("StartLine").and_then(Value::as_u64).is_some())
+            {
+                ordered.sort_by(|a, b| {
+                    let sa = a.get("StartLine").and_then(Value::as_u64).unwrap_or(0);
+                    let sb = b.get("StartLine").and_then(Value::as_u64).unwrap_or(0);
+                    sb.cmp(&sa)
+                });
+            }
+            for ch in ordered {
+                let target_str = ch
+                    .get("TargetContent")
+                    .or_else(|| ch.get("Target"))
+                    .and_then(Value::as_str)?;
+                let repl_str = ch
+                    .get("ReplacementContent")
+                    .or_else(|| ch.get("Replacement"))
+                    .and_then(Value::as_str)?;
+                let allow_mult = ch
+                    .get("AllowMultiple")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let sl = ch
+                    .get("StartLine")
+                    .and_then(Value::as_u64)
+                    .map(|n| n as usize);
+                let el = ch
+                    .get("EndLine")
+                    .and_then(Value::as_u64)
+                    .map(|n| n as usize);
+                cur = apply_in_ram_replacement(
+                    &cur,
+                    file_uses_crlf,
+                    target_str,
+                    repl_str,
+                    allow_mult,
+                    sl,
+                    el,
+                )?;
+            }
+            let post_bytes = cur.into_bytes();
+            let raw_tok = ((post_bytes.len() + 3) / 4) as u64;
+            Some((post_bytes, raw_tok))
+        }
+        _ => None,
+    }
+}
+
+fn record_working_set_edit(
+    target_file: &Path,
+    tool_name: &str,
+    args: &Value,
+    global_db: Option<&LibreDb>,
+) -> Result<(), String> {
     let Some(root) = find_workspace_root(target_file) else {
         return Ok(());
     };
@@ -902,6 +1356,12 @@ fn record_working_set_edit(target_file: &Path, global_db: Option<&LibreDb>) -> R
     if !crate::security::is_workspace_memory_trusted(global_db, &root) {
         return Ok(());
     }
+    let _ws_lock = match global_db.filter(|_| !crate::security::is_private_brain_workspace(&root)) {
+        Some(gdb) => Some(crate::security::WorkspaceTrustLockGuard::acquire(
+            gdb, &root,
+        )?),
+        None => None,
+    };
     let (proj_db, did_migrate) = open_project_ldb_silent(&ldb_path)?;
     if did_migrate && !crate::security::is_private_brain_workspace(&root) {
         let gdb = global_db.ok_or_else(|| {
@@ -909,6 +1369,23 @@ fn record_working_set_edit(target_file: &Path, global_db: Option<&LibreDb>) -> R
         })?;
         crate::security::seal_workspace_memory(gdb, &proj_db, &root)?;
     }
+
+    // Live single-file symbol line-span shift in RAM (`< 2 ms`, zero source-file disk mutation,
+    // zero impact on `hmac-sha256:v4` workspace seal because WorkingSet & Symbol are unsealed).
+    if let Some((post_bytes, raw_tok)) = simulate_post_edit_bytes(target_file, tool_name, args) {
+        if let Ok(shifted) =
+            libredb_cognitive::sync_single_file_symbols(&proj_db, &root, target_file, &post_bytes)
+        {
+            if shifted > 0 {
+                crate::telemetry::record_event(
+                    crate::telemetry::TelemetryEvent::HookSymbolShift {
+                        reread_tokens_avoided: raw_tok,
+                    },
+                );
+            }
+        }
+    }
+
     let rel_key = target_file
         .strip_prefix(&root)
         .unwrap_or(target_file)
@@ -1478,5 +1955,204 @@ mod tests {
         assert!(line.ends_with("@ unborn"), "Unexpected telemetry line: {line}");
 
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn pre_tool_use_shifts_symbol_spans_in_ram_while_preserving_v4_hmac_seal() {
+        use super::{LibreDb, NodeKind, Value, WriteRequest};
+        let base_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join(format!(
+                "libredb_hook_shift_prod_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos())
+            ));
+        let ws_repo = base_dir.join("prod_workspace");
+        fs::create_dir_all(ws_repo.join(".agents")).unwrap();
+        fs::create_dir_all(ws_repo.join(".git")).unwrap();
+        fs::create_dir_all(ws_repo.join("src")).unwrap();
+
+        let src_file = ws_repo.join("src").join("engine.rs");
+        let initial_crlf = "pub fn alpha() -> u32 {\r\n    1\r\n}\r\n\r\npub fn omega(x: u32) -> u32 {\r\n    alpha() + x\r\n}\r\n";
+        fs::write(&src_file, initial_crlf.as_bytes()).unwrap();
+
+        let global_path = base_dir.join("customizations.ldb");
+        let proj_ldb = ws_repo.join(".agents").join("memory.ldb");
+        {
+            let gdb = LibreDb::open(&global_path).unwrap();
+            let pdb = LibreDb::open(&proj_ldb).unwrap();
+            pdb.put(
+                WriteRequest::new(NodeKind::Fact, b"core_mode = strict".to_vec())
+                    .with_key("core_mode"),
+            )
+            .unwrap();
+            libredb_cognitive::index_workspace(&pdb, &ws_repo, true).unwrap();
+            crate::security::seal_workspace_memory(&gdb, &pdb, &ws_repo).unwrap();
+        }
+
+        // Simulate 10 sequential edits via `PreToolUse` BEFORE the IDE writes to disk on each step,
+        // verifying: (a) source file on disk is NEVER mutated by PreToolUse, (b) CRLF is preserved,
+        // (c) `omega` symbol span shifts cleanly on all 10 edits, and (d) `hmac-sha256:v4` seal stays valid!
+        let mut cur_content = initial_crlf.to_owned();
+        for step in 1..=10usize {
+            let old_fn = if step == 1 {
+                "pub fn alpha() -> u32 {\r\n    1\r\n}".to_owned()
+            } else {
+                let mut prev = String::from("pub fn alpha() -> u32 {\r\n");
+                for k in 1..step {
+                    prev.push_str(&format!("    let _pad_{k} = {k}u32;\r\n"));
+                }
+                prev.push_str("    1\r\n}");
+                prev
+            };
+            let mut next_fn = String::from("pub fn alpha() -> u32 {\r\n");
+            for k in 1..=step {
+                next_fn.push_str(&format!("    let _pad_{k} = {k}u32;\r\n"));
+            }
+            next_fn.push_str("    1\r\n}");
+
+            // Pass LF snippets in toolArgs (as LLMs do) while the file on disk uses CRLF:
+            let edit_payload = json!({
+                "toolName": "edit_file",
+                "workspacePaths": [ws_repo.to_string_lossy().to_string()],
+                "toolArgs": {
+                    "Path": src_file.to_string_lossy().to_string(),
+                    "Target": old_fn.replace("\r\n", "\n"),
+                    "Replacement": next_fn.replace("\r\n", "\n")
+                }
+            });
+            let out = super::evaluate_pre_tool_payload(&edit_payload, Some(&global_path));
+            assert_eq!(out.get("decision").and_then(Value::as_str), Some("allow"));
+
+            // Verify `PreToolUse` NEVER modified `src_file` on disk:
+            let on_disk_before_ide = fs::read_to_string(&src_file).unwrap();
+            assert_eq!(on_disk_before_ide, cur_content);
+
+            // Verify `omega` line span in `.agents/memory.ldb` ALREADY shifted by `+step` lines!
+            let pdb = LibreDb::open(&proj_ldb).unwrap();
+            let sym_rec = pdb
+                .get_by_key(NodeKind::Symbol, "src/engine.rs::omega")
+                .unwrap();
+            let sym_text = String::from_utf8_lossy(&sym_rec.payload);
+            let expected_start = 5 + step;
+            let expected_end = 7 + step;
+            assert!(
+                sym_text.contains(&format!("[L{expected_start}-L{expected_end}]")),
+                "Step {step}: expected omega at L{expected_start}-L{expected_end}, got: {sym_text}"
+            );
+
+            // Now simulate the IDE writing the post-edit CRLF bytes to disk:
+            cur_content = cur_content.replacen(&old_fn, &next_fn, 1);
+            assert!(cur_content.contains("\r\n"));
+            fs::write(&src_file, cur_content.as_bytes()).unwrap();
+        }
+
+        // Security invariant: `hmac-sha256:v4` workspace trust seal MUST still verify cleanly,
+        // AND `PreInvocation` MUST NEVER inject `WorkingSet` or `Symbol` content!
+        let gdb = LibreDb::open(&global_path).unwrap();
+        assert!(crate::security::is_workspace_memory_trusted(
+            Some(&gdb),
+            &ws_repo
+        ));
+
+        let pre_inv = super::evaluate_pre_invocation_payload(
+            &json!({
+                "conversationId": "conv-shift-seal-check",
+                "workspacePaths": [ws_repo.to_string_lossy().to_string()]
+            }),
+            Some(&global_path),
+        )
+        .unwrap();
+        let pre_inv_str = serde_json::to_string(&pre_inv).unwrap();
+        assert!(pre_inv_str.contains("core_mode = strict"));
+        assert!(
+            !pre_inv_str.contains("omega") && !pre_inv_str.contains("WorkingSet"),
+            "Unsealed Symbol/WorkingSet nodes MUST NEVER appear in PreInvocation <SYSTEM_MESSAGE>: {pre_inv_str}"
+        );
+
+        let _ = fs::remove_dir_all(&base_dir);
+    }
+
+    #[test]
+    fn pre_invocation_bm25_recalls_early_fact_within_450_token_cap() {
+        use super::{LibreDb, NodeKind, WriteRequest};
+        let base_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join(format!(
+                "libredb_pre_inv_bm25_cap_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos())
+            ));
+        let ws_repo = base_dir.join("repo");
+        fs::create_dir_all(ws_repo.join(".agents")).unwrap();
+        let global_path = base_dir.join("customizations.ldb");
+        let proj_ldb = ws_repo.join(".agents").join("memory.ldb");
+        {
+            let gdb = LibreDb::open(&global_path).unwrap();
+            let pdb = std::sync::Arc::new(LibreDb::open(&proj_ldb).unwrap());
+            // Fact #1 (oldest): unique early architectural fact that used to be pushed out by 12-fact recency cap!
+            pdb.put(
+                WriteRequest::new(
+                    NodeKind::Fact,
+                    b"early_anchor_fact = Dalvik R8 descriptor resolution uses two-hop supertype table".to_vec(),
+                )
+                .with_key("early_anchor_fact"),
+            )
+            .unwrap();
+            for i in 2..=30 {
+                let filler = format!(
+                    "filler_metric_{i:02} = Synthetic historical benchmark observation number {i} with verbose telemetry numbers and padding text to exceed naive budgets"
+                );
+                pdb.put(
+                    WriteRequest::new(NodeKind::Fact, filler.into_bytes())
+                        .with_key(format!("filler_metric_{i:02}")),
+                )
+                .unwrap();
+            }
+            for d in 1..=6 {
+                let verbose_dec = format!(
+                    "[Decision: verbose_arch_dec_{d}] Long historical architectural narrative #{d}: {}",
+                    "detailed design rationale and migration notes across subsystems ".repeat(12)
+                );
+                pdb.put(
+                    WriteRequest::new(NodeKind::Decision, verbose_dec.into_bytes())
+                        .with_key(format!("verbose_arch_dec_{d}")),
+                )
+                .unwrap();
+            }
+            let mut cog = libredb_cognitive::CognitiveEngine::open_db(std::sync::Arc::clone(&pdb)).unwrap();
+            cog.save_index_snapshot().unwrap();
+            crate::security::seal_workspace_memory(&gdb, &pdb, &ws_repo).unwrap();
+        }
+
+        let payload = json!({
+            "conversationId": "conv-bm25-cap-check",
+            "workspacePaths": [ws_repo.to_string_lossy().to_string()],
+            "prompt": "How does Dalvik R8 supertype descriptor resolution work?"
+        });
+        let out = super::evaluate_pre_invocation_payload(&payload, Some(&global_path)).unwrap();
+        let sys_msg = out["injectSteps"][0]["systemMessage"]["systemMessage"]
+            .as_str()
+            .expect("Expected hydrated systemMessage");
+
+        assert!(
+            sys_msg.len() <= super::MAX_PRE_INVOCATION_BYTES,
+            "Hydrated PreInvocation message exceeded 1,800-byte (~450-token) cap: {} bytes\n{sys_msg}",
+            sys_msg.len()
+        );
+        assert!(
+            sys_msg.contains("early_anchor_fact"),
+            "BM25-assisted PreInvocation failed to recall Fact #1 ('early_anchor_fact') from 30 facts:\n{sys_msg}"
+        );
+
+        let _ = fs::remove_dir_all(&base_dir);
     }
 }

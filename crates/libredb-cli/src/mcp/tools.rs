@@ -5,14 +5,17 @@
 use super::authz::{default_libredb_home, infer_antigravity_transcript_path};
 use super::{canonical_brain_cache_key, McpServerState};
 use crate::hooks::{open_global_ldb, user_home_dir};
+use crate::telemetry::{
+    build_savings_report, format_savings_report, record_event, SavingsQueryOptions, TelemetryEvent,
+};
 use libredb_bridge::import_sqlite_readonly;
 use libredb_cognitive::skeleton::{
     read_bounded_source_file, SKELETON_HASH_SEED, SKELETON_KEY_PREFIX,
 };
 use libredb_cognitive::{
-    create_subagent_handoff, execute_atomic_batch, extract_fim_slice, query_symbol_impact,
-    sync_transcript_epoch, AtomicBatchSpec, CognitiveEngine, FileSkeleton, PulseRequest,
-    ReflexEngine, ReflexRule, SessionState,
+    create_subagent_handoff, execute_atomic_batch, extract_fim_slice, format_impact_compact,
+    query_symbol_impact, sync_transcript_epoch, AtomicBatchSpec, CognitiveEngine, FileSkeleton,
+    PulseRequest, ReflexEngine, ReflexRule, SessionState,
 };
 use libredb_core::crc::hash_key;
 use libredb_core::{LibreDb, LibreDbError, NodeKind, PreparedWrite, WriteRequest};
@@ -65,8 +68,7 @@ fn execute_skeleton_with_zero_repeat(
             Err(other) => return Err(other.into()),
         }
 
-        let text = String::from_utf8_lossy(&raw_bytes);
-        let skel = FileSkeleton::extract(label, &text);
+        let skel = FileSkeleton::extract_from_bytes(label, &raw_bytes);
         let encoded = serde_json::to_vec(&skel)
             .map_err(|_| LibreDbError::CorruptFormat("skeleton json serialize"))?;
         let prep = proj_db.prepare(
@@ -139,13 +141,19 @@ fn execute_skeleton_with_zero_repeat(
 
     let mut out_blocks: Vec<String> = Vec::with_capacity(skeletons.len() + 1);
     let mut session_dirty = false;
+    let mut zr_hits = 0u64;
+    let mut baseline_raw_tokens = 0u64;
+    let mut emitted_tokens = 0u64;
 
     for skel in skeletons {
+        baseline_raw_tokens = baseline_raw_tokens.saturating_add(skel.raw_tokens as u64);
         if !force && sym_filter.is_none() {
             if let Some((_, ref mut sess)) = session_opt {
                 if sess.is_skeleton_in_context(&skel.file_label, skel.content_hash) {
                     sess.record_suppression(skel.raw_tokens, 16);
                     session_dirty = true;
+                    zr_hits += 1;
+                    emitted_tokens = emitted_tokens.saturating_add(16);
                     out_blocks.push(format!(
                         "=== [Zero-Repeat Skeleton]: {} (unchanged in session, hash={:016x}, L1-L{}, {} contracts, saved ~{} tok) ===\n",
                         skel.file_label,
@@ -160,8 +168,16 @@ fn execute_skeleton_with_zero_repeat(
                 session_dirty = true;
             }
         }
-        out_blocks.push(skel.render_compact(sym_filter, sym_filter.is_some()));
+        let rendered = skel.render_compact(sym_filter, sym_filter.is_some());
+        emitted_tokens = emitted_tokens.saturating_add(((rendered.len() + 3) / 4) as u64);
+        out_blocks.push(rendered);
     }
+
+    record_event(TelemetryEvent::Skeleton {
+        zero_repeat_hits: zr_hits,
+        baseline_tokens: baseline_raw_tokens.max(emitted_tokens),
+        emitted_tokens,
+    });
 
     if session_dirty {
         if let Some((cid, sess)) = session_opt {
@@ -237,13 +253,61 @@ pub(super) fn dispatch_tool(
             }
 
             let resp = brain.pulse(&req)?;
-            Ok(resp.format_compact())
+            let formatted = resp.format_compact();
+            let emitted_tok = ((formatted.len() + 3) / 4) as u64;
+            let baseline_tok = emitted_tok
+                .saturating_add(resp.tokens_saved_by_delta as u64)
+                .max((resp.tokens_emitted + resp.tokens_saved_by_delta) as u64);
+            record_event(TelemetryEvent::Pulse {
+                baseline_tokens: baseline_tok,
+                emitted_tokens: emitted_tok,
+            });
+            Ok(formatted)
         }
         "libredb_code" => {
             let action = args
                 .get("action")
                 .and_then(Value::as_str)
                 .unwrap_or("skeleton");
+            let raw_cwd_arg = args.get("cwd").and_then(Value::as_str);
+            if action == "savings" {
+                let proj_filter = if let Some(pin) = state.pinned_workspace_root.clone() {
+                    if let Some(raw_c) = raw_cwd_arg.filter(|s| !s.trim().is_empty()) {
+                        if let Some(err) =
+                            crate::security::check_mcp_workspace_containment(Path::new(raw_c), &pin)
+                        {
+                            return Err(err.into());
+                        }
+                        Some(PathBuf::from(raw_c))
+                    } else {
+                        Some(pin)
+                    }
+                } else {
+                    raw_cwd_arg
+                        .filter(|s| !s.trim().is_empty())
+                        .map(PathBuf::from)
+                };
+                let days_opt = args.get("days").and_then(Value::as_u64).map(|d| d as u32);
+                let opts = SavingsQueryOptions {
+                    today_only: days_opt == Some(0),
+                    days: days_opt.filter(|&d| d > 0),
+                    cid_filter: cid_arg,
+                    project_filter: proj_filter.as_deref(),
+                    custom_brain_dir: None,
+                    custom_telemetry_ldb: None,
+                };
+                let rep = build_savings_report(&opts);
+                let want_json = args
+                    .get("format")
+                    .and_then(Value::as_str)
+                    .is_some_and(|f| f.eq_ignore_ascii_case("json"));
+                return if want_json {
+                    Ok(serde_json::to_string_pretty(&rep)?)
+                } else {
+                    Ok(format_savings_report(&rep))
+                };
+            }
+
             let target_opt = args.get("target").and_then(Value::as_str);
             let files_arr: Vec<String> = args
                 .get("files")
@@ -260,7 +324,6 @@ pub(super) fn dispatch_tool(
             let line = args.get("line").and_then(Value::as_u64).map(|n| n as usize);
             let pad = args.get("pad").and_then(Value::as_u64).unwrap_or(12) as usize;
             let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
-            let raw_cwd_arg = args.get("cwd").and_then(Value::as_str);
 
             let (ws_root, containment_root) = state.resolve_authorized_code_workspace(
                 raw_cwd_arg,
@@ -346,7 +409,27 @@ pub(super) fn dispatch_tool(
                         cid_arg,
                     )?;
                     let reports = query_symbol_impact(&proj_db, target)?;
-                    Ok(serde_json::to_string_pretty(&reports)?)
+                    let want_json = args
+                        .get("format")
+                        .and_then(Value::as_str)
+                        .is_some_and(|f| f.eq_ignore_ascii_case("json"));
+                    let rendered = if want_json {
+                        serde_json::to_string_pretty(&reports)?
+                    } else {
+                        format_impact_compact(target, &reports)
+                    };
+                    let emitted_tok = ((rendered.len() + 3) / 4) as u64;
+                    let total_refs: usize = reports
+                        .iter()
+                        .map(|r| r.total_callers.max(r.callers.len()))
+                        .sum();
+                    let baseline_grep_tok =
+                        ((total_refs.max(1) * 180).max(rendered.len() / 4)) as u64;
+                    record_event(TelemetryEvent::Impact {
+                        baseline_tokens: baseline_grep_tok.max(emitted_tok),
+                        emitted_tokens: emitted_tok,
+                    });
+                    Ok(rendered)
                 }
                 "fim" => {
                     let target = target_opt.ok_or("Missing target")?;
@@ -362,7 +445,17 @@ pub(super) fn dispatch_tool(
                         cid_arg,
                     )?;
                     let bundle = extract_fim_slice(&proj_db, &resolved_target, sym, line, pad)?;
-                    Ok(bundle.format_compact())
+                    let rendered = bundle.format_compact();
+                    let emitted_tok = ((rendered.len() + 3) / 4) as u64;
+                    let raw_file_tok = std::fs::metadata(&resolved_target)
+                        .map(|m| (m.len().saturating_add(3)) / 4)
+                        .unwrap_or(emitted_tok)
+                        .max(emitted_tok);
+                    record_event(TelemetryEvent::Fim {
+                        baseline_tokens: raw_file_tok,
+                        emitted_tokens: emitted_tok,
+                    });
+                    Ok(rendered)
                 }
                 "index" => {
                     let target = target_opt.ok_or("Missing target")?;

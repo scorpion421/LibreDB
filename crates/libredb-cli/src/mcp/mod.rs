@@ -16,7 +16,6 @@ mod tools;
 mod tests;
 
 pub use protocol::process_mcp_stream;
-#[cfg(test)]
 pub(crate) use protocol::handle_rpc_method;
 
 use crate::hooks::{default_global_ldb_path, open_global_ldb_checked};

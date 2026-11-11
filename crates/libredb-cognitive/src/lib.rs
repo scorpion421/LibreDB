@@ -30,8 +30,9 @@ pub use transcript::{
     sync_transcript_epoch, AtomicBatchReport, AtomicBatchSpec, TaskCapsule, TranscriptEpochState,
 };
 pub use workspace::{
-    extract_fim_slice, has_project_root_marker, index_workspace, index_workspace_with_exclusions,
-    query_symbol_impact, FimSliceBundle, SymbolImpactReport, WorkspaceIndexReport,
+    extract_fim_slice, format_impact_compact, has_project_root_marker, index_workspace,
+    index_workspace_with_exclusions, query_symbol_impact, sync_single_file_symbols, FimSliceBundle,
+    SymbolImpactReport, WorkspaceIndexReport,
 };
 
 use libredb_core::{EdgeKind, LibreDb, NodeFlags, NodeKind, Result};

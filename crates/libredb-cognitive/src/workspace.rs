@@ -9,8 +9,39 @@ use crate::skeleton::{FileSkeleton, SKELETON_HASH_SEED, SKELETON_KEY_PREFIX};
 use libredb_core::crc::hash_key;
 use libredb_core::{EdgeKind, LibreDb, LibreDbError, NodeKind, PreparedWrite, Result, WriteRequest};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+
+/// Internal non-sealed cache key storing `(len, mtime_ns, content_hash)` per workspace file
+/// plus governance fingerprint for `< 2 ms` `racy-git`-safe incremental skip.
+pub const WORKSPACE_GRAPH_STATE_KEY: &str = "sys::workspace_graph_state";
+const WORKSPACE_GRAPH_STATE_VERSION: u32 = 2;
+const RACY_SUBSEC_WINDOW_NS: u128 = 50_000_000;
+const RACY_COARSE_WINDOW_NS: u128 = 2_000_000_000;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedFileStat {
+    len: u64,
+    mtime_ns: u128,
+    content_hash: u64,
+    is_binary: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkspaceGraphState {
+    version: u32,
+    skeleton_seed: u8,
+    indexed_at_ns: u128,
+    scan_root_key: String,
+    exclusions_sorted: Vec<String>,
+    gov_fingerprint: u64,
+    files_scanned: usize,
+    binary_files_skipped: usize,
+    symbols_indexed: usize,
+    call_synapses_wired: usize,
+    governance_synapses_wired: usize,
+    files: BTreeMap<String, CachedFileStat>,
+}
 
 /// Summary returned after indexing or refreshing a source workspace.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,6 +53,8 @@ pub struct WorkspaceIndexReport {
     pub symbols_indexed: usize,
     pub call_synapses_wired: usize,
     pub governance_synapses_wired: usize,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fast_path_hit: bool,
 }
 
 /// Blast-radius impact and causal governance report for a located symbol.
@@ -30,12 +63,18 @@ pub struct SymbolImpactReport {
     pub node_id: u64,
     pub symbol_key: String,
     pub contract: String,
-    /// Symbols in the workspace that call or reference this symbol.
+    /// Total incoming caller count before output bounding.
+    #[serde(default)]
+    pub total_callers: usize,
+    /// Symbols in the workspace that call or reference this symbol (bounded for context hygiene).
     pub callers: Vec<String>,
     /// Concrete types or methods that implement, extend, or override this interface/trait/method.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub implementors: Vec<String>,
-    /// Symbols that this symbol calls or depends on.
+    /// Total outgoing callee/dependency count before output bounding.
+    #[serde(default)]
+    pub total_callees: usize,
+    /// Symbols that this symbol calls or depends on (bounded for context hygiene).
     pub callees: Vec<String>,
     /// Architectural `Decision` or `Task` capsules governing why this symbol exists.
     pub governing_decisions: Vec<String>,
@@ -94,6 +133,170 @@ impl FimSliceBundle {
     }
 }
 
+fn file_mtime_ns(meta: &std::fs::Metadata) -> u128 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos())
+}
+
+fn current_unix_ns() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos())
+}
+
+fn compute_governance_fingerprint(db: &LibreDb) -> u64 {
+    let mut buf = Vec::new();
+    for kind in [NodeKind::Decision, NodeKind::Task] {
+        let mut inodes = db.list_inodes(Some(kind), false);
+        inodes.sort_unstable_by_key(|(i, _, _)| i.node_id);
+        for (ino, _, _) in inodes {
+            buf.extend_from_slice(&ino.node_id.to_le_bytes());
+            buf.extend_from_slice(&ino.updated_ns.to_le_bytes());
+        }
+    }
+    hash_key(211, &buf)
+}
+
+/// Updates `skeleton::<rel_path>` (`NodeKind::WorkingSet`) and all `NodeKind::Symbol` `[Lstart-Lend]`
+/// contracts for a single edited source file in one atomic `commit_batch` (`< 2 ms`, `0` source-file
+/// disk writes, `0` mutation of `hmac-sha256:v4` sealed cognitive nodes).
+pub fn sync_single_file_symbols(
+    db: &LibreDb,
+    ws_root: &Path,
+    target_file: &Path,
+    post_edit_bytes: &[u8],
+) -> Result<usize> {
+    if post_edit_bytes.len() > crate::skeleton::MAX_SKELETON_FILE_BYTES as usize {
+        return Ok(0);
+    }
+    let probe_len = post_edit_bytes.len().min(2048);
+    if post_edit_bytes[..probe_len].contains(&0u8) {
+        return Ok(0);
+    }
+
+    let rel_path = target_file
+        .strip_prefix(ws_root)
+        .ok()
+        .map(|r| r.to_string_lossy().replace('\\', "/"))
+        .or_else(|| {
+            let root_canon = std::fs::canonicalize(ws_root).ok()?;
+            let parent_canon = std::fs::canonicalize(target_file.parent()?).ok()?;
+            let joined = parent_canon.join(target_file.file_name()?);
+            joined
+                .strip_prefix(&root_canon)
+                .ok()
+                .map(|r| r.to_string_lossy().replace('\\', "/"))
+        })
+        .unwrap_or_else(|| target_file.to_string_lossy().replace('\\', "/"));
+    if rel_path.is_empty() || rel_path.starts_with("..") {
+        return Ok(0);
+    }
+
+    let skel_key = format!("{SKELETON_KEY_PREFIX}{rel_path}");
+    let new_hash = hash_key(SKELETON_HASH_SEED, post_edit_bytes);
+    if let Ok(rec) = db.get_by_key(NodeKind::WorkingSet, &skel_key) {
+        if let Ok(cached) = serde_json::from_slice::<FileSkeleton>(&rec.payload) {
+            if cached.content_hash == new_hash {
+                return Ok(0);
+            }
+        }
+    }
+
+    let new_skel = FileSkeleton::extract_from_bytes(rel_path.clone(), post_edit_bytes);
+    let file_prefix = format!("{rel_path}::");
+
+    // Capture existing symbol IDs & outgoing synapses for `rel_path` (keyed by `(base_sym, ordinal)`)
+    // so even overloaded methods keep their outgoing `Calls`/`DependsOn`/`CausedBy` edges across shifts.
+    let mut old_by_ord: HashMap<(String, usize), Vec<libredb_core::Synapse>> = HashMap::new();
+    let mut old_ord_counts: HashMap<String, usize> = HashMap::new();
+    let mut existing_file_syms: Vec<(u64, String)> = Vec::new();
+    for (ino, key_opt, syns) in db.list_inodes(Some(NodeKind::Symbol), false) {
+        if let Some(full_k) = key_opt {
+            if full_k.starts_with(&file_prefix) {
+                let base_k = full_k.split('@').next().unwrap_or("").to_owned();
+                let ord = *old_ord_counts.entry(base_k.clone()).and_modify(|c| *c += 1).or_insert(0);
+                old_by_ord.insert((base_k, ord), syns);
+                existing_file_syms.push((ino.node_id, full_k));
+            }
+        }
+    }
+
+    let mut prepared: Vec<PreparedWrite> = Vec::with_capacity(1 + new_skel.symbols.len());
+    let skel_bytes = serde_json::to_vec(&new_skel)
+        .map_err(|_| LibreDbError::CorruptFormat("skeleton serialize"))?;
+    prepared.push(db.prepare(
+        WriteRequest::new(NodeKind::WorkingSet, skel_bytes)
+            .with_key(skel_key)
+            .with_importance(190),
+        0,
+    )?);
+
+    let sym_keys = compute_file_symbol_keys(&rel_path, &new_skel);
+    let mut new_key_set: HashSet<String> = HashSet::with_capacity(sym_keys.len());
+    let mut new_ord_counts: HashMap<String, usize> = HashMap::new();
+    let mut preserved_synapses_per_slot: Vec<Vec<libredb_core::Synapse>> =
+        Vec::with_capacity(sym_keys.len());
+
+    for (slot_i, (sym_idx, sym_key)) in sym_keys.into_iter().enumerate() {
+        let sym = &new_skel.symbols[sym_idx];
+        let qname = sym.qualified_name();
+        let doc_part = if sym.doc_summary.is_empty() {
+            String::new()
+        } else {
+            format!(" // {}", sym.doc_summary)
+        };
+        let body = format!(
+            "{rel_path} :: {qname} [L{}-L{}] ({}) {}{doc_part}",
+            sym.start_line, sym.end_line, sym.kind, sym.signature
+        );
+        let base_k = sym_key.split('@').next().unwrap_or(&sym_key).to_owned();
+        let ord = *new_ord_counts.entry(base_k.clone()).and_modify(|c| *c += 1).or_insert(0);
+        let prior_syns = old_by_ord.remove(&(base_k, ord)).unwrap_or_default();
+        preserved_synapses_per_slot.push(prior_syns);
+        new_key_set.insert(sym_key.clone());
+        prepared.push(db.prepare(
+            WriteRequest::new(NodeKind::Symbol, body.into_bytes())
+                .with_key(sym_key)
+                .with_importance(180),
+            slot_i + 1,
+        )?);
+    }
+
+    let stale_ids: Vec<u64> = existing_file_syms
+        .into_iter()
+        .filter_map(|(nid, k)| (!new_key_set.contains(&k)).then_some(nid))
+        .collect();
+    if !stale_ids.is_empty() {
+        db.deprecate_nodes(&stale_ids)?;
+    }
+
+    let committed_ids = db.commit_batch(&prepared)?;
+    let updated_sym_count = committed_ids.len().saturating_sub(1);
+
+    // Re-attach preserved outgoing synapses (`Calls`, `DependsOn`, `CausedBy`) to the new symbol IDs.
+    let mut restored_edges: Vec<(u64, EdgeKind, u64, u8)> = Vec::new();
+    for (slot_i, syns) in preserved_synapses_per_slot.into_iter().enumerate() {
+        if let Some(&new_id) = committed_ids.get(slot_i + 1) {
+            for s in syns {
+                if matches!(s.kind, EdgeKind::Calls | EdgeKind::DependsOn | EdgeKind::CausedBy) {
+                    restored_edges.push((new_id, s.kind, s.target_id, s.weight));
+                }
+            }
+        }
+    }
+    if !restored_edges.is_empty() {
+        db.link_batch(&restored_edges)?;
+    }
+
+    // Invalidate `sys::workspace_graph_state` so the next workspace-wide `impact`/`fim` refreshes
+    // inter-file call edges cleanly while single-file symbol `[Lstart-Lend]` spans are already exact.
+    let _ = db.deprecate_key(NodeKind::Generic, WORKSPACE_GRAPH_STATE_KEY);
+
+    Ok(updated_sym_count)
+}
+
 /// Incrementally indexes all non-binary source files under `root` into `db`, wiring both
 /// code call-graph synapses (`Calls`) and causal architecture synapses (`Decision <-> Symbol`).
 pub fn index_workspace(db: &LibreDb, root: &Path, force: bool) -> Result<WorkspaceIndexReport> {
@@ -111,11 +314,112 @@ pub fn index_workspace_with_exclusions(
 ) -> Result<WorkspaceIndexReport> {
     let scan_cfg = WorkspaceScanConfig::from_db_and_root(db, root, excluded_subroots);
     let mut source_files = Vec::new();
-    let mut binary_skipped = 0usize;
-    collect_source_files(root, root, &scan_cfg, &mut source_files, &mut binary_skipped)?;
+    let mut walk_binary_skipped = 0usize;
+    collect_source_files(root, root, &scan_cfg, &mut source_files, &mut walk_binary_skipped)?;
 
+    let scan_root_key = normalize_scan_boundary_key(root);
+    let mut exclusions_sorted: Vec<String> = scan_cfg.excluded_subroots.iter().cloned().collect();
+    exclusions_sorted.sort();
+    let gov_fp = compute_governance_fingerprint(db);
+    let scan_started_ns = current_unix_ns();
+
+    // `racy-git`-safe fast-path (Git `is_racy_timestamp` clean/smudge design):
+    // Verify `symlink_metadata` `(len, mtime_ns)` on every candidate file. Any file whose `mtime_ns`
+    // fell inside the OS clock granularity window (`50 ms` on sub-second NTFS/ext4/APFS, `2 s` on
+    // coarse integer-second filesystems) relative to `state.indexed_at_ns` is re-hashed via `FNV-1a`
+    // to catch sub-millisecond same-size edits; once `scan_started_ns` has safely advanced past all
+    // smudged `mtime_ns` values, `state.indexed_at_ns` is un-smudged once so all subsequent warm
+    // `index` / `impact` / `fim` calls complete in `< 2 ms` with `0` file opens and `0` DB writes!
+    if !force {
+        if let Ok(state_rec) = db.get_by_key(NodeKind::Generic, WORKSPACE_GRAPH_STATE_KEY) {
+            if let Ok(mut state) = serde_json::from_slice::<WorkspaceGraphState>(&state_rec.payload) {
+                if state.version == WORKSPACE_GRAPH_STATE_VERSION
+                    && state.skeleton_seed == SKELETON_HASH_SEED
+                    && state.scan_root_key == scan_root_key
+                    && state.exclusions_sorted == exclusions_sorted
+                    && state.gov_fingerprint == gov_fp
+                {
+                    let mut all_clean = true;
+                    let mut verified_count = 0usize;
+                    let mut any_smudged_checked = false;
+                    let mut can_unsmudge_all = true;
+
+                    for (abs_path, rel_path) in &source_files {
+                        let Ok(sym_meta) = std::fs::symlink_metadata(abs_path) else {
+                            all_clean = false;
+                            break;
+                        };
+                        if sym_meta.file_type().is_symlink()
+                            || !sym_meta.is_file()
+                            || sym_meta.len() > scan_cfg.max_file_bytes as u64
+                        {
+                            continue;
+                        }
+                        let Some(cached_stat) = state.files.get(rel_path) else {
+                            all_clean = false;
+                            break;
+                        };
+                        let mtime_ns = file_mtime_ns(&sym_meta);
+                        if cached_stat.len != sym_meta.len() || cached_stat.mtime_ns != mtime_ns {
+                            all_clean = false;
+                            break;
+                        }
+                        let racy_win = if mtime_ns == 0 || mtime_ns % 1_000_000_000 == 0 {
+                            RACY_COARSE_WINDOW_NS
+                        } else {
+                            RACY_SUBSEC_WINDOW_NS
+                        };
+                        let smudged = mtime_ns == 0
+                            || state.indexed_at_ns.saturating_sub(mtime_ns) <= racy_win;
+                        if smudged {
+                            any_smudged_checked = true;
+                            let Ok(raw_bytes) = std::fs::read(abs_path) else {
+                                all_clean = false;
+                                break;
+                            };
+                            if hash_key(SKELETON_HASH_SEED, &raw_bytes) != cached_stat.content_hash {
+                                all_clean = false;
+                                break;
+                            }
+                            if mtime_ns == 0
+                                || scan_started_ns.saturating_sub(mtime_ns) <= racy_win
+                            {
+                                can_unsmudge_all = false;
+                            }
+                        }
+                        verified_count += 1;
+                    }
+                    if all_clean && verified_count == state.files.len() {
+                        if any_smudged_checked && can_unsmudge_all {
+                            state.indexed_at_ns = scan_started_ns;
+                            if let Ok(state_bytes) = serde_json::to_vec(&state) {
+                                let _ = db.put(
+                                    WriteRequest::new(NodeKind::Generic, state_bytes)
+                                        .with_key(WORKSPACE_GRAPH_STATE_KEY)
+                                        .with_importance(64),
+                                );
+                            }
+                        }
+                        return Ok(WorkspaceIndexReport {
+                            files_scanned: state.files_scanned,
+                            files_unchanged_cached: state.files_scanned,
+                            files_reindexed: 0,
+                            binary_files_skipped: walk_binary_skipped + state.binary_files_skipped,
+                            symbols_indexed: state.symbols_indexed,
+                            call_synapses_wired: state.call_synapses_wired,
+                            governance_synapses_wired: state.governance_synapses_wired,
+                            fast_path_hit: true,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    let mut binary_probe_skipped = 0usize;
     let mut unchanged = 0usize;
     let mut reindexed = 0usize;
+    let mut next_file_stats: BTreeMap<String, CachedFileStat> = BTreeMap::new();
 
     struct ParsedFile {
         rel_path: String,
@@ -135,6 +439,7 @@ pub fn index_workspace_with_exclusions(
         {
             continue;
         }
+        let mtime_ns = file_mtime_ns(&sym_meta);
         let raw_bytes = match std::fs::read(&abs_path) {
             Ok(b) => b,
             Err(_) => continue,
@@ -142,14 +447,32 @@ pub fn index_workspace_with_exclusions(
         if raw_bytes.len() > scan_cfg.max_file_bytes {
             continue;
         }
+        let current_hash = hash_key(SKELETON_HASH_SEED, &raw_bytes);
         // Universal binary file guard: any file containing a NUL byte in its first 2 KB is binary!
         let probe_len = raw_bytes.len().min(2048);
         if raw_bytes[..probe_len].contains(&0u8) {
-            binary_skipped += 1;
+            binary_probe_skipped += 1;
+            next_file_stats.insert(
+                rel_path,
+                CachedFileStat {
+                    len: raw_bytes.len() as u64,
+                    mtime_ns,
+                    content_hash: current_hash,
+                    is_binary: true,
+                },
+            );
             continue;
         }
 
-        let current_hash = hash_key(SKELETON_HASH_SEED, &raw_bytes);
+        next_file_stats.insert(
+            rel_path.clone(),
+            CachedFileStat {
+                len: raw_bytes.len() as u64,
+                mtime_ns,
+                content_hash: current_hash,
+                is_binary: false,
+            },
+        );
         let skel_key = format!("{SKELETON_KEY_PREFIX}{rel_path}");
 
         if !force {
@@ -166,7 +489,7 @@ pub fn index_workspace_with_exclusions(
         }
 
         let raw_text = String::from_utf8_lossy(&raw_bytes).into_owned();
-        let skel = FileSkeleton::extract(rel_path.clone(), &raw_text);
+        let skel = FileSkeleton::extract_from_bytes(rel_path.clone(), &raw_bytes);
         reindexed += 1;
         all_skeletons.push((rel_path.clone(), skel.clone(), Some(raw_text)));
         changed_files.push(ParsedFile {
@@ -174,6 +497,8 @@ pub fn index_workspace_with_exclusions(
             skeleton: skel,
         });
     }
+
+    let binary_skipped = walk_binary_skipped + binary_probe_skipped;
 
     let files_scanned = unchanged + reindexed;
 
@@ -435,16 +760,49 @@ pub fn index_workspace_with_exclusions(
                 let own_qname = sym.qualified_name();
                 let sites = extract_call_sites(&body_slice, sym.container.as_deref());
 
-                // Stage A: Exact qualified calls (`Type::method`, `Type.method`, `Self::method`, `self.method(`)
+                // Stage A: Exact qualified calls (`Type::method`, `Type.method`, `Lpkg/Cls;->method(`, `Self::method`)
+                // plus 2-hop supertype/interface method resolution when Dalvik/OO bytecode invokes an inherited method
+                // via the subclass static descriptor (`Lci/Sub;->m(` where `m` is declared on `Base`).
                 for qcall in sites.qualified_calls {
                     if qcall == own_qname {
                         continue;
                     }
+                    let mut resolved = false;
                     if let Some(targets) = by_qualified_name.get(&qcall) {
+                        resolved = true;
                         for &(dst_id, _) in targets {
                             if dst_id != src_id && seen_targets.insert(dst_id) {
                                 edges.push((src_id, EdgeKind::Calls, dst_id, 220));
                                 call_edges += 1;
+                            }
+                        }
+                    }
+                    if !resolved {
+                        if let Some((recv_cls, m_name)) = qcall.rsplit_once("::") {
+                            if let Some(sups_1) = type_supertypes.get(recv_cls) {
+                                for sup1 in sups_1 {
+                                    let sup1_q = format!("{sup1}::{m_name}");
+                                    if let Some(targets) = by_qualified_name.get(&sup1_q) {
+                                        for &(dst_id, _) in targets {
+                                            if dst_id != src_id && seen_targets.insert(dst_id) {
+                                                edges.push((src_id, EdgeKind::Calls, dst_id, 215));
+                                                call_edges += 1;
+                                            }
+                                        }
+                                    } else if let Some(sups_2) = type_supertypes.get(sup1) {
+                                        for sup2 in sups_2 {
+                                            let sup2_q = format!("{sup2}::{m_name}");
+                                            if let Some(targets) = by_qualified_name.get(&sup2_q) {
+                                                for &(dst_id, _) in targets {
+                                                    if dst_id != src_id && seen_targets.insert(dst_id) {
+                                                        edges.push((src_id, EdgeKind::Calls, dst_id, 212));
+                                                        call_edges += 1;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -610,6 +968,28 @@ pub fn index_workspace_with_exclusions(
         &gov_out_edges,
     )?;
 
+    let graph_state = WorkspaceGraphState {
+        version: WORKSPACE_GRAPH_STATE_VERSION,
+        skeleton_seed: SKELETON_HASH_SEED,
+        indexed_at_ns: scan_started_ns,
+        scan_root_key,
+        exclusions_sorted,
+        gov_fingerprint: gov_fp,
+        files_scanned,
+        binary_files_skipped: binary_probe_skipped,
+        symbols_indexed,
+        call_synapses_wired: call_edges,
+        governance_synapses_wired: gov_edges,
+        files: next_file_stats,
+    };
+    if let Ok(state_bytes) = serde_json::to_vec(&graph_state) {
+        let _ = db.put(
+            WriteRequest::new(NodeKind::Generic, state_bytes)
+                .with_key(WORKSPACE_GRAPH_STATE_KEY)
+                .with_importance(64),
+        );
+    }
+
     Ok(WorkspaceIndexReport {
         files_scanned,
         files_unchanged_cached: unchanged,
@@ -618,37 +998,102 @@ pub fn index_workspace_with_exclusions(
         symbols_indexed,
         call_synapses_wired: call_edges,
         governance_synapses_wired: gov_edges,
+        fast_path_hit: false,
     })
+}
+
+fn compact_contract_ref(contract: &str) -> &str {
+    if let Some(close_paren_idx) = contract.find(") ") {
+        contract[..=close_paren_idx].trim()
+    } else {
+        contract.trim()
+    }
+}
+
+/// Renders a token-minimal structural blast-radius summary (`80-90%` smaller than pretty JSON).
+pub fn format_impact_compact(symbol_query: &str, reports: &[SymbolImpactReport]) -> String {
+    if reports.is_empty() {
+        return format!("=== IMPACT: {symbol_query} (0 symbols matched) ===\n");
+    }
+    let mut out = format!(
+        "=== IMPACT: {} ({} symbol{} matched) ===\n",
+        symbol_query,
+        reports.len(),
+        if reports.len() == 1 { "" } else { "s" }
+    );
+    for rep in reports.iter().take(10) {
+        out.push_str(&format!("* {}\n", rep.contract.trim()));
+        if !rep.governing_decisions.is_empty() {
+            out.push_str("  Decisions:\n");
+            for d in rep.governing_decisions.iter().take(4) {
+                out.push_str(&format!("    ! {d}\n"));
+            }
+        }
+        if !rep.implementors.is_empty() {
+            out.push_str(&format!("  Implementors ({}):\n", rep.implementors.len()));
+            for imp in rep.implementors.iter().take(8) {
+                out.push_str(&format!("    <= {}\n", compact_contract_ref(imp)));
+            }
+        }
+        if rep.total_callers > 0 {
+            let shown = rep.callers.len().min(10);
+            if rep.total_callers > shown {
+                out.push_str(&format!("  Callers ({} total, top {}):\n", rep.total_callers, shown));
+            } else {
+                out.push_str(&format!("  Callers ({}):\n", rep.total_callers));
+            }
+            for c in rep.callers.iter().take(shown) {
+                out.push_str(&format!("    <- {}\n", compact_contract_ref(c)));
+            }
+        }
+        if rep.total_callees > 0 {
+            let shown = rep.callees.len().min(8);
+            if rep.total_callees > shown {
+                out.push_str(&format!("  Callees ({} total, top {}):\n", rep.total_callees, shown));
+            } else {
+                out.push_str(&format!("  Callees ({}):\n", rep.total_callees));
+            }
+            for c in rep.callees.iter().take(shown) {
+                out.push_str(&format!("    -> {}\n", compact_contract_ref(c)));
+            }
+        }
+    }
+    out
 }
 
 /// Locates symbols matching `symbol_query` and computes their bidirectional blast-radius (`callers`,
 /// `implementors`, `callees`) plus governing architectural `Decision`/`Task` capsules in `O(N_symbols)` RAM time.
 pub fn query_symbol_impact(db: &LibreDb, symbol_query: &str) -> Result<Vec<SymbolImpactReport>> {
-    let q_low = symbol_query.to_lowercase();
+    let raw_q = symbol_query.trim().trim_start_matches("::");
+    if raw_q.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Normalize `Cls.m` / `Cls->m` / `Lpkg/Cls;->m` into canonical `Cls::m` when qualified:
+    let normalized_q: String = if let Some((_, after_semi)) = raw_q.split_once(";->") {
+        let before = raw_q.split(";->").next().unwrap_or("");
+        let cls = before.trim_start_matches('L').rsplit('/').next().unwrap_or(before);
+        let m = after_semi.split(['(', ':']).next().unwrap_or(after_semi);
+        format!("{cls}::{m}")
+    } else if raw_q.contains("->") {
+        raw_q.replace("->", "::")
+    } else if raw_q.contains('.') && !raw_q.ends_with(".rs") && !raw_q.ends_with(".smali") && !raw_q.contains('/') {
+        raw_q.replace('.', "::")
+    } else {
+        raw_q.to_owned()
+    };
+    let q_low = normalized_q.to_lowercase();
+    let is_qualified_query = normalized_q.contains("::");
+
     let sym_inodes = db.list_inodes(Some(NodeKind::Symbol), false);
 
     // Build reverse `Calls` and `DependsOn` lookups in-memory (`0` disk I/O!).
     let mut reverse_calls: HashMap<u64, Vec<u64>> = HashMap::new();
     let mut reverse_deps: HashMap<u64, Vec<u64>> = HashMap::new();
-    let mut exact_qual_ids: Vec<(u64, String)> = Vec::new();
-    let mut matched_ids: Vec<(u64, String)> = Vec::new();
-    let bounded_qual = if q_low.contains("::") && !q_low.starts_with("::") {
-        Some(format!("::{q_low}"))
-    } else {
-        None
-    };
+    let mut tier1_exact: Vec<(u64, String)> = Vec::new();
+    let mut tier2_ci: Vec<(u64, String)> = Vec::new();
+    let mut tier3_substr: Vec<(u64, String)> = Vec::new();
 
     for (ino, key_opt, syns) in &sym_inodes {
-        let k = key_opt.clone().unwrap_or_default();
-        let k_low = k.to_lowercase();
-        if let Some(ref bq) = bounded_qual {
-            if k_low.contains(bq) {
-                exact_qual_ids.push((ino.node_id, k.clone()));
-            }
-        }
-        if k_low.contains(&q_low) {
-            matched_ids.push((ino.node_id, k));
-        }
         for syn in syns {
             if syn.kind == EdgeKind::Calls {
                 reverse_calls.entry(syn.target_id).or_default().push(ino.node_id);
@@ -656,13 +1101,60 @@ pub fn query_symbol_impact(db: &LibreDb, symbol_query: &str) -> Result<Vec<Symbo
                 reverse_deps.entry(syn.target_id).or_default().push(ino.node_id);
             }
         }
-    }
-    if !exact_qual_ids.is_empty() {
-        matched_ids = exact_qual_ids;
+
+        let Some(ref full_k) = key_opt else { continue };
+        let Some((_, raw_sym_part)) = full_k.split_once("::") else { continue };
+        let sym_part = raw_sym_part.split('@').next().unwrap_or(raw_sym_part);
+        let short_name = sym_part.rsplit_once("::").map_or(sym_part, |(_, m)| m);
+
+        if is_qualified_query {
+            let suffix = format!("::{normalized_q}");
+            if sym_part == normalized_q || sym_part.ends_with(&suffix) {
+                tier1_exact.push((ino.node_id, full_k.clone()));
+            } else {
+                let sym_low = sym_part.to_lowercase();
+                let suffix_low = format!("::{q_low}");
+                if sym_low == q_low || sym_low.ends_with(&suffix_low) {
+                    tier2_ci.push((ino.node_id, full_k.clone()));
+                } else if q_low.len() >= 4 && sym_low.contains(&q_low) {
+                    tier3_substr.push((ino.node_id, full_k.clone()));
+                }
+            }
+        } else if short_name == normalized_q || sym_part == normalized_q {
+            tier1_exact.push((ino.node_id, full_k.clone()));
+        } else if short_name.eq_ignore_ascii_case(&normalized_q)
+            || sym_part.eq_ignore_ascii_case(&normalized_q)
+        {
+            tier2_ci.push((ino.node_id, full_k.clone()));
+        } else if q_low.len() >= 3 && sym_part.to_lowercase().contains(&q_low) {
+            // Never match against `file_part` so short queries (`"a"`, `"i4"`) never pull unrelated files!
+            tier3_substr.push((ino.node_id, full_k.clone()));
+        }
     }
 
+    let mut matched_ids = if !tier1_exact.is_empty() {
+        tier1_exact
+    } else if !tier2_ci.is_empty() {
+        tier2_ci
+    } else {
+        tier3_substr
+    };
+
+    // Rank ambiguous matches (e.g. R8 short method `"a"` across 80 classes) by incoming caller fan-in
+    // descending so the highest-impact call-graph hubs always surface first!
+    matched_ids.sort_by(|(id_a, k_a), (id_b, k_b)| {
+        let ca = reverse_calls.get(id_a).map_or(0, Vec::len)
+            + reverse_deps.get(id_a).map_or(0, Vec::len);
+        let cb = reverse_calls.get(id_b).map_or(0, Vec::len)
+            + reverse_deps.get(id_b).map_or(0, Vec::len);
+        cb.cmp(&ca).then_with(|| k_a.cmp(k_b))
+    });
+
+    const MAX_SERIALIZED_CALLERS: usize = 20;
+    const MAX_SERIALIZED_CALLEES: usize = 12;
+
     let mut reports = Vec::new();
-    for (nid, sym_key) in matched_ids.into_iter().take(15) {
+    for (nid, sym_key) in matched_ids.into_iter().take(12) {
         let rec = db.get(nid)?;
         let contract = String::from_utf8_lossy(&rec.payload).into_owned();
 
@@ -683,13 +1175,16 @@ pub fn query_symbol_impact(db: &LibreDb, symbol_query: &str) -> Result<Vec<Symbo
             }
         }
 
+        let total_callers = caller_ids.len();
+        caller_ids.truncate(MAX_SERIALIZED_CALLERS);
         let (caller_recs, _) = db.get_many_coalesced(&caller_ids)?;
         let callers: Vec<String> = caller_recs
             .into_iter()
             .map(|r| String::from_utf8_lossy(&r.payload).into_owned())
             .collect();
 
-        let imp_ids = reverse_deps.get(&nid).cloned().unwrap_or_default();
+        let mut imp_ids = reverse_deps.get(&nid).cloned().unwrap_or_default();
+        imp_ids.truncate(MAX_SERIALIZED_CALLERS);
         let (imp_recs, _) = db.get_many_coalesced(&imp_ids)?;
         let implementors: Vec<String> = imp_recs
             .into_iter()
@@ -710,6 +1205,8 @@ pub fn query_symbol_impact(db: &LibreDb, symbol_query: &str) -> Result<Vec<Symbo
             }
         }
 
+        let total_callees = callee_ids.len();
+        callee_ids.truncate(MAX_SERIALIZED_CALLEES);
         let (callee_recs, _) = db.get_many_coalesced(&callee_ids)?;
         let callees: Vec<String> = callee_recs
             .into_iter()
@@ -729,8 +1226,10 @@ pub fn query_symbol_impact(db: &LibreDb, symbol_query: &str) -> Result<Vec<Symbo
             node_id: nid,
             symbol_key: sym_key,
             contract,
+            total_callers,
             callers,
             implementors,
+            total_callees,
             callees,
             governing_decisions,
         });
@@ -1143,14 +1642,41 @@ fn extract_call_sites(text: &str, self_container: Option<&str>) -> CallSiteBucke
     let mut i = 0usize;
 
     while i < n {
-        // Skip line comments (`//`) so prose words inside comments never synthesize call edges!
+        // 1. Skip `//` line comments
         if i + 1 < n && bytes[i] == b'/' && bytes[i + 1] == b'/' {
             while i < n && bytes[i] != b'\n' {
                 i += 1;
             }
             continue;
         }
-        // Skip string literals (`"..."`) so error strings and SQL/JSON text do not synthesize call edges!
+        // 2. Skip `/* ... */` block comments
+        if i + 1 < n && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < n && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(n);
+            continue;
+        }
+        // 3. Skip `#` comments (Smali, Python, Shell, Ruby, Makefile), preserving Rust `#[attr]` / `#![attr]`
+        if bytes[i] == b'#' && (i + 1 >= n || (bytes[i + 1] != b'[' && bytes[i + 1] != b'!')) {
+            while i < n && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // 4. Skip `--` comments (SQL, Lua) when preceded by start-of-file or whitespace (never C `x--`)
+        if i + 1 < n
+            && bytes[i] == b'-'
+            && bytes[i + 1] == b'-'
+            && (i == 0 || bytes[i - 1].is_ascii_whitespace())
+        {
+            while i < n && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // 5. Skip string literals (`"..."`) so error strings and SQL/JSON text do not synthesize call edges!
         if bytes[i] == b'"' {
             i += 1;
             while i < n {
@@ -1167,8 +1693,62 @@ fn extract_call_sites(text: &str, self_container: Option<&str>) -> CallSiteBucke
             continue;
         }
 
-        let preceded_by_access = (i >= 1 && bytes[i - 1] == b'.')
-            || (i >= 2 && bytes[i - 2] == b':' && bytes[i - 1] == b':')
+        // 6. Dalvik / Smali member descriptors: `L<pkg/Cls>;-><method>(` or `L<pkg/Cls>;-><field>:`
+        // Supports obfuscated lowercase R8 class names (`p1`, `j4`, `i4`) and 1-char member names (`l`, `a`, `b`)!
+        if bytes[i] == b'L'
+            && (i == 0 || (!bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_'))
+        {
+            let mut k = i + 1;
+            while k < n
+                && (bytes[k].is_ascii_alphanumeric()
+                    || matches!(bytes[k], b'/' | b'_' | b'$' | b'-'))
+            {
+                k += 1;
+            }
+            if k > i + 1
+                && k + 3 < n
+                && bytes[k] == b';'
+                && bytes[k + 1] == b'-'
+                && bytes[k + 2] == b'>'
+            {
+                let desc = &text[i + 1..k];
+                let cls_short = desc.rsplit('/').next().unwrap_or(desc);
+                let m_start = k + 3;
+                if bytes[m_start] == b'<' {
+                    // `<init>` or `<clinit>`: advance past closing `>` without polluting method call graph
+                    let mut m_end = m_start + 1;
+                    while m_end < n && bytes[m_end] != b'>' && bytes[m_end] != b'\n' {
+                        m_end += 1;
+                    }
+                    if cls_short.len() >= 2 {
+                        bare_calls_and_types.insert(cls_short.to_owned());
+                    }
+                    i = (m_end + 1).min(n);
+                    continue;
+                }
+                let mut m_end = m_start;
+                while m_end < n
+                    && (bytes[m_end].is_ascii_alphanumeric()
+                        || bytes[m_end] == b'_'
+                        || bytes[m_end] == b'$')
+                {
+                    m_end += 1;
+                }
+                if m_end > m_start && m_end < n && (bytes[m_end] == b'(' || bytes[m_end] == b':') {
+                    let member = &text[m_start..m_end];
+                    if !cls_short.is_empty() && !member.is_empty() {
+                        qualified_calls.insert(format!("{cls_short}::{member}"));
+                        if cls_short.len() >= 2 {
+                            bare_calls_and_types.insert(cls_short.to_owned());
+                        }
+                    }
+                    i = m_end;
+                    continue;
+                }
+            }
+        }
+
+        let preceded_by_access = (i >= 1 && (bytes[i - 1] == b'.' || bytes[i - 1] == b':'))
             || (i >= 2 && bytes[i - 2] == b'-' && bytes[i - 1] == b'>');
 
         if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
@@ -1179,13 +1759,15 @@ fn extract_call_sites(text: &str, self_container: Option<&str>) -> CallSiteBucke
             }
             let lhs = &text[s1..i];
 
-            // Check if `lhs` is followed by `::`, `.`, or `->`
+            // Check if `lhs` is followed by `::`, `->`, `.`, or Lua/Smalltalk `:` call
             let sep_info: Option<(usize, u8)> = if i + 1 < n && bytes[i] == b':' && bytes[i + 1] == b':' {
                 Some((i + 2, b':'))
             } else if i + 1 < n && bytes[i] == b'-' && bytes[i + 1] == b'>' {
-                Some((i + 2, b'.'))
+                Some((i + 2, b'>'))
             } else if i < n && bytes[i] == b'.' {
                 Some((i + 1, b'.'))
+            } else if i + 1 < n && bytes[i] == b':' && bytes[i + 1] != b':' && bytes[i + 1].is_ascii_alphabetic() {
+                Some((i + 1, b':'))
             } else {
                 None
             };
@@ -1198,41 +1780,56 @@ fn extract_call_sites(text: &str, self_container: Option<&str>) -> CallSiteBucke
                     }
                     let rhs = &text[sep_end..j];
                     let has_call_paren = has_following_call_paren(bytes, j);
+                    // Single `:` (`x: Foo` vs Lua `obj:method(`) requires `(` unless it was `::`!
+                    let single_colon_not_call =
+                        sep_end == i + 1 && bytes[i] == b':' && !has_call_paren;
 
-                    let resolved_owner: Option<(&str, bool)> = if lhs == "Self" {
-                        self_container.map(|c| (c, false))
-                    } else if matches!(lhs, "self" | "this") {
-                        self_container.map(|c| (c, true))
-                    } else if lhs.len() >= 2 && lhs.as_bytes()[0].is_ascii_uppercase() {
-                        Some((lhs, false))
-                    } else {
-                        None
-                    };
+                    if !single_colon_not_call {
+                        let resolved_owner: Option<(&str, bool)> = if lhs == "Self" {
+                            self_container.map(|c| (c, false))
+                        } else if matches!(lhs, "self" | "this") {
+                            self_container.map(|c| (c, true))
+                        } else if lhs.len() >= 1 && lhs.as_bytes()[0].is_ascii_uppercase() {
+                            Some((lhs, false))
+                        } else {
+                            None
+                        };
 
-                    if let Some((owner_type, req_paren)) = resolved_owner {
-                        if owner_type.len() >= 3 && !preceded_by_access {
-                            bare_calls_and_types.insert(owner_type.to_owned());
+                        if let Some((owner_type, req_paren)) = resolved_owner {
+                            if owner_type.len() >= 3 && !preceded_by_access {
+                                bare_calls_and_types.insert(owner_type.to_owned());
+                            }
+                            if (!rhs.is_empty() && has_call_paren)
+                                || (rhs.len() >= 2 && !req_paren)
+                            {
+                                qualified_calls.insert(format!("{owner_type}::{rhs}"));
+                            }
+                            if j < n
+                                && (bytes[j] == b'.'
+                                    || (j + 1 < n && bytes[j] == b':' && bytes[j + 1] == b':')
+                                    || (j + 1 < n && bytes[j] == b'-' && bytes[j + 1] == b'>'))
+                            {
+                                i = sep_end;
+                            } else {
+                                i = j;
+                            }
+                            continue;
+                        } else if matches!(sep_kind, b'.' | b'>' | b':')
+                            && has_call_paren
+                            && rhs.len() >= 3
+                        {
+                            // Lowercase receiver call (`var.method(`, `ptr->method(`, `obj:method(`):
+                            receiver_methods.insert(rhs.to_owned());
+                            if j < n
+                                && (bytes[j] == b'.'
+                                    || (j + 1 < n && bytes[j] == b'-' && bytes[j + 1] == b'>'))
+                            {
+                                i = sep_end;
+                            } else {
+                                i = j;
+                            }
+                            continue;
                         }
-                        if rhs.len() >= 2 && (!req_paren || has_call_paren) {
-                            qualified_calls.insert(format!("{owner_type}::{rhs}"));
-                        }
-                        // Advance to `sep_end` ONLY if `rhs` itself chains another `::` or `.` (e.g. `Mod::Type::method`);
-                        // otherwise advance completely past `rhs` (`j`) so `rhs` is NEVER re-scanned as a bare identifier!
-                        if j < n && (bytes[j] == b'.' || (j + 1 < n && bytes[j] == b':' && bytes[j + 1] == b':')) {
-                            i = sep_end;
-                        } else {
-                            i = j;
-                        }
-                        continue;
-                    } else if sep_kind == b'.' && has_call_paren && rhs.len() >= 3 {
-                        // Lowercase receiver call (`var.method(`): record in `receiver_methods`!
-                        receiver_methods.insert(rhs.to_owned());
-                        if j < n && bytes[j] == b'.' {
-                            i = sep_end;
-                        } else {
-                            i = j;
-                        }
-                        continue;
                     }
                 }
             }
@@ -1422,6 +2019,162 @@ public sealed class SqlOrderRepository(IDbConnection db) : BaseRepository, IOrde
             .implementors
             .iter()
             .any(|s| s.contains("SqlOrderRepository::PersistApprovalAsync")));
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn smali_dalvik_call_graph_and_r8_short_methods() {
+        let tmp = std::env::temp_dir().join(format!("libredb_smali_cg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("smali_classes3/ci")).unwrap();
+        std::fs::create_dir_all(tmp.join("smali/com/acme")).unwrap();
+
+        std::fs::write(
+            tmp.join("smali_classes3/ci/p0.smali"),
+            r#".class public interface abstract Lci/p0;
+.super Ljava/lang/Object;
+.method public abstract b(I)Z
+.end method
+"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            tmp.join("smali_classes3/ci/p1.smali"),
+            r#".class public Lci/p1;
+.super Ljava/lang/Object;
+.implements Lci/p0;
+.method public final l(Landroid/content/Context;)Z
+    .registers 3
+    # Comment mentioning Lci/p0;->b(I)Z must be ignored
+    const/4 v0, 0x1
+    return v0
+.end method
+.method public b(I)Z
+    .registers 2
+    const/4 v0, 0x1
+    return v0
+.end method
+"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            tmp.join("smali_classes3/ci/j4.smali"),
+            r#".class public final Lci/j4;
+.super Lci/p1;
+.field public c:Lci/p0;
+.method public final checkLicense(Landroid/content/Context;)Z
+    .registers 4
+    iget-object v0, p0, Lci/j4;->c:Lci/p0;
+    invoke-interface {v0, p1}, Lci/p0;->b(I)Z
+    invoke-virtual {p0, p1}, Lci/j4;->l(Landroid/content/Context;)Z
+    move-result v1
+    return v1
+.end method
+"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            tmp.join("smali/com/acme/AlphaScreen.smali"),
+            r#".class public final Lcom/acme/AlphaScreen;
+.super Ljava/lang/Object;
+.method public final renderView()V
+    .registers 1
+    return-void
+.end method
+"#,
+        )
+        .unwrap();
+
+        let db = LibreDb::open(tmp.join(".agents_mem.ldb")).unwrap();
+        let rep = index_workspace(&db, &tmp, true).unwrap();
+        assert_eq!(rep.files_scanned, 4);
+        assert!(rep.call_synapses_wired >= 3);
+
+        // 1. Inherited Dalvik call `Lci/j4;->l(` resolves to superclass `p1::l`!
+        let p1_l = query_symbol_impact(&db, "p1::l").unwrap();
+        assert_eq!(p1_l.len(), 1);
+        assert_eq!(p1_l[0].total_callers, 1);
+        assert!(p1_l[0]
+            .callers
+            .iter()
+            .any(|c| c.contains("j4::checkLicense")));
+
+        // 2. Interface Dalvik call `Lci/p0;->b(` resolves on both interface `p0::b` AND implementor `p1::b`!
+        let p1_b = query_symbol_impact(&db, "p1::b").unwrap();
+        assert_eq!(p1_b.len(), 1);
+        assert!(p1_b[0]
+            .callers
+            .iter()
+            .any(|c| c.contains("j4::checkLicense")));
+
+        // 3. Querying 1-char `"a"` MUST NOT match `AlphaScreen` or `smali/...` file-path letters!
+        let bogus_a = query_symbol_impact(&db, "a").unwrap();
+        assert!(
+            bogus_a.is_empty(),
+            "Short query 'a' must never match file-path substrings: {bogus_a:?}"
+        );
+
+        let compact = format_impact_compact("p1::l", &p1_l);
+        assert!(compact.contains("=== IMPACT: p1::l (1 symbol matched) ==="));
+        assert!(compact.contains("j4::checkLicense"));
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn workspace_index_racy_git_fast_path_and_immediate_mutation_detection() {
+        let tmp = std::env::temp_dir().join(format!("libredb_racy_idx_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("src")).unwrap();
+
+        let f_a = tmp.join("src/alpha.rs");
+        let f_b = tmp.join("src/beta.rs");
+        std::fs::write(&f_a, "pub fn compute_val() -> i32 {\n    10\n}\n").unwrap();
+        std::fs::write(&f_b, "pub fn caller_fn() -> i32 {\n    compute_val()\n}\n").unwrap();
+
+        let db = LibreDb::open(tmp.join("idx.ldb")).unwrap();
+        let r1 = index_workspace(&db, &tmp, false).unwrap();
+        assert_eq!(r1.files_reindexed, 2);
+
+        // Warm scan hits `sys::workspace_graph_state` with 0 reindexed files
+        let r2 = index_workspace(&db, &tmp, false).unwrap();
+        assert_eq!(r2.files_reindexed, 0);
+        assert_eq!(r2.files_unchanged_cached, 2);
+
+        // Immediate sub-millisecond same-byte-length overwrite inside the 2s `racy-git` window MUST be detected!
+        std::fs::write(&f_a, "pub fn renamed_val() -> i32 {\n    10\n}\n").unwrap();
+        let r3 = index_workspace(&db, &tmp, false).unwrap();
+        assert_eq!(
+            r3.files_reindexed, 1,
+            "Same-length racy overwrite must never serve stale graph state"
+        );
+        assert!(!query_symbol_impact(&db, "renamed_val").unwrap().is_empty());
+        assert!(query_symbol_impact(&db, "compute_val").unwrap().is_empty());
+
+        // Single-file symbol line-shift updates `[Lstart-Lend]` spans in one batch without touching source file
+        let shifted = b"// line 1\n// line 2\n// line 3\npub fn renamed_val() -> i32 {\n    10\n}\n";
+        let updated_cnt = sync_single_file_symbols(&db, &tmp, &f_a, shifted).unwrap();
+        assert_eq!(updated_cnt, 1);
+        let imp = query_symbol_impact(&db, "renamed_val").unwrap();
+        assert!(
+            imp[0].contract.contains("[L4-L6]"),
+            "Symbol span must shift immediately to [L4-L6]: {}",
+            imp[0].contract
+        );
+
+        // File deletion MUST be detected immediately and tombstone orphan symbols
+        std::fs::remove_file(&f_a).unwrap();
+        let _r4 = index_workspace(&db, &tmp, false).unwrap();
+        assert!(
+            query_symbol_impact(&db, "renamed_val").unwrap().is_empty(),
+            "Deleted file symbols must be tombstoned on next scan"
+        );
 
         drop(db);
         let _ = std::fs::remove_dir_all(&tmp);

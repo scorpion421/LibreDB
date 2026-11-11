@@ -1,5 +1,5 @@
 #!/bin/sh
-# POSIX / Linux / macOS Antigravity plugin installer for LibreDB (v1.0.0)
+# POSIX / Linux / macOS Antigravity plugin installer for LibreDB (v1.1.0)
 # Enterprise-neutral by default (never installs personal rules or imports legacy SQLite unless requested).
 set -eu
 
@@ -134,12 +134,12 @@ cat > "$PLUGIN_DIR/plugin.json" <<'EOF'
 {
   "name": "libredb",
   "displayName": "LibreDB Cognitive Memory",
-  "version": "1.0.0",
-  "description": "Enterprise-ready Rust cognitive memory & MCP code graph: single-file LIBREDB1 storage, silent SQLite auto-porter, sub-2ms hooks, content-bound HMAC-SHA256 workspace trust seals, ChaCha20-Poly1305 OS credential vault, 20-language DI-aware causal code graph, and multi-remote Git/Gitea/GitHub automation.",
+  "version": "1.1.0",
+  "description": "Enterprise-ready Rust cognitive memory, token-economy analytics & MCP code graph: single-file LIBREDB1 storage, silent SQLite auto-porter, sub-2ms hooks, content-bound HMAC-SHA256 workspace trust seals, ChaCha20-Poly1305 OS credential vault, zero-hardcode topology & Dalvik/DI causal code graph, built-in benchmarks & token-savings reports, and multi-remote Git/Gitea/GitHub automation.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
+    "Show my LibreDB token savings report for today and all workspaces",
     "Run a LibreDB cognitive pulse on the active workspace to load deduplicated context",
-    "Check local Gitea status and run a strict LibreDB guardrail audit on the workspace",
     "Extract a surgical FIM code slice and DI blast-radius impact map with libredb_code"
   ]
 }
@@ -244,41 +244,37 @@ if [ "$PROFILE" = "personal" ]; then
         > "$RULES_DIR/AGENTS.md" <<'EOF'
 # Central LibreDB rules directive
 
-All system rules, coding standards, administrative credentials, and skills are maintained in `~/.gemini/libredb/customizations.ldb` (with automatic silent 1:1 background migration from any pre-existing `.db` files). Adhere to these active global rules with HIGHEST PRIORITY:
+All system rules, coding standards, administrative credentials, and skills live in `~/.gemini/libredb/customizations.ldb` (auto-migrating legacy `.db` files 1:1 on first touch). Enforce with HIGHEST PRIORITY:
 
-1. **Global output formatting invariant (strict enforcement across all operations)**:
-   - **No em-dashes or en-dashes**: Never output em-dashes (U+2014) or en-dashes (U+2013) in chat, markdown, code comments, commit messages, or artifacts. Use standard ASCII hyphens (`-`), colons (`:`), or parentheses.
+1. **Global output formatting invariant**:
+   - **No em-dashes or en-dashes**: Never output U+2014 or U+2013 in chat, markdown, code comments, commits, or artifacts. Use `-`, `:`, or `(...)`.
    - **No emojis**: Never output emojis, smileys, or decorative Unicode symbols.
-   - **Sentence case for headings and labels**: Use natural sentence case for headings, subheadings, and bold bullet labels (capitalize only the first word and proper nouns/acronyms like `GitHub`, `Gitea`, `LibreDB`, `SkillsDB`, `SQLite`, `JSONL`, `UTF-8`, `API`, `CLI`, `IDE`, `MCP`). Never use Title Case.
+   - **Sentence case for headings and labels**: Capitalize only the first word and proper nouns/acronyms (`GitHub`, `Gitea`, `LibreDB`, `SQLite`, `JSONL`, `UTF-8`, `API`, `CLI`, `IDE`, `MCP`). Never use Title Case.
 
 2. **Conversational communication and writing standards**:
-   - Always use informal German ("Du" / "Dein" for the user, "wir" / "unser" for joint work; strictly NEVER formal "Sie" or plural "Ihr" / "Euer" / "Euch").
-   - Use natural German spelling including umlauts (__UMLAUT_LIST__).
-   - **German compound nouns (strictly no Deppenbindestriche)**: Always write German compound nouns (Komposita) as a single joined word (e.g., "Abteilungskontingent" never "Abteilungs-Kontingent", "Browsertool" never "Browser-Tool", "Tabwechsel" never "Tab-Wechsel", "Standardeinstellung" never "Standard-Einstellung", "Kontextkompaktierung" never "Kontext-Kompaktierung", "Subagentenisolation" never "Subagenten-Isolation", "Tokenreduktion" never "Token-Reduktion", "__TOKEN_OEKONOMIE__" never "__TOKEN_OEKONOMIE_BAD__").
-   - **Candid architectural pushback (zero sugarcoating)**: When the user's idea or direction in a coding project shoots past the target, introduces unnecessary complexity, hardcodes a fragile pattern, or is technically suboptimal, tell the user directly that it is wrong or suboptimal and propose the better engineering approach immediately. Never hold back technical critique out of personal consideration.
+   - Use informal German ("Du"/"Dein", "wir"/"unser"; NEVER formal "Sie" or plural "Ihr"/"Euer"/"Euch") with natural umlauts (__UMLAUT_LIST__).
+   - **German compound nouns (no Deppenbindestriche)**: Join Komposita into one word (e.g., "Abteilungskontingent", "Browsertool", "Tabwechsel", "Standardeinstellung", "Kontextkompaktierung", "Subagentenisolation", "Tokenreduktion", "__TOKEN_OEKONOMIE__" never "__TOKEN_OEKONOMIE_BAD__").
+   - **Candid architectural pushback**: When an idea overshoots the target, adds unnecessary complexity, or hardcodes a fragile assumption, say directly that it is suboptimal and propose the cleaner engineering approach immediately.
 
-3. **Coding and scripting standards (strict language separation, SemVer 2.0.0, and Keep a Changelog 1.1.0)**:
-   - **Language boundary (zero exceptions)**: All code, comments, console outputs, logs, UI labels, buttons, dialogs, error strings, and commit messages MUST be in grammatically correct English (ASCII only). Never translate UI strings to German.
-   - **Strict Semantic Versioning (SemVer 2.0.0) and Keep a Changelog 1.1.0**: Version projects according to https://semver.org/ (`MAJOR.MINOR.PATCH`) and https://keepachangelog.com/en/1.1.0/. Never overwrite an already published release version in place; increment the version, document changes in `CHANGELOG.md` under `## [X.Y.Z] - YYYY-MM-DD` (`### Added`, `### Changed`, `### Deprecated`, `### Removed`, `### Fixed`, `### Security`), and publish matching Git tags and Releases (`libredb gitea-sync -m "<msg>" --project "<dir>" --releases` and `libredb gitea-release vX.Y.Z --project "<dir>"`). Place built deliverable artifacts (`.apk`, `.aab`, `.exe`, `.msi`, `.xpi`, `.vsix`, `.whl`, `.jar`, `.zip`) in `dist/` or `releases/` so they attach automatically.
-   - **Authoring & scripting hygiene**: Author commits as `Antigravity <antigravity@local.dev>`. Strictly no VBScript (`.vbs`, `cscript`, `wscript`).
-   - **Standardized 9-block `README.md` blueprint**: (1) `# Title`, (2) clickable Shields.io badges (`Version` -> `CHANGELOG.md`, `Tests` -> `tests/`, tech stack, `License` -> `LICENSE` `AGPLv3 + Commons Clause`), (3) 1-3 sentence summary, (4) `## Table of contents`, (5) executive summary & impact table, (6) installation & quickstart, (7) usage & commands, (8) architecture & ASCII tree (`|--`), (9) SemVer 2.0.0 & license.
+3. **Coding, SemVer 2.0.0, and Keep a Changelog 1.1.0**:
+   - **Language boundary**: 100% grammatically correct ASCII English in all code, comments, logs, UI strings, and commits. Never translate UI strings to German.
+   - **SemVer & releases**: Follow https://semver.org/ (`MAJOR.MINOR.PATCH`) and https://keepachangelog.com/en/1.1.0/. Never overwrite published tags; bump version, update `CHANGELOG.md` (`## [X.Y.Z] - YYYY-MM-DD`), place deliverables (`.apk`, `.aab`, `.exe`, `.msi`, `.xpi`, `.vsix`, `.whl`, `.jar`, `.zip`) in `dist/` or `releases/`, and sync via `libredb git-sync -m "<msg>" --project "<dir>" --releases` / `libredb git-release vX.Y.Z --project "<dir>"`.
+   - **Authoring & README**: Commit as `Antigravity <antigravity@local.dev>`. Strictly no VBScript (`.vbs`, `cscript`, `wscript`). Follow the 9-block `README.md` blueprint: (1) `# Title`, (2) Shields.io badges (`Version`, `Tests`, stack, `AGPLv3 + Commons Clause`), (3) 1-3 sentence summary, (4) `## Table of contents`, (5) executive summary table, (6) installation & quickstart, (7) usage & commands, (8) architecture & ASCII tree (`|--`), (9) SemVer & license.
 
-4. **Admin elevation and 100% transparent IT audit standard (`C:\IT_ADMIN_LOGS\<USERNAME>\<TASK>\<TARGET>\<Date>\<hh_mm_ss>\`)**:
-   - Execute admin tasks directly if elevated, via optional DPAPI credentials (`~/.gemini/config/credentials/*.credential.xml`), or `Start-Process -Verb RunAs`.
-   - **SOC-compliant transparent administration**: Never stage in `C:\Windows\Temp`, never use cryptic names or `cmd.exe /c` wrappers, never create remote services via `sc.exe \\`, and never hardcode usernames, hosts, or domains. After user approval, use `C:\IT_ADMIN_LOGS\<USERNAME>\<TASK>\<TARGET>\<Date>\<hh_mm_ss>\` and task folder `\IT_ADMIN_LOGS\<USERNAME>\` with a live-queried `AuditLog_<Target>_<Date>_<hh_mm_ss>.log` (`[1/4 PRE-CHECK]`, `[2/4..3/4 ACTION]`, `[4/4 POST-CHECK]`, `[CLEANUP]`).
+4. **Admin elevation and SOC audit standard (`C:\IT_ADMIN_LOGS\<USERNAME>\<TASK>\<TARGET>\<Date>\<hh_mm_ss>\`)**:
+   - Elevate directly, via DPAPI (`~/.gemini/config/credentials/*.credential.xml`), or `Start-Process -Verb RunAs`. Never stage in `C:\Windows\Temp`, use `cmd.exe /c` wrappers, create remote services (`sc.exe \\`), or hardcode identities. After approval, log `[1/4 PRE-CHECK]`, `[2/4..3/4 ACTION]`, `[4/4 POST-CHECK]`, `[CLEANUP]` to `AuditLog_<Target>_<Date>_<hh_mm_ss>.log`.
 
-5. **Turn-economy, diagnostic protocol, and context hygiene**:
-   - **Anti-salami-slicing & symbol lookup**: Read files `<= 800 lines` in a single `read_file` call. For files `> 800 lines`, inspect exact contract spans and edit slices first via `libredb_code` (`action="skeleton"`, `"fim"`, or `"impact"` on `libredb-mcp`) and batch `read_file` calls in parallel.
-   - **Subagent firewall**: Run targeted edits (1-3 files) and host/WMI/CIM admin commands directly in main context. Delegate open-ended codebase exploration (`>= 4` searches or `> 5` files) to a `research` subagent (`Model="flash"`).
-   - **Cluster-fix, batching, and zero-polling**: Search for all occurrences of a bug class before rebuilding, chain `build && test && verify`, use `libredb_memorize` to combine facts, decisions, tasks, and snapshots in one atomic call, verify formatting via `libredb guardrail check --path "<dir>" --staged --strict`, and set `WaitMsBeforeAsync=10000` (never poll `manage_task status`). Append a brief note at the end of your response if an internal tool needed a workaround.
+5. **Turn-economy, diagnostics, and built-in benchmarks**:
+   - **Anti-salami-slicing**: Read files `<= 800 lines` in one `read_file` call; for `> 800 lines` use `libredb_code` (`skeleton`, `fim`, `impact`) and batch parallel reads.
+   - **Subagent firewall**: Run 1-3 file edits and WMI/CIM commands in main context; delegate `>= 4` searches or `> 5` files to `research` (`Model="flash"`).
+   - **Batching & verification**: Fix entire bug classes before rebuilding, chain `build && test && verify`, commit memory via `libredb_memorize`, check `libredb guardrail check --path "<dir>" --staged --strict`, inspect savings/benchmarks natively via `libredb savings` and `libredb bench` (zero ad-hoc scripts), and use `WaitMsBeforeAsync=10000` without polling. Note any internal tool workarounds briefly at the end.
 
-6. **Autonomous project memory, silent SQLite migration, Gitea sync, and knowledge protocol (pure Pull)**:
-   - Persist facts, architectural decisions, tasks, snapshots, Hebbian associations, and situational reflexes in `.agents/memory.ldb` via `libredb_memorize` (`cwd`, `cid`, `facts`, `decisions`, `tasks`, `snapshot`, `learn_assoc`, `learn_reflex`). Any pre-existing `.agents/memory.db` in an older project or chat is automatically and silently migrated 1:1 into `.agents/memory.ldb` on first access, while new projects and chats use `.agents/memory.ldb` exclusively.
-   - Recall deduplicated rules, domain micro-skills, decisions, and facts on demand via `libredb_pulse` (`query`, `cwd`, `cid`, `budget`) or `libredb get-skill <name> [--section "<Section>"]`.
-   - **Dynamic Git & Gitea sync**: Use `libredb git-init "<dir>"` (`gitea-init`), `libredb git-sync -m "<msg>" --project "<dir>" [--remote <r>] [--all-remotes] [--github] [--releases]` (`gitea-sync`), `libredb git-release [vX.Y.Z] --project "<dir>" [--all-remotes] [--github]` (`gitea-release`), and `libredb gitea-status`. Existing non-Gitea `origin` remotes are never hijacked, and Gitea Basic Auth headers are sent exclusively to the configured Gitea host. Ask confirmation before `--allow-unversioned` ("Soll ich das wirklich ohne Versionierung hochladen?") and pause on `[GITEA REPOSITORY COLLISION]` (`--use-existing`, `--name`, or `--overwrite`). Format Gitea/GitHub URLs as clickable links `[Label](url)`.
+6. **Autonomous project memory & Git/Gitea sync (pure Pull)**:
+   - Persist/recall via `libredb_memorize`, `libredb_pulse` (`query`, `cwd`, `cid`, `budget`), and `libredb get-skill <name> [--section "<Section>"]` on `.agents/memory.ldb` (auto-migrating legacy `.agents/memory.db` 1:1).
+   - Use `libredb git-init`, `git-sync`, `git-release`, and `gitea-status`. Never hijack non-Gitea `origin` remotes or leak Gitea auth headers; ask before `--allow-unversioned` ("Soll ich das wirklich ohne Versionierung hochladen?") and pause on `[GITEA REPOSITORY COLLISION]`. Link URLs as `[Label](url)`.
 
-7. **Model & concurrency catalog (pure Pull, zero background control plane)**:
-   - Supports `ultra` (16 parallel reader lanes) and `pro` (8 lanes) across `Gemini 4 Argon`, `Gemini 4 Carbon`, `Gemini 3.8 Flash`, `Claude Opus 5.5`, `Claude Sonnet 5.5`, and `GPT-OSS 120B`. Keep 100% of code generation on `Gemini 4 Argon`, `Gemini 4 Carbon`, or `Claude 5.5`; route only read-only `research` subagents to `Model="flash"`.
+7. **Model & concurrency catalog**:
+   - `ultra` (16 reader lanes) and `pro` (8 lanes) across `Gemini 4 Argon`, `Gemini 4 Carbon`, `Gemini 3.8 Flash`, `Claude Opus 5.5`, `Claude Sonnet 5.5`, `GPT-OSS 120B`. Keep 100% of code generation on `Argon`, `Carbon`, or `Claude 5.5`; route only read-only `research` subagents to `Model="flash"`.
 EOF
     echo "[OK] Installed personal AGENTS.md rules directive (--personal-rules)."
 elif [ -f "$RULES_DIR/AGENTS.md" ]; then
@@ -317,16 +313,20 @@ description: >-
 1. **`libredb_pulse`** (`query`, `cwd`, `cid`, `budget`, `error`):
    - Retrieves relevant rules, micro-skills, decisions, facts, tasks, snapshots, and symbols across global + workspace layers within `budget` tokens.
    - Always pass `cid` (Conversation ID) and `cwd` so RAM-first `Zero-Repeat Delta` suppresses already-delivered items (`0` disk I/O reads on Turn 2+) and automatically re-hydrates after `/compact`.
-2. **`libredb_code`** (`action`: `"index"` | `"skeleton"` | `"impact"` | `"fim"`, `target`, `files`, `cwd`, `cid`, `force`, `symbol`, `line`, `pad`):
-   - `"index"`: Incrementally scans all non-binary source files in `target`, wiring `Calls` and `Decision -> Governs -> Symbol` synapses.
-   - `"skeleton"`: Returns a `92-99%` compressed `[Lstart-Lend]` contract map of a single `target` file or a multi-file batch (`files: [...]`) across 15+ languages (including `.smali`, `.asm`, `Makefile`, and `.md`) with session-aware `[Zero-Repeat Skeleton]` deduplication (`cid`).
-   - `"impact"`: Returns bidirectional callers, DI/interface implementors, callees, and governing architectural decisions for a symbol.
+2. **`libredb_code`** (`action`: `"index"` | `"skeleton"` | `"impact"` | `"fim"` | `"savings"`, `target`, `files`, `cwd`, `cid`, `force`, `symbol`, `line`, `pad`, `format`, `days`):
+   - `"index"`: Incrementally scans non-binary source files in `target` (`< 3 ms` warm stat+hash fast path), wiring `Calls` (including Dalvik/Smali descriptors & `1..2`-char R8 methods) and `Decision -> Governs -> Symbol` synapses.
+   - `"skeleton"`: Returns a `92-99%` compressed `[Lstart-Lend]` contract map of a single `target` file or multi-file batch (`files: [...]`) across 25+ languages and `< 5 us` topology-inferred extensionless files with session-aware `[Zero-Repeat Skeleton]` deduplication (`cid`).
+   - `"impact"`: Returns compact (`-70%` token) bidirectional callers, DI/interface implementors, callees, and governing architectural decisions (`format="json"` for raw JSON).
    - `"fim"`: Returns a surgical `[Lstart-Lend]` edit slice with blast-radius callers, implementors, and governing decisions attached.
+   - `"savings"`: Returns a live token-consumption and savings report across sessions and workspaces (`days=0` for today).
 3. **`libredb_memorize`** (`cwd`, `cid`, `facts`, `decisions`, `tasks`, `snapshot`, `learn_assoc`, `learn_reflex`, `sync_central_sqlite`):
    - Atomically commits workspace/chat facts, architectural decisions (auto-linked to symbols), tasks, milestone snapshots, language-agnostic Hebbian concept bridges, or situational pitfall reflexes.
 
 ## CLI commands (`libredb`)
 
+- **Token savings & reproducible benchmarks:**
+  - `libredb savings | report [--today] [--days <n>] [--cid <id>] [--project "<dir>"] [--json]`
+  - `libredb bench [--suite kernel|full] [--workspace "<dir>"] [--filter <p1,p2>] [--ext <e1,e2>] [--max-files <n>] [--nodes <n>] [--threads <t>] [--json]`
 - **Guardrails:** `libredb guardrail check --path "<dir>" [--staged] [--strict]`
 - **Workspace trust & universal config:**
   - `libredb trust [<dir>] [--revoke] [--list] [--accept-rollback] [--reinit-lost] [--migrate-v3 [--confirm-metadata]] [--migrate-v2] [--if-clean]`
@@ -353,8 +353,8 @@ else
 fi
 
 if [ "$PROFILE" = "personal" ]; then
-    "$TARGET_EXE" config set "hook:subagent_flash_routing" "true" --global "$GLOBAL_LDB" >/dev/null
-    "$TARGET_EXE" config set "hook:exploratory_firewall" "true" --global "$GLOBAL_LDB" >/dev/null
+    "$TARGET_EXE" config unset "hook:subagent_flash_routing" --global "$GLOBAL_LDB" >/dev/null
+    "$TARGET_EXE" config unset "hook:exploratory_firewall" --global "$GLOBAL_LDB" >/dev/null
     "$TARGET_EXE" config set "guardrail:style_rules" "true" --global "$GLOBAL_LDB" >/dev/null
     "$TARGET_EXE" config set "git:author_name" "Antigravity" --global "$GLOBAL_LDB" >/dev/null
     "$TARGET_EXE" config set "git:author_email" "antigravity@local.dev" --global "$GLOBAL_LDB" >/dev/null
@@ -390,13 +390,13 @@ EOF
 
 # 7. Write user-facing README.md inside plugin bundle
 cat > "$PLUGIN_DIR/README.md" <<'EOF'
-# LibreDB cognitive memory plugin (v1.0.0)
+# LibreDB cognitive memory plugin (v1.1.0)
 
-Enterprise-ready standalone Rust cognitive memory & code-graph engine for `Antigravity`:
-- `libredb-mcp`: 3-tool multi-workspace cognitive memory & 20-language zero-hardcode heuristic DI code-graph server with interface/implementation resolution (`implementors`), zero-I/O RAM session delta, fault-resilient `[Zero-Repeat Skeleton]` deduplication, and corpus-`IDF` call-graph disambiguation.
-- Standards-compliant security: monotonic content-and-metadata-bound RFC 2104 `HMAC-SHA256` (`v4:r<rev>`) workspace trust seals (`libredb trust`), RFC 8439 `ChaCha20-Poly1305` AEAD OS credential vault (`0600` `.vault.key` with safe `vault:v1` -> `vault:v2` migration and symlink guards), symlink-canonicalized control-plane & credential path protection (`hooks.json`, `mcp_config.json`, `.git/hooks/*`, `.env`), and universal `libredb config` customization.
-- Strictly neutral by default: `deploy_plugin.sh` installs `libredb-mcp` and security guardrails with `0` personal rules, `0` implicit legacy DB imports, and preserved corporate `git config` identity; pass `--personal-rules` for maintainer rules, `--migrate-legacy` to import legacy `customizations.db`, or `--no-hooks` for MCP-only evaluation.
-- Compaction garbage collection (`compact_with_options`, `maybe_auto_compact`) and `INDEX_FORMAT_VERSION = 5` `HybridIndex` with alphanumeric technical identifier preservation and dead-posting garbage collection across superseded Inodes.
+Enterprise-ready standalone Rust cognitive memory, token-economy analytics & code-graph engine for `Antigravity`:
+- `libredb-mcp`: 3-tool multi-workspace cognitive memory & 25+ language zero-hardcode topology + Dalvik/DI code-graph server with compact blast-radius `impact`, live `PreToolUse` in-RAM symbol shifting, `BM25`-assisted `<= 450`-token `PreInvocation` hydration, zero-I/O RAM session delta, and `[Zero-Repeat Skeleton]` deduplication.
+- Built-in analytics & reproducible benchmarks: `libredb savings` (`report`) combines `~/.gemini/libredb/telemetry.ldb` with bounded read-only `Antigravity` transcript parsing (`--today`, `--days`, `--cid`, `--project`, `--json`), and `libredb bench` (`--suite kernel|full`, `--workspace`) runs `C1..C6` token-economy & `v4`-seal benchmarks natively without external scripts.
+- Standards-compliant security: monotonic content-and-metadata-bound RFC 2104 `HMAC-SHA256` (`v4:r<rev>`) workspace trust seals (`libredb trust`), RFC 8439 `ChaCha20-Poly1305` AEAD OS credential vault (`0600` `.vault.key` with safe `vault:v1` -> `vault:v2` migration and symlink guards), symlink-canonicalized control-plane & credential path protection, and universal `libredb config` customization.
+- Strictly neutral by default: `deploy_plugin.sh` installs `libredb-mcp` and security guardrails with `0` personal rules, `0` implicit legacy DB imports, and preserved corporate `git config` identity.
 EOF
 
 # 8. Enable "libredb" in ~/.gemini/config/config.json if present and python3 is available
@@ -431,6 +431,6 @@ PYEOF
     fi
 fi
 
-echo "[OK] Deployed LibreDB v1.0.0 standalone binary to: $BIN_DIR (profile=$PROFILE)"
+echo "[OK] Deployed LibreDB v1.1.0 standalone binary to: $BIN_DIR (profile=$PROFILE)"
 echo "[OK] Hydrated and modernized global store at: $GLOBAL_LDB"
 echo "[OK] Installed complete Antigravity plugin at: $PLUGIN_DIR"

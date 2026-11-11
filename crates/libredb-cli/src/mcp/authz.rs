@@ -474,8 +474,14 @@ impl McpServerState {
         };
         let rep = index_workspace_with_exclusions(proj_db, scan_dir, false, &nested_exclusions)
             .map_err(|e| e.to_string())?;
-        let mut cog = CognitiveEngine::open_db(Arc::clone(proj_db)).map_err(|e| e.to_string())?;
-        cog.save_index_snapshot().map_err(|e| e.to_string())?;
+        if !rep.fast_path_hit
+            || proj_db
+                .get_by_key(libredb_core::NodeKind::Generic, "sys::index_snapshot")
+                .is_err()
+        {
+            let mut cog = CognitiveEngine::open_db(Arc::clone(proj_db)).map_err(|e| e.to_string())?;
+            cog.save_index_snapshot().map_err(|e| e.to_string())?;
+        }
         drop(_idx_lock);
         let brain = self.resolve_brain_mut(brain_hint, cid_opt, false)?;
         brain.refresh_if_needed().map_err(|e| e.to_string())?;

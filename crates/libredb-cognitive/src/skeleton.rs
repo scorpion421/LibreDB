@@ -11,8 +11,9 @@ use std::path::Path;
 
 pub const SKELETON_KEY_PREFIX: &str = "skeleton::";
 /// Content-hash seed bumped whenever `FileSkeleton` extraction semantics upgrade (e.g. `container`
-/// qualification, `supertypes`, interface/abstract method contracts, and `Makefile` targets in v0.9.0).
-pub const SKELETON_HASH_SEED: u8 = 109;
+/// qualification, `supertypes`, interface/abstract method contracts, `Makefile`, and `< 5 us`
+/// content-topology dispatch + `end`-block extraction in v1.1.0).
+pub const SKELETON_HASH_SEED: u8 = 110;
 /// Hard safety cap (`16 MiB`) for individual source files read by `skeleton` and `fim` so oversized
 /// or special files cannot trigger unbounded memory allocations.
 pub const MAX_SKELETON_FILE_BYTES: u64 = 16 * 1024 * 1024;
@@ -109,16 +110,29 @@ pub struct FileSkeleton {
 impl FileSkeleton {
     /// Extracts a `FileSkeleton` directly from in-memory source text.
     pub fn extract(file_label: impl Into<String>, source: &str) -> Self {
+        Self::extract_from_bytes(file_label, source.as_bytes())
+    }
+
+    /// Extracts a `FileSkeleton` from raw file bytes, computing `content_hash` over the exact raw
+    /// byte buffer (`CRLF` or `LF` preserved) so in-RAM `PreToolUse` simulations match post-edit
+    /// disk files identically.
+    pub fn extract_from_bytes(file_label: impl Into<String>, raw_bytes: &[u8]) -> Self {
         let label = file_label.into();
-        let lang = detect_language(&label);
-        let content_hash = hash_key(SKELETON_HASH_SEED, source.as_bytes());
-        let raw_tokens = count_tokens_exact(source.as_bytes());
-        let lines: Vec<&str> = source.lines().collect();
+        let content_hash = hash_key(SKELETON_HASH_SEED, raw_bytes);
+        let raw_tokens = count_tokens_exact(raw_bytes);
+        let text = String::from_utf8_lossy(raw_bytes);
+        let lines: Vec<&str> = text.lines().collect();
         let total_lines = lines.len();
+        let ext_lang = detect_language(&label);
+        let lang = if ext_lang == "code" {
+            infer_topology_from_content(&lines).to_owned()
+        } else {
+            ext_lang
+        };
 
         let sections = extract_sections(&lines, total_lines);
         let symbols = match lang.as_str() {
-            "python" => extract_python_symbols(&lines, total_lines),
+            "python" | "nim" | "gdscript" => extract_python_symbols(&lines, total_lines),
             "smali" => extract_smali_symbols(&lines, total_lines),
             "asm" => extract_asm_symbols(&lines, total_lines),
             "markdown" => extract_markdown_symbols(&lines, total_lines),
@@ -126,6 +140,9 @@ impl FileSkeleton {
             "sql" => extract_sql_symbols(&lines, total_lines),
             "powershell" => extract_powershell_symbols(&lines, total_lines),
             "shell" => extract_shell_symbols(&lines, total_lines),
+            "ruby" | "lua" | "elixir" | "julia" | "verilog" | "endblock" => {
+                extract_end_block_symbols(&lines, total_lines)
+            }
             _ => extract_brace_symbols(&lines, total_lines, &lang),
         };
 
@@ -171,8 +188,7 @@ impl FileSkeleton {
             }
         }
 
-        let text = String::from_utf8_lossy(raw_bytes);
-        let skel = Self::extract(label, &text);
+        let skel = Self::extract_from_bytes(label, raw_bytes);
         let encoded = serde_json::to_vec(&skel)
             .map_err(|_| LibreDbError::CorruptFormat("skeleton json serialize"))?;
         db.put(
@@ -210,8 +226,7 @@ impl FileSkeleton {
                 }
             }
 
-            let text = String::from_utf8_lossy(&raw_bytes);
-            let skel = Self::extract(label, &text);
+            let skel = Self::extract_from_bytes(label, &raw_bytes);
             let encoded = serde_json::to_vec(&skel)
                 .map_err(|_| LibreDbError::CorruptFormat("skeleton json serialize"))?;
             let prep = db.prepare(
@@ -310,8 +325,12 @@ fn detect_language(label: &str) -> String {
     }
     if low.ends_with(".rs") {
         "rust".to_owned()
-    } else if low.ends_with(".py") {
+    } else if low.ends_with(".py") || low.ends_with(".pyi") || low.ends_with(".star") || low.ends_with(".mojo") {
         "python".to_owned()
+    } else if low.ends_with(".nim") {
+        "nim".to_owned()
+    } else if low.ends_with(".gd") {
+        "gdscript".to_owned()
     } else if low.ends_with(".ts") || low.ends_with(".tsx") {
         "typescript".to_owned()
     } else if low.ends_with(".js") || low.ends_with(".jsx") || low.ends_with(".mjs") || low.ends_with(".cjs") {
@@ -320,6 +339,8 @@ fn detect_language(label: &str) -> String {
         "dart".to_owned()
     } else if low.ends_with(".go") {
         "go".to_owned()
+    } else if low.ends_with(".zig") {
+        "zig".to_owned()
     } else if low.ends_with(".smali") {
         "smali".to_owned()
     } else if low.ends_with(".asm")
@@ -355,10 +376,137 @@ fn detect_language(label: &str) -> String {
         "swift".to_owned()
     } else if low.ends_with(".rb") {
         "ruby".to_owned()
+    } else if low.ends_with(".lua") {
+        "lua".to_owned()
+    } else if low.ends_with(".ex") || low.ends_with(".exs") {
+        "elixir".to_owned()
+    } else if low.ends_with(".jl") {
+        "julia".to_owned()
+    } else if low.ends_with(".v") || low.ends_with(".sv") {
+        "verilog".to_owned()
     } else if low.ends_with(".php") {
         "php".to_owned()
     } else {
         "code".to_owned()
+    }
+}
+
+/// Deterministic `< 5 us` local syntax-topology fingerprint over at most the first `80` lines
+/// when a file lacks a known extension (extensionless scripts, `.dump`, `.txt`, `.bak`, etc.).
+/// Zero network calls, zero LLM tokens, `O(1)` bounded work.
+fn infer_topology_from_content(lines: &[&str]) -> &'static str {
+    if let Some(first) = lines.first().map(|l| l.trim()) {
+        if let Some(shebang) = first.strip_prefix("#!") {
+            let low = shebang.to_ascii_lowercase();
+            if low.contains("python") || low.contains("mojo") {
+                return "python";
+            }
+            if low.contains("ruby") || low.contains("lua") || low.contains("elixir") || low.contains("julia") {
+                return "endblock";
+            }
+            if low.contains("pwsh") || low.contains("powershell") {
+                return "powershell";
+            }
+            if low.contains("node") || low.contains("deno") || low.contains("bun") {
+                return "javascript";
+            }
+            if low.contains("bash") || low.contains("/sh") || low.contains(" sh") || low.contains("zsh") {
+                return "shell";
+            }
+        }
+    }
+
+    let mut smali_hits = 0usize;
+    let mut asm_hits = 0usize;
+    let mut sql_hits = 0usize;
+    let mut brace_hits = 0usize;
+    let mut indent_colon_hits = 0usize;
+    let mut end_block_openers = 0usize;
+    let mut end_block_closers = 0usize;
+    let mut md_heading_hits = 0usize;
+    let mut non_empty = 0usize;
+
+    for &line in lines.iter().take(120) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        non_empty += 1;
+        if non_empty > 80 {
+            break;
+        }
+
+        if trimmed.starts_with(".class ")
+            || trimmed.starts_with(".super ")
+            || trimmed.starts_with(".method ")
+            || trimmed == ".end method"
+            || trimmed.starts_with("invoke-")
+        {
+            smali_hits += 1;
+        }
+        if trimmed.contains(" PROC")
+            || trimmed.ends_with(" ENDP")
+            || trimmed.starts_with(".globl ")
+            || trimmed.starts_with(".section ")
+            || trimmed.starts_with("SECTION ")
+        {
+            asm_hits += 1;
+        }
+        let up = trimmed.to_ascii_uppercase();
+        if up.starts_with("CREATE TABLE ")
+            || up.starts_with("CREATE VIEW ")
+            || up.starts_with("CREATE FUNCTION ")
+            || up.starts_with("ALTER TABLE ")
+        {
+            sql_hits += 1;
+        }
+        if trimmed.ends_with('{') || trimmed == "}" || trimmed.starts_with("} ") {
+            brace_hits += 1;
+        }
+        if !trimmed.contains('{')
+            && trimmed.ends_with(':')
+            && (trimmed.starts_with("def ")
+                || trimmed.starts_with("async def ")
+                || trimmed.starts_with("class ")
+                || trimmed.starts_with("func ")
+                || trimmed.starts_with("proc "))
+        {
+            indent_colon_hits += 1;
+        }
+        if !trimmed.contains('{')
+            && !trimmed.ends_with(':')
+            && (trimmed.starts_with("function ")
+                || trimmed.starts_with("local function ")
+                || trimmed.starts_with("def ")
+                || trimmed.starts_with("defp ")
+                || trimmed.starts_with("defmodule ")
+                || trimmed.starts_with("module ")
+                || trimmed.starts_with("class "))
+        {
+            end_block_openers += 1;
+        }
+        if matches!(trimmed, "end" | "endmodule") {
+            end_block_closers += 1;
+        }
+        if trimmed.starts_with("# ") || trimmed.starts_with("## ") || trimmed.starts_with("### ") {
+            md_heading_hits += 1;
+        }
+    }
+
+    if smali_hits >= 2 {
+        "smali"
+    } else if asm_hits >= 2 {
+        "asm"
+    } else if sql_hits >= 1 && brace_hits == 0 {
+        "sql"
+    } else if indent_colon_hits >= 1 && brace_hits == 0 {
+        "python"
+    } else if end_block_openers >= 1 && end_block_closers >= 1 && brace_hits == 0 {
+        "endblock"
+    } else if md_heading_hits >= 2 && brace_hits == 0 {
+        "markdown"
+    } else {
+        "code"
     }
 }
 
@@ -404,6 +552,10 @@ fn extract_python_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContr
             ("def", r)
         } else if let Some(r) = trimmed.strip_prefix("async def ") {
             ("async def", r)
+        } else if let Some(r) = trimmed.strip_prefix("func ") {
+            ("func", r)
+        } else if let Some(r) = trimmed.strip_prefix("proc ") {
+            ("proc", r)
         } else if let Some(r) = trimmed.strip_prefix("class ") {
             ("class", r)
         } else {
@@ -866,6 +1018,123 @@ fn extract_makefile_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolCon
             end_line: end_line.min(total_lines.max(start)),
         });
     }
+    out
+}
+
+/// Extracts `class`/`module`/`defmodule` containers and `def`/`defp`/`function`/`local function`
+/// contracts across keyword-delimited `end` languages (`Ruby`, `Lua`, `Elixir`, `Julia`, `Verilog`).
+fn extract_end_block_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContract> {
+    let mut out = Vec::new();
+    let mut active_container: Option<(String, usize)> = None;
+
+    for (idx, &line) in lines.iter().enumerate() {
+        let indent = line.len() - line.trim_start().len();
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("--") || trimmed.starts_with("//") {
+            continue;
+        }
+
+        if let Some((_, c_indent)) = active_container {
+            if indent <= c_indent && matches!(trimmed, "end" | "endmodule") {
+                active_container = None;
+                continue;
+            }
+        }
+
+        let (kind, raw_rest, is_container) = if let Some(r) = trimmed.strip_prefix("defmodule ") {
+            ("module", r, true)
+        } else if let Some(r) = trimmed.strip_prefix("module ") {
+            ("module", r, true)
+        } else if let Some(r) = trimmed.strip_prefix("class ") {
+            ("class", r, true)
+        } else if let Some(r) = trimmed.strip_prefix("local function ") {
+            ("function", r, false)
+        } else if let Some(r) = trimmed.strip_prefix("function ") {
+            ("function", r, false)
+        } else if let Some(r) = trimmed.strip_prefix("defp ") {
+            ("defp", r, false)
+        } else if let Some(r) = trimmed.strip_prefix("def ") {
+            ("def", r, false)
+        } else {
+            continue;
+        };
+
+        let raw_head = raw_rest
+            .split(['(', ' ', '<', ';', ','])
+            .next()
+            .unwrap_or("")
+            .trim();
+        if raw_head.is_empty() {
+            continue;
+        }
+
+        // Handle Lua `M.foo` / `M:foo` and Ruby `self.foo` qualified method syntax cleanly:
+        let (explicit_owner, clean_name) = if let Some((owner, m)) = raw_head.rsplit_once(['.', ':']) {
+            let owner_clean = owner.trim();
+            if owner_clean == "self" {
+                (None, m.trim())
+            } else {
+                (Some(owner_clean.to_owned()), m.trim())
+            }
+        } else {
+            (None, raw_head)
+        };
+        if clean_name.is_empty() {
+            continue;
+        }
+
+        let mut supertypes = Vec::new();
+        if is_container {
+            if let Some((_, sup_part)) = raw_rest.split_once('<') {
+                let sup = sup_part
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or("")
+                    .trim();
+                if !sup.is_empty() {
+                    supertypes.push(sup.to_owned());
+                }
+            }
+        }
+
+        // Scan forward for matching indentation `end` / `endmodule` (or single-line `, do:` in Elixir):
+        let mut end_line = idx + 1;
+        if !trimmed.contains(", do:") {
+            for (s_idx, &s_line) in lines.iter().enumerate().skip(idx + 1) {
+                let s_trim = s_line.trim();
+                if s_trim.is_empty() || s_trim.starts_with('#') || s_trim.starts_with("--") {
+                    continue;
+                }
+                let s_indent = s_line.len() - s_line.trim_start().len();
+                if s_indent <= indent && matches!(s_trim, "end" | "endmodule") {
+                    end_line = s_idx + 1;
+                    break;
+                }
+            }
+        }
+
+        let container = if is_container {
+            active_container = Some((clean_name.to_owned(), indent));
+            None
+        } else {
+            explicit_owner.or_else(|| active_container.as_ref().map(|(c, _)| c.clone()))
+        };
+
+        out.push(SymbolContract {
+            kind: kind.to_owned(),
+            name: clean_name.to_owned(),
+            container,
+            supertypes,
+            signature: truncate_chars(trimmed, 115),
+            doc_summary: String::new(),
+            start_line: idx + 1,
+            end_line: end_line.min(total_lines.max(idx + 1)),
+        });
+    }
+
     out
 }
 
@@ -2252,5 +2521,35 @@ public sealed class SqlOrderRepo(IDbConnection db) : BaseRepo, IOrderRepo {
             .find(|s| s.name == "LiveOrderService")
             .expect("Python class extracted");
         assert_eq!(py_cls.supertypes, vec!["BaseService", "OrderPort"]);
+    }
+
+    #[test]
+    fn infers_extensionless_and_end_block_topologies_locally_without_hardcoding() {
+        // 1. Extensionless Python script via shebang
+        let extless_py = "#!/usr/bin/env python3\nclass TokenLedger:\n    def record_save(self, n: int) -> int:\n        return n * 2\n";
+        let sk_shebang = FileSkeleton::extract("bin/ledger-tool", extless_py);
+        assert_eq!(sk_shebang.language, "python");
+        assert!(sk_shebang
+            .symbols
+            .iter()
+            .any(|s| s.qualified_name() == "TokenLedger::record_save"));
+
+        // 2. Unknown `.dump` Smali file detected via structural directives
+        let dump_smali = ".class public final Lci/p1;\n.super Ljava/lang/Object;\n.method public final l(I)Z\n    .registers 2\n    const/4 v0, 0x1\n    return v0\n.end method\n";
+        let sk_smali = FileSkeleton::extract("decompiled_p1.dump", dump_smali);
+        assert_eq!(sk_smali.language, "smali");
+        assert!(sk_smali
+            .symbols
+            .iter()
+            .any(|s| s.qualified_name() == "p1::l" && s.start_line == 3 && s.end_line == 7));
+
+        // 3. Lua & Elixir `end`-block topology (both extensionless and `.lua`)
+        let lua_src = "local M = {}\nfunction M:dispatch(req)\n    return req\nend\nreturn M\n";
+        let sk_lua = FileSkeleton::extract("router.unknown", lua_src);
+        assert_eq!(sk_lua.language, "endblock");
+        assert!(sk_lua
+            .symbols
+            .iter()
+            .any(|s| s.qualified_name() == "M::dispatch" && s.start_line == 2 && s.end_line == 4));
     }
 }
