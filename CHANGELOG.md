@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.5] - 2026-11-11
+
+### Added
+
+- Added `index_workspace_with_exclusions` (`crates/libredb-cognitive/src/workspace.rs`, re-exported from `crates/libredb-cognitive/src/lib.rs`), nested workspace target boundary verifiers (`collect_nested_child_workspaces` and `verify_target_belongs_to_workspace` in `crates/libredb-cli/src/mcp.rs`), `.initializing` liveness staging in `create_private_ephemeral_dir` / `reap_abandoned_ephemeral_dirs` (`crates/libredb-cli/src/security.rs`), and an 8-scenario end-to-end OS-subprocess security and reliability integration suite (`crates/libredb-cli/tests/military_grade_mcp_security.rs`, bringing the automated suite to 87 tests + 10k crash simulations across Linux, macOS, and Windows).
+
+### Changed
+
+- Preserved cognitive session continuity and token efficiency across dynamic `MCP` root updates (`process_mcp_stream`, `client_roots_refresh_pending`, and `replace_client_workspace_roots` in `crates/libredb-cli/src/mcp.rs`): `notifications/roots/list_changed` (and `notifications/initialized` root discovery) now immediately suspends client-root authorization (`client_roots_refresh_pending = true`, failing closed during the pending `roots/list` round-trip) without wiping `OverlayBrain` caches or deleting ephemeral `.ldb` files prematurely; when the verified `roots/list` reply arrives, `replace_client_workspace_roots` diffs `[A, B] -> [A, C]` and evicts/deletes only removed workspace `B` while preserving `A`'s `SessionState` and `[Zero-Repeat Skeleton]` history intact (and revokes all client roots on a JSON-RPC `error` reply).
+
+### Security
+
+- Closed cross-workspace indexing and file-read boundary crossings from parent to nested subproject workspaces (`verify_target_belongs_to_workspace`, `collect_nested_child_workspaces`, `authorize_mcp_workspace_path`, and `run_locked_workspace_index` in `crates/libredb-cli/src/mcp.rs`, plus `collect_source_files` in `crates/libredb-cognitive/src/workspace.rs`): calling `libredb_code` (`index`, `skeleton` including multi-file `files`, or `fim`), `libredb_skeleton`, or `libredb_fim` with `cwd` pointing to a parent workspace (`Projects/Main`) and `target` pointing inside a nested workspace (`Projects/Main/Subproject`, a clean registered child root, or an unsealed nested `.agents` directory, including via symlinks/junctions) now fails closed with an explicit `workspace boundary violation` error instead of indexing or reading child files under the parent's `.agents/memory.ldb`; `authorize_mcp_workspace_path` rejects silent fallback to a parent root when `cwd` sits inside an unauthorized nested `.agents` workspace; and recursive parent scans (`index_workspace_with_exclusions` and `CLI` `index-workspace`) automatically skip nested child workspaces.
+- Eliminated the startup `TOCTOU` window between `.owner.lock` creation and `try_lock_write_region` during concurrent `MCP` process spawning (`create_private_ephemeral_dir` and `reap_abandoned_ephemeral_dirs` in `crates/libredb-cli/src/security.rs`), hardened `extract_pre_tool_name_and_args` and `evaluate_pre_tool_payload` (`crates/libredb-cli/src/hooks.rs`) to enforce `PreToolUse` write-path policies on snake_case `"tool_name"` envelopes and file deletion/rename tools, hardened `PreMutationSealGuard::verify_before_write` to fail closed whenever an already-sealed `<ws>/.agents/memory.ldb` is targeted without `customizations.ldb` (`global_db == None`), and added uniform `--global <customizations.ldb>` support across all `CLI` project read/write/index/bridge/compact subcommands (`extract_cli_global_flag` in `crates/libredb-cli/src/main.rs`), verified under real OS `SIGKILL` / `TerminateProcess` subprocess kills and concurrent multi-process `MCP + CLI` mutations in `crates/libredb-cli/tests/military_grade_mcp_security.rs`.
+
 ## [0.10.4] - 2026-11-11
 
 ### Added

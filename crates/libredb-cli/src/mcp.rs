@@ -15,9 +15,10 @@ use crate::hooks::{
 };
 use libredb_bridge::import_sqlite_readonly;
 use libredb_cognitive::{
-    create_subagent_handoff, execute_atomic_batch, extract_fim_slice, index_workspace,
-    query_symbol_impact, sync_transcript_epoch, AtomicBatchSpec, CognitiveEngine, FileSkeleton,
-    OverlayBrain, PulseRequest, ReflexEngine, ReflexRule, SessionState,
+    create_subagent_handoff, execute_atomic_batch, extract_fim_slice,
+    index_workspace_with_exclusions, query_symbol_impact, sync_transcript_epoch, AtomicBatchSpec,
+    CognitiveEngine, FileSkeleton, OverlayBrain, PulseRequest, ReflexEngine, ReflexRule,
+    SessionState,
 };
 use libredb_core::LibreDb;
 use serde_json::{json, Value};
@@ -43,6 +44,11 @@ pub struct McpServerState {
     client_workspace_roots: Vec<PathBuf>,
     /// True if the MCP host client advertised `capabilities.roots` during `initialize`.
     client_supports_roots: bool,
+    /// True while a `notifications/roots/list_changed` (or post-`initialize`) `roots/list` query
+    /// is in flight: suspends client-root authorization fail-closed immediately while preserving
+    /// cached `OverlayBrain`s and ephemeral `.ldb` session state for surviving roots until the
+    /// updated root list arrives and is diffed.
+    client_roots_refresh_pending: bool,
     /// Monotonic counter for server-initiated `roots/list` JSON-RPC queries.
     next_server_req_seq: u64,
     /// In-flight server-to-client `roots/list` request ID awaiting a JSON-RPC response on stdin.
@@ -329,6 +335,7 @@ impl McpServerState {
             pinned_workspace_root,
             client_workspace_roots: Vec::new(),
             client_supports_roots: false,
+            client_roots_refresh_pending: false,
             next_server_req_seq: 0,
             pending_roots_request_id: None,
             brains: HashMap::new(),
@@ -418,6 +425,7 @@ impl McpServerState {
             .and_then(|c| c.get("roots"))
             .is_some();
         self.pending_roots_request_id = None;
+        self.client_roots_refresh_pending = false;
         let candidates = extract_workspace_roots_from_value(params);
         self.replace_client_workspace_roots(candidates);
     }
@@ -523,14 +531,17 @@ impl McpServerState {
 
         // 2. Trusted MCP host client roots (`initialize` / `roots/list`):
         //    Always select the deepest containing workspace root (`max_by_key`), never `.iter().find()`.
-        if let Some(deepest_client_root) = self
-            .client_workspace_roots
-            .iter()
-            .filter(|cr| crate::security::check_mcp_workspace_containment(&canon, cr).is_none())
-            .max_by_key(|cr| crate::security::normalize_workspace_key(cr).len())
-            .cloned()
-        {
-            candidates_by_specificity.push(deepest_client_root);
+        //    Suspended fail-closed while `client_roots_refresh_pending` is awaiting `roots/list`.
+        if !self.client_roots_refresh_pending {
+            if let Some(deepest_client_root) = self
+                .client_workspace_roots
+                .iter()
+                .filter(|cr| crate::security::check_mcp_workspace_containment(&canon, cr).is_none())
+                .max_by_key(|cr| crate::security::normalize_workspace_key(cr).len())
+                .cloned()
+            {
+                candidates_by_specificity.push(deepest_client_root);
+            }
         }
 
         // 3. Server-side `customizations.ldb` explicitly authorized workspaces:
@@ -553,6 +564,27 @@ impl McpServerState {
             .into_iter()
             .max_by_key(|p| crate::security::normalize_workspace_key(p).len())
         {
+            // Reject unapproved nested `.agents` boundaries strictly below `selected_root`:
+            // if `selected_root < d <= canon` contains its own `.agents` directory, `d` was NOT
+            // authorized as a nested workspace (otherwise `max_by_key` would have selected `d`),
+            // so `canon` must NOT silently fall back into `selected_root`'s cognitive brain!
+            let selected_norm = crate::security::normalize_workspace_key(&selected_root);
+            let mut probe_anc = Some(canon.as_path());
+            while let Some(d) = probe_anc {
+                if crate::security::normalize_workspace_key(d) == selected_norm {
+                    break;
+                }
+                if d.join(".agents").is_dir() {
+                    return Err(format!(
+                        "LibreDB MCP access denied: nested workspace '{}' contains its own '.agents' cognitive store that is not authorized or sealed on the server; refusing to fall back to parent workspace '{}'. Run 'libredb trust \"{}\"' in a terminal if you trust this nested workspace.",
+                        d.display(),
+                        selected_root.display(),
+                        d.display()
+                    ));
+                }
+                probe_anc = d.parent();
+            }
+
             if !crate::security::is_workspace_memory_trusted(
                 self.global_db.as_deref(),
                 &selected_root,
@@ -645,7 +677,8 @@ impl McpServerState {
             return Ok((ws_root.clone(), ws_root));
         }
 
-        if self.client_workspace_roots.len() == 1
+        if !self.client_roots_refresh_pending
+            && self.client_workspace_roots.len() == 1
             && (allow_symbol_only
                 || target_hint_opt.is_some_and(|h| Path::new(h.trim()).is_relative()))
         {
@@ -667,9 +700,11 @@ impl McpServerState {
                         .to_owned(),
                 );
             }
-            if self.global_db.is_none() && self.client_workspace_roots.is_empty() {
+            if self.global_db.is_none()
+                && (self.client_roots_refresh_pending || self.client_workspace_roots.is_empty())
+            {
                 return Err(
-                    "LibreDB MCP access denied: omitting 'cwd' is not permitted when neither customizations.ldb nor '--workspace-root' is configured"
+                    "LibreDB MCP access denied: omitting 'cwd' is not permitted when neither customizations.ldb nor active client workspace roots are available"
                         .to_owned(),
                 );
             }
@@ -705,9 +740,95 @@ impl McpServerState {
         canonical_brain_cache_key(p) == canonical_brain_cache_key(&q_path)
     }
 
+    /// Collects all server-known nested child workspace roots strictly inside `parent_ws` so
+    /// parent-level `index` / `impact` / `fim` scans never ingest a nested project's source files.
+    fn collect_nested_child_workspaces(&self, parent_ws: &Path) -> Vec<PathBuf> {
+        let parent_norm = crate::security::normalize_workspace_key(parent_ws);
+        let child_prefix = format!("{parent_norm}/");
+        let mut out: Vec<PathBuf> = Vec::new();
+        let mut push_unique = |cand: PathBuf| {
+            let cn = crate::security::normalize_workspace_key(&cand);
+            if cn.starts_with(&child_prefix)
+                && !out
+                    .iter()
+                    .any(|existing| crate::security::normalize_workspace_key(existing) == cn)
+            {
+                out.push(cand);
+            }
+        };
+        for cr in &self.client_workspace_roots {
+            push_unique(cr.clone());
+        }
+        if let Some(ref gdb) = self.global_db {
+            if let Ok(trusted) = crate::security::list_trusted_workspaces(gdb) {
+                for (norm, raw) in trusted {
+                    if norm.starts_with(&child_prefix) {
+                        push_unique(PathBuf::from(raw));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Enforces strict cognitive workspace boundary isolation between `expected_ws_root` (derived
+    /// from `cwd`) and a concrete `target_path` (`skeleton`, `fim`, `index`, or batch `files`):
+    /// if `target_path` resolves into a more specific nested workspace (either registered on the
+    /// server or owning its own `.agents` directory), fails closed instead of polluting or reading
+    /// across workspace brains.
+    fn verify_target_belongs_to_workspace(
+        &mut self,
+        target_path: &Path,
+        expected_ws_root: &Path,
+    ) -> Result<(), String> {
+        let abs = if target_path.is_relative() {
+            expected_ws_root.join(target_path)
+        } else {
+            target_path.to_path_buf()
+        };
+        let canon = crate::security::canonicalize_with_missing_tail(&abs).unwrap_or(abs);
+        let probe_dir = if canon.is_dir() {
+            canon.as_path()
+        } else {
+            canon
+                .parent()
+                .ok_or_else(|| "LibreDB MCP access denied: invalid target path".to_owned())?
+        };
+        let expected_norm = crate::security::normalize_workspace_key(expected_ws_root);
+
+        let mut cur = Some(probe_dir);
+        while let Some(d) = cur {
+            if crate::security::normalize_workspace_key(d) == expected_norm {
+                break;
+            }
+            if d.join(".agents").is_dir() {
+                return Err(format!(
+                    "LibreDB MCP workspace boundary violation: target '{}' resides inside nested workspace '{}', which maintains its own isolated cognitive store separate from '{}'. Pass cwd='{}' to query or index that nested workspace directly.",
+                    target_path.display(),
+                    d.display(),
+                    expected_ws_root.display(),
+                    d.display()
+                ));
+            }
+            cur = d.parent();
+        }
+
+        let actual_ws = self.authorize_mcp_workspace_path(probe_dir, false)?;
+        if crate::security::normalize_workspace_key(&actual_ws) != expected_norm {
+            return Err(format!(
+                "LibreDB MCP workspace boundary violation: target '{}' belongs to nested workspace '{}', which is isolated from requested cwd workspace '{}'. Pass cwd='{}' to query or index that nested workspace directly.",
+                target_path.display(),
+                actual_ws.display(),
+                expected_ws_root.display(),
+                actual_ws.display()
+            ));
+        }
+        Ok(())
+    }
+
     /// Acquires `WorkspaceTrustLockGuard` on the canonical owning workspace root (never swallowing
-    /// lock failures via `.ok()`), runs `index_workspace`, updates the cognitive index snapshot,
-    /// and refreshes the cached `OverlayBrain`.
+    /// lock failures via `.ok()`), runs `index_workspace_with_exclusions`, updates the cognitive
+    /// index snapshot, and refreshes the cached `OverlayBrain`.
     fn run_locked_workspace_index(
         &mut self,
         proj_db: &Arc<LibreDb>,
@@ -722,6 +843,7 @@ impl McpServerState {
                 scan_dir.display()
             ));
         }
+        let nested_exclusions = self.collect_nested_child_workspaces(ws_root);
         let lock_root = resolve_canonical_workspace_lock_root(proj_db, ws_root);
         let _idx_lock = match self
             .global_db
@@ -733,7 +855,8 @@ impl McpServerState {
             )?),
             None => None,
         };
-        let rep = index_workspace(proj_db, scan_dir, false).map_err(|e| e.to_string())?;
+        let rep = index_workspace_with_exclusions(proj_db, scan_dir, false, &nested_exclusions)
+            .map_err(|e| e.to_string())?;
         let mut cog = CognitiveEngine::open_db(Arc::clone(proj_db)).map_err(|e| e.to_string())?;
         cog.save_index_snapshot().map_err(|e| e.to_string())?;
         drop(_idx_lock);
@@ -837,7 +960,8 @@ impl McpServerState {
             None => {
                 if let Some(ref pin) = self.pinned_workspace_root {
                     pin.join(".agents").join("memory.ldb")
-                } else if self.client_workspace_roots.len() == 1 {
+                } else if !self.client_roots_refresh_pending && self.client_workspace_roots.len() == 1
+                {
                     self.client_workspace_roots[0]
                         .join(".agents")
                         .join("memory.ldb")
@@ -964,9 +1088,12 @@ impl McpServerState {
                             }
                         }
                         Err(auth_err) => {
-                            // Evict any cached OverlayBrain via canonical key and never create `.agents/memory.ldb`
-                            // inside unauthorized or quarantined workspaces.
-                            self.brains.remove(&candidate_cache_key);
+                            // Evict any cached OverlayBrain via canonical key (unless client roots
+                            // are merely suspended awaiting `roots/list`) and never create
+                            // `.agents/memory.ldb` inside unauthorized or quarantined workspaces.
+                            if !self.client_roots_refresh_pending {
+                                self.brains.remove(&candidate_cache_key);
+                            }
                             if is_explicit_memorize || self.global_db.is_none() {
                                 return Err(auth_err);
                             }
@@ -1157,6 +1284,7 @@ pub fn process_mcp_stream<R: BufRead, W: Write>(
             ) {
                 if resp_id == expected_id {
                     state.pending_roots_request_id = None;
+                    state.client_roots_refresh_pending = false;
                     if let Some(result_obj) = req.get("result") {
                         let updated = extract_workspace_roots_from_value(result_obj);
                         state.replace_client_workspace_roots(updated);
@@ -1179,11 +1307,14 @@ pub fn process_mcp_stream<R: BufRead, W: Write>(
                     state.client_supports_roots = true;
                     if has_explicit_root_fields(&params) {
                         state.pending_roots_request_id = None;
+                        state.client_roots_refresh_pending = false;
                         let updated = extract_workspace_roots_from_value(&params);
                         state.replace_client_workspace_roots(updated);
                     } else {
-                        // Fail closed immediately for any closed workspace while querying fresh `roots/list`.
-                        state.replace_client_workspace_roots(Vec::new());
+                        // Suspend client-root authorization fail-closed immediately while preserving
+                        // cached `OverlayBrain`s, `SessionState`s, and ephemeral `.ldb` files for
+                        // workspaces that remain open when the `roots/list` response arrives.
+                        state.client_roots_refresh_pending = true;
                         let roots_req = state.issue_roots_list_request();
                         writeln!(writer, "{roots_req}")?;
                         writer.flush()?;
@@ -1194,6 +1325,7 @@ pub fn process_mcp_stream<R: BufRead, W: Write>(
                         && state.client_workspace_roots.is_empty()
                         && state.pending_roots_request_id.is_none()
                     {
+                        state.client_roots_refresh_pending = true;
                         let roots_req = state.issue_roots_list_request();
                         writeln!(writer, "{roots_req}")?;
                         writer.flush()?;
@@ -1519,6 +1651,7 @@ fn dispatch_tool(
                     }
                     for rp in &requested_paths {
                         check_target_access(rp)?;
+                        state.verify_target_belongs_to_workspace(rp, &ws_root)?;
                     }
 
                     let items: Vec<(&Path, Option<&str>)> = requested_paths
@@ -1591,6 +1724,7 @@ fn dispatch_tool(
                     let resolved_target = resolve_rel(target);
                     check_target_access(&resolved_target)?;
                     check_target_access(&ws_root)?;
+                    state.verify_target_belongs_to_workspace(&resolved_target, &ws_root)?;
                     state.run_locked_workspace_index(
                         &proj_db,
                         &ws_root,
@@ -1605,6 +1739,7 @@ fn dispatch_tool(
                     let target = target_opt.ok_or("Missing target")?;
                     let resolved_target = resolve_rel(target);
                     check_target_access(&resolved_target)?;
+                    state.verify_target_belongs_to_workspace(&resolved_target, &ws_root)?;
                     let rep = state.run_locked_workspace_index(
                         &proj_db,
                         &ws_root,
@@ -1793,6 +1928,7 @@ fn dispatch_tool(
             {
                 return Err(err.into());
             }
+            state.verify_target_belongs_to_workspace(&resolved_fp, &ws_root)?;
             let (skel, _) = FileSkeleton::index_or_get_cached(&proj_db, &resolved_fp, None)?;
             Ok(skel.render_compact(flt, flt.is_some()))
         }
@@ -1857,6 +1993,7 @@ fn dispatch_tool(
             {
                 return Err(err.into());
             }
+            state.verify_target_belongs_to_workspace(&resolved_fp, &ws_root)?;
             let bundle = extract_fim_slice(&proj_db, &resolved_fp, sym, line, pad)?;
             Ok(bundle.format_compact())
         }
@@ -3422,8 +3559,8 @@ mod tests {
         assert!(eph_a_file.is_file(), "Ephemeral .ldb for ws_a must exist while ws_a is active");
 
         // Phase 3: Client sends `notifications/roots/list_changed` AND immediately pipelines a `tools/call`
-        // on closed `ws_a` BEFORE replying to `libredb-roots-2` -> server MUST revoke `ws_a` immediately
-        // (fail-closed), delete `eph_a_file`, emit `libredb-roots-2`, and reject the pipelined `ws_a` call!
+        // on `ws_a` BEFORE replying to `libredb-roots-2` -> server MUST suspend client roots immediately
+        // (fail-closed) while preserving `eph_a_file` until `roots/list` confirms whether `ws_a` was closed!
         let out_p3 = run_frames(
             &mut state,
             &[
@@ -3451,14 +3588,15 @@ mod tests {
         assert_eq!(out_p3[1]["id"], json!(4));
         assert!(
             out_p3[1].get("error").is_some(),
-            "Closed workspace ws_a MUST be revoked immediately on notifications/roots/list_changed!"
+            "Client workspace ws_a MUST fail closed while roots/list refresh is pending!"
         );
         assert!(
-            !eph_a_file.exists(),
-            "Ephemeral .ldb file for revoked ws_a MUST be deleted on root eviction!"
+            eph_a_file.is_file(),
+            "Ephemeral .ldb for ws_a MUST be preserved during pending roots/list refresh until removal is confirmed!"
         );
 
-        // Phase 4: Client replies to `libredb-roots-2` with `[ws_b]` -> `ws_a` remains denied, `ws_b` now succeeds!
+        // Phase 4: Client replies to `libredb-roots-2` with `[ws_b]` -> `ws_a` is now confirmed removed
+        // (its ephemeral `.ldb` is deleted and calls stay denied), while `ws_b` succeeds!
         let out_p4 = run_frames(
             &mut state,
             &[
@@ -3498,6 +3636,10 @@ mod tests {
             ],
         );
         assert_eq!(out_p4.len(), 2);
+        assert!(
+            !eph_a_file.exists(),
+            "Ephemeral .ldb file for confirmed-closed ws_a MUST be deleted once roots/list excludes ws_a!"
+        );
         assert_eq!(out_p4[0]["id"], json!(5));
         assert!(out_p4[0].get("error").is_some(), "Closed ws_a MUST stay denied after switching to ws_b");
         assert_eq!(out_p4[1]["id"], json!(6));

@@ -97,7 +97,19 @@ impl FimSliceBundle {
 /// Incrementally indexes all non-binary source files under `root` into `db`, wiring both
 /// code call-graph synapses (`Calls`) and causal architecture synapses (`Decision <-> Symbol`).
 pub fn index_workspace(db: &LibreDb, root: &Path, force: bool) -> Result<WorkspaceIndexReport> {
-    let scan_cfg = WorkspaceScanConfig::from_db_and_root(db, root);
+    index_workspace_with_exclusions(db, root, force, &[])
+}
+
+/// Incrementally indexes all non-binary source files under `root` into `db`, skipping nested
+/// child cognitive workspaces (any subdirectory strictly below `root` that contains its own
+/// `.agents` directory or matches one of `excluded_subroots`).
+pub fn index_workspace_with_exclusions(
+    db: &LibreDb,
+    root: &Path,
+    force: bool,
+    excluded_subroots: &[PathBuf],
+) -> Result<WorkspaceIndexReport> {
+    let scan_cfg = WorkspaceScanConfig::from_db_and_root(db, root, excluded_subroots);
     let mut source_files = Vec::new();
     let mut binary_skipped = 0usize;
     collect_source_files(root, root, &scan_cfg, &mut source_files, &mut binary_skipped)?;
@@ -814,11 +826,37 @@ pub fn extract_fim_slice(
 struct WorkspaceScanConfig {
     extra_extensions: Vec<String>,
     ignore_dirs: HashSet<String>,
+    excluded_subroots: HashSet<String>,
     max_file_bytes: usize,
 }
 
+fn normalize_scan_boundary_key(p: &Path) -> String {
+    let canon = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let s = canon.to_string_lossy().replace('\\', "/");
+    let stripped = s.strip_prefix("//?/").unwrap_or(&s);
+    let trimmed = if stripped.len() > 1 {
+        stripped.trim_end_matches('/')
+    } else {
+        stripped
+    };
+    #[cfg(windows)]
+    {
+        trimmed.to_ascii_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        trimmed.to_owned()
+    }
+}
+
 impl WorkspaceScanConfig {
-    fn from_db_and_root(db: &LibreDb, root: &Path) -> Self {
+    fn from_db_and_root(db: &LibreDb, root: &Path, excluded_paths: &[PathBuf]) -> Self {
+        let root_key = normalize_scan_boundary_key(root);
+        let excluded_subroots: HashSet<String> = excluded_paths
+            .iter()
+            .map(|p| normalize_scan_boundary_key(p))
+            .filter(|k| !k.is_empty() && k != &root_key)
+            .collect();
         let mut ignore_dirs: HashSet<String> = [
             ".git",
             ".agents",
@@ -882,6 +920,7 @@ impl WorkspaceScanConfig {
         Self {
             extra_extensions,
             ignore_dirs,
+            excluded_subroots,
             max_file_bytes,
         }
     }
@@ -917,6 +956,19 @@ fn collect_source_files(
                 || matches!(low.as_str(), ".ssh" | ".gnupg" | ".aws" | ".azure" | ".kube")
             {
                 continue;
+            }
+            // Never cross into nested child cognitive workspaces during a parent scan:
+            // any subdirectory strictly below `root` with its own `.agents` directory or an
+            // explicit server-registered workspace boundary owns an isolated cognitive brain.
+            if p != root {
+                if p.join(".agents").is_dir() {
+                    continue;
+                }
+                if !cfg.excluded_subroots.is_empty()
+                    && cfg.excluded_subroots.contains(&normalize_scan_boundary_key(&p))
+                {
+                    continue;
+                }
             }
             collect_source_files(root, &p, cfg, out, binary_skipped)?;
         } else if ft.is_file() {

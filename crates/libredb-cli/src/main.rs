@@ -10,7 +10,7 @@ use libredb_bridge::{
 };
 use libredb_cognitive::{
     audit_workspace_guardrails_with_prefixes, create_subagent_handoff, execute_atomic_batch,
-    extract_fim_slice, index_workspace, query_symbol_impact, sync_transcript_epoch,
+    extract_fim_slice, index_workspace_with_exclusions, query_symbol_impact, sync_transcript_epoch,
     AtomicBatchSpec, CognitiveEngine, FileSkeleton, OverlayBrain, PulseRequest, ReflexEngine,
     ReflexRule,
 };
@@ -78,6 +78,30 @@ Core Storage & Graph Commands:
   libredb bench [--nodes <n>] [--threads <t>]",
         env!("CARGO_PKG_VERSION")
     );
+}
+
+fn extract_cli_global_flag(
+    raw_args: &[String],
+    min_positional: usize,
+) -> Result<(Option<PathBuf>, Vec<String>), String> {
+    let mut global_override: Option<PathBuf> = None;
+    let mut cleaned = Vec::with_capacity(raw_args.len());
+    let head = min_positional.min(raw_args.len());
+    cleaned.extend_from_slice(&raw_args[..head]);
+    let mut i = head;
+    while i < raw_args.len() {
+        if raw_args[i] == "--global" {
+            if i + 1 >= raw_args.len() {
+                return Err("Missing path argument after '--global'".to_owned());
+            }
+            global_override = Some(PathBuf::from(&raw_args[i + 1]));
+            i += 2;
+        } else {
+            cleaned.push(raw_args[i].clone());
+            i += 1;
+        }
+    }
+    Ok((global_override, cleaned))
 }
 
 fn main() {
@@ -158,6 +182,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             hooks::run_pre_invocation_hook(global_path.as_deref())?;
         }
         "guardrail" => {
+            let (global_override, args) = extract_cli_global_flag(&args, 2)?;
             let sub = args.get(1).map(String::as_str).unwrap_or("check");
             if sub != "check" {
                 return Err("Usage: libredb guardrail check [--path <dir>] [--staged] [--strict]".into());
@@ -183,7 +208,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     other => return Err(format!("Unknown guardrail flag '{other}'").into()),
                 }
             }
-            let gdb_res = hooks::open_global_ldb_checked(None);
+            let gdb_res = hooks::open_global_ldb_checked(global_override.as_deref());
             let gdb_opt = gdb_res.as_ref().ok().and_then(Clone::clone);
             let pdb_opt = if gdb_res.is_ok()
                 && security::is_workspace_memory_trusted(gdb_opt.as_deref(), &dir)
@@ -1163,17 +1188,39 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("[Completed in {elapsed_ms:.2} ms]");
         }
         "index-workspace" => {
+            let (global_override, args) = extract_cli_global_flag(&args, 3)?;
             if args.len() < 3 {
-                return Err("Usage: libredb index-workspace <db.ldb> <workspace_dir> [--force]".into());
+                return Err("Usage: libredb index-workspace <db.ldb> <workspace_dir> [--force] [--global <customizations.ldb>]".into());
             }
-            let force = args.get(3).map(String::as_str) == Some("--force");
+            let mut force = false;
+            for flag in &args[3..] {
+                if flag == "--force" {
+                    force = true;
+                } else {
+                    return Err(format!("Unknown index-workspace flag '{flag}'").into());
+                }
+            }
             let t0 = Instant::now();
             let db_path = Path::new(&args[1]);
-            let gdb_opt = hooks::open_global_ldb_checked(None)?;
+            let gdb_opt = hooks::open_global_ldb_checked(global_override.as_deref())?;
             let seal_guard =
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
             let db = Arc::new(LibreDb::open(db_path)?);
-            let rep = index_workspace(&db, Path::new(&args[2]), force)?;
+            let ws_arg = Path::new(&args[2]);
+            let ws_canon = std::fs::canonicalize(ws_arg).unwrap_or_else(|_| ws_arg.to_path_buf());
+            let ws_norm = security::normalize_workspace_key(&ws_canon);
+            let ws_prefix = format!("{ws_norm}/");
+            let mut excluded_children = Vec::new();
+            if let Some(ref gdb) = gdb_opt {
+                if let Ok(trusted) = security::list_trusted_workspaces(gdb) {
+                    for (t_norm, raw_path) in trusted {
+                        if t_norm != ws_norm && t_norm.starts_with(&ws_prefix) {
+                            excluded_children.push(PathBuf::from(raw_path));
+                        }
+                    }
+                }
+            }
+            let rep = index_workspace_with_exclusions(&db, ws_arg, force, &excluded_children)?;
             let mut cog = CognitiveEngine::open_db(Arc::clone(&db))?;
             cog.save_index_snapshot()?;
             seal_guard.reseal_after_write(gdb_opt.as_deref(), &db)?;
@@ -1191,6 +1238,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         "skeleton" => {
+            let (global_override, args) = extract_cli_global_flag(&args, 3)?;
             if args.len() < 3 {
                 return Err("Usage: libredb skeleton <db.ldb> <source_file> [--filter <substr>]".into());
             }
@@ -1199,7 +1247,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 filter = Some(args[4].clone());
             }
             let t0 = Instant::now();
-            let db = open_cli_verified_project_db(None, Path::new(&args[1]))?;
+            let db = open_cli_verified_project_db(global_override.as_deref(), Path::new(&args[1]))?;
             let src_path = Path::new(&args[2]);
             let (skel, cache_hit) = FileSkeleton::index_or_get_cached(&db, src_path, None)?;
             let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -1215,11 +1263,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         "impact" => {
+            let (global_override, args) = extract_cli_global_flag(&args, 3)?;
             if args.len() < 3 {
                 return Err("Usage: libredb impact <db.ldb> <symbol_query>".into());
             }
             let t0 = Instant::now();
-            let db = open_cli_verified_project_db(None, Path::new(&args[1]))?;
+            let db = open_cli_verified_project_db(global_override.as_deref(), Path::new(&args[1]))?;
             let reports = query_symbol_impact(&db, &args[2])?;
             println!(
                 "=== BLAST-RADIUS & CAUSAL IMPACT: '{}' ({} matches in {:.2} ms) ===",
@@ -1244,6 +1293,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         "fim" => {
+            let (global_override, args) = extract_cli_global_flag(&args, 3)?;
             if args.len() < 3 {
                 return Err("Usage: libredb fim <db.ldb> <source_file> [--symbol <name> | --line <n>] [--pad <lines>]".into());
             }
@@ -1268,12 +1318,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     other => return Err(format!("Unknown flag '{other}'").into()),
                 }
             }
-            let db = open_cli_verified_project_db(None, Path::new(&args[1]))?;
+            let db = open_cli_verified_project_db(global_override.as_deref(), Path::new(&args[1]))?;
             let bundle =
                 extract_fim_slice(&db, Path::new(&args[2]), symbol.as_deref(), line, pad)?;
             print!("{}", bundle.format_compact());
         }
         "batch" => {
+            let (global_override, args) = extract_cli_global_flag(&args, 2)?;
             if args.len() < 3 {
                 return Err("Usage: libredb batch <db.ldb> [--fact k=v] [--decision Title::Body] [--task key::title::status::prio] [--snapshot <text>]".into());
             }
@@ -1314,7 +1365,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             let t0 = Instant::now();
             let db_path = Path::new(&args[1]);
-            let gdb_opt = hooks::open_global_ldb_checked(None)?;
+            let gdb_opt = hooks::open_global_ldb_checked(global_override.as_deref())?;
             let seal_guard =
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
             let db = Arc::new(LibreDb::open(db_path)?);
@@ -1329,6 +1380,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         "handoff" => {
+            let (global_override, args) = extract_cli_global_flag(&args, 5)?;
             if args.len() < 5 {
                 return Err("Usage: libredb handoff <db.ldb> <handoff_id> <task_key> <role> [--notes <text>]".into());
             }
@@ -1337,7 +1389,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 notes = &args[6];
             }
             let db_path = Path::new(&args[1]);
-            let gdb_opt = hooks::open_global_ldb_checked(None)?;
+            let gdb_opt = hooks::open_global_ldb_checked(global_override.as_deref())?;
             let seal_guard =
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
             let db = Arc::new(LibreDb::open(db_path)?);
@@ -1346,6 +1398,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             print!("{block}");
         }
         "learn-assoc" => {
+            let (global_override, args) = extract_cli_global_flag(&args, 4)?;
             if args.len() < 4 {
                 return Err("Usage: libredb learn-assoc <db.ldb> <cue_phrase> <id1,id2,...>".into());
             }
@@ -1356,7 +1409,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .collect();
             let target_ids = target_ids?;
             let db_path = Path::new(&args[1]);
-            let gdb_opt = hooks::open_global_ldb_checked(None)?;
+            let gdb_opt = hooks::open_global_ldb_checked(global_override.as_deref())?;
             let seal_guard =
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
             let db = Arc::new(LibreDb::open(db_path)?);
@@ -1370,6 +1423,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         "learn-reflex" => {
+            let (global_override, args) = extract_cli_global_flag(&args, 4)?;
             if args.len() < 4 {
                 return Err("Usage: libredb learn-reflex <db.ldb> <id> <directive> [--stack s] [--action a] [--env e]".into());
             }
@@ -1396,7 +1450,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 i += 2;
             }
             let db_path = Path::new(&args[1]);
-            let gdb_opt = hooks::open_global_ldb_checked(None)?;
+            let gdb_opt = hooks::open_global_ldb_checked(global_override.as_deref())?;
             let seal_guard =
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
             let db = Arc::new(LibreDb::open(db_path)?);
@@ -1405,16 +1459,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("Learned situational reflex '{}' as node #{nid}", rule.id);
         }
         "import-sqlite" => {
+            let (global_override, args) = extract_cli_global_flag(&args, 3)?;
             if args.len() < 3 {
-                return Err("Usage: libredb import-sqlite <db.ldb> <source.db> [--scope central|project]".into());
+                return Err("Usage: libredb import-sqlite <db.ldb> <source.db> [--scope central|project] [--global <customizations.ldb>]".into());
             }
             let mut scope = "central";
-            if args.len() >= 5 && args[3] == "--scope" {
-                scope = &args[4];
+            let mut i = 3usize;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--scope" if i + 1 < args.len() => {
+                        scope = &args[i + 1];
+                        i += 2;
+                    }
+                    other => return Err(format!("Unknown import-sqlite flag '{other}'").into()),
+                }
             }
             let t0 = Instant::now();
             let db_path = Path::new(&args[1]);
-            let gdb_opt = hooks::open_global_ldb_checked(None)?;
+            let gdb_opt = hooks::open_global_ldb_checked(global_override.as_deref())?;
             let seal_guard = if scope == "central" {
                 security::PreMutationSealGuard::verify_before_write_allow_fresh_global_import(
                     gdb_opt.as_deref(),
@@ -1440,15 +1502,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         "export-sqlite" => {
+            let (global_override, args) = extract_cli_global_flag(&args, 3)?;
             if args.len() < 3 {
-                return Err("Usage: libredb export-sqlite <db.ldb> <reconstructed.db> [--scope central|project]".into());
+                return Err("Usage: libredb export-sqlite <db.ldb> <reconstructed.db> [--scope central|project] [--global <customizations.ldb>]".into());
             }
             let mut scope = "central";
-            if args.len() >= 5 && args[3] == "--scope" {
-                scope = &args[4];
+            let mut i = 3usize;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--scope" if i + 1 < args.len() => {
+                        scope = &args[i + 1];
+                        i += 2;
+                    }
+                    other => return Err(format!("Unknown export-sqlite flag '{other}'").into()),
+                }
             }
             let t0 = Instant::now();
-            let db = open_cli_verified_project_db(None, Path::new(&args[1]))?;
+            let db = open_cli_verified_project_db(global_override.as_deref(), Path::new(&args[1]))?;
             let rows = export_sqlite_database(&db, scope, Path::new(&args[2]))?;
             println!(
                 "[OK] Reconstructed SQLite '{}' (scope={}, {} rows + FTS5 indexes) in {:.2} ms",
@@ -1522,11 +1592,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("  Total round-trip time: {:.2} ms", elapsed_ms);
         }
         "init" => {
+            let (global_override, args) = extract_cli_global_flag(&args, 2)?;
             if args.len() < 2 {
-                return Err("Usage: libredb init <db.ldb>".into());
+                return Err("Usage: libredb init <db.ldb> [--global <customizations.ldb>]".into());
             }
             let db_path = Path::new(&args[1]);
-            let gdb_opt = hooks::open_global_ldb_checked(None)?;
+            let gdb_opt = hooks::open_global_ldb_checked(global_override.as_deref())?;
             let _seal_guard =
                 security::PreMutationSealGuard::verify_before_write_allow_fresh_global_import(
                     gdb_opt.as_deref(),
@@ -1540,6 +1611,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         "put" => {
+            let (global_override, args) = extract_cli_global_flag(&args, 4)?;
             if args.len() < 4 {
                 return Err("Usage: libredb put <db.ldb> <kind> <payload> [--key <k>] [--importance <0..255>] [--pin]".into());
             }
@@ -1579,7 +1651,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let db_path = Path::new(&args[1]);
-            let gdb_opt = hooks::open_global_ldb_checked(None)?;
+            let gdb_opt = hooks::open_global_ldb_checked(global_override.as_deref())?;
             let seal_guard =
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
             let db = LibreDb::open(db_path)?;
@@ -1596,25 +1668,28 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         "get" => {
+            let (global_override, args) = extract_cli_global_flag(&args, 3)?;
             if args.len() < 3 {
                 return Err("Usage: libredb get <db.ldb> <node_id>".into());
             }
-            let db = open_cli_verified_project_db(None, Path::new(&args[1]))?;
+            let db = open_cli_verified_project_db(global_override.as_deref(), Path::new(&args[1]))?;
             let id: u64 = args[2].parse()?;
             let rec = db.get(id)?;
             print_record(&rec);
         }
         "get-key" => {
+            let (global_override, args) = extract_cli_global_flag(&args, 4)?;
             if args.len() < 4 {
                 return Err("Usage: libredb get-key <db.ldb> <kind> <key>".into());
             }
             let kind = NodeKind::parse(&args[2])
                 .ok_or_else(|| format!("Unknown node kind '{}'", args[2]))?;
-            let db = open_cli_verified_project_db(None, Path::new(&args[1]))?;
+            let db = open_cli_verified_project_db(global_override.as_deref(), Path::new(&args[1]))?;
             let rec = db.get_by_key(kind, &args[3])?;
             print_record(&rec);
         }
         "link" => {
+            let (global_override, args) = extract_cli_global_flag(&args, 5)?;
             if args.len() < 5 {
                 return Err("Usage: libredb link <db.ldb> <src_id> <edge_kind> <dst_id> [--weight <0..255>]".into());
             }
@@ -1627,7 +1702,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 weight = args[6].parse()?;
             }
             let db_path = Path::new(&args[1]);
-            let gdb_opt = hooks::open_global_ldb_checked(None)?;
+            let gdb_opt = hooks::open_global_ldb_checked(global_override.as_deref())?;
             let seal_guard =
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
             let db = LibreDb::open(db_path)?;
@@ -1642,6 +1717,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         "deprecate" => {
+            let (global_override, args) = extract_cli_global_flag(&args, 4)?;
             if args.len() < 4 {
                 return Err("Usage: libredb deprecate <db.ldb> <kind> <key>".into());
             }
@@ -1655,7 +1731,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .into());
             }
             let db_path = Path::new(&args[1]);
-            let gdb_opt = hooks::open_global_ldb_checked(None)?;
+            let gdb_opt = hooks::open_global_ldb_checked(global_override.as_deref())?;
             let seal_guard =
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
             let db = LibreDb::open(db_path)?;
@@ -1668,6 +1744,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         "trace" => {
+            let (global_override, args) = extract_cli_global_flag(&args, 3)?;
             if args.len() < 3 {
                 return Err("Usage: libredb trace <db.ldb> <node_id> [--depth <n>]".into());
             }
@@ -1676,7 +1753,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             if args.len() >= 5 && args[3] == "--depth" {
                 depth = args[4].parse()?;
             }
-            let db = open_cli_verified_project_db(None, Path::new(&args[1]))?;
+            let db = open_cli_verified_project_db(global_override.as_deref(), Path::new(&args[1]))?;
             let chain = db.trace_lineage(root_id, depth)?;
             println!(
                 "Causal & temporal lineage from node #{root_id} ({} steps):",
@@ -1698,6 +1775,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         "recall" => {
+            let (global_override, args) = extract_cli_global_flag(&args, 3)?;
             if args.len() < 3 {
                 return Err("Usage: libredb recall <db.ldb> <seed_id> [--hops <n>] [--budget <tokens>]".into());
             }
@@ -1718,7 +1796,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     other => return Err(format!("Unknown flag '{other}'").into()),
                 }
             }
-            let db = open_cli_verified_project_db(None, Path::new(&args[1]))?;
+            let db = open_cli_verified_project_db(global_override.as_deref(), Path::new(&args[1]))?;
             let bundle = db.recall_within_budget(&[seed_id], hops, budget, false)?;
             println!(
                 "Recall bundle: {} nodes, {}/{} tokens, {} coalesced I/O read(s)",
@@ -1738,13 +1816,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         "compact" => {
+            let (global_override, args) = extract_cli_global_flag(&args, 2)?;
             if args.len() < 2 {
-                return Err("Usage: libredb compact <db.ldb> [--prune]".into());
+                return Err("Usage: libredb compact <db.ldb> [--prune] [--global <customizations.ldb>]".into());
             }
             let prune = args.iter().skip(2).any(|a| a == "--prune");
             let t0 = Instant::now();
             let db_path = Path::new(&args[1]);
-            let gdb_opt = hooks::open_global_ldb_checked(None)?;
+            let gdb_opt = hooks::open_global_ldb_checked(global_override.as_deref())?;
             let seal_guard =
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
             let db = Arc::new(LibreDb::open(db_path)?);

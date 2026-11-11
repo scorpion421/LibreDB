@@ -736,6 +736,18 @@ pub(crate) fn reap_abandoned_ephemeral_dirs(prefix: &str) -> usize {
                 continue;
             }
         }
+        let init_marker = dir_path.join(".initializing");
+        if let Ok(init_meta) = fs::symlink_metadata(&init_marker) {
+            let init_recent = init_meta
+                .modified()
+                .ok()
+                .and_then(|m| std::time::SystemTime::now().duration_since(m).ok())
+                .is_none_or(|age| age < std::time::Duration::from_secs(60));
+            if init_recent {
+                // Concurrent sibling process is between `DirBuilder::create` and `.owner.lock` acquisition.
+                continue;
+            }
+        }
         let sentinel = dir_path.join(".owner.lock");
         match fs::symlink_metadata(&sentinel) {
             Ok(s_meta) => {
@@ -799,6 +811,14 @@ pub(crate) fn create_private_ephemeral_dir(
         }
         match builder.create(&candidate) {
             Ok(()) => {
+                let init_marker = candidate.join(".initializing");
+                if let Err(e) = fs::write(&init_marker, b"1") {
+                    let _ = fs::remove_dir_all(&candidate);
+                    return Err(format!(
+                        "Failed to stage ephemeral init marker '{}': {e}",
+                        init_marker.display()
+                    ));
+                }
                 let sentinel = candidate.join(".owner.lock");
                 let lock_backend = match OsFileBackend::open(&sentinel) {
                     Ok(b) => b,
@@ -811,7 +831,10 @@ pub(crate) fn create_private_ephemeral_dir(
                     }
                 };
                 match lock_backend.try_lock_write_region() {
-                    Ok(true) => return Ok((candidate, lock_backend)),
+                    Ok(true) => {
+                        let _ = fs::remove_file(&init_marker);
+                        return Ok((candidate, lock_backend));
+                    }
                     Ok(false) => {
                         drop(lock_backend);
                         let _ = fs::remove_dir_all(&candidate);
@@ -1706,6 +1729,29 @@ impl PreMutationSealGuard {
         }
 
         let Some(gdb) = global_db else {
+            let is_agents_memory = resolved_db
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.eq_ignore_ascii_case(".agents"))
+                && resolved_db
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.eq_ignore_ascii_case("memory.ldb"));
+            if is_agents_memory && resolved_db.is_file() {
+                let db = LibreDb::open(&resolved_db).map_err(|e| {
+                    format!(
+                        "Refusing to mutate unreadable workspace memory '{}' without customizations.ldb: {e}",
+                        db_path.display()
+                    )
+                })?;
+                if db.get_by_key(NodeKind::Config, "sys::trust_seals").is_ok() {
+                    return Err(format!(
+                        "Workspace memory at '{}' carries a cryptographic trust seal, but global customizations.ldb is unavailable; pass '--global <customizations.ldb>' or initialize the host trust store before mutating it.",
+                        db_path.display()
+                    ));
+                }
+            }
             return Ok(Self {
                 authorized_ws: None,
                 _ws_lock: None,

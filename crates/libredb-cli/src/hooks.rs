@@ -297,11 +297,20 @@ pub(crate) fn evaluate_pre_tool_payload(payload: &Value, global_ldb_opt: Option<
             | "write_to_file"
             | "replace_file_content"
             | "multi_replace_file_content"
+            | "delete_file"
+            | "remove_file"
+            | "rename_file"
+            | "move_file"
     );
     let is_write_or_edit = is_explicit_write_tool
         || args.get("Content").is_some()
         || args.get("Replacement").is_some()
-        || args.get("ReplacementChunks").is_some();
+        || args.get("ReplacementChunks").is_some()
+        || args.get("CodeContent").is_some()
+        || args.get("ReplacementContent").is_some()
+        || args.get("content").is_some()
+        || args.get("replacement").is_some()
+        || args.get("new_string").is_some();
 
     if is_write_or_edit {
         if is_explicit_write_tool && target_file == "<tool_input>" {
@@ -1233,9 +1242,11 @@ fn extract_pre_tool_name_and_args(payload: &Value) -> (&str, &Value) {
 
     let tool_name = tc
         .get("toolName")
+        .or_else(|| tc.get("tool_name"))
         .or_else(|| tc.get("tool"))
         .or_else(|| tc.get("name"))
         .or_else(|| payload.get("toolName"))
+        .or_else(|| payload.get("tool_name"))
         .or_else(|| payload.get("tool"))
         .or_else(|| payload.get("name"))
         .and_then(Value::as_str)
