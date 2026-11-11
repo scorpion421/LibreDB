@@ -808,8 +808,17 @@ fn scan_transcripts_by_day(
     out
 }
 
+fn is_rooted_any_os(raw: &str) -> bool {
+    raw.starts_with('/')
+        || raw.starts_with('\\')
+        || (raw.len() >= 2
+            && raw.as_bytes()[0].is_ascii_alphabetic()
+            && raw.as_bytes()[1] == b':')
+}
+
 fn lexical_clean_slash(p: &Path) -> String {
-    let abs = if p.is_absolute() || p.has_root() {
+    let raw_in = p.to_string_lossy();
+    let abs = if p.is_absolute() || p.has_root() || is_rooted_any_os(&raw_in) {
         p.to_path_buf()
     } else {
         env::current_dir()
@@ -854,7 +863,7 @@ fn lexical_clean_slash(p: &Path) -> String {
 /// (`/private/var/folders/...`, junctions, or symlinked workspace roots), plus Windows JSON-escaped
 /// double-backslash (`d:\\...`) and `file:///d%3a/...` URI representations.
 fn build_workspace_needles(p: &Path) -> Vec<Vec<u8>> {
-    let mut slash_variants: Vec<String> = Vec::with_capacity(3);
+    let mut slash_variants: Vec<String> = Vec::with_capacity(4);
     let push_unique_str = |vec: &mut Vec<String>, s: String| {
         if !s.is_empty() && s != "/" && s != "//" && !vec.contains(&s) {
             vec.push(s);
@@ -863,26 +872,49 @@ fn build_workspace_needles(p: &Path) -> Vec<Vec<u8>> {
 
     push_unique_str(&mut slash_variants, lexical_clean_slash(p));
 
-    let canon_opt = crate::security::canonicalize_with_missing_tail(p)
-        .or_else(|| std::fs::canonicalize(p).ok());
-    if let Some(ref canon) = canon_opt {
-        push_unique_str(&mut slash_variants, lexical_clean_slash(canon));
+    let raw_p = p.to_string_lossy();
+    let is_foreign_os_path = if cfg!(windows) {
+        raw_p.starts_with('/') && !raw_p.starts_with("//")
+    } else {
+        raw_p.starts_with('\\')
+            || (raw_p.len() >= 2
+                && raw_p.as_bytes()[0].is_ascii_alphabetic()
+                && raw_p.as_bytes()[1] == b':')
+    };
 
-        // When `p` was already canonicalized upstream (e.g. `/private/var/...` or `/private/tmp/...`
-        // on macOS), also admit the unprefixed `/var/...` or `/tmp/...` alias iff it resolves back
-        // to the exact same canonical inode path on this host.
-        let canon_slash = canon.to_string_lossy().replace('\\', "/");
-        for firmlink_prefix in ["/private/var/", "/private/tmp/", "/private/etc/"] {
-            if canon_slash.starts_with(firmlink_prefix) {
-                let unprefixed = &canon_slash["/private".len()..];
-                let alt_canon =
-                    crate::security::canonicalize_with_missing_tail(Path::new(unprefixed))
-                        .or_else(|| std::fs::canonicalize(unprefixed).ok());
-                if alt_canon.as_ref() == Some(canon) {
-                    push_unique_str(
-                        &mut slash_variants,
-                        lexical_clean_slash(Path::new(unprefixed)),
-                    );
+    if !is_foreign_os_path {
+        if let Ok(link_target) = std::fs::read_link(p) {
+            let resolved_link = if link_target.is_absolute() {
+                link_target
+            } else {
+                p.parent()
+                    .map(|parent| parent.join(&link_target))
+                    .unwrap_or(link_target)
+            };
+            push_unique_str(&mut slash_variants, lexical_clean_slash(&resolved_link));
+        }
+
+        let canon_opt = crate::security::canonicalize_with_missing_tail(p)
+            .or_else(|| std::fs::canonicalize(p).ok());
+        if let Some(ref canon) = canon_opt {
+            push_unique_str(&mut slash_variants, lexical_clean_slash(canon));
+
+            // When `p` was already canonicalized upstream (e.g. `/private/var/...` or `/private/tmp/...`
+            // on macOS), also admit the unprefixed `/var/...` or `/tmp/...` alias iff it resolves back
+            // to the exact same canonical inode path on this host.
+            let canon_slash = canon.to_string_lossy().replace('\\', "/");
+            for firmlink_prefix in ["/private/var/", "/private/tmp/", "/private/etc/"] {
+                if canon_slash.starts_with(firmlink_prefix) {
+                    let unprefixed = &canon_slash["/private".len()..];
+                    let alt_canon =
+                        crate::security::canonicalize_with_missing_tail(Path::new(unprefixed))
+                            .or_else(|| std::fs::canonicalize(unprefixed).ok());
+                    if alt_canon.as_ref() == Some(canon) {
+                        push_unique_str(
+                            &mut slash_variants,
+                            lexical_clean_slash(Path::new(unprefixed)),
+                        );
+                    }
                 }
             }
         }
