@@ -698,9 +698,89 @@ pub fn is_admin_only_security_config_key(key: &str) -> bool {
     libredb_core::is_admin_only_security_config_key(key)
 }
 
+/// Scans `std::env::temp_dir()` for `prefix_*` directories orphaned by hard-crashed (`SIGKILL` /
+/// `TerminateProcess`) MCP server processes and removes ONLY directories whose `.owner.lock`
+/// sentinel is NOT held by any live OS file handle (plus lockless partial dirs older than 60s).
+/// Active MCP server processes hold an exclusive kernel lock on `.owner.lock` for their entire
+/// lifetime and are never disturbed.
+pub(crate) fn reap_abandoned_ephemeral_dirs(prefix: &str) -> usize {
+    let base = std::env::temp_dir();
+    let Ok(entries) = fs::read_dir(&base) else {
+        return 0;
+    };
+    let match_prefix = format!("{prefix}_");
+    let mut reaped = 0usize;
+    for entry_res in entries {
+        let Ok(entry) = entry_res else { continue };
+        let fname_os = entry.file_name();
+        let Some(fname) = fname_os.to_str() else {
+            continue;
+        };
+        if !fname.starts_with(&match_prefix) {
+            continue;
+        }
+        let dir_path = entry.path();
+        let Ok(meta) = fs::symlink_metadata(&dir_path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            extern "C" {
+                fn geteuid() -> u32;
+            }
+            if meta.uid() != unsafe { geteuid() } {
+                continue;
+            }
+        }
+        let sentinel = dir_path.join(".owner.lock");
+        match fs::symlink_metadata(&sentinel) {
+            Ok(s_meta) => {
+                if s_meta.file_type().is_symlink() || !s_meta.is_file() {
+                    continue;
+                }
+                let Ok(probe_lock) = OsFileBackend::open(&sentinel) else {
+                    continue;
+                };
+                match probe_lock.try_lock_write_region() {
+                    Ok(true) => {
+                        let _ = probe_lock.unlock_exclusive();
+                        drop(probe_lock);
+                        if fs::remove_dir_all(&dir_path).is_ok() {
+                            reaped += 1;
+                        }
+                    }
+                    Ok(false) | Err(_) => {
+                        // Active MCP process holds `.owner.lock`; never touch!
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let is_stale_partial = meta
+                    .modified()
+                    .ok()
+                    .and_then(|m| std::time::SystemTime::now().duration_since(m).ok())
+                    .is_some_and(|age| age >= std::time::Duration::from_secs(60));
+                if is_stale_partial && fs::remove_dir_all(&dir_path).is_ok() {
+                    reaped += 1;
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    reaped
+}
+
 /// Creates an owner-only (`0700` on Unix) CSPRNG-named ephemeral directory inside `std::env::temp_dir()`
-/// using non-recursive `DirBuilder::create` (atomic fail-if-exists semantics against pre-created symlinks).
-pub(crate) fn create_private_ephemeral_dir(prefix: &str) -> Result<PathBuf, String> {
+/// using non-recursive `DirBuilder::create` (atomic fail-if-exists semantics against pre-created symlinks)
+/// and acquires an exclusive kernel liveness lock on `<dir>/.owner.lock`.
+pub(crate) fn create_private_ephemeral_dir(
+    prefix: &str,
+) -> Result<(PathBuf, OsFileBackend), String> {
+    let _ = reap_abandoned_ephemeral_dirs(prefix);
     let base = std::env::temp_dir();
     for _ in 0..8 {
         let mut rnd = [0u8; 16];
@@ -718,7 +798,38 @@ pub(crate) fn create_private_ephemeral_dir(prefix: &str) -> Result<PathBuf, Stri
             builder.mode(0o700);
         }
         match builder.create(&candidate) {
-            Ok(()) => return Ok(candidate),
+            Ok(()) => {
+                let sentinel = candidate.join(".owner.lock");
+                let lock_backend = match OsFileBackend::open(&sentinel) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let _ = fs::remove_dir_all(&candidate);
+                        return Err(format!(
+                            "Failed to create ephemeral liveness sentinel '{}': {e}",
+                            sentinel.display()
+                        ));
+                    }
+                };
+                match lock_backend.try_lock_write_region() {
+                    Ok(true) => return Ok((candidate, lock_backend)),
+                    Ok(false) => {
+                        drop(lock_backend);
+                        let _ = fs::remove_dir_all(&candidate);
+                        return Err(format!(
+                            "Unexpected lock contention on fresh ephemeral sentinel '{}'",
+                            sentinel.display()
+                        ));
+                    }
+                    Err(e) => {
+                        drop(lock_backend);
+                        let _ = fs::remove_dir_all(&candidate);
+                        return Err(format!(
+                            "Failed to lock ephemeral sentinel '{}': {e}",
+                            sentinel.display()
+                        ));
+                    }
+                }
+            }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => {
                 return Err(format!(
@@ -752,7 +863,7 @@ pub fn workspace_id_config_key(norm: &str) -> String {
     format!("workspace_id::{}", hex_encode(&digest[..8]))
 }
 
-fn is_workspace_path_authorized_synced(gdb: &LibreDb, ws_root: &Path) -> bool {
+pub(crate) fn is_workspace_path_authorized_synced(gdb: &LibreDb, ws_root: &Path) -> bool {
     let norm = normalize_workspace_key(ws_root);
     match has_config_key_fail_closed(gdb, &format!("trust:revoked::{norm}")) {
         Ok(false) => {}
@@ -779,14 +890,21 @@ fn is_workspace_path_authorized_synced(gdb: &LibreDb, ws_root: &Path) -> bool {
     false
 }
 
+/// Returns true if the host administrator explicitly enabled `mcp:allow_untrusted_workspaces = true`
+/// inside `customizations.ldb`.
+pub(crate) fn is_mcp_untrusted_workspaces_allowed(gdb: &LibreDb) -> bool {
+    load_bool_config(Some(gdb), None, "mcp:allow_untrusted_workspaces", false)
+}
+
 /// Returns true if `ws_root` is authorized for `libredb-mcp` workspace operations according to
 /// an already-synchronized `global_db` (`trust:allowed::<ws>`, registered `workspace_id::*` /
 /// `workspace:*`, or explicit administrator opt-out `mcp:allow_untrusted_workspaces = true`).
+#[cfg(test)]
 pub(crate) fn is_mcp_workspace_authorized_in_global(gdb: &LibreDb, ws_root: &Path) -> bool {
     if is_workspace_path_authorized_synced(gdb, ws_root) {
         return true;
     }
-    load_bool_config(Some(gdb), None, "mcp:allow_untrusted_workspaces", false)
+    is_mcp_untrusted_workspaces_allowed(gdb)
 }
 
 /// Returns true if `ws_root` resides inside an Antigravity per-conversation private brain folder

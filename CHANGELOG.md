@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.4] - 2026-11-11
+
+### Added
+
+- Added non-blocking OS file-lock probes (`OsFileBackend::try_lock_write_region` and `OsFileBackend::unlock_exclusive` in `crates/libredb-core/src/io.rs`), crash-resilient `MCP` ephemeral directory liveness reaping (`reap_abandoned_ephemeral_dirs` and `.owner.lock` acquisition in `create_private_ephemeral_dir` in `crates/libredb-cli/src/security.rs`), stream-level `MCP` `2024-11-05` dynamic root refresh (`process_mcp_stream`, `replace_client_workspace_roots`, and `issue_roots_list_request` in `crates/libredb-cli/src/mcp.rs`), and 3 dedicated security and isolation regression tests (`mcp_nested_workspaces_always_select_most_specific_cognitive_brain_regardless_of_order`, `mcp_stream_refreshes_client_roots_on_list_changed_and_revokes_closed_workspaces`, and `mcp_reaps_orphaned_ephemeral_dbs_from_crashed_processes_without_touching_live_sessions` in `crates/libredb-cli/src/mcp.rs`, bringing the automated suite to 79 tests + 10k crash simulations).
+
+### Changed
+
+- Upgraded `process_mcp_stream` and `McpServerState` (`crates/libredb-cli/src/mcp.rs`) to support live workspace root changes during long-running `MCP` sessions: handling `notifications/initialized` (querying `roots/list` when `capabilities.roots` is advertised without inline `workspaceFolders`), `notifications/roots/list_changed` (immediately revoking stale client roots fail-closed, evicting removed `OverlayBrain` caches and ephemeral `.ldb` files, and issuing a fresh `roots/list` JSON-RPC request), and client `roots/list` responses.
+- Updated `McpServerState::new_with_workspace_root` and `create_private_ephemeral_dir` (`crates/libredb-cli/src/mcp.rs` and `crates/libredb-cli/src/security.rs`) so each running `MCP` server holds a kernel-enforced exclusive lock on `<ephemeral_dir>/.owner.lock` for its lifetime, allowing new `MCP` processes to reap orphaned `libredb_mcp_eph_*` directories left behind by `SIGKILL` / `TerminateProcess` crashes without ever disturbing active sessions.
+
+### Security
+
+- Fixed nested workspace brain selection in `authorize_mcp_workspace_path`, `resolve_explicit_hint_ldb_path`, and `run_locked_workspace_index` (`crates/libredb-cli/src/mcp.rs`): replaced registration-order `.iter().find(...)` matching and premature `find_owning_repo_or_agents_ancestor` upward walks with a strict deepest-prefix total order (`.max_by_key(|p| normalize_workspace_key(p).len())`) across `--workspace-root` (while preserving hard outer containment), `MCP` client roots (`initialize` / `roots/list`), and `customizations.ldb` trusted ancestors, guaranteeing that nested workspaces (`Projects/Main` + `Projects/Main/Subproject`) deterministically isolate reads, code-graph indexing, and `libredb_memorize` writes to the most specific authorized workspace regardless of root registration order.
+
 ## [0.10.3] - 2026-11-11
 
 ### Added

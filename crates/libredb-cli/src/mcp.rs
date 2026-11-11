@@ -38,9 +38,15 @@ pub struct McpServerState {
     /// MCP workspace and file operations are strictly confined within this directory regardless
     /// of caller-supplied `cwd` or other entries in `customizations.ldb`.
     pinned_workspace_root: Option<PathBuf>,
-    /// Workspace roots reported by the trusted MCP host client during the JSON-RPC `initialize`
-    /// handshake (`rootUri`, `rootPath`, `workspaceFolders`). Never controllable by tool calls.
+    /// Workspace roots reported by the trusted MCP host client during `initialize` or updated
+    /// dynamically via `notifications/roots/list_changed` -> `roots/list`. Never controllable by tool calls.
     client_workspace_roots: Vec<PathBuf>,
+    /// True if the MCP host client advertised `capabilities.roots` during `initialize`.
+    client_supports_roots: bool,
+    /// Monotonic counter for server-initiated `roots/list` JSON-RPC queries.
+    next_server_req_seq: u64,
+    /// In-flight server-to-client `roots/list` request ID awaiting a JSON-RPC response on stdin.
+    pending_roots_request_id: Option<String>,
     /// Keyed by `canonical_brain_cache_key(db_path)` so relative paths, `..` segments, symlinks,
     /// and Windows casing variants always address and evict the exact same cached `OverlayBrain`.
     brains: HashMap<String, OverlayBrain>,
@@ -48,11 +54,18 @@ pub struct McpServerState {
     /// opened before `.agents/memory.ldb` exists or when `customizations.ldb` is absent, ensuring
     /// read/code MCP tools never materialize unsealed `.agents/memory.ldb` files inside repos.
     ephemeral_dir: Option<PathBuf>,
+    /// Exclusive kernel file lock on `<ephemeral_dir>/.owner.lock` held for the lifetime of this
+    /// server so crashed (`SIGKILL`) directories can be reaped without touching active sessions.
+    ephemeral_lock: Option<libredb_core::OsFileBackend>,
 }
 
 impl Drop for McpServerState {
     fn drop(&mut self) {
         self.brains.clear();
+        if let Some(lock_backend) = self.ephemeral_lock.take() {
+            let _ = lock_backend.unlock_exclusive();
+            drop(lock_backend);
+        }
         if let Some(dir) = self.ephemeral_dir.take() {
             let _ = std::fs::remove_dir_all(dir);
         }
@@ -238,28 +251,21 @@ pub(crate) fn parse_file_uri_or_path(raw: &str) -> Option<PathBuf> {
 /// contend on the exact same lock identity.
 pub(crate) fn resolve_canonical_workspace_lock_root(
     proj_db: &LibreDb,
-    fallback_dir: &Path,
+    authorized_ws_root: &Path,
 ) -> PathBuf {
     if let Some(db_path) = proj_db.path() {
         if let Some(ws_root) = workspace_root_from_agents_ldb(db_path) {
             return ws_root;
         }
     }
-    let abs = if fallback_dir.is_relative() {
+    let abs = if authorized_ws_root.is_relative() {
         std::env::current_dir()
-            .map(|cwd| cwd.join(fallback_dir))
-            .unwrap_or_else(|_| fallback_dir.to_path_buf())
+            .map(|cwd| cwd.join(authorized_ws_root))
+            .unwrap_or_else(|_| authorized_ws_root.to_path_buf())
     } else {
-        fallback_dir.to_path_buf()
+        authorized_ws_root.to_path_buf()
     };
-    let canon = crate::security::canonicalize_with_missing_tail(&abs).unwrap_or(abs);
-    if let Some(repo_anc) = find_owning_repo_or_agents_ancestor(&canon) {
-        return repo_anc;
-    }
-    if let Some(found_root) = find_workspace_root(&canon) {
-        return crate::security::canonicalize_with_missing_tail(&found_root).unwrap_or(found_root);
-    }
-    canon
+    crate::security::canonicalize_with_missing_tail(&abs).unwrap_or(abs)
 }
 
 fn find_owning_repo_or_agents_ancestor(start_dir: &Path) -> Option<PathBuf> {
@@ -313,6 +319,7 @@ impl McpServerState {
                 let def = default_global_ldb_path();
                 def.is_file().then_some(def)
             });
+        let _ = crate::security::reap_abandoned_ephemeral_dirs("libredb_mcp_eph");
         let global_db = open_global_ldb_checked(global_path)?;
 
         Ok(Self {
@@ -321,43 +328,40 @@ impl McpServerState {
             global_db,
             pinned_workspace_root,
             client_workspace_roots: Vec::new(),
+            client_supports_roots: false,
+            next_server_req_seq: 0,
+            pending_roots_request_id: None,
             brains: HashMap::new(),
             ephemeral_dir: None,
+            ephemeral_lock: None,
         })
+    }
+
+    #[cfg(test)]
+    fn simulate_hard_crash_for_test(mut self) -> Option<PathBuf> {
+        self.brains.clear();
+        if let Some(lock_backend) = self.ephemeral_lock.take() {
+            let _ = lock_backend.unlock_exclusive();
+            drop(lock_backend);
+        }
+        // Take `ephemeral_dir` before `Drop` runs so `remove_dir_all` is skipped, faithfully
+        // reproducing OS kernel file-descriptor teardown after `SIGKILL` / `TerminateProcess`.
+        self.ephemeral_dir.take()
     }
 
     fn ephemeral_workspace_ldb_path(&mut self, ws_root: &Path) -> Result<PathBuf, String> {
         if self.ephemeral_dir.is_none() {
-            self.ephemeral_dir = Some(crate::security::create_private_ephemeral_dir(
-                "libredb_mcp_eph",
-            )?);
+            let (dir, lock_backend) =
+                crate::security::create_private_ephemeral_dir("libredb_mcp_eph")?;
+            self.ephemeral_dir = Some(dir);
+            self.ephemeral_lock = Some(lock_backend);
         }
         let dir = self.ephemeral_dir.as_ref().unwrap();
         Ok(dir.join(crate::security::ephemeral_workspace_ldb_filename(ws_root)))
     }
 
-    pub(crate) fn register_initialize_roots(&mut self, params: &Value) {
-        let mut candidates: Vec<PathBuf> = Vec::new();
-        for key in ["rootUri", "rootPath"] {
-            if let Some(s) = params.get(key).and_then(Value::as_str) {
-                if let Some(p) = parse_file_uri_or_path(s) {
-                    candidates.push(p);
-                }
-            }
-        }
-        if let Some(arr) = params.get("workspaceFolders").and_then(Value::as_array) {
-            for item in arr {
-                if let Some(u) = item
-                    .get("uri")
-                    .or_else(|| item.get("path"))
-                    .and_then(Value::as_str)
-                {
-                    if let Some(p) = parse_file_uri_or_path(u) {
-                        candidates.push(p);
-                    }
-                }
-            }
-        }
+    pub(crate) fn replace_client_workspace_roots(&mut self, candidates: Vec<PathBuf>) {
+        let mut next_roots: Vec<PathBuf> = Vec::new();
         for cand in candidates {
             if let Some(ref pin) = self.pinned_workspace_root {
                 if crate::security::check_mcp_workspace_containment(&cand, pin).is_some() {
@@ -365,14 +369,69 @@ impl McpServerState {
                 }
             }
             let cand_norm = crate::security::normalize_workspace_key(&cand);
-            if !self
-                .client_workspace_roots
+            if !next_roots
                 .iter()
                 .any(|existing| crate::security::normalize_workspace_key(existing) == cand_norm)
             {
-                self.client_workspace_roots.push(cand);
+                next_roots.push(cand);
             }
         }
+
+        for old_root in &self.client_workspace_roots {
+            let old_norm = crate::security::normalize_workspace_key(old_root);
+            let still_present = next_roots
+                .iter()
+                .any(|nr| crate::security::normalize_workspace_key(nr) == old_norm);
+            if !still_present {
+                let old_ldb = old_root.join(".agents").join("memory.ldb");
+                self.brains.remove(&canonical_brain_cache_key(&old_ldb));
+                if let Some(ref dir) = self.ephemeral_dir {
+                    let eph_file = dir.join(crate::security::ephemeral_workspace_ldb_filename(old_root));
+                    self.brains.remove(&canonical_brain_cache_key(&eph_file));
+                    let _ = std::fs::remove_file(&eph_file);
+                }
+                let stale_keys: Vec<String> = self
+                    .brains
+                    .iter()
+                    .filter_map(|(k, b)| {
+                        let p = b.project_db().path()?;
+                        let in_old =
+                            crate::security::check_mcp_workspace_containment(p, old_root).is_none();
+                        let in_next = next_roots
+                            .iter()
+                            .any(|nr| crate::security::check_mcp_workspace_containment(p, nr).is_none());
+                        (in_old && !in_next).then(|| k.clone())
+                    })
+                    .collect();
+                for sk in stale_keys {
+                    self.brains.remove(&sk);
+                }
+            }
+        }
+
+        self.client_workspace_roots = next_roots;
+    }
+
+    pub(crate) fn register_initialize_roots(&mut self, params: &Value) {
+        self.client_supports_roots = params
+            .get("capabilities")
+            .and_then(|c| c.get("roots"))
+            .is_some();
+        self.pending_roots_request_id = None;
+        let candidates = extract_workspace_roots_from_value(params);
+        self.replace_client_workspace_roots(candidates);
+    }
+
+    fn issue_roots_list_request(&mut self) -> Value {
+        self.next_server_req_seq = self.next_server_req_seq.saturating_add(1);
+        let req_id = format!("libredb-roots-{}", self.next_server_req_seq);
+        self.pending_roots_request_id = Some(req_id.clone());
+        json!({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "method": "roots/list",
+            "params": {}
+        })
     }
 
     fn sync_global_db_or_purge(&mut self) -> Result<(), String> {
@@ -411,9 +470,9 @@ impl McpServerState {
     }
 
     /// Validates `candidate_dir` against server-side workspace boundaries (`pinned_workspace_root`,
-    /// MCP `initialize` `client_workspace_roots`, or `customizations.ldb` trusted workspaces) and
-    /// returns the canonical authorized workspace root on success. Never falls back to accepting
-    /// self-declared `cwd` paths when `customizations.ldb` is absent.
+    /// MCP `initialize` / `roots/list` `client_workspace_roots`, or `customizations.ldb` trusted
+    /// workspaces) and returns the MOST SPECIFIC (deepest) canonical authorized workspace root.
+    /// Never depends on client root registration order and never falls back to self-declared `cwd`.
     fn authorize_mcp_workspace_path(
         &mut self,
         candidate_dir: &Path,
@@ -444,7 +503,10 @@ impl McpServerState {
             ));
         }
 
+        let mut candidates_by_specificity: Vec<PathBuf> = Vec::new();
+
         // 1. Hard server pin (`--workspace-root`, `LIBREDB_MCP_WORKSPACE_ROOT`, or `--project`):
+        //    Enforces a strict outer containment boundary on `canon` before considering nested roots.
         if let Some(ref pin_root) = self.pinned_workspace_root {
             if let Some(err) = crate::security::check_mcp_workspace_containment(&canon, pin_root) {
                 return Err(err);
@@ -456,58 +518,80 @@ impl McpServerState {
                     pin_root.display()
                 ));
             }
-            return Ok(pin_root.clone());
+            candidates_by_specificity.push(pin_root.clone());
         }
 
-        // 2. Trusted MCP host client `initialize` roots (`rootUri` / `workspaceFolders`):
-        if let Some(matched_client_root) = self
+        // 2. Trusted MCP host client roots (`initialize` / `roots/list`):
+        //    Always select the deepest containing workspace root (`max_by_key`), never `.iter().find()`.
+        if let Some(deepest_client_root) = self
             .client_workspace_roots
             .iter()
-            .find(|cr| crate::security::check_mcp_workspace_containment(&canon, cr).is_none())
+            .filter(|cr| crate::security::check_mcp_workspace_containment(&canon, cr).is_none())
+            .max_by_key(|cr| crate::security::normalize_workspace_key(cr).len())
             .cloned()
         {
-            if !crate::security::is_workspace_memory_trusted(
-                self.global_db.as_deref(),
-                &matched_client_root,
-            ) {
-                return Err(format!(
-                    "LibreDB MCP access denied: workspace memory in '{}' is untrusted, tampered, or rolled back; run 'libredb trust \"{}\"' in a terminal.",
-                    matched_client_root.display(),
-                    matched_client_root.display()
-                ));
-            }
-            return Ok(matched_client_root);
+            candidates_by_specificity.push(deepest_client_root);
         }
 
-        // 3. Server-side `customizations.ldb` workspace authorization:
+        // 3. Server-side `customizations.ldb` explicitly authorized workspaces:
+        //    Walking upward from `canon` yields the deepest explicitly authorized workspace first.
         if let Some(ref gdb) = self.global_db {
-            let mut matched_auth_root: Option<PathBuf> = None;
             let mut cur = Some(canon.as_path());
             while let Some(anc) = cur {
                 if crate::security::is_forbidden_mcp_workspace_root(anc) {
                     break;
                 }
-                if crate::security::is_mcp_workspace_authorized_in_global(gdb, anc) {
-                    matched_auth_root = Some(anc.to_path_buf());
+                if crate::security::is_workspace_path_authorized_synced(gdb, anc) {
+                    candidates_by_specificity.push(anc.to_path_buf());
                     break;
                 }
                 cur = anc.parent();
             }
-            let Some(auth_root) = matched_auth_root else {
-                return Err(format!(
-                    "LibreDB MCP access denied: workspace '{}' is not authorized on the server (neither pinned via '--workspace-root', declared in MCP 'initialize' roots, nor trusted in customizations.ldb). Run 'libredb trust \"{}\"' in a terminal if you trust this workspace.",
-                    candidate_dir.display(),
-                    canon.display()
-                ));
-            };
-            if !crate::security::is_workspace_memory_trusted(Some(gdb), &auth_root) {
+        }
+
+        if let Some(selected_root) = candidates_by_specificity
+            .into_iter()
+            .max_by_key(|p| crate::security::normalize_workspace_key(p).len())
+        {
+            if !crate::security::is_workspace_memory_trusted(
+                self.global_db.as_deref(),
+                &selected_root,
+            ) {
                 return Err(format!(
                     "LibreDB MCP access denied: workspace memory in '{}' is untrusted, tampered, or rolled back; run 'libredb trust \"{}\"' in a terminal.",
-                    auth_root.display(),
-                    auth_root.display()
+                    selected_root.display(),
+                    selected_root.display()
                 ));
             }
-            return Ok(auth_root);
+            return Ok(selected_root);
+        }
+
+        // 4. Optional administrator opt-out (`mcp:allow_untrusted_workspaces = true` in `customizations.ldb`):
+        if let Some(ref gdb) = self.global_db {
+            if crate::security::is_mcp_untrusted_workspaces_allowed(gdb) {
+                let inferred_root = find_owning_repo_or_agents_ancestor(&canon)
+                    .or_else(|| find_workspace_root(&canon))
+                    .unwrap_or_else(|| canon.clone());
+                if crate::security::is_forbidden_mcp_workspace_root(&inferred_root) {
+                    return Err(format!(
+                        "LibreDB MCP access denied: '{}' is a forbidden workspace root",
+                        candidate_dir.display()
+                    ));
+                }
+                if !crate::security::is_workspace_memory_trusted(Some(gdb), &inferred_root) {
+                    return Err(format!(
+                        "LibreDB MCP access denied: workspace memory in '{}' is untrusted, tampered, or rolled back; run 'libredb trust \"{}\"' in a terminal.",
+                        inferred_root.display(),
+                        inferred_root.display()
+                    ));
+                }
+                return Ok(inferred_root);
+            }
+            return Err(format!(
+                "LibreDB MCP access denied: workspace '{}' is not authorized on the server (neither pinned via '--workspace-root', declared in MCP 'initialize' roots, nor trusted in customizations.ldb). Run 'libredb trust \"{}\"' in a terminal if you trust this workspace.",
+                candidate_dir.display(),
+                canon.display()
+            ));
         }
 
         Err(format!(
@@ -627,6 +711,7 @@ impl McpServerState {
     fn run_locked_workspace_index(
         &mut self,
         proj_db: &Arc<LibreDb>,
+        ws_root: &Path,
         scan_dir: &Path,
         brain_hint: Option<&str>,
         cid_opt: Option<&str>,
@@ -637,7 +722,7 @@ impl McpServerState {
                 scan_dir.display()
             ));
         }
-        let lock_root = resolve_canonical_workspace_lock_root(proj_db, scan_dir);
+        let lock_root = resolve_canonical_workspace_lock_root(proj_db, ws_root);
         let _idx_lock = match self
             .global_db
             .as_deref()
@@ -1008,9 +1093,20 @@ pub fn run_mcp_stdio_server_with_workspace_root(
     let stdin = io::stdin();
     let mut reader = stdin.lock();
     let mut stdout = io::stdout();
+    process_mcp_stream(&mut reader, &mut stdout, &mut state)?;
+    Ok(())
+}
 
+/// Processes a newline-delimited JSON-RPC 2.0 MCP stream, handling requests, client notifications
+/// (`notifications/initialized`, `notifications/roots/list_changed`), and client responses to
+/// server-initiated `roots/list` refreshes.
+pub fn process_mcp_stream<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    state: &mut McpServerState,
+) -> io::Result<()> {
     loop {
-        let line = match read_bounded_jsonrpc_line(&mut reader, MAX_MCP_LINE_BYTES) {
+        let line = match read_bounded_jsonrpc_line(reader, MAX_MCP_LINE_BYTES) {
             Ok(BoundedLineRead::Eof) => break,
             Ok(BoundedLineRead::Oversized) => {
                 let err_resp = json!({
@@ -1018,8 +1114,8 @@ pub fn run_mcp_stdio_server_with_workspace_root(
                     "id": Value::Null,
                     "error": { "code": -32700, "message": "Parse error: JSON-RPC line exceeded 16 MiB limit" }
                 });
-                writeln!(stdout, "{err_resp}")?;
-                stdout.flush()?;
+                writeln!(writer, "{err_resp}")?;
+                writer.flush()?;
                 continue;
             }
             Ok(BoundedLineRead::Line(l)) => l,
@@ -1029,8 +1125,8 @@ pub fn run_mcp_stdio_server_with_workspace_root(
                     "id": Value::Null,
                     "error": { "code": -32700, "message": format!("Parse error: {e}") }
                 });
-                writeln!(stdout, "{err_resp}")?;
-                stdout.flush()?;
+                writeln!(writer, "{err_resp}")?;
+                writer.flush()?;
                 continue;
             }
         };
@@ -1047,22 +1143,69 @@ pub fn run_mcp_stdio_server_with_workspace_root(
                     "id": Value::Null,
                     "error": { "code": -32700, "message": format!("Parse error: {e}") }
                 });
-                writeln!(stdout, "{err_resp}")?;
-                stdout.flush()?;
+                writeln!(writer, "{err_resp}")?;
+                writer.flush()?;
                 continue;
             }
         };
+
+        // Handle JSON-RPC responses from the MCP host client to server-initiated `roots/list` queries:
+        if req.get("method").is_none() {
+            if let (Some(resp_id), Some(expected_id)) = (
+                req.get("id").and_then(Value::as_str),
+                state.pending_roots_request_id.as_deref(),
+            ) {
+                if resp_id == expected_id {
+                    state.pending_roots_request_id = None;
+                    if let Some(result_obj) = req.get("result") {
+                        let updated = extract_workspace_roots_from_value(result_obj);
+                        state.replace_client_workspace_roots(updated);
+                    } else {
+                        state.replace_client_workspace_roots(Vec::new());
+                    }
+                }
+            }
+            continue;
+        }
 
         let id = req.get("id").cloned();
         let method = req.get("method").and_then(Value::as_str).unwrap_or("");
         let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
 
+        // Handle JSON-RPC notifications (no `id` member):
         if id.is_none() {
+            match method {
+                "notifications/roots/list_changed" => {
+                    state.client_supports_roots = true;
+                    if has_explicit_root_fields(&params) {
+                        state.pending_roots_request_id = None;
+                        let updated = extract_workspace_roots_from_value(&params);
+                        state.replace_client_workspace_roots(updated);
+                    } else {
+                        // Fail closed immediately for any closed workspace while querying fresh `roots/list`.
+                        state.replace_client_workspace_roots(Vec::new());
+                        let roots_req = state.issue_roots_list_request();
+                        writeln!(writer, "{roots_req}")?;
+                        writer.flush()?;
+                    }
+                }
+                "notifications/initialized" => {
+                    if state.client_supports_roots
+                        && state.client_workspace_roots.is_empty()
+                        && state.pending_roots_request_id.is_none()
+                    {
+                        let roots_req = state.issue_roots_list_request();
+                        writeln!(writer, "{roots_req}")?;
+                        writer.flush()?;
+                    }
+                }
+                _ => {}
+            }
             continue;
         }
         let req_id = id.unwrap();
 
-        let response = match handle_rpc_method(method, &params, &mut state) {
+        let response = match handle_rpc_method(method, &params, state) {
             Ok(result_val) => json!({
                 "jsonrpc": "2.0",
                 "id": req_id,
@@ -1075,11 +1218,48 @@ pub fn run_mcp_stdio_server_with_workspace_root(
             }),
         };
 
-        writeln!(stdout, "{response}")?;
-        stdout.flush()?;
+        writeln!(writer, "{response}")?;
+        writer.flush()?;
     }
 
     Ok(())
+}
+
+fn has_explicit_root_fields(val: &Value) -> bool {
+    let Some(obj) = val.as_object() else {
+        return false;
+    };
+    obj.contains_key("roots")
+        || obj.contains_key("workspaceFolders")
+        || obj.contains_key("rootUri")
+        || obj.contains_key("rootPath")
+}
+
+fn extract_workspace_roots_from_value(val: &Value) -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for key in ["rootUri", "rootPath"] {
+        if let Some(s) = val.get(key).and_then(Value::as_str) {
+            if let Some(p) = parse_file_uri_or_path(s) {
+                candidates.push(p);
+            }
+        }
+    }
+    for arr_key in ["workspaceFolders", "roots"] {
+        if let Some(arr) = val.get(arr_key).and_then(Value::as_array) {
+            for item in arr {
+                if let Some(u) = item
+                    .get("uri")
+                    .or_else(|| item.get("path"))
+                    .and_then(Value::as_str)
+                {
+                    if let Some(p) = parse_file_uri_or_path(u) {
+                        candidates.push(p);
+                    }
+                }
+            }
+        }
+    }
+    candidates
 }
 
 pub fn handle_rpc_method(
@@ -1098,6 +1278,16 @@ pub fn handle_rpc_method(
                     "version": env!("CARGO_PKG_VERSION")
                 }
             }))
+        }
+        "notifications/roots/list_changed" => {
+            if has_explicit_root_fields(params) {
+                state.pending_roots_request_id = None;
+                let updated = extract_workspace_roots_from_value(params);
+                state.replace_client_workspace_roots(updated);
+            } else {
+                state.replace_client_workspace_roots(Vec::new());
+            }
+            Ok(json!({}))
         }
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({
@@ -1389,6 +1579,7 @@ fn dispatch_tool(
                     state.run_locked_workspace_index(
                         &proj_db,
                         &ws_root,
+                        &ws_root,
                         Some(&ws_root_str),
                         cid_arg,
                     )?;
@@ -1403,6 +1594,7 @@ fn dispatch_tool(
                     state.run_locked_workspace_index(
                         &proj_db,
                         &ws_root,
+                        &ws_root,
                         Some(&ws_root_str),
                         cid_arg,
                     )?;
@@ -1415,6 +1607,7 @@ fn dispatch_tool(
                     check_target_access(&resolved_target)?;
                     let rep = state.run_locked_workspace_index(
                         &proj_db,
+                        &ws_root,
                         &resolved_target,
                         Some(&ws_root_str),
                         cid_arg,
@@ -1777,11 +1970,10 @@ fn resolve_explicit_hint_ldb_path(probe: &Path) -> Result<PathBuf, String> {
             probe.display()
         ));
     }
-    if let Some(repo_anc) = find_owning_repo_or_agents_ancestor(start_dir) {
-        return Ok(repo_anc.join(".agents").join("memory.ldb"));
-    }
-    if let Some(root) = find_workspace_root(start_dir) {
-        return Ok(root.join(".agents").join("memory.ldb"));
+    if crate::security::is_private_brain_workspace(start_dir) {
+        if let Some(repo_anc) = find_owning_repo_or_agents_ancestor(start_dir) {
+            return Ok(repo_anc.join(".agents").join("memory.ldb"));
+        }
     }
     Ok(start_dir.join(".agents").join("memory.ldb"))
 }
@@ -2831,6 +3023,602 @@ mod tests {
             "Pinned workspace without customizations.ldb MUST NOT leave unsealed .agents/memory.ldb on disk!"
         );
         drop(pinned_no_global);
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn mcp_nested_workspaces_always_select_most_specific_cognitive_brain_regardless_of_order() {
+        use super::handle_rpc_method;
+        use libredb_cognitive::CognitiveEngine;
+        use serde_json::json;
+        use std::sync::Arc;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "libredb_mcp_nested_ws_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let main_ws = tmp.join("Projects").join("Main");
+        let sub_ws = main_ws.join("Subproject");
+        let clean_sub_ws = main_ws.join("CleanSub");
+        fs::create_dir_all(main_ws.join(".git")).unwrap();
+        fs::create_dir_all(main_ws.join(".agents")).unwrap();
+        fs::create_dir_all(main_ws.join("src")).unwrap();
+        fs::create_dir_all(sub_ws.join(".agents")).unwrap();
+        fs::create_dir_all(sub_ws.join("src")).unwrap();
+        fs::create_dir_all(clean_sub_ws.join("src")).unwrap();
+
+        fs::write(
+            main_ws.join("src").join("main_mod.rs"),
+            "pub fn parent_main_entry() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            sub_ws.join("src").join("sub_mod.rs"),
+            "pub fn child_sub_entry() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            clean_sub_ws.join("src").join("clean_mod.rs"),
+            "pub fn clean_nested_entry() {}\n",
+        )
+        .unwrap();
+
+        let global_path = tmp.join("customizations.ldb");
+        let main_ldb = main_ws.join(".agents").join("memory.ldb");
+        let sub_ldb = sub_ws.join(".agents").join("memory.ldb");
+
+        {
+            let gdb = LibreDb::open(&global_path).unwrap();
+
+            let pdb_main = Arc::new(LibreDb::open(&main_ldb).unwrap());
+            pdb_main
+                .put(
+                    WriteRequest::new(NodeKind::Fact, b"ws_role = parent_main_marker".to_vec())
+                        .with_key("ws_role"),
+                )
+                .unwrap();
+            let mut cog_main = CognitiveEngine::open_db(Arc::clone(&pdb_main)).unwrap();
+            cog_main.save_index_snapshot().unwrap();
+            crate::security::seal_workspace_memory(&gdb, &pdb_main, &main_ws).unwrap();
+
+            let pdb_sub = Arc::new(LibreDb::open(&sub_ldb).unwrap());
+            pdb_sub
+                .put(
+                    WriteRequest::new(NodeKind::Fact, b"ws_role = child_sub_marker".to_vec())
+                        .with_key("ws_role"),
+                )
+                .unwrap();
+            let mut cog_sub = CognitiveEngine::open_db(Arc::clone(&pdb_sub)).unwrap();
+            cog_sub.save_index_snapshot().unwrap();
+            crate::security::seal_workspace_memory(&gdb, &pdb_sub, &sub_ws).unwrap();
+        }
+
+        let to_file_uri = |p: &std::path::Path| -> String {
+            format!(
+                "file:///{}",
+                p.to_string_lossy()
+                    .replace('\\', "/")
+                    .trim_start_matches('/')
+            )
+        };
+        let main_uri = to_file_uri(&main_ws);
+        let sub_uri = to_file_uri(&sub_ws);
+        let clean_sub_uri = to_file_uri(&clean_sub_ws);
+
+        // 1. Register `[Main, Main/Subproject]` (parent FIRST, child SECOND) - previously `.iter().find`
+        //    returned `Main` instead of `Main/Subproject`!
+        let mut state_parent_first = McpServerState::new_with_workspace_root(
+            None,
+            Some(&global_path),
+            None,
+        )
+        .unwrap();
+        handle_rpc_method(
+            "initialize",
+            &json!({
+                "workspaceFolders": [
+                    { "uri": main_uri, "name": "Main" },
+                    { "uri": sub_uri, "name": "Subproject" }
+                ]
+            }),
+            &mut state_parent_first,
+        )
+        .unwrap();
+
+        let sub_pulse = handle_rpc_method(
+            "tools/call",
+            &json!({
+                "name": "libredb_pulse",
+                "arguments": {
+                    "query": "ws_role",
+                    "cwd": sub_ws.to_string_lossy().to_string()
+                }
+            }),
+            &mut state_parent_first,
+        )
+        .unwrap();
+        let sub_pulse_txt = sub_pulse["content"][0]["text"].as_str().unwrap();
+        assert!(
+            sub_pulse_txt.contains("child_sub_marker")
+                && !sub_pulse_txt.contains("parent_main_marker"),
+            "Nested Subproject pulse MUST read child_sub_marker from Subproject, never parent_main_marker: {sub_pulse_txt}"
+        );
+
+        handle_rpc_method(
+            "tools/call",
+            &json!({
+                "name": "libredb_code",
+                "arguments": {
+                    "action": "index",
+                    "cwd": sub_ws.to_string_lossy().to_string(),
+                    "target": "."
+                }
+            }),
+            &mut state_parent_first,
+        )
+        .unwrap();
+
+        // Indexing `Subproject` MUST populate `Subproject/.agents/memory.ldb` and leave `Main/.agents/memory.ldb` untouched:
+        {
+            let pdb_main = LibreDb::open(&main_ldb).unwrap();
+            let pdb_sub = LibreDb::open(&sub_ldb).unwrap();
+            assert!(
+                pdb_main.list_inodes(Some(NodeKind::Symbol), false).is_empty(),
+                "Indexing nested Subproject MUST NOT write Symbol nodes into parent Main/.agents/memory.ldb!"
+            );
+            assert!(
+                !pdb_sub.list_inodes(Some(NodeKind::Symbol), false).is_empty(),
+                "Indexing nested Subproject MUST write Symbol nodes into Subproject/.agents/memory.ldb!"
+            );
+        }
+
+        // Memorizing from a subdirectory (`Main/Subproject/src`) MUST persist and seal into
+        // `Main/Subproject/.agents/memory.ldb` (neither `Main` nor `Main/Subproject/src/.agents`):
+        handle_rpc_method(
+            "tools/call",
+            &json!({
+                "name": "libredb_memorize",
+                "arguments": {
+                    "cwd": sub_ws.join("src").to_string_lossy().to_string(),
+                    "facts": { "nested_write_scope": "strictly_child_subproject" }
+                }
+            }),
+            &mut state_parent_first,
+        )
+        .unwrap();
+        assert!(
+            !sub_ws.join("src").join(".agents").exists(),
+            "Memorizing from Subproject/src MUST NOT create Subproject/src/.agents!"
+        );
+        {
+            let gdb = LibreDb::open(&global_path).unwrap();
+            let pdb_main = LibreDb::open(&main_ldb).unwrap();
+            let pdb_sub = LibreDb::open(&sub_ldb).unwrap();
+            assert!(pdb_main.get_by_key(NodeKind::Fact, "nested_write_scope").is_err());
+            assert!(pdb_sub.get_by_key(NodeKind::Fact, "nested_write_scope").is_ok());
+            assert!(crate::security::is_workspace_memory_trusted(Some(&gdb), &main_ws));
+            assert!(crate::security::is_workspace_memory_trusted(Some(&gdb), &sub_ws));
+        }
+
+        // Omitted-`cwd` absolute target inside `Subproject` MUST also resolve to `Subproject`:
+        let skel_res = handle_rpc_method(
+            "tools/call",
+            &json!({
+                "name": "libredb_code",
+                "arguments": {
+                    "action": "skeleton",
+                    "target": sub_ws.join("src").join("sub_mod.rs").to_string_lossy().to_string()
+                }
+            }),
+            &mut state_parent_first,
+        )
+        .unwrap();
+        assert!(skel_res["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("child_sub_entry"));
+        drop(state_parent_first);
+
+        // 2. Reverse registration order `[Main/Subproject, Main]` AND cross-source nesting
+        //    `[Main, Main/CleanSub]` (where `CleanSub` has NO `.agents` and NO `.git` inside `Main`'s `.git` tree):
+        let mut state_child_first = McpServerState::new_with_workspace_root(
+            None,
+            Some(&global_path),
+            None,
+        )
+        .unwrap();
+        handle_rpc_method(
+            "initialize",
+            &json!({
+                "workspaceFolders": [
+                    { "uri": sub_uri, "name": "Subproject" },
+                    { "uri": main_uri, "name": "Main" },
+                    { "uri": clean_sub_uri, "name": "CleanSub" }
+                ]
+            }),
+            &mut state_child_first,
+        )
+        .unwrap();
+
+        let main_pulse = handle_rpc_method(
+            "tools/call",
+            &json!({
+                "name": "libredb_pulse",
+                "arguments": {
+                    "query": "ws_role",
+                    "cwd": main_ws.to_string_lossy().to_string()
+                }
+            }),
+            &mut state_child_first,
+        )
+        .unwrap();
+        let main_pulse_txt = main_pulse["content"][0]["text"].as_str().unwrap();
+        assert!(
+            main_pulse_txt.contains("parent_main_marker")
+                && !main_pulse_txt.contains("child_sub_marker"),
+            "Parent Main pulse MUST read parent_main_marker, never child_sub_marker: {main_pulse_txt}"
+        );
+
+        handle_rpc_method(
+            "tools/call",
+            &json!({
+                "name": "libredb_code",
+                "arguments": {
+                    "action": "index",
+                    "cwd": clean_sub_ws.to_string_lossy().to_string(),
+                    "target": "."
+                }
+            }),
+            &mut state_child_first,
+        )
+        .unwrap();
+        assert!(
+            !clean_sub_ws.join(".agents").join("memory.ldb").exists(),
+            "Clean nested workspace without .agents MUST use ephemeral brain without creating .agents/memory.ldb!"
+        );
+        {
+            let pdb_main = LibreDb::open(&main_ldb).unwrap();
+            assert!(
+                pdb_main.list_inodes(Some(NodeKind::Symbol), false).is_empty(),
+                "Indexing clean nested CleanSub MUST NOT walk up into parent Main/.agents/memory.ldb!"
+            );
+        }
+
+        drop(state_child_first);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn mcp_stream_refreshes_client_roots_on_list_changed_and_revokes_closed_workspaces() {
+        use super::process_mcp_stream;
+        use serde_json::{json, Value};
+        use std::io::Cursor;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "libredb_mcp_dynamic_roots_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let missing_global = tmp.join("nonexistent_customizations.ldb");
+        let ws_a = tmp.join("ws_alpha");
+        let ws_b = tmp.join("ws_beta");
+        fs::create_dir_all(ws_a.join("src")).unwrap();
+        fs::create_dir_all(ws_b.join("src")).unwrap();
+        fs::write(ws_a.join("src").join("alpha.rs"), "pub fn alpha_fn() {}\n").unwrap();
+        fs::write(ws_b.join("src").join("beta.rs"), "pub fn beta_fn() {}\n").unwrap();
+
+        let to_file_uri = |p: &std::path::Path| -> String {
+            format!(
+                "file:///{}",
+                p.to_string_lossy()
+                    .replace('\\', "/")
+                    .trim_start_matches('/')
+            )
+        };
+        let uri_a = to_file_uri(&ws_a);
+        let uri_b = to_file_uri(&ws_b);
+
+        let mut state =
+            McpServerState::new_with_workspace_root(None, Some(&missing_global), None).unwrap();
+
+        let run_frames = |st: &mut McpServerState, frames: &[Value]| -> Vec<Value> {
+            let mut input_bytes = Vec::new();
+            for f in frames {
+                input_bytes.extend_from_slice(f.to_string().as_bytes());
+                input_bytes.push(b'\n');
+            }
+            let mut reader = Cursor::new(input_bytes);
+            let mut out_bytes = Vec::new();
+            process_mcp_stream(&mut reader, &mut out_bytes, st).unwrap();
+            String::from_utf8(out_bytes)
+                .unwrap()
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| serde_json::from_str::<Value>(l).unwrap())
+                .collect()
+        };
+
+        // Phase 1: MCP `2024-11-05` client declares `capabilities.roots` without inline `workspaceFolders`,
+        // followed by `notifications/initialized` -> server MUST emit `roots/list` (`id = "libredb-roots-1"`):
+        let out_p1 = run_frames(
+            &mut state,
+            &[
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": { "roots": { "listChanged": true } }
+                    }
+                }),
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized"
+                }),
+            ],
+        );
+        assert_eq!(out_p1.len(), 2);
+        assert_eq!(out_p1[0]["id"], json!(1));
+        assert!(out_p1[0].get("result").is_some());
+        assert_eq!(out_p1[1]["method"], json!("roots/list"));
+        assert_eq!(out_p1[1]["id"], json!("libredb-roots-1"));
+
+        // Phase 2: Client responds with `[ws_a]` -> `ws_a` succeeds (opening ephemeral `.ldb`), `ws_b` is denied:
+        let out_p2 = run_frames(
+            &mut state,
+            &[
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": "libredb-roots-1",
+                    "result": {
+                        "roots": [{ "uri": uri_a, "name": "ws_alpha" }]
+                    }
+                }),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "libredb_pulse",
+                        "arguments": {
+                            "query": "alpha",
+                            "cwd": ws_a.to_string_lossy().to_string()
+                        }
+                    }
+                }),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "libredb_code",
+                        "arguments": {
+                            "action": "skeleton",
+                            "cwd": ws_b.to_string_lossy().to_string(),
+                            "target": "src/beta.rs"
+                        }
+                    }
+                }),
+            ],
+        );
+        assert_eq!(out_p2.len(), 2);
+        assert_eq!(out_p2[0]["id"], json!(2));
+        assert!(out_p2[0].get("result").is_some(), "Authorized ws_a MUST succeed: {:?}", out_p2[0]);
+        assert_eq!(out_p2[1]["id"], json!(3));
+        assert!(out_p2[1].get("error").is_some(), "Unauthorized ws_b MUST fail closed: {:?}", out_p2[1]);
+
+        let eph_a_file = state
+            .ephemeral_dir
+            .as_ref()
+            .unwrap()
+            .join(crate::security::ephemeral_workspace_ldb_filename(&ws_a));
+        assert!(eph_a_file.is_file(), "Ephemeral .ldb for ws_a must exist while ws_a is active");
+
+        // Phase 3: Client sends `notifications/roots/list_changed` AND immediately pipelines a `tools/call`
+        // on closed `ws_a` BEFORE replying to `libredb-roots-2` -> server MUST revoke `ws_a` immediately
+        // (fail-closed), delete `eph_a_file`, emit `libredb-roots-2`, and reject the pipelined `ws_a` call!
+        let out_p3 = run_frames(
+            &mut state,
+            &[
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/roots/list_changed"
+                }),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "libredb_pulse",
+                        "arguments": {
+                            "query": "alpha",
+                            "cwd": ws_a.to_string_lossy().to_string()
+                        }
+                    }
+                }),
+            ],
+        );
+        assert_eq!(out_p3.len(), 2);
+        assert_eq!(out_p3[0]["method"], json!("roots/list"));
+        assert_eq!(out_p3[0]["id"], json!("libredb-roots-2"));
+        assert_eq!(out_p3[1]["id"], json!(4));
+        assert!(
+            out_p3[1].get("error").is_some(),
+            "Closed workspace ws_a MUST be revoked immediately on notifications/roots/list_changed!"
+        );
+        assert!(
+            !eph_a_file.exists(),
+            "Ephemeral .ldb file for revoked ws_a MUST be deleted on root eviction!"
+        );
+
+        // Phase 4: Client replies to `libredb-roots-2` with `[ws_b]` -> `ws_a` remains denied, `ws_b` now succeeds!
+        let out_p4 = run_frames(
+            &mut state,
+            &[
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": "libredb-roots-2",
+                    "result": {
+                        "roots": [{ "uri": uri_b, "name": "ws_beta" }]
+                    }
+                }),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "libredb_code",
+                        "arguments": {
+                            "action": "skeleton",
+                            "cwd": ws_a.to_string_lossy().to_string(),
+                            "target": "src/alpha.rs"
+                        }
+                    }
+                }),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 6,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "libredb_code",
+                        "arguments": {
+                            "action": "skeleton",
+                            "cwd": ws_b.to_string_lossy().to_string(),
+                            "target": "src/beta.rs"
+                        }
+                    }
+                }),
+            ],
+        );
+        assert_eq!(out_p4.len(), 2);
+        assert_eq!(out_p4[0]["id"], json!(5));
+        assert!(out_p4[0].get("error").is_some(), "Closed ws_a MUST stay denied after switching to ws_b");
+        assert_eq!(out_p4[1]["id"], json!(6));
+        assert!(
+            out_p4[1]["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("beta_fn"),
+            "Newly added ws_b MUST succeed after roots/list refresh: {:?}",
+            out_p4[1]
+        );
+
+        drop(state);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn mcp_reaps_orphaned_ephemeral_dbs_from_crashed_processes_without_touching_live_sessions() {
+        use super::handle_rpc_method;
+        use serde_json::json;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "libredb_mcp_eph_reaper_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let missing_global = tmp.join("nonexistent_customizations.ldb");
+        let ws_live = tmp.join("ws_live");
+        let ws_crashed = tmp.join("ws_crashed");
+        fs::create_dir_all(ws_live.join("src")).unwrap();
+        fs::create_dir_all(ws_crashed.join("src")).unwrap();
+        fs::write(ws_live.join("src").join("live.rs"), "pub fn live_fn() {}\n").unwrap();
+        fs::write(
+            ws_crashed.join("src").join("crashed.rs"),
+            "pub fn crashed_fn() {}\n",
+        )
+        .unwrap();
+
+        let mut state_live = McpServerState::new_with_workspace_root(
+            None,
+            Some(&missing_global),
+            Some(&ws_live),
+        )
+        .unwrap();
+        let mut state_crashed = McpServerState::new_with_workspace_root(
+            None,
+            Some(&missing_global),
+            Some(&ws_crashed),
+        )
+        .unwrap();
+
+        handle_rpc_method(
+            "tools/call",
+            &json!({
+                "name": "libredb_pulse",
+                "arguments": { "query": "live_fn" }
+            }),
+            &mut state_live,
+        )
+        .unwrap();
+        handle_rpc_method(
+            "tools/call",
+            &json!({
+                "name": "libredb_pulse",
+                "arguments": { "query": "crashed_fn" }
+            }),
+            &mut state_crashed,
+        )
+        .unwrap();
+
+        let live_dir = state_live.ephemeral_dir.clone().unwrap();
+        let leaked_dir = state_crashed
+            .simulate_hard_crash_for_test()
+            .expect("Expected ephemeral directory on crashed MCP state");
+        assert!(live_dir.exists());
+        assert!(
+            leaked_dir.exists(),
+            "Simulated SIGKILL/TerminateProcess MUST leave orphaned ephemeral dir on disk prior to reaping"
+        );
+
+        // Starting a new MCP server (while `state_live` is still running and holding `.owner.lock`)
+        // MUST reap `leaked_dir` and MUST NOT disturb `live_dir`!
+        let state_reaper = McpServerState::new_with_workspace_root(
+            None,
+            Some(&missing_global),
+            Some(&ws_live),
+        )
+        .unwrap();
+        assert!(
+            !leaked_dir.exists(),
+            "Abandoned ephemeral directory from crashed MCP server MUST be reaped on startup!"
+        );
+        assert!(
+            live_dir.exists(),
+            "Live MCP server's locked ephemeral directory MUST NEVER be deleted by concurrent reaper!"
+        );
+
+        assert!(
+            handle_rpc_method(
+                "tools/call",
+                &json!({
+                    "name": "libredb_code",
+                    "arguments": {
+                        "action": "impact",
+                        "target": "live_fn"
+                    }
+                }),
+                &mut state_live,
+            )
+            .is_ok(),
+            "Live MCP session MUST continue operating cleanly after concurrent ephemeral reaping!"
+        );
+
+        drop(state_reaper);
+        drop(state_live);
+        assert!(
+            !live_dir.exists(),
+            "Live MCP session MUST still clean up its own ephemeral directory on normal Drop!"
+        );
 
         let _ = fs::remove_dir_all(&tmp);
     }

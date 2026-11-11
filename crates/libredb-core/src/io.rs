@@ -211,6 +211,44 @@ impl OsFileBackend {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Attempts to acquire the exclusive inter-process writer lock without blocking (`0 ms`).
+    /// Returns `Ok(true)` if acquired, `Ok(false)` if held by another live file handle or process.
+    pub fn try_lock_write_region(&self) -> Result<bool> {
+        #[cfg(windows)]
+        {
+            match win_lock::lock_high_byte(&self.file, 0) {
+                Ok(()) => Ok(true),
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => Ok(false),
+                Err(e) => Err(LibreDbError::Io(e)),
+            }
+        }
+        #[cfg(unix)]
+        {
+            match self.file.try_lock() {
+                Ok(()) => Ok(true),
+                Err(std::fs::TryLockError::WouldBlock) => Ok(false),
+                Err(std::fs::TryLockError::Error(e)) => Err(LibreDbError::Io(e)),
+            }
+        }
+        #[cfg(not(any(windows, unix)))]
+        {
+            Ok(true)
+        }
+    }
+
+    /// Releases the exclusive inter-process lock acquired via `try_lock_write_region` or `lock_write_region`.
+    pub fn unlock_exclusive(&self) -> Result<()> {
+        #[cfg(windows)]
+        {
+            win_lock::unlock_high_byte(&self.file)?;
+        }
+        #[cfg(unix)]
+        {
+            self.file.unlock()?;
+        }
+        Ok(())
+    }
 }
 
 /// Detects UNC paths (`\\server\share`, `\\?\UNC\...`), mapped SMB network drives (`Q:\...`),
