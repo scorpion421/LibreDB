@@ -465,9 +465,12 @@ pub fn cmd_gitea_init(
 
     record_learned_workspace(&ldb, &clean_root);
     let proj_ldb_path = clean_root.join(".agents").join("memory.ldb");
-    if proj_ldb_path.is_file() {
+    if proj_ldb_path.is_file()
+        && crate::security::is_workspace_memory_trusted(Some(&ldb), &clean_root)
+    {
         if let Ok(pdb) = LibreDb::open(&proj_ldb_path) {
-            let _ = crate::security::seal_workspace_memory(&ldb, &pdb, &clean_root);
+            crate::security::seal_workspace_memory(&ldb, &pdb, &clean_root)
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         }
     }
     println!(
@@ -512,7 +515,8 @@ pub fn cmd_gitea_sync(
     {
         if let Ok(pdb) = LibreDb::open(&proj_ldb_path) {
             let pdb = Arc::new(pdb);
-            let _ = crate::security::seal_workspace_memory(&ldb, &pdb, &clean_root);
+            crate::security::seal_workspace_memory(&ldb, &pdb, &clean_root)
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
             if let Ok(rep) = index_workspace(&pdb, &clean_root, false) {
                 if rep.files_reindexed > 0 {
                     if let Ok(mut cog) = CognitiveEngine::open_db(Arc::clone(&pdb)) {

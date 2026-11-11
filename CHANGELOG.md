@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.7] - 2026-11-11
+
+### Added
+
+- Added `--reinit-lost` to `libredb trust` (`has_prior_workspace_seal_marker` and `is_unsealed_replacement_of_sealed_workspace` in `crates/libredb-cli/src/security.rs` and `crates/libredb-cli/src/main.rs`) to explicitly separate first-time workspace initialization from recovery after deletion or replacement of a previously sealed `.agents/memory.ldb`.
+
+### Fixed
+
+- Gated `seal_workspace_memory` inside `cmd_gitea_init` (`crates/libredb-cli/src/gitea.rs`) on `is_workspace_memory_trusted` and propagated `Result` errors in both `cmd_gitea_init` and `cmd_gitea_sync` instead of discarding them.
+- Synchronized external `customizations.ldb` commits in `is_workspace_memory_trusted`, `seal_workspace_memory`, `has_valid_legacy_v3_content_seal`, and cross-version migration helpers via `LibreDb::sync_from_disk_if_changed`, and expanded `modernize_global_db` (`crates/libredb-cli/src/main.rs`) to audit and report previously sealed workspace directories even when `.agents/memory.ldb` has been deleted from disk.
+
+### Security
+
+- Closed the missing/empty replacement bypass on previously sealed workspaces (`is_workspace_memory_trusted`, `seal_workspace_memory`, and `PreMutationSealGuard` in `crates/libredb-cli/src/security.rs`, plus `libredb trust` in `crates/libredb-cli/src/main.rs`): once a workspace records a seal marker (`trust:sealed::<ws>`, `trust:v4_upgraded::<ws>`, or `trust:v3_upgraded::<ws>`, plus `trust:nonempty_sealed::<ws>` once `>= 1` cognitive capsules have been sealed), deleting `.agents/memory.ldb`, replacing it with an empty unsealed `.agents/memory.ldb`, or rolling a populated database back to an older `0`-capsule `v4`-sealed snapshot fails closed across hooks, `MCP`, `CLI` writes, `libredb trust --if-clean`, and plain `libredb trust`, requiring backup restoration or explicit `libredb trust --reinit-lost "<dir>"`.
+- Tightened `migrate_workspace_seal_v3_to_v4` (`libredb trust --migrate-v3`) in `crates/libredb-cli/src/security.rs` so that any legacy `v0.9.3` database containing `>= 1` active cognitive capsules requires explicit `--confirm-metadata` (`confirm_unauthenticated_metadata == true`) and surfaces the `created_ns..updated_ns` timestamp span alongside metadata/synapse counts, closing silent adoption of symmetrically patched `created_ns == updated_ns` timestamps on single-capsule `v0.9.3` databases while retaining automatic migration for `0`-capsule `v0.9.3` databases and unconditional rejection of asymmetric `Inode` timestamp or `token_count` tampering.
+- Replaced overwriting `fs::rename` in `load_or_create_posix_vault_key_inner_with_hook` (`atomic_rename_noreplace` in `crates/libredb-cli/src/security.rs`) with kernel-atomic non-overwriting rename syscalls (`renameat2(..., RENAME_NOREPLACE)` on Linux, `renamex_np(..., RENAME_EXCL)` on macOS, `MoveFileExW(..., 0)` without `MOVEFILE_REPLACE_EXISTING` on Windows) and fail-closed error handling if unsupported, guaranteeing that even an uncooperative external process creating `.vault.key` without `.vault.key.lock` can never have its keyfile overwritten.
+
 ## [0.9.6] - 2026-11-10
 
 ### Added

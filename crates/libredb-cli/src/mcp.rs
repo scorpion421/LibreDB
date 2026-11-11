@@ -90,7 +90,7 @@ impl McpServerState {
                     canonical_brain_cache_key(&ws_root.join(".agents").join("memory.ldb"));
                 self.brains.remove(&cache_key);
                 return Err(format!(
-                    "Workspace mutation succeeded, but updating hmac-sha256:v3 trust seal for '{}' failed: {err}",
+                    "Workspace mutation succeeded, but updating hmac-sha256:v4 trust seal for '{}' failed: {err}",
                     ws_root.display()
                 ));
             }
@@ -975,7 +975,7 @@ mod tests {
         let err = state
             .seal_project_db_if_authorized(ws_seal_opt.as_deref(), &proj_arc)
             .expect_err("Expected seal failure on corrupted secret");
-        assert!(err.contains("updating hmac-sha256:v3 trust seal"));
+        assert!(err.contains("updating hmac-sha256:v4 trust seal"));
         assert!(
             state.brains.is_empty(),
             "Cached OverlayBrain must be evicted even when opened via non-canonical/relative path"

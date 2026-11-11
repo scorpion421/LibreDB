@@ -46,7 +46,7 @@ Antigravity Cognitive & Code-Graph Commands:
   libredb mcp-serve [<default_project.ldb>] [--global <customizations.ldb>]
 
 Security, Trust & Universal Configuration Commands:
-  libredb trust [<dir>] [--revoke] [--list] [--migrate-v3 [--confirm-metadata]] [--migrate-v2] [--if-clean] [--global <customizations.ldb>]
+  libredb trust [<dir>] [--revoke] [--list] [--reinit-lost] [--migrate-v3 [--confirm-metadata]] [--migrate-v2] [--if-clean] [--global <customizations.ldb>]
   libredb config <get|set|unset|list> [<key>] [<value>] [--project <dir>] [--global <customizations.ldb>]
   libredb guardrail check [--path <dir>] [--staged] [--strict]
   libredb hook-pre-tool [--global <customizations.ldb>]
@@ -213,6 +213,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let mut migrate_v2 = false;
             let mut migrate_v3 = false;
             let mut confirm_metadata = false;
+            let mut reinit_lost = false;
             let mut if_clean = false;
             let mut global_path: Option<PathBuf> = None;
             let mut i = 1usize;
@@ -236,6 +237,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     "--confirm-metadata" => {
                         confirm_metadata = true;
+                        i += 1;
+                    }
+                    "--reinit-lost" => {
+                        reinit_lost = true;
                         i += 1;
                     }
                     "--if-clean" => {
@@ -281,7 +286,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let mut rejected = 0usize;
                     for (_, raw_ws) in security::list_trusted_workspaces(&gdb) {
                         let ws_path = PathBuf::from(raw_ws.trim());
-                        if !ws_path.is_dir() || !ws_path.join(".agents").join("memory.ldb").is_file() {
+                        if !ws_path.is_dir()
+                            || (!ws_path.join(".agents").join("memory.ldb").is_file()
+                                && !security::has_prior_workspace_seal_marker(&gdb, &ws_path))
+                        {
                             continue;
                         }
                         match security::migrate_workspace_seal_v3_to_v4(
@@ -316,12 +324,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let clean = gitea::strip_verbatim_prefix(&abs);
                     if security::migrate_workspace_seal_v2_to_v3(&gdb, &clean)? {
                         println!(
-                            "[OK] Verified legacy v2 HMAC and upgraded workspace '{}' to content-bound v3 seal",
+                            "[OK] Verified legacy v2 HMAC and upgraded workspace '{}' to content-bound v4 seal",
                             clean.display()
                         );
                     } else {
                         println!(
-                            "[OK] Workspace '{}' already carries a valid content-bound v3 trust seal",
+                            "[OK] Workspace '{}' already carries a valid content-bound v4 trust seal",
                             clean.display()
                         );
                     }
@@ -331,7 +339,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let mut rejected = 0usize;
                     for (_, raw_ws) in security::list_trusted_workspaces(&gdb) {
                         let ws_path = PathBuf::from(raw_ws.trim());
-                        if !ws_path.is_dir() || !ws_path.join(".agents").join("memory.ldb").is_file() {
+                        if !ws_path.is_dir()
+                            || (!ws_path.join(".agents").join("memory.ldb").is_file()
+                                && !security::has_prior_workspace_seal_marker(&gdb, &ws_path))
+                        {
                             continue;
                         }
                         match security::migrate_workspace_seal_v2_to_v3(&gdb, &ws_path) {
@@ -344,7 +355,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     println!(
-                        "[OK] Workspace v2->v3 seal migration summary: {migrated} upgraded, {already_valid} already v3, {rejected} rejected"
+                        "[OK] Workspace v2->v4 seal migration summary: {migrated} upgraded, {already_valid} already v4, {rejected} rejected"
                     );
                     if rejected > 0 {
                         return Err(format!("{rejected} workspace(s) failed v2 HMAC verification and remain quarantined").into());
@@ -366,6 +377,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             "[OK] Trusted and cryptographically sealed clean workspace '{}'",
                             clean.display()
                         );
+                    } else if security::is_unsealed_replacement_of_sealed_workspace(&gdb, &clean) {
+                        println!(
+                            "[WARN] Skipping automatic workspace trust for '{}': previously sealed .agents/memory.ldb is missing, unsealed, or rolled back to empty; restore from backup or run 'libredb trust --reinit-lost \"{}\"' if intentionally starting fresh.",
+                            clean.display(),
+                            clean.display()
+                        );
                     } else {
                         println!(
                             "[WARN] Skipping automatic workspace trust for '{}': pre-existing .agents database has an unverified or modified seal; inspect and run 'libredb trust \"{}\"' manually if trusted.",
@@ -373,14 +390,30 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             clean.display()
                         );
                     }
+                } else if !reinit_lost
+                    && security::is_unsealed_replacement_of_sealed_workspace(&gdb, &clean)
+                {
+                    return Err(format!(
+                        "Workspace '{}' was previously sealed on this host, but .agents/memory.ldb is now missing, unsealed, or rolled back to empty. Restore .agents/memory.ldb from backup or pass '--reinit-lost' ('libredb trust --reinit-lost \"{}\"') to explicitly re-initialize workspace trust after database loss.",
+                        clean.display(),
+                        clean.display()
+                    )
+                    .into());
                 } else {
                     let ldb_path = clean.join(".agents").join("memory.ldb");
                     let (pdb, _) = hooks::open_project_ldb_silent(&ldb_path)?;
                     security::seal_workspace_memory(&gdb, &pdb, &clean)?;
-                    println!(
-                        "[OK] Trusted and cryptographically sealed workspace '{}'",
-                        clean.display()
-                    );
+                    if reinit_lost {
+                        println!(
+                            "[OK] Re-initialized and cryptographically sealed workspace '{}' after database loss (--reinit-lost)",
+                            clean.display()
+                        );
+                    } else {
+                        println!(
+                            "[OK] Trusted and cryptographically sealed workspace '{}'",
+                            clean.display()
+                        );
+                    }
                 }
             }
         }
@@ -495,6 +528,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     for (ino, k_opt, _) in db.list_inodes(Some(NodeKind::Config), false) {
                         let Some(k) = k_opt else { continue };
                         if k == "sys::trust_anchor_secret"
+                            || k.starts_with("trust:sealed::")
+                            || k.starts_with("trust:nonempty_sealed::")
                             || k.starts_with("trust:v3_upgraded::")
                             || k.starts_with("trust:v4_upgraded::")
                         {
@@ -2155,12 +2190,20 @@ fn modernize_global_db(
     for (_, raw_ws) in security::list_trusted_workspaces(gdb) {
         let ws_path = PathBuf::from(raw_ws.trim());
         let ldb_p = ws_path.join(".agents").join("memory.ldb");
-        if ws_path.is_dir() && ldb_p.is_file() {
+        if ws_path.is_dir()
+            && (ldb_p.is_file() || security::has_prior_workspace_seal_marker(gdb, &ws_path))
+        {
             if security::is_workspace_memory_trusted(Some(gdb), &ws_path) {
                 verified_workspaces += 1;
             } else {
                 quarantined_workspaces += 1;
-                if security::has_valid_legacy_v3_content_seal(gdb, &ws_path) {
+                if security::is_unsealed_replacement_of_sealed_workspace(gdb, &ws_path) {
+                    println!(
+                        "[WARN] Quarantined workspace '{}': previously sealed .agents/memory.ldb is missing, unsealed, or rolled back to empty; restore from backup or run 'libredb trust --reinit-lost \"{}\"' to re-initialize.",
+                        ws_path.display(),
+                        ws_path.display()
+                    );
+                } else if security::has_valid_legacy_v3_content_seal(gdb, &ws_path) {
                     println!(
                         "[WARN] Quarantined workspace '{}': .agents/memory.ldb carries a valid legacy v0.9.3 content seal (CognitiveContent::v3) without v4 metadata authentication; run 'libredb trust --migrate-v3 \"{}\"' (adding '--confirm-metadata' after reviewing unauthenticated metadata if prompted).",
                         ws_path.display(),
