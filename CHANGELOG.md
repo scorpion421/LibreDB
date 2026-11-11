@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.1] - 2026-11-11
+
+### Fixed
+
+- Permitted first-time bootstrap creation of a non-existent `customizations.ldb` in `libredb init` via `PreMutationSealGuard::verify_before_write_allow_fresh_global_import` (`crates/libredb-cli/src/main.rs`), fixing fresh neutral and personal plugin installations (`scripts/deploy_plugin.sh` and `scripts/deploy_plugin.ps1`) on hosts without a pre-existing `~/.gemini/libredb/customizations.ldb` while continuing to block any low-level CLI mutation once `customizations.ldb` exists on disk.
+- Gated `DPAPI_PREFIX` with `#[cfg(any(windows, test))]` in `crates/libredb-cli/src/security.rs` and enabled `RUSTFLAGS: "-D warnings"` across `linux`, `macos`, and `windows` in `.github/workflows/ci.yml` so POSIX release builds compile with zero warnings, backed by unit test `cli_init_allows_fresh_global_db_bootstrap_and_blocks_existing_global_db`.
+
 ## [0.10.0] - 2026-11-11
 
 ### Added

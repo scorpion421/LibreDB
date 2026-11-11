@@ -18,6 +18,7 @@ use std::path::{Component, Path, PathBuf};
 
 type HmacSha256 = Hmac<Sha256>;
 
+#[cfg(any(windows, test))]
 const DPAPI_PREFIX: &str = "dpapi:v1:";
 const VAULT_V1_PREFIX: &str = "vault:v1:";
 const VAULT_V2_PREFIX: &str = "vault:v2:";

@@ -1501,7 +1501,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let db_path = Path::new(&args[1]);
             let gdb_opt = hooks::open_global_ldb_checked(None)?;
             let _seal_guard =
-                security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
+                security::PreMutationSealGuard::verify_before_write_allow_fresh_global_import(
+                    gdb_opt.as_deref(),
+                    db_path,
+                )?;
             let db = LibreDb::open(db_path)?;
             let st = db.stats()?;
             println!(
@@ -2600,6 +2603,47 @@ mod tests {
         assert!(
             !security::is_workspace_memory_trusted(Some(&gdb), &ws_tampered),
             "personal modernize_global_db must NEVER re-seal an offline-tampered workspace"
+        );
+
+        drop(gdb);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cli_init_allows_fresh_global_db_bootstrap_and_blocks_existing_global_db() {
+        let dir = env::temp_dir().join(format!(
+            "libredb_fresh_init_test_{}_{}",
+            process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let libre_dir = dir.join(".gemini").join("libredb");
+        std::fs::create_dir_all(&libre_dir).unwrap();
+        let fresh_global = libre_dir.join("customizations.ldb");
+        assert!(!fresh_global.exists());
+
+        // 1. Fresh installer bootstrap (`libredb init <non-existent customizations.ldb>`) MUST succeed:
+        assert!(
+            security::PreMutationSealGuard::verify_before_write_allow_fresh_global_import(
+                None,
+                &fresh_global
+            )
+            .is_ok()
+        );
+        let gdb = LibreDb::open(&fresh_global).unwrap();
+        assert!(fresh_global.is_file());
+
+        // 2. Once `customizations.ldb` exists on disk, low-level `init` / `put` / `import-sqlite` MUST fail closed:
+        assert!(
+            security::PreMutationSealGuard::verify_before_write_allow_fresh_global_import(
+                Some(&gdb),
+                &fresh_global
+            )
+            .is_err()
+        );
+        assert!(
+            security::PreMutationSealGuard::verify_before_write(Some(&gdb), &fresh_global).is_err()
         );
 
         drop(gdb);
