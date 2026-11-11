@@ -26,6 +26,9 @@ use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+const MAX_CACHED_BRAINS: usize = 16;
+const MAX_MCP_LINE_BYTES: usize = 16 * 1024 * 1024;
+
 pub struct McpServerState {
     default_project_path: PathBuf,
     global_path: Option<PathBuf>,
@@ -33,6 +36,83 @@ pub struct McpServerState {
     /// Keyed by `canonical_brain_cache_key(db_path)` so relative paths, `..` segments, symlinks,
     /// and Windows casing variants always address and evict the exact same cached `OverlayBrain`.
     brains: HashMap<String, OverlayBrain>,
+}
+
+fn insert_brain_bounded(
+    brains: &mut HashMap<String, OverlayBrain>,
+    key: String,
+    brain: OverlayBrain,
+) {
+    if !brains.contains_key(&key) && brains.len() >= MAX_CACHED_BRAINS {
+        if let Some(victim) = brains.keys().next().cloned() {
+            brains.remove(&victim);
+        }
+    }
+    brains.insert(key, brain);
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum BoundedLineRead {
+    Line(String),
+    Oversized,
+    Eof,
+}
+
+/// Reads a single `\n`-delimited JSON-RPC line with a hard upper bound of `max_bytes`,
+/// draining the remainder of any oversized line in fixed chunks without unbounded heap allocation.
+pub(crate) fn read_bounded_jsonrpc_line<R: BufRead>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> io::Result<BoundedLineRead> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut oversized = false;
+
+    loop {
+        let buf = reader.fill_buf()?;
+        if buf.is_empty() {
+            if out.is_empty() && !oversized {
+                return Ok(BoundedLineRead::Eof);
+            }
+            if oversized {
+                return Ok(BoundedLineRead::Oversized);
+            }
+            return String::from_utf8(out)
+                .map(BoundedLineRead::Line)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
+        }
+
+        if let Some(nl_pos) = buf.iter().position(|&b| b == b'\n') {
+            if !oversized {
+                if out.len() + nl_pos > max_bytes {
+                    oversized = true;
+                    out.clear();
+                } else {
+                    out.extend_from_slice(&buf[..nl_pos]);
+                }
+            }
+            reader.consume(nl_pos + 1);
+            if oversized {
+                return Ok(BoundedLineRead::Oversized);
+            }
+            if out.last() == Some(&b'\r') {
+                out.pop();
+            }
+            return String::from_utf8(out)
+                .map(BoundedLineRead::Line)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
+        }
+
+        let avail = buf.len();
+        if !oversized {
+            if out.len() + avail > max_bytes {
+                oversized = true;
+                out.clear();
+            } else {
+                out.extend_from_slice(buf);
+            }
+        }
+        reader.consume(avail);
+    }
 }
 
 pub(crate) fn canonical_brain_cache_key(db_path: &Path) -> String {
@@ -98,6 +178,18 @@ impl McpServerState {
         Ok(())
     }
 
+    fn is_global_customizations_target(&self, candidate_key: &str) -> bool {
+        if candidate_key.ends_with("/.gemini/libredb/customizations.ldb") {
+            return true;
+        }
+        if let Some(ref gp) = self.global_path {
+            if canonical_brain_cache_key(gp) == candidate_key {
+                return true;
+            }
+        }
+        false
+    }
+
     fn resolve_brain_with_seal_target(
         &mut self,
         hint_path: Option<&str>,
@@ -154,18 +246,57 @@ impl McpServerState {
         };
         let candidate_cache_key = canonical_brain_cache_key(&candidate_path);
 
+        if self.is_global_customizations_target(&candidate_cache_key) {
+            if is_explicit_memorize {
+                return Err(
+                    "Refusing to mutate global customizations.ldb via workspace MCP tools; use 'libredb config' or 'libredb trust'."
+                        .to_owned(),
+                );
+            }
+            let q_path = default_libredb_home().join("quarantined_workspace.ldb");
+            let q_key = canonical_brain_cache_key(&q_path);
+            if !self.brains.contains_key(&q_key) {
+                let (q_db, _) = open_project_ldb_silent(&q_path)?;
+                let q_brain = OverlayBrain::open(self.global_db.clone(), q_db)
+                    .map_err(|e| e.to_string())?;
+                insert_brain_bounded(&mut self.brains, q_key.clone(), q_brain);
+            }
+            let brain = self.brains.get_mut(&q_key).unwrap();
+            brain.refresh_if_needed().map_err(|e| e.to_string())?;
+            return Ok((None, None, brain));
+        }
+
         let mut ws_write_lock: Option<crate::security::WorkspaceTrustLockGuard> = None;
         let mut ws_root_to_seal: Option<PathBuf> = None;
         let (mut db_path, mut cache_key) =
             if let Some(ws_root) = workspace_root_from_agents_ldb(&candidate_path) {
-                if is_explicit_memorize && !crate::security::is_private_brain_workspace(&ws_root) {
+                let needs_mig_lock = !candidate_path.is_file()
+                    && candidate_path.with_extension("db").exists();
+                if (is_explicit_memorize || needs_mig_lock)
+                    && !crate::security::is_private_brain_workspace(&ws_root)
+                {
                     if let Some(ref gdb) = self.global_db {
                         ws_write_lock = Some(crate::security::WorkspaceTrustLockGuard::acquire(
                             gdb, &ws_root,
                         )?);
                     }
                 }
-                if crate::security::is_workspace_memory_trusted(self.global_db.as_deref(), &ws_root)
+                let allow_readonly_sqlite_mig = !needs_mig_lock
+                    || is_explicit_memorize
+                    || crate::security::is_private_brain_workspace(&ws_root)
+                    || self.global_db.as_deref().is_some_and(|gdb| {
+                        let norm = crate::security::normalize_workspace_key(&ws_root);
+                        gdb.get_by_key(
+                            libredb_core::NodeKind::Config,
+                            &format!("trust:allowed::{norm}"),
+                        )
+                        .is_ok()
+                    });
+                if allow_readonly_sqlite_mig
+                    && crate::security::is_workspace_memory_trusted(
+                        self.global_db.as_deref(),
+                        &ws_root,
+                    )
                 {
                     if is_explicit_memorize {
                         ws_root_to_seal = Some(ws_root);
@@ -181,6 +312,7 @@ impl McpServerState {
                             ws_root.display()
                         ));
                     }
+                    ws_write_lock = None;
                     let q_path = default_libredb_home().join("quarantined_workspace.ldb");
                     let q_key = canonical_brain_cache_key(&q_path);
                     (q_path, q_key)
@@ -221,7 +353,7 @@ impl McpServerState {
                                 let (q_db, _) = open_project_ldb_silent(&db_path)?;
                                 let q_brain = OverlayBrain::open(self.global_db.clone(), q_db)
                                     .map_err(|e| e.to_string())?;
-                                self.brains.insert(cache_key.clone(), q_brain);
+                                insert_brain_bounded(&mut self.brains, cache_key.clone(), q_brain);
                             }
                         }
                     }
@@ -230,7 +362,7 @@ impl McpServerState {
             if let Some(valid_db) = ready_db {
                 let brain = OverlayBrain::open(self.global_db.clone(), valid_db)
                     .map_err(|e| e.to_string())?;
-                self.brains.insert(cache_key.clone(), brain);
+                insert_brain_bounded(&mut self.brains, cache_key.clone(), brain);
             }
         }
 
@@ -252,9 +384,20 @@ impl McpServerState {
 
     fn reload_global_db(&mut self) -> Result<(), String> {
         if let Some(ref gp) = self.global_path {
-            let gdb = Arc::new(LibreDb::open(gp).map_err(|e| e.to_string())?);
-            self.global_db = Some(gdb);
-            self.brains.clear();
+            match open_global_ldb_checked(Some(gp)) {
+                Ok(Some(gdb)) => {
+                    self.global_db = Some(gdb);
+                    self.brains.clear();
+                }
+                Ok(None) => {
+                    self.global_db = None;
+                    self.brains.clear();
+                }
+                Err(err) => {
+                    self.brains.clear();
+                    return Err(err);
+                }
+            }
         }
         Ok(())
     }
@@ -267,10 +410,34 @@ pub fn run_mcp_stdio_server(
     let mut state = McpServerState::new(default_project_db, global_db_path)?;
 
     let stdin = io::stdin();
+    let mut reader = stdin.lock();
     let mut stdout = io::stdout();
 
-    for line_res in stdin.lock().lines() {
-        let line = line_res?;
+    loop {
+        let line = match read_bounded_jsonrpc_line(&mut reader, MAX_MCP_LINE_BYTES) {
+            Ok(BoundedLineRead::Eof) => break,
+            Ok(BoundedLineRead::Oversized) => {
+                let err_resp = json!({
+                    "jsonrpc": "2.0",
+                    "id": Value::Null,
+                    "error": { "code": -32700, "message": "Parse error: JSON-RPC line exceeded 16 MiB limit" }
+                });
+                writeln!(stdout, "{err_resp}")?;
+                stdout.flush()?;
+                continue;
+            }
+            Ok(BoundedLineRead::Line(l)) => l,
+            Err(e) => {
+                let err_resp = json!({
+                    "jsonrpc": "2.0",
+                    "id": Value::Null,
+                    "error": { "code": -32700, "message": format!("Parse error: {e}") }
+                });
+                writeln!(stdout, "{err_resp}")?;
+                stdout.flush()?;
+                continue;
+            }
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -540,6 +707,11 @@ fn dispatch_tool(
                         {
                             return Err(err.into());
                         }
+                        if let Some(err) =
+                            crate::security::check_mcp_workspace_containment(rp, ws_root.as_deref())
+                        {
+                            return Err(err.into());
+                        }
                     }
 
                     let items: Vec<(&Path, Option<&str>)> = requested_paths
@@ -600,6 +772,14 @@ fn dispatch_tool(
                         if crate::security::check_mcp_read_path_policy(root, &protected_paths)
                             .is_none()
                         {
+                            let _idx_lock = state
+                                .global_db
+                                .as_deref()
+                                .filter(|_| !crate::security::is_private_brain_workspace(root))
+                                .and_then(|gdb| {
+                                    crate::security::WorkspaceTrustLockGuard::acquire(gdb, root)
+                                        .ok()
+                                });
                             if let Ok(rep) = index_workspace(&proj_db, root, false) {
                                 if rep.files_reindexed > 0 {
                                     if let Ok(mut cog) =
@@ -630,10 +810,24 @@ fn dispatch_tool(
                     ) {
                         return Err(err.into());
                     }
+                    if let Some(err) = crate::security::check_mcp_workspace_containment(
+                        &resolved_target,
+                        ws_root.as_deref(),
+                    ) {
+                        return Err(err.into());
+                    }
                     if let Some(ref root) = ws_root {
                         if crate::security::check_mcp_read_path_policy(root, &protected_paths)
                             .is_none()
                         {
+                            let _idx_lock = state
+                                .global_db
+                                .as_deref()
+                                .filter(|_| !crate::security::is_private_brain_workspace(root))
+                                .and_then(|gdb| {
+                                    crate::security::WorkspaceTrustLockGuard::acquire(gdb, root)
+                                        .ok()
+                                });
                             if let Ok(rep) = index_workspace(&proj_db, root, false) {
                                 if rep.files_reindexed > 0 {
                                     if let Ok(mut cog) =
@@ -664,9 +858,27 @@ fn dispatch_tool(
                     ) {
                         return Err(err.into());
                     }
+                    if let Some(err) = crate::security::check_mcp_workspace_containment(
+                        &resolved_target,
+                        ws_root.as_deref(),
+                    ) {
+                        return Err(err.into());
+                    }
+                    let _idx_lock = match state
+                        .global_db
+                        .as_deref()
+                        .filter(|_| !crate::security::is_private_brain_workspace(&resolved_target))
+                    {
+                        Some(gdb) => Some(crate::security::WorkspaceTrustLockGuard::acquire(
+                            gdb,
+                            &resolved_target,
+                        )?),
+                        None => None,
+                    };
                     let rep = index_workspace(&proj_db, &resolved_target, false)?;
                     let mut cog = CognitiveEngine::open_db(proj_db)?;
                     cog.save_index_snapshot()?;
+                    drop(_idx_lock);
                     let brain =
                         state.resolve_brain_mut(cwd_hint.or(first_file_hint), cid_arg, false)?;
                     brain.refresh_if_needed()?;
@@ -682,7 +894,7 @@ fn dispatch_tool(
                 let central_sqlite = user_home_dir().join(".gemini").join("database").join("customizations.db");
                 if let Some(ref gp) = state.global_path.clone() {
                     if central_sqlite.exists() {
-                        let gdb = Arc::new(LibreDb::open(gp)?);
+                        let gdb = open_global_ldb(Some(gp))?;
                         let sum = import_sqlite_readonly(&central_sqlite, &gdb, "central")?;
                         let mut cog = CognitiveEngine::open_db(gdb)?;
                         cog.save_index_snapshot()?;
@@ -802,6 +1014,11 @@ fn dispatch_tool(
         "libredb_skeleton" => {
             let fp = args.get("file_path").and_then(Value::as_str).ok_or("Missing file_path")?;
             let flt = args.get("filter").and_then(Value::as_str);
+            let ws_root_alias: Option<PathBuf> = args
+                .get("cwd")
+                .and_then(Value::as_str)
+                .map(PathBuf::from)
+                .filter(|p| p.is_dir());
             let resolved_fp = if Path::new(fp).is_relative() {
                 args.get("cwd")
                     .and_then(Value::as_str)
@@ -821,6 +1038,12 @@ fn dispatch_tool(
             {
                 return Err(err.into());
             }
+            if let Some(err) = crate::security::check_mcp_workspace_containment(
+                &resolved_fp,
+                ws_root_alias.as_deref(),
+            ) {
+                return Err(err.into());
+            }
             let (skel, _) = FileSkeleton::index_or_get_cached(&proj_db, &resolved_fp, None)?;
             Ok(skel.render_compact(flt, flt.is_some()))
         }
@@ -835,6 +1058,11 @@ fn dispatch_tool(
             let sym = args.get("symbol").and_then(Value::as_str);
             let line = args.get("line").and_then(Value::as_u64).map(|n| n as usize);
             let pad = args.get("pad").and_then(Value::as_u64).unwrap_or(12) as usize;
+            let ws_root_alias: Option<PathBuf> = args
+                .get("cwd")
+                .and_then(Value::as_str)
+                .map(PathBuf::from)
+                .filter(|p| p.is_dir());
             let resolved_fp = if Path::new(fp).is_relative() {
                 args.get("cwd")
                     .and_then(Value::as_str)
@@ -852,6 +1080,12 @@ fn dispatch_tool(
             if let Some(err) =
                 crate::security::check_mcp_read_path_policy(&resolved_fp, &protected)
             {
+                return Err(err.into());
+            }
+            if let Some(err) = crate::security::check_mcp_workspace_containment(
+                &resolved_fp,
+                ws_root_alias.as_deref(),
+            ) {
                 return Err(err.into());
             }
             let bundle = extract_fim_slice(&proj_db, &resolved_fp, sym, line, pad)?;
@@ -892,9 +1126,20 @@ fn workspace_root_from_agents_ldb(db_path: &Path) -> Option<PathBuf> {
         db_path.to_path_buf()
     };
     let resolved = crate::security::canonicalize_with_missing_tail(&joined).unwrap_or(joined);
+    let fname = resolved.file_name()?.to_str()?;
+    if !fname.eq_ignore_ascii_case("memory.ldb") {
+        return None;
+    }
     let parent = resolved.parent()?;
-    if parent.file_name().and_then(|n| n.to_str()) == Some(".agents") {
-        parent.parent().filter(|p| !p.as_os_str().is_empty()).map(Path::to_path_buf)
+    if parent
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case(".agents"))
+    {
+        parent
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf)
     } else {
         None
     }
@@ -1036,5 +1281,96 @@ mod tests {
         drop(proj_arc);
         drop(state);
         let _ = fs::remove_dir_all(&base_target);
+    }
+
+    #[test]
+    fn bounded_jsonrpc_reader_and_mcp_workspace_containment_and_customizations_guard() {
+        use super::{
+            handle_rpc_method, read_bounded_jsonrpc_line, BoundedLineRead,
+        };
+        use serde_json::json;
+        use std::io::Cursor;
+
+        // 1. Oversized JSON-RPC line must be drained safely without unbounded allocation,
+        //    leaving the next valid JSON-RPC line intact on the stream!
+        let mut stream_bytes = Vec::new();
+        stream_bytes.extend_from_slice(&vec![b'A'; 1024]);
+        stream_bytes.push(b'\n');
+        stream_bytes.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n");
+        let mut cursor = Cursor::new(stream_bytes);
+        assert_eq!(
+            read_bounded_jsonrpc_line(&mut cursor, 256).unwrap(),
+            BoundedLineRead::Oversized
+        );
+        assert_eq!(
+            read_bounded_jsonrpc_line(&mut cursor, 256).unwrap(),
+            BoundedLineRead::Line("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}".to_owned())
+        );
+        assert_eq!(
+            read_bounded_jsonrpc_line(&mut cursor, 256).unwrap(),
+            BoundedLineRead::Eof
+        );
+
+        // 2. `libredb_code` MUST reject paths escaping outside `cwd` AND `libredb_memorize`
+        //    MUST reject targeting `customizations.ldb`!
+        let tmp = std::env::temp_dir().join(format!(
+            "libredb_mcp_containment_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let ws_dir = tmp.join("workspace");
+        let outside_dir = tmp.join("outside");
+        fs::create_dir_all(ws_dir.join(".agents")).unwrap();
+        fs::create_dir_all(&outside_dir).unwrap();
+        let outside_rs = outside_dir.join("secret_algo.rs");
+        fs::write(&outside_rs, "pub fn top_secret() {}\n").unwrap();
+
+        let global_path = tmp.join("customizations.ldb");
+        {
+            let gdb = LibreDb::open(&global_path).unwrap();
+            let pdb = LibreDb::open(ws_dir.join(".agents").join("memory.ldb")).unwrap();
+            crate::security::seal_workspace_memory(&gdb, &pdb, &ws_dir).unwrap();
+        }
+
+        let mut state =
+            McpServerState::new(Some(&tmp.join("default.ldb")), Some(&global_path)).unwrap();
+
+        let escape_res = handle_rpc_method(
+            "tools/call",
+            &json!({
+                "name": "libredb_code",
+                "arguments": {
+                    "action": "skeleton",
+                    "cwd": ws_dir.to_string_lossy().to_string(),
+                    "target": "../outside/secret_algo.rs"
+                }
+            }),
+            &mut state,
+        );
+        assert!(
+            escape_res.is_err(),
+            "libredb_code MUST reject '../outside/secret_algo.rs' escaping outside cwd!"
+        );
+
+        let global_mut_res = handle_rpc_method(
+            "tools/call",
+            &json!({
+                "name": "libredb_memorize",
+                "arguments": {
+                    "cwd": global_path.to_string_lossy().to_string(),
+                    "facts": { "evil": "1" }
+                }
+            }),
+            &mut state,
+        );
+        assert!(
+            global_mut_res.is_err(),
+            "libredb_memorize MUST refuse mutating customizations.ldb!"
+        );
+
+        drop(state);
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

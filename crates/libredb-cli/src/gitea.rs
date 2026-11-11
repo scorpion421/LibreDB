@@ -196,9 +196,50 @@ fn extract_url_port(url: &str) -> u16 {
     default_port
 }
 
+pub(crate) fn validate_safe_git_identifier(val: &str, kind: &str) -> Result<(), String> {
+    let t = val.trim();
+    if t.is_empty() {
+        return Err(format!("{kind} must not be empty"));
+    }
+    if t.starts_with('-') || t.starts_with('.') {
+        return Err(format!(
+            "Refusing {kind} '{t}' starting with '-' or '.' (potential Git CLI option or hidden-ref injection)"
+        ));
+    }
+    if t.ends_with(".lock") || t.ends_with('/') || t.ends_with('.') {
+        return Err(format!(
+            "Refusing {kind} '{t}' with unsafe trailing '.lock', '/', or '.'"
+        ));
+    }
+    if t.contains("..")
+        || t.contains("//")
+        || t.contains("@{")
+        || t.chars().any(|c| {
+            c.is_whitespace()
+                || c.is_control()
+                || matches!(c, '\\' | ':' | '?' | '*' | '[' | '~' | '^')
+        })
+    {
+        return Err(format!(
+            "Refusing unsafe {kind} '{t}' violating git-check-ref-format character invariants"
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_no_http_header_chars(val: &str, field: &str) -> Result<(), String> {
+    if val.bytes().any(|b| matches!(b, b'\r' | b'\n' | b'\0')) {
+        return Err(format!(
+            "Refusing {field} containing CR/LF/NUL header-injection characters"
+        ));
+    }
+    Ok(())
+}
+
 fn should_supply_git_credentials(cfg: &GiteaConfig, git_stdin: &str) -> bool {
     let mut proto = "";
     let mut host = "";
+    let mut path_part = "";
     for line in git_stdin.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -208,12 +249,22 @@ fn should_supply_git_credentials(cfg: &GiteaConfig, git_stdin: &str) -> bool {
             proto = p.trim();
         } else if let Some(h) = trimmed.strip_prefix("host=") {
             host = h.trim();
+        } else if let Some(pa) = trimmed.strip_prefix("path=") {
+            path_part = pa.trim();
         }
     }
-    if proto.is_empty() || host.is_empty() {
+    if proto.is_empty()
+        || host.is_empty()
+        || proto.chars().any(|c| c.is_whitespace() || c.is_control())
+        || host.chars().any(|c| c.is_whitespace() || c.is_control() || c == '@')
+    {
         return false;
     }
-    let candidate = format!("{proto}://{host}");
+    let candidate = if path_part.is_empty() {
+        format!("{proto}://{host}")
+    } else {
+        format!("{proto}://{host}/{}", path_part.trim_start_matches('/'))
+    };
     cfg.allows_credentials_for_url(&candidate)
 }
 
@@ -230,7 +281,9 @@ pub fn cmd_gitea_credential_helper(
     global_opt: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut stdin_buf = String::new();
-    let _ = std::io::stdin().read_to_string(&mut stdin_buf);
+    let _ = std::io::stdin()
+        .take(16 * 1024)
+        .read_to_string(&mut stdin_buf);
     if action != "get" {
         return Ok(());
     }
@@ -238,6 +291,8 @@ pub fn cmd_gitea_credential_helper(
     let cfg = GiteaConfig::load(&ldb);
     if !cfg.user.is_empty()
         && !cfg.token.is_empty()
+        && ensure_no_http_header_chars(&cfg.user, "gitea_user").is_ok()
+        && ensure_no_http_header_chars(&cfg.token, "gitea_token").is_ok()
         && should_supply_git_credentials(&cfg, &stdin_buf)
     {
         let mut out = std::io::stdout().lock();
@@ -257,21 +312,32 @@ pub fn cmd_gitea_config(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let ldb = open_global_ldb(global_opt)?;
     if let Some(u) = url {
+        let trimmed_u = u.trim().trim_end_matches('/');
+        ensure_no_http_header_chars(trimmed_u, "gitea_url")?;
+        if !trimmed_u.is_empty()
+            && !trimmed_u.starts_with("http://")
+            && !trimmed_u.starts_with("https://")
+        {
+            return Err("gitea_url must start with http:// or https://".into());
+        }
         ldb.put(
-            WriteRequest::new(NodeKind::Config, u.trim().trim_end_matches('/').as_bytes().to_vec())
+            WriteRequest::new(NodeKind::Config, trimmed_u.as_bytes().to_vec())
                 .with_key("gitea_url")
                 .with_importance(190),
         )?;
     }
     if let Some(usr) = user {
+        let trimmed_usr = usr.trim();
+        ensure_no_http_header_chars(trimmed_usr, "gitea_user")?;
         ldb.put(
-            WriteRequest::new(NodeKind::Config, usr.trim().as_bytes().to_vec())
+            WriteRequest::new(NodeKind::Config, trimmed_usr.as_bytes().to_vec())
                 .with_key("gitea_user")
                 .with_importance(190),
         )?;
     }
     if let Some(tok) = token {
         let trimmed_tok = tok.trim();
+        ensure_no_http_header_chars(trimmed_tok, "gitea_token")?;
         if trimmed_tok.is_empty() {
             let _ = ldb.deprecate_key(NodeKind::Config, "gitea_token");
         } else {
@@ -296,25 +362,36 @@ pub fn cmd_gitea_config(
     if register_helper {
         if let Ok(exe) = env::current_exe() {
             let exe_fwd = exe.to_string_lossy().replace('\\', "/");
-            let helper_cmd = format!("!\"{exe_fwd}\" gitea-credential-helper");
-            let mut endpoints = vec![cfg.url.clone()];
-            if is_loopback_http_url(&cfg.url) {
-                let port = extract_url_port(&cfg.url);
-                for host in ["127.0.0.1", "localhost"] {
-                    let ep = if port == 80 {
-                        format!("http://{host}")
-                    } else {
-                        format!("http://{host}:{port}")
-                    };
-                    if !endpoints.iter().any(|x| x.eq_ignore_ascii_case(&ep)) {
-                        endpoints.push(ep);
+            if !exe_fwd.contains('"') && !exe_fwd.chars().any(char::is_control) {
+                let helper_cmd = format!("!\"{exe_fwd}\" gitea-credential-helper");
+                let mut endpoints = vec![cfg.url.clone()];
+                if is_loopback_http_url(&cfg.url) {
+                    let port = extract_url_port(&cfg.url);
+                    for host in ["127.0.0.1", "localhost"] {
+                        let ep = if port == 80 {
+                            format!("http://{host}")
+                        } else {
+                            format!("http://{host}:{port}")
+                        };
+                        if !endpoints.iter().any(|x| x.eq_ignore_ascii_case(&ep)) {
+                            endpoints.push(ep);
+                        }
                     }
                 }
-            }
-            for ep in endpoints {
-                let _ = Command::new("git")
-                    .args(["config", "--global", &format!("credential.{ep}.helper"), &helper_cmd])
-                    .output();
+                for ep in endpoints {
+                    if (ep.starts_with("http://") || ep.starts_with("https://"))
+                        && !ep.chars().any(|c| c.is_whitespace() || c.is_control())
+                    {
+                        let _ = Command::new("git")
+                            .args([
+                                "config",
+                                "--global",
+                                &format!("credential.{ep}.helper"),
+                                &helper_cmd,
+                            ])
+                            .output();
+                    }
+                }
             }
         }
     }
@@ -402,6 +479,7 @@ pub fn cmd_gitea_init(
         .map(ToOwned::to_owned)
         .or_else(|| clean_root.file_name().and_then(|n| n.to_str()).map(ToOwned::to_owned))
         .ok_or("Cannot determine repository name")?;
+    validate_safe_git_identifier(&repo_name, "repository name")?;
 
     if !cfg.user.is_empty() && !cfg.token.is_empty() {
         if let Some((exists, is_empty, html_url, _clone_url)) = inspect_remote_repo(&cfg, &repo_name)
@@ -419,7 +497,7 @@ pub fn cmd_gitea_init(
             if exists && overwrite {
                 let _ = http_request(
                     "DELETE",
-                    &format!("{}/api/v1/repos/{}/{}", cfg.url, cfg.user, repo_name),
+                    &format!("{}/api/v1/repos/{}/{}", cfg.url, cfg.user, percent_encode(&repo_name)),
                     &cfg.token,
                     cfg.allow_insecure_http,
                     None,
@@ -438,7 +516,7 @@ pub fn cmd_gitea_init(
     if let Some((_, existing_origin_url)) = remotes.iter().find(|(n, _)| n == "origin") {
         if cfg.is_gitea_remote_url(existing_origin_url) {
             let _ = Command::new("git")
-                .args(["remote", "set-url", "origin", &clone_url])
+                .args(["remote", "set-url", "--", "origin", &clone_url])
                 .current_dir(&clean_root)
                 .output()?;
         } else {
@@ -446,24 +524,23 @@ pub fn cmd_gitea_init(
             linked_remote_name = "gitea";
             if remotes.iter().any(|(n, _)| n == "gitea") {
                 let _ = Command::new("git")
-                    .args(["remote", "set-url", "gitea", &clone_url])
+                    .args(["remote", "set-url", "--", "gitea", &clone_url])
                     .current_dir(&clean_root)
                     .output()?;
             } else {
                 let _ = Command::new("git")
-                    .args(["remote", "add", "gitea", &clone_url])
+                    .args(["remote", "add", "--", "gitea", &clone_url])
                     .current_dir(&clean_root)
                     .output()?;
             }
         }
     } else {
         let _ = Command::new("git")
-            .args(["remote", "add", "origin", &clone_url])
+            .args(["remote", "add", "--", "origin", &clone_url])
             .current_dir(&clean_root)
             .output()?;
     }
 
-    record_learned_workspace(&ldb, &clean_root);
     let proj_ldb_path = clean_root.join(".agents").join("memory.ldb");
     if proj_ldb_path.is_file() {
         let _ws_lock = crate::security::WorkspaceTrustLockGuard::acquire(&ldb, &clean_root)
@@ -475,6 +552,7 @@ pub fn cmd_gitea_init(
             }
         }
     }
+    record_learned_workspace(&ldb, &clean_root);
     println!(
         "[OK] Initialized Git & linked remote '{linked_remote_name}' ('{}') -> {}/{}/{}",
         clean_root.display(),
@@ -676,11 +754,12 @@ pub fn cmd_gitea_sync(
     let short_hash = String::from_utf8_lossy(&rev_out.stdout).trim().to_owned();
 
     let repo_name = resolve_repo_name_from_git_or_dir(&clean_root);
+    validate_safe_git_identifier(&repo_name, "repository name")?;
     let mut remotes = list_git_remotes(&clean_root);
     if remotes.is_empty() && !cfg.user.is_empty() && !cfg.token.is_empty() {
         if let Ok(clone_url) = ensure_remote_repo_created(&cfg, &repo_name) {
             let _ = Command::new("git")
-                .args(["remote", "add", "origin", &clone_url])
+                .args(["remote", "add", "--", "origin", &clone_url])
                 .current_dir(&clean_root)
                 .output();
             remotes = list_git_remotes(&clean_root);
@@ -698,17 +777,19 @@ pub fn cmd_gitea_sync(
     }
 
     let branch = current_git_branch(&clean_root);
+    validate_safe_git_identifier(&branch, "branch name")?;
     println!("Synchronizing workspace: {} ({})", repo_name, clean_root.display());
     println!("  [OK] HEAD commit:    {short_hash} ({changed_cnt} files committed)");
 
     for (rem_name, rem_url) in &target_remotes {
+        validate_safe_git_identifier(rem_name, "remote name")?;
         if cfg.is_gitea_remote_url(rem_url) && !cfg.user.is_empty() && !cfg.token.is_empty() {
             let _ = ensure_remote_repo_created(&cfg, &repo_name);
         }
         let mut push_cmd = Command::new("git");
         cfg.configure_git_command_for_remote(&mut push_cmd, rem_url);
         let p_out = push_cmd
-            .args(["push", "-u", rem_name, &branch])
+            .args(["push", "-u", "--", rem_name, &branch])
             .current_dir(&clean_root)
             .output()?;
         if !p_out.status.success() {
@@ -787,11 +868,13 @@ fn publish_gitea_release_internal(
     }
 
     let repo_name = resolve_repo_name_from_git_or_dir(project_root);
+    validate_safe_git_identifier(&repo_name, "repository name")?;
 
     // Ensure local annotated Git tag exists for selected release(s) and verify SemVer tag immutability!
     let head_sha = resolve_git_head_commit(project_root);
     let mut created_any_tag = false;
     for entry in &selected {
+        validate_safe_git_identifier(&entry.tag, "release tag")?;
         if let Some(tag_sha) = resolve_git_tag_commit(project_root, &entry.tag) {
             // If explicitly releasing the top changelog version (`entries[0]`) and its tag points to an older commit than HEAD:
             if target_tag_opt.is_some()
@@ -816,9 +899,10 @@ fn publish_gitea_release_internal(
                     "user.email=antigravity@local.dev",
                     "tag",
                     "-a",
-                    &entry.tag,
                     "-m",
                     &format!("{repo_name} {}", entry.tag),
+                    "--",
+                    &entry.tag,
                 ])
                 .current_dir(project_root)
                 .output()?;
@@ -827,10 +911,11 @@ fn publish_gitea_release_internal(
     }
     if created_any_tag || target_tag_opt.is_some() {
         for (rem_name, rem_url) in target_remotes {
+            validate_safe_git_identifier(rem_name, "remote name")?;
             let mut tpush_cmd = Command::new("git");
             cfg.configure_git_command_for_remote(&mut tpush_cmd, rem_url);
             let _ = tpush_cmd
-                .args(["push", rem_name, "--tags"])
+                .args(["push", "--tags", "--", rem_name])
                 .current_dir(project_root)
                 .output();
         }
@@ -853,7 +938,7 @@ fn publish_gitea_release_internal(
     // Fetch existing Gitea releases
     let rels_url = format!(
         "{}/api/v1/repos/{}/{}/releases?limit=100",
-        cfg.url, cfg.user, repo_name
+        cfg.url, cfg.user, percent_encode(&repo_name)
     );
     let existing_rels: Vec<Value> =
         match http_request("GET", &rels_url, &cfg.token, cfg.allow_insecure_http, None, None) {
@@ -884,7 +969,7 @@ fn publish_gitea_release_internal(
             let rel_id = ex.get("id").and_then(Value::as_u64).unwrap_or(0);
             let patch_url = format!(
                 "{}/api/v1/repos/{}/{}/releases/{rel_id}",
-                cfg.url, cfg.user, repo_name
+                cfg.url, cfg.user, percent_encode(&repo_name)
             );
             match http_request(
                 "PATCH",
@@ -898,7 +983,12 @@ fn publish_gitea_release_internal(
                 _ => Some(ex.clone()),
             }
         } else {
-            let post_url = format!("{}/api/v1/repos/{}/{}/releases", cfg.url, cfg.user, repo_name);
+            let post_url = format!(
+                "{}/api/v1/repos/{}/{}/releases",
+                cfg.url,
+                cfg.user,
+                percent_encode(&repo_name)
+            );
             match http_request(
                 "POST",
                 &post_url,
@@ -943,6 +1033,9 @@ fn publish_gitea_release_internal(
     Ok(synced_tags)
 }
 
+const MAX_DELIVERABLE_ASSET_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_HTTP_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
+
 fn attach_release_assets(
     cfg: &GiteaConfig,
     repo_name: &str,
@@ -953,22 +1046,36 @@ fn attach_release_assets(
 ) -> Vec<String> {
     let deliverables = discover_deliverable_files(project_root, tag);
     let mut uploaded = Vec::new();
+    let enc_repo = percent_encode(repo_name);
 
     for file_path in deliverables {
+        let Ok(sym_meta) = fs::symlink_metadata(&file_path) else {
+            continue;
+        };
+        if !sym_meta.file_type().is_file() || sym_meta.len() > MAX_DELIVERABLE_ASSET_BYTES {
+            continue;
+        }
         let Some(fname) = file_path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
+        let safe_fname: String = fname
+            .chars()
+            .filter(|&c| c != '"' && c != '\\' && c != '\r' && c != '\n' && !c.is_control())
+            .collect();
+        if safe_fname.is_empty() {
+            continue;
+        }
         let Ok(file_bytes) = fs::read(&file_path) else {
             continue;
         };
 
         // Replace existing asset of the same name if overwriting/updating release
         for ex in existing_assets {
-            if ex.get("name").and_then(Value::as_str) == Some(fname) {
+            if ex.get("name").and_then(Value::as_str) == Some(safe_fname.as_str()) {
                 if let Some(aid) = ex.get("id").and_then(Value::as_u64) {
                     let del_url = format!(
-                        "{}/api/v1/repos/{}/{}/releases/{rel_id}/assets/{aid}",
-                        cfg.url, cfg.user, repo_name
+                        "{}/api/v1/repos/{}/{enc_repo}/releases/{rel_id}/assets/{aid}",
+                        cfg.url, cfg.user
                     );
                     let _ = http_request(
                         "DELETE",
@@ -983,7 +1090,7 @@ fn attach_release_assets(
         }
 
         let boundary = format!("----LibreDBAssetBoundary{}", std::process::id());
-        let content_type_inner = if fname.ends_with(".zip") || fname.ends_with(".whl") {
+        let content_type_inner = if safe_fname.ends_with(".zip") || safe_fname.ends_with(".whl") {
             "application/zip"
         } else {
             "application/octet-stream"
@@ -992,18 +1099,17 @@ fn attach_release_assets(
         let mut body = Vec::with_capacity(file_bytes.len() + 512);
         write!(
             &mut body,
-            "--{boundary}\r\nContent-Disposition: form-data; name=\"attachment\"; filename=\"{fname}\"\r\nContent-Type: {content_type_inner}\r\n\r\n"
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"attachment\"; filename=\"{safe_fname}\"\r\nContent-Type: {content_type_inner}\r\n\r\n"
         )
         .unwrap();
         body.extend_from_slice(&file_bytes);
         write!(&mut body, "\r\n--{boundary}--\r\n").unwrap();
 
         let up_url = format!(
-            "{}/api/v1/repos/{}/{}/releases/{rel_id}/assets?name={}",
+            "{}/api/v1/repos/{}/{enc_repo}/releases/{rel_id}/assets?name={}",
             cfg.url,
             cfg.user,
-            repo_name,
-            percent_encode(fname)
+            percent_encode(&safe_fname)
         );
         let mp_hdr = format!("multipart/form-data; boundary={boundary}");
         if let Ok((st, _)) = http_request(
@@ -1015,7 +1121,7 @@ fn attach_release_assets(
             Some(&body),
         ) {
             if st == 200 || st == 201 {
-                uploaded.push(fname.to_owned());
+                uploaded.push(safe_fname);
             }
         }
     }
@@ -1030,13 +1136,20 @@ fn discover_deliverable_files(project_root: &Path, tag: &str) -> Vec<PathBuf> {
     let mut found = Vec::new();
     for sub in ["dist", "releases"] {
         let dir = project_root.join(sub);
+        if fs::symlink_metadata(&dir).is_ok_and(|m| m.file_type().is_symlink()) {
+            continue;
+        }
         if let Ok(rd) = fs::read_dir(&dir) {
             let mut entries: Vec<PathBuf> = rd
                 .filter_map(|e| e.ok().map(|x| x.path()))
-                .filter(|p| p.is_file())
+                .filter(|p| {
+                    fs::symlink_metadata(p).is_ok_and(|m| {
+                        m.file_type().is_file() && m.len() <= MAX_DELIVERABLE_ASSET_BYTES
+                    })
+                })
                 .filter(|p| {
                     let low = p.file_name().unwrap_or_default().to_string_lossy().to_ascii_lowercase();
-                    exts.iter().any(|ext| low.ends_with(ext))
+                    !low.starts_with('-') && exts.iter().any(|ext| low.ends_with(ext))
                 })
                 .collect();
             entries.sort();
@@ -1291,11 +1404,11 @@ fn list_git_remotes(root: &Path) -> Vec<(String, String)> {
     }
     for name in String::from_utf8_lossy(&rem_out.stdout).lines() {
         let rem = name.trim();
-        if rem.is_empty() {
+        if rem.is_empty() || validate_safe_git_identifier(rem, "remote name").is_err() {
             continue;
         }
         if let Ok(u_out) = Command::new("git")
-            .args(["-c", "core.fsmonitor=false", "remote", "get-url", rem])
+            .args(["-c", "core.fsmonitor=false", "remote", "get-url", "--", rem])
             .current_dir(root)
             .output()
         {
@@ -1350,8 +1463,19 @@ fn select_target_remotes(
 }
 
 fn resolve_git_tag_commit(root: &Path, tag: &str) -> Option<String> {
+    if validate_safe_git_identifier(tag, "tag").is_err() {
+        return None;
+    }
     let out = Command::new("git")
-        .args(["-c", "core.fsmonitor=false", "rev-list", "-n", "1", tag])
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "rev-list",
+            "-n",
+            "1",
+            tag,
+            "--",
+        ])
         .current_dir(root)
         .output()
         .ok()?;
@@ -1378,10 +1502,13 @@ fn resolve_git_head_commit(root: &Path) -> String {
 }
 
 fn publish_github_cli_release(project_root: &Path, repo_name: &str, entry: &ChangelogEntry) {
+    if validate_safe_git_identifier(&entry.tag, "release tag").is_err() {
+        return;
+    }
     let title = format!("{repo_name} {}", entry.tag);
     let deliverables = discover_deliverable_files(project_root, &entry.tag);
     let view_ok = Command::new("gh")
-        .args(["release", "view", &entry.tag])
+        .args(["release", "view", "--", &entry.tag])
         .current_dir(project_root)
         .output()
         .is_ok_and(|o| o.status.success());
@@ -1401,17 +1528,18 @@ fn publish_github_cli_release(project_root: &Path, repo_name: &str, entry: &Chan
             .output();
         for f in &deliverables {
             if let Some(fs_str) = f.to_str() {
-                let _ = Command::new("gh")
-                    .args(["release", "upload", &entry.tag, fs_str, "--clobber"])
-                    .current_dir(project_root)
-                    .output();
+                if !fs_str.starts_with('-') {
+                    let _ = Command::new("gh")
+                        .args(["release", "upload", "--clobber", "--", &entry.tag, fs_str])
+                        .current_dir(project_root)
+                        .output();
+                }
             }
         }
     } else {
         let mut create_args = vec![
             "release".to_owned(),
             "create".to_owned(),
-            entry.tag.clone(),
             "--title".to_owned(),
             title,
             "--notes".to_owned(),
@@ -1420,9 +1548,13 @@ fn publish_github_cli_release(project_root: &Path, repo_name: &str, entry: &Chan
         if entry.version.contains('-') {
             create_args.push("--prerelease".to_owned());
         }
+        create_args.push("--".to_owned());
+        create_args.push(entry.tag.clone());
         for f in &deliverables {
             if let Some(fs_str) = f.to_str() {
-                create_args.push(fs_str.to_owned());
+                if !fs_str.starts_with('-') {
+                    create_args.push(fs_str.to_owned());
+                }
             }
         }
         let _ = Command::new("gh")
@@ -1433,21 +1565,46 @@ fn publish_github_cli_release(project_root: &Path, repo_name: &str, entry: &Chan
 }
 
 fn record_learned_workspace(ldb: &LibreDb, clean_root: &Path) {
-    if let Some(name) = clean_root.file_name().and_then(|n| n.to_str()) {
-        let key = format!("workspace:{name}");
-        let val = clean_root.to_string_lossy().into_owned();
-        let _ = ldb.put(
-            WriteRequest::new(NodeKind::Config, val.clone().into_bytes())
-                .with_key(key)
-                .with_importance(175),
-        );
-        let norm = crate::security::normalize_workspace_key(clean_root);
-        let _ = ldb.put(
-            WriteRequest::new(NodeKind::Config, val.into_bytes())
-                .with_key(format!("trust:allowed::{norm}"))
-                .with_importance(185),
-        );
+    if crate::hooks::is_protected_profile_dir(clean_root) {
+        return;
     }
+    let norm = crate::security::normalize_workspace_key(clean_root);
+    if norm.is_empty() {
+        return;
+    }
+    let _ws_lock = match crate::security::WorkspaceTrustLockGuard::acquire_norm(ldb, &norm) {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    if crate::security::has_config_key_fail_closed(ldb, &format!("trust:revoked::{norm}"))
+        .unwrap_or(true)
+    {
+        return;
+    }
+    let has_existing_or_prior_memory = clean_root.join(".agents").join("memory.ldb").exists()
+        || clean_root.join(".agents").join("memory.db").exists()
+        || crate::security::has_prior_workspace_seal_marker(ldb, clean_root)
+        || crate::security::is_git_index_tracking_agents_db(clean_root);
+    if has_existing_or_prior_memory
+        && !crate::security::is_workspace_memory_trusted(Some(ldb), clean_root)
+    {
+        // Never grant `trust:allowed::<norm>` to a repository containing an untrusted, unsealed,
+        // tampered, or Git-tracked `.agents/memory.*` database!
+        return;
+    }
+
+    let val = clean_root.to_string_lossy().into_owned();
+    let ws_id_key = crate::security::workspace_id_config_key(&norm);
+    let _ = ldb.put(
+        WriteRequest::new(NodeKind::Config, val.clone().into_bytes())
+            .with_key(ws_id_key)
+            .with_importance(175),
+    );
+    let _ = ldb.put(
+        WriteRequest::new(NodeKind::Config, val.into_bytes())
+            .with_key(format!("trust:allowed::{norm}"))
+            .with_importance(185),
+    );
 }
 
 pub fn strip_verbatim_prefix(p: &Path) -> PathBuf {
@@ -1512,7 +1669,11 @@ fn list_remote_repos(cfg: &GiteaConfig) -> Vec<(String, String)> {
         return Vec::new();
     }
     let url = if !cfg.user.is_empty() {
-        format!("{}/api/v1/users/{}/repos?limit=100", cfg.url, cfg.user)
+        format!(
+            "{}/api/v1/users/{}/repos?limit=100",
+            cfg.url,
+            percent_encode(&cfg.user)
+        )
     } else {
         format!("{}/api/v1/user/repos?limit=100", cfg.url)
     };
@@ -1540,7 +1701,12 @@ fn inspect_remote_repo(
     cfg: &GiteaConfig,
     repo_name: &str,
 ) -> Option<(bool, bool, String, String)> {
-    let url = format!("{}/api/v1/repos/{}/{}", cfg.url, cfg.user, repo_name);
+    let url = format!(
+        "{}/api/v1/repos/{}/{}",
+        cfg.url,
+        percent_encode(&cfg.user),
+        percent_encode(repo_name)
+    );
     match http_request("GET", &url, &cfg.token, cfg.allow_insecure_http, None, None) {
         Ok((200, body)) => {
             let v: Value = serde_json::from_slice(&body).ok()?;
@@ -1566,6 +1732,7 @@ fn ensure_remote_repo_created(
     cfg: &GiteaConfig,
     repo_name: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    validate_safe_git_identifier(repo_name, "repository name")?;
     if let Some((true, _, _, clone_url)) = inspect_remote_repo(cfg, repo_name) {
         if !clone_url.is_empty() {
             return Ok(clone_url);
@@ -1600,7 +1767,8 @@ fn ensure_remote_repo_created(
 /// Minimal, dependency-free HTTP/1.1 client over `std::net::TcpStream` for local loopback `http://`
 /// Gitea API calls, with automatic native OS `curl` (`System32\curl.exe` Schannel / POSIX `curl`)
 /// fallback for `https://`. Refuses to transmit tokens over remote cleartext `http://` unless
-/// `allow_insecure_http` is explicitly enabled.
+/// `allow_insecure_http` is explicitly enabled, validates all header inputs against CRLF/NUL
+/// injection, and bounds response bodies to `32 MiB`.
 fn http_request(
     method: &str,
     url: &str,
@@ -1609,6 +1777,17 @@ fn http_request(
     content_type: Option<&str>,
     body: Option<&[u8]>,
 ) -> std::io::Result<(u16, Vec<u8>)> {
+    ensure_no_http_header_chars(method, "HTTP method")
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    ensure_no_http_header_chars(url, "HTTP URL")
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    ensure_no_http_header_chars(token, "API token")
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    if let Some(ct) = content_type {
+        ensure_no_http_header_chars(ct, "Content-Type")
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    }
+
     if url.starts_with("https://") {
         return https_request_via_system_curl(method, url, token, content_type, body);
     }
@@ -1661,7 +1840,15 @@ fn http_request(
     stream.flush()?;
 
     let mut raw_resp = Vec::new();
-    stream.read_to_end(&mut raw_resp)?;
+    stream
+        .take(MAX_HTTP_RESPONSE_BYTES + 1)
+        .read_to_end(&mut raw_resp)?;
+    if raw_resp.len() as u64 > MAX_HTTP_RESPONSE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "HTTP response exceeded 32 MiB safety limit",
+        ));
+    }
     parse_http_response(&raw_resp)
 }
 
@@ -1727,8 +1914,18 @@ struct EphemeralCurlConfig {
 
 impl EphemeralCurlConfig {
     fn create_with_token(token: &str) -> std::io::Result<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CURL_CFG_SEQ: AtomicU64 = AtomicU64::new(0);
+
         let base_dir = crate::hooks::user_home_dir().join(".gemini").join("libredb");
-        let dir = if fs::create_dir_all(&base_dir).is_ok() {
+        let dir = if fs::create_dir_all(&base_dir).is_ok()
+            && fs::symlink_metadata(&base_dir).is_ok_and(|m| m.file_type().is_dir())
+        {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&base_dir, fs::Permissions::from_mode(0o700));
+            }
             base_dir
         } else {
             env::temp_dir()
@@ -1736,10 +1933,19 @@ impl EphemeralCurlConfig {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
-        let cfg_path = dir.join(format!(".curl_hdr_{}_{stamp}.cfg", std::process::id()));
+        let seq = CURL_CFG_SEQ.fetch_add(1, Ordering::Relaxed);
+        let cfg_path = dir.join(format!(
+            ".curl_hdr_{}_{stamp}_{seq}.cfg",
+            std::process::id()
+        ));
         let content = format_curl_auth_header_line(token);
         let mut opts = fs::OpenOptions::new();
         opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
         #[cfg(windows)]
         {
             use std::os::windows::fs::OpenOptionsExt;
@@ -1747,11 +1953,6 @@ impl EphemeralCurlConfig {
             opts.attributes(FILE_ATTRIBUTE_TEMPORARY);
         }
         let mut f = opts.open(&cfg_path)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = f.set_permissions(fs::Permissions::from_mode(0o600));
-        }
         f.write_all(content.as_bytes())?;
         f.flush()?;
         Ok(Self {
@@ -1776,7 +1977,7 @@ impl Drop for EphemeralCurlConfig {
 /// which natively uses Windows Schannel and trusts Active Directory GPO Enterprise Root CAs).
 /// Enforces `--proto =https`, disables cross-origin redirect auth leaks (no `--location`), pipes `-K -`
 /// over `stdin` with zero disk writes when `body.is_none()`, and falls back to `FILE_ATTRIBUTE_TEMPORARY`
-/// RAII-wiped `EphemeralCurlConfig` only when `stdin` carries a request body.
+/// `0600` RAII-wiped `EphemeralCurlConfig` only when `stdin` carries a request body.
 fn https_request_via_system_curl(
     method: &str,
     url: &str,
@@ -1813,6 +2014,8 @@ fn https_request_via_system_curl(
         "=https",
         "--max-time",
         "30",
+        "--max-filesize",
+        "33554432",
         "-X",
         method,
         "-H",
@@ -1834,7 +2037,7 @@ fn https_request_via_system_curl(
     } else {
         cmd.stdin(Stdio::null());
     }
-    cmd.args(["-w", &format!("{marker}%{{http_code}}"), url]);
+    cmd.args(["-w", &format!("{marker}%{{http_code}}"), "--", url]);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
@@ -1921,9 +2124,12 @@ fn percent_encode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        http_request, parse_http_response, should_supply_git_credentials, strip_verbatim_prefix,
+        ensure_no_http_header_chars, http_request, parse_http_response, record_learned_workspace,
+        should_supply_git_credentials, strip_verbatim_prefix, validate_safe_git_identifier,
         GiteaConfig,
     };
+    use libredb_core::{LibreDb, NodeKind, WriteRequest};
+    use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
@@ -2022,5 +2228,118 @@ mod tests {
         let (status, body) = parse_http_response(raw).unwrap();
         assert_eq!(status, 201);
         assert_eq!(body, b"{\"id\":42}");
+    }
+
+    #[test]
+    fn git_identifiers_crlf_headers_and_untrusted_workspace_learning_are_guarded() {
+        for bad_id in [
+            "--upload-pack=evil",
+            "-u",
+            "foo..bar",
+            "bad\nref",
+            "bad space",
+            ".hidden",
+            "repo.lock",
+        ] {
+            assert!(
+                validate_safe_git_identifier(bad_id, "identifier").is_err(),
+                "Expected unsafe Git identifier '{bad_id}' to be rejected!"
+            );
+        }
+        for good_id in ["v0.10.0", "origin", "feature/sec-audit", "LibreDB"] {
+            assert!(validate_safe_git_identifier(good_id, "identifier").is_ok());
+        }
+
+        assert!(ensure_no_http_header_chars("tok\r\nX-Injected: 1", "token").is_err());
+        assert!(
+            http_request(
+                "GET",
+                "http://127.0.0.1:3000/api\r\nInjected: 1",
+                "tok",
+                false,
+                None,
+                None
+            )
+            .is_err(),
+            "CRLF header injection in URL must be rejected before opening socket!"
+        );
+
+        // Subpath-hosted Gitea (`https://corp.example/gitea`) must enforce path prefix in credential helper!
+        let subpath_cfg = GiteaConfig {
+            url: "https://corp.example/gitea".to_owned(),
+            user: "bot".to_owned(),
+            token: "tok".to_owned(),
+            service_name: "gitea".to_owned(),
+            allow_insecure_http: false,
+        };
+        assert!(!should_supply_git_credentials(
+            &subpath_cfg,
+            "protocol=https\nhost=corp.example\npath=gitlab/other.git\n\n"
+        ));
+        assert!(should_supply_git_credentials(
+            &subpath_cfg,
+            "protocol=https\nhost=corp.example\npath=gitea/org/repo.git\n\n"
+        ));
+
+        // `record_learned_workspace` must NOT grant `trust:allowed` to OS temp dirs or when an
+        // unsealed `.agents/memory.*` is present, while recording clean non-temp workspaces!
+        let tmp = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join(format!(
+                "test_gitea_learn_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos())
+            ));
+        let clean_ws = tmp.join("clean_ws");
+        let poisoned_ws = tmp.join("poisoned_ws");
+        let os_temp_ws = std::env::temp_dir().join(format!("libredb_tmp_ws_{}", std::process::id()));
+        fs::create_dir_all(&clean_ws).unwrap();
+        fs::create_dir_all(poisoned_ws.join(".agents")).unwrap();
+        fs::create_dir_all(&os_temp_ws).unwrap();
+        let unsealed_pdb = LibreDb::open(poisoned_ws.join(".agents").join("memory.ldb")).unwrap();
+        unsealed_pdb
+            .put(WriteRequest::new(NodeKind::Rule, b"evil".to_vec()).with_key("r"))
+            .unwrap();
+        drop(unsealed_pdb);
+
+        let gdb = LibreDb::open(tmp.join("customizations.ldb")).unwrap();
+        record_learned_workspace(&gdb, &clean_ws);
+        record_learned_workspace(&gdb, &poisoned_ws);
+        record_learned_workspace(&gdb, &os_temp_ws);
+
+        let clean_norm = crate::security::normalize_workspace_key(&clean_ws);
+        let poisoned_norm = crate::security::normalize_workspace_key(&poisoned_ws);
+        let os_temp_norm = crate::security::normalize_workspace_key(&os_temp_ws);
+        assert!(
+            gdb.get_by_key(NodeKind::Config, &format!("trust:allowed::{clean_norm}"))
+                .is_ok(),
+            "Clean workspace without .agents must be recorded!"
+        );
+        assert!(
+            gdb.get_by_key(
+                NodeKind::Config,
+                &crate::security::workspace_id_config_key(&clean_norm)
+            )
+            .is_ok(),
+            "Clean workspace must record collision-free workspace_id::<hash>!"
+        );
+        assert!(
+            gdb.get_by_key(NodeKind::Config, &format!("trust:allowed::{poisoned_norm}"))
+                .is_err(),
+            "Workspace with unsealed .agents/memory.ldb MUST NOT receive trust:allowed via git-sync/git-init!"
+        );
+        assert!(
+            gdb.get_by_key(NodeKind::Config, &format!("trust:allowed::{os_temp_norm}"))
+                .is_err(),
+            "OS temp directories MUST NOT be learned as trusted workspaces!"
+        );
+
+        drop(gdb);
+        let _ = fs::remove_dir_all(&tmp);
+        let _ = fs::remove_dir_all(&os_temp_ws);
     }
 }

@@ -28,6 +28,20 @@ pub fn default_central_sqlite_path() -> PathBuf {
 }
 
 const MIN_VALID_LDB_BYTES: u64 = 8192;
+const MAX_HOOK_STDIN_BYTES: u64 = 16 * 1024 * 1024;
+
+fn read_bounded_hook_stdin() -> io::Result<(String, bool)> {
+    let mut buf = Vec::with_capacity(4096);
+    io::stdin()
+        .take(MAX_HOOK_STDIN_BYTES + 1)
+        .read_to_end(&mut buf)?;
+    if (buf.len() as u64) > MAX_HOOK_STDIN_BYTES {
+        buf.truncate(MAX_HOOK_STDIN_BYTES as usize);
+        Ok((String::from_utf8_lossy(&buf).into_owned(), true))
+    } else {
+        Ok((String::from_utf8_lossy(&buf).into_owned(), false))
+    }
+}
 
 pub fn open_global_ldb(override_path: Option<&Path>) -> Result<Arc<LibreDb>, String> {
     let target = override_path
@@ -49,7 +63,13 @@ pub fn open_global_ldb(override_path: Option<&Path>) -> Result<Arc<LibreDb>, Str
                 ));
             }
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = target.parent() {
+                if !parent.as_os_str().is_empty() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+            }
+        }
         Err(e) => {
             return Err(format!(
                 "Failed to inspect global customizations.ldb metadata at '{}': {e}",
@@ -57,18 +77,13 @@ pub fn open_global_ldb(override_path: Option<&Path>) -> Result<Arc<LibreDb>, Str
             ));
         }
     }
-    let central_sql = default_central_sqlite_path();
-    let sql_opt = if override_path.is_none() {
-        Some(central_sql.as_path())
-    } else {
-        None
-    };
-    let (db, migrated) =
-        open_or_auto_migrate(&target, sql_opt, "central").map_err(|e| e.to_string())?;
-    if migrated.is_some() {
-        if let Ok(mut cog) = CognitiveEngine::open_db(Arc::clone(&db)) {
-            let _ = cog.save_index_snapshot();
-        }
+    // Never implicitly import legacy `~/.gemini/database/customizations.db` on cold CLI opens;
+    // legacy SQLite migration requires explicit `--migrate-legacy` or `libredb import-sqlite`.
+    let (db, _) = open_or_auto_migrate(&target, None, "central").map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600));
     }
     Ok(db)
 }
@@ -127,11 +142,48 @@ pub fn open_project_ldb_silent(ldb_path: &Path) -> Result<(Arc<LibreDb>, bool), 
 
 /// Handles Antigravity `PreToolUse` JSON hook from `stdin` (`< 1.5 ms`).
 pub fn run_pre_tool_hook(global_ldb_opt: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
-    let mut raw = String::new();
-    let _ = io::stdin().read_to_string(&mut raw);
-    let payload: Value = serde_json::from_str(raw.trim()).unwrap_or_else(|_| json!({}));
+    let (raw, exceeded) = match read_bounded_hook_stdin() {
+        Ok(pair) => pair,
+        Err(e) => {
+            emit_json(&json!({
+                "decision": "deny",
+                "reason": format!("LibreDB PreToolUse failed to read hook stdin: {e}")
+            }))?;
+            return Ok(());
+        }
+    };
+    if exceeded {
+        emit_json(&json!({
+            "decision": "deny",
+            "reason": "LibreDB PreToolUse hook payload exceeded 16 MiB safety limit."
+        }))?;
+        return Ok(());
+    }
+    let trimmed = raw.trim();
+    let payload: Value = if trimmed.is_empty() {
+        json!({})
+    } else {
+        match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(e) => {
+                emit_json(&json!({
+                    "decision": "deny",
+                    "reason": format!("LibreDB PreToolUse rejected malformed JSON payload: {e}")
+                }))?;
+                return Ok(());
+            }
+        }
+    };
 
-    let (tool_name, args) = extract_pre_tool_name_and_args(&payload);
+    let response = evaluate_pre_tool_payload(&payload, global_ldb_opt);
+    emit_json(&response)?;
+    Ok(())
+}
+
+/// Pure, directly unit-testable `PreToolUse` evaluator enforcing fail-closed behavior whenever
+/// `customizations.ldb` exists on disk yet is corrupted, truncated, or symlinked.
+pub(crate) fn evaluate_pre_tool_payload(payload: &Value, global_ldb_opt: Option<&Path>) -> Value {
+    let (tool_name, args) = extract_pre_tool_name_and_args(payload);
     let mut global_db_cache: Option<Result<Option<Arc<LibreDb>>, String>> = None;
     let mut get_global_db_checked = || -> Result<Option<Arc<LibreDb>>, String> {
         global_db_cache
@@ -163,11 +215,10 @@ pub fn run_pre_tool_hook(global_ldb_opt: Option<&Path>) -> Result<(), Box<dyn st
                     false,
                 )
             {
-                emit_json(&json!({
+                return json!({
                     "decision": "allow",
                     "overwrite": { "Model": "flash" }
-                }))?;
-                return Ok(());
+                });
             }
         }
     }
@@ -180,15 +231,35 @@ pub fn run_pre_tool_hook(global_ldb_opt: Option<&Path>) -> Result<(), Box<dyn st
 
     if let Some(cmd_line) = cmd_opt {
         if let Some(v) = check_command_guardrails(cmd_line) {
-            emit_json(&json!({
+            return json!({
                 "decision": "deny",
                 "reason": format!("LibreDB Guardrail Blocked Command ({}): {}", v.rule, v.message)
-            }))?;
-            return Ok(());
+            });
+        }
+
+        let gdb_opt = match get_global_db_checked() {
+            Ok(opt) => opt,
+            Err(err) => {
+                return json!({
+                    "decision": "deny",
+                    "reason": format!(
+                        "LibreDB PreToolUse failed closed because global customizations.ldb could not be verified: {err}"
+                    )
+                });
+            }
+        };
+        if let Some(ref gdb) = gdb_opt {
+            if let Err(err) = crate::security::check_global_trust_sync(gdb) {
+                return json!({
+                    "decision": "deny",
+                    "reason": format!(
+                        "LibreDB PreToolUse failed closed because global customizations.ldb could not synchronize: {err}"
+                    )
+                });
+            }
         }
 
         // Opt-in Subagent Firewall (`hook:exploratory_firewall = true`, off by default on neutral installs)
-        let gdb_opt = get_global_db_checked().ok().flatten();
         if is_exploratory_search_cmd(cmd_line)
             && crate::security::load_bool_config(
                 gdb_opt.as_deref(),
@@ -197,13 +268,12 @@ pub fn run_pre_tool_hook(global_ldb_opt: Option<&Path>) -> Result<(), Box<dyn st
                 false,
             )
         {
-            if let Some((cid, t_path)) = resolve_cid_and_transcript(&payload) {
+            if let Some((cid, t_path)) = resolve_cid_and_transcript(payload) {
                 if !cid.is_empty() && t_path.is_file() && count_recent_exploratory_streak(&t_path) >= 4 {
-                    emit_json(&json!({
+                    return json!({
                         "decision": "deny",
                         "reason": "LibreDB Subagent Firewall (Rule 5): 4+ consecutive exploratory shell search commands executed in main context. Delegate open multi-file searching to invoke_subagent(TypeName='research', Model='flash') or use libredb_code(action='skeleton'|'fim'|'impact')."
-                    }))?;
-                    return Ok(());
+                    });
                 }
             }
         }
@@ -215,24 +285,53 @@ pub fn run_pre_tool_hook(global_ldb_opt: Option<&Path>) -> Result<(), Box<dyn st
         .or_else(|| args.get("TargetFile"))
         .or_else(|| args.get("file_path"))
         .or_else(|| args.get("path"))
+        .or_else(|| args.get("target_file"))
+        .or_else(|| args.get("filename"))
         .and_then(Value::as_str)
         .unwrap_or("<tool_input>");
 
-    let is_write_or_edit = matches!(
+    let is_explicit_write_tool = matches!(
         tool_name,
         "write_file"
             | "edit_file"
             | "write_to_file"
             | "replace_file_content"
             | "multi_replace_file_content"
-    ) || args.get("Content").is_some()
+    );
+    let is_write_or_edit = is_explicit_write_tool
+        || args.get("Content").is_some()
         || args.get("Replacement").is_some()
         || args.get("ReplacementChunks").is_some();
 
     if is_write_or_edit {
-        let global_db_res = get_global_db_checked();
-        let global_db_ro = global_db_res.as_ref().ok().and_then(Clone::clone);
-        let proj_db_ro = if target_file != "<tool_input>" && global_db_res.is_ok() {
+        if is_explicit_write_tool && target_file == "<tool_input>" {
+            return json!({
+                "decision": "deny",
+                "reason": "LibreDB Control-Plane Guardrail Blocked Write: missing target file path in write/edit tool invocation."
+            });
+        }
+        let global_db_ro = match get_global_db_checked() {
+            Ok(opt) => opt,
+            Err(err) => {
+                return json!({
+                    "decision": "deny",
+                    "reason": format!(
+                        "LibreDB Control-Plane Guardrail failed closed because global customizations.ldb could not be verified: {err}"
+                    )
+                });
+            }
+        };
+        if let Some(ref gdb) = global_db_ro {
+            if let Err(err) = crate::security::check_global_trust_sync(gdb) {
+                return json!({
+                    "decision": "deny",
+                    "reason": format!(
+                        "LibreDB Control-Plane Guardrail failed closed because global customizations.ldb could not synchronize: {err}"
+                    )
+                });
+            }
+        }
+        let proj_db_ro = if target_file != "<tool_input>" {
             find_workspace_root(Path::new(target_file)).and_then(|root| {
                 if crate::security::is_workspace_memory_trusted(global_db_ro.as_deref(), &root) {
                     let ldb_p = root.join(".agents").join("memory.ldb");
@@ -251,17 +350,16 @@ pub fn run_pre_tool_hook(global_ldb_opt: Option<&Path>) -> Result<(), Box<dyn st
                 proj_db_ro.as_ref(),
                 "guardrail:protected_paths",
             );
-            let hook_ws = resolve_hook_workspace(&payload, None).or_else(|| env::current_dir().ok());
+            let hook_ws = resolve_hook_workspace(payload, None).or_else(|| env::current_dir().ok());
             if let Some(reason) = crate::security::check_tool_write_path_policy_with_base(
                 target_file,
                 hook_ws.as_deref(),
                 &custom_protected,
             ) {
-                emit_json(&json!({
+                return json!({
                     "decision": "deny",
                     "reason": format!("LibreDB Control-Plane Guardrail Blocked Write: {reason}")
-                }))?;
-                return Ok(());
+                });
             }
         }
 
@@ -317,34 +415,38 @@ pub fn run_pre_tool_hook(global_ldb_opt: Option<&Path>) -> Result<(), Box<dyn st
                         && (enforce_style
                             || !matches!(v.rule.as_str(), "no-em-en-dash" | "no-emojis"))
                 }) {
-                    emit_json(&json!({
+                    return json!({
                         "decision": "deny",
                         "reason": format!(
                             "LibreDB Guardrail Blocked Code Modification ({}): {} In snippet: '{}'",
                             first_crit.rule, first_crit.message, first_crit.snippet
                         )
-                    }))?;
-                    return Ok(());
+                    });
                 }
             }
         }
 
-        if target_file != "<tool_input>" && !is_test_or_scratch_path(target_file) && global_db_res.is_ok() {
+        if target_file != "<tool_input>" && !is_test_or_scratch_path(target_file) {
             let target_path = Path::new(target_file);
             let _ = record_working_set_edit(target_path, global_db_ro.as_deref());
         }
     }
 
-    emit_json(&json!({ "decision": "allow" }))?;
-    Ok(())
+    json!({ "decision": "allow" })
 }
 
 /// Handles Antigravity `PreInvocation` JSON hook from `stdin` (`< 2.5 ms` warm, `< 30 ms` on first-time SQLite auto-port).
 pub fn run_pre_invocation_hook(
     global_ldb_opt: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut raw = String::new();
-    let _ = io::stdin().read_to_string(&mut raw);
+    let Ok((raw, exceeded)) = read_bounded_hook_stdin() else {
+        emit_json(&json!({ "injectSteps": [] }))?;
+        return Ok(());
+    };
+    if exceeded {
+        emit_json(&json!({ "injectSteps": [] }))?;
+        return Ok(());
+    }
     let payload: Value = serde_json::from_str(raw.trim()).unwrap_or_else(|_| json!({}));
     let response = evaluate_pre_invocation_payload(&payload, global_ldb_opt)?;
     emit_json(&response)?;
@@ -421,20 +523,19 @@ pub(crate) fn evaluate_pre_invocation_payload(
                             &global_db, &proj_db, root,
                         )
                         .map(|()| {
-                            if let Some(name) = root.file_name().and_then(|n| n.to_str()) {
-                                let ws_cfg_key = format!("workspace:{name}");
-                                let root_str = root.to_string_lossy().into_owned();
-                                let already_same = global_db
-                                    .get_by_key(NodeKind::Config, &ws_cfg_key)
-                                    .map(|r| r.payload == root_str.as_bytes())
-                                    .unwrap_or(false);
-                                if !already_same {
-                                    let _ = global_db.put(
-                                        WriteRequest::new(NodeKind::Config, root_str.into_bytes())
-                                            .with_key(ws_cfg_key)
-                                            .with_importance(170),
-                                    );
-                                }
+                            let norm = crate::security::normalize_workspace_key(root);
+                            let ws_cfg_key = crate::security::workspace_id_config_key(&norm);
+                            let root_str = root.to_string_lossy().into_owned();
+                            let already_same = global_db
+                                .get_by_key(NodeKind::Config, &ws_cfg_key)
+                                .map(|r| r.payload == root_str.as_bytes())
+                                .unwrap_or(false);
+                            if !already_same {
+                                let _ = global_db.put(
+                                    WriteRequest::new(NodeKind::Config, root_str.into_bytes())
+                                        .with_key(ws_cfg_key)
+                                        .with_importance(170),
+                                );
                             }
                         }),
                         Ok(None) => Err("global customizations.ldb is unavailable".to_owned()),
@@ -513,21 +614,20 @@ pub(crate) fn evaluate_pre_invocation_payload(
     if !did_migrate && (!had_prior_cursor || global_ldb_opt.is_some()) {
         if let Some(ref root) = ws_root {
             if !is_protected_profile_dir(root) {
-                if let Some(name) = root.file_name().and_then(|n| n.to_str()) {
-                    if let Ok(Some(global_db)) = open_global_ldb_checked(global_ldb_opt) {
-                        let ws_cfg_key = format!("workspace:{name}");
-                        let root_str = root.to_string_lossy().into_owned();
-                        let already_same = global_db
-                            .get_by_key(NodeKind::Config, &ws_cfg_key)
-                            .map(|r| r.payload == root_str.as_bytes())
-                            .unwrap_or(false);
-                        if !already_same {
-                            let _ = global_db.put(
-                                WriteRequest::new(NodeKind::Config, root_str.into_bytes())
-                                    .with_key(ws_cfg_key)
-                                    .with_importance(170),
-                            );
-                        }
+                if let Ok(Some(global_db)) = open_global_ldb_checked(global_ldb_opt) {
+                    let norm = crate::security::normalize_workspace_key(root);
+                    let ws_cfg_key = crate::security::workspace_id_config_key(&norm);
+                    let root_str = root.to_string_lossy().into_owned();
+                    let already_same = global_db
+                        .get_by_key(NodeKind::Config, &ws_cfg_key)
+                        .map(|r| r.payload == root_str.as_bytes())
+                        .unwrap_or(false);
+                    if !already_same {
+                        let _ = global_db.put(
+                            WriteRequest::new(NodeKind::Config, root_str.into_bytes())
+                                .with_key(ws_cfg_key)
+                                .with_importance(170),
+                        );
                     }
                 }
             }
@@ -696,41 +796,66 @@ fn build_project_memory_hydration(proj_db: &LibreDb, ws_root: Option<&Path>) -> 
 
 fn collect_git_telemetry_line(root: &Path) -> Option<String> {
     let git_dir = root.join(".git");
-    let head_raw = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head_path = git_dir.join("HEAD");
+    let head_meta = std::fs::symlink_metadata(&head_path).ok()?;
+    if head_meta.file_type().is_symlink() || !head_meta.is_file() || head_meta.len() > 4096 {
+        return None;
+    }
+    let head_raw = std::fs::read_to_string(&head_path).ok()?;
     let head_trimmed = head_raw.trim();
     if let Some(ref_rel) = head_trimmed.strip_prefix("ref: ") {
         let ref_rel = ref_rel.trim();
         let raw_branch = ref_rel.strip_prefix("refs/heads/").unwrap_or(ref_rel);
         let branch = crate::security::sanitize_git_ref_for_prompt(raw_branch);
+        let valid_ref_rel = ref_rel.starts_with("refs/")
+            && !ref_rel.contains("..")
+            && !ref_rel.contains('\\')
+            && !ref_rel.contains(':')
+            && !ref_rel.bytes().any(|b| b < 0x20);
         let ref_file = git_dir.join(ref_rel);
-        let short_hash = if let Ok(hash_raw) = std::fs::read_to_string(&ref_file) {
-            hash_raw
-                .trim()
-                .chars()
-                .filter(char::is_ascii_hexdigit)
-                .take(7)
-                .collect::<String>()
-        } else if let Ok(packed) = std::fs::read_to_string(git_dir.join("packed-refs")) {
-            packed
-                .lines()
-                .find_map(|l| {
-                    let l = l.trim();
-                    if l.starts_with('#') || l.starts_with('^') {
-                        return None;
-                    }
-                    let mut parts = l.split_whitespace();
-                    let h = parts.next()?;
-                    let r = parts.next()?;
-                    if r == ref_rel {
-                        Some(
-                            h.chars()
-                                .filter(char::is_ascii_hexdigit)
-                                .take(7)
-                                .collect::<String>(),
-                        )
-                    } else {
-                        None
-                    }
+        let ref_file_ok = valid_ref_rel
+            && std::fs::symlink_metadata(&ref_file)
+                .is_ok_and(|m| !m.file_type().is_symlink() && m.is_file() && m.len() <= 256);
+        let packed_path = git_dir.join("packed-refs");
+        let packed_ok = valid_ref_rel
+            && std::fs::symlink_metadata(&packed_path).is_ok_and(|m| {
+                !m.file_type().is_symlink() && m.is_file() && m.len() <= 4 * 1024 * 1024
+            });
+        let short_hash = if ref_file_ok {
+            std::fs::read_to_string(&ref_file)
+                .ok()
+                .map(|hash_raw| {
+                    hash_raw
+                        .trim()
+                        .chars()
+                        .filter(char::is_ascii_hexdigit)
+                        .take(7)
+                        .collect::<String>()
+                })
+                .unwrap_or_else(|| "unborn".to_owned())
+        } else if packed_ok {
+            std::fs::read_to_string(&packed_path)
+                .ok()
+                .and_then(|packed| {
+                    packed.lines().find_map(|l| {
+                        let l = l.trim();
+                        if l.starts_with('#') || l.starts_with('^') {
+                            return None;
+                        }
+                        let mut parts = l.split_whitespace();
+                        let h = parts.next()?;
+                        let r = parts.next()?;
+                        if r == ref_rel {
+                            Some(
+                                h.chars()
+                                    .filter(char::is_ascii_hexdigit)
+                                    .take(7)
+                                    .collect::<String>(),
+                            )
+                        } else {
+                            None
+                        }
+                    })
                 })
                 .unwrap_or_else(|| "unborn".to_owned())
         } else {
@@ -1118,13 +1243,19 @@ fn extract_pre_tool_name_and_args(payload: &Value) -> (&str, &Value) {
 
     let args = tc
         .get("toolInput")
+        .or_else(|| tc.get("toolArgs"))
+        .or_else(|| tc.get("tool_args"))
         .or_else(|| tc.get("parameters"))
         .or_else(|| tc.get("arguments"))
         .or_else(|| tc.get("args"))
+        .or_else(|| tc.get("input"))
         .or_else(|| payload.get("toolInput"))
+        .or_else(|| payload.get("toolArgs"))
+        .or_else(|| payload.get("tool_args"))
         .or_else(|| payload.get("parameters"))
         .or_else(|| payload.get("arguments"))
         .or_else(|| payload.get("args"))
+        .or_else(|| payload.get("input"))
         .unwrap_or(tc);
 
     (tool_name, args)
@@ -1134,6 +1265,7 @@ fn extract_pre_tool_name_and_args(payload: &Value) -> (&str, &Value) {
 mod tests {
     use super::extract_pre_tool_name_and_args;
     use serde_json::json;
+    use std::fs;
 
     #[test]
     fn extract_pre_tool_unwraps_nested_tool_call_and_flat_payloads() {
@@ -1257,5 +1389,83 @@ mod tests {
         assert_eq!(out2, json!({ "injectSteps": [] }));
 
         let _ = fs::remove_dir_all(&base_target);
+    }
+
+    #[test]
+    fn pre_tool_use_fails_closed_when_customizations_ldb_is_corrupted_and_blocks_missing_write_path() {
+        let tmp = std::env::temp_dir().join(format!(
+            "libredb_pre_tool_fail_closed_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+        let corrupt_global = tmp.join("customizations.ldb");
+        fs::write(&corrupt_global, b"truncated_corrupt_header").unwrap();
+
+        let cmd_payload = json!({
+            "toolName": "run_command",
+            "toolArgs": { "CommandLine": "echo hello" }
+        });
+        let cmd_out = super::evaluate_pre_tool_payload(&cmd_payload, Some(&corrupt_global));
+        assert_eq!(
+            cmd_out.get("decision").and_then(serde_json::Value::as_str),
+            Some("deny"),
+            "run_command MUST fail closed when customizations.ldb is corrupted: {cmd_out}"
+        );
+
+        let write_payload = json!({
+            "toolName": "write_file",
+            "toolArgs": { "Path": tmp.join("src.rs").to_string_lossy().to_string(), "Content": "fn main() {}\n" }
+        });
+        let write_out = super::evaluate_pre_tool_payload(&write_payload, Some(&corrupt_global));
+        assert_eq!(
+            write_out.get("decision").and_then(serde_json::Value::as_str),
+            Some("deny"),
+            "write_file MUST fail closed when customizations.ldb is corrupted: {write_out}"
+        );
+
+        let missing_path_write = json!({
+            "toolName": "write_file",
+            "toolArgs": { "Content": "fn sneaky() {}\n" }
+        });
+        let missing_out = super::evaluate_pre_tool_payload(&missing_path_write, None);
+        assert_eq!(
+            missing_out.get("decision").and_then(serde_json::Value::as_str),
+            Some("deny"),
+            "write_file omitting Path MUST be denied fail-closed: {missing_out}"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn git_telemetry_blocks_dotdot_ref_traversal() {
+        let tmp = std::env::temp_dir().join(format!(
+            "libredb_git_telemetry_traversal_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let repo = tmp.join("sub").join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let secret_outside = tmp.join("outside_hex_secret");
+        fs::write(&secret_outside, "deadbeefcafe1234\n").unwrap();
+        fs::write(
+            repo.join(".git").join("HEAD"),
+            "ref: ../../outside_hex_secret\n",
+        )
+        .unwrap();
+
+        let line = super::collect_git_telemetry_line(&repo).unwrap();
+        assert!(
+            !line.contains("deadbee"),
+            "collect_git_telemetry_line MUST NEVER read files via '..' ref traversal: {line}"
+        );
+        assert!(line.ends_with("@ unborn"), "Unexpected telemetry line: {line}");
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

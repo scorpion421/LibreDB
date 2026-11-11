@@ -286,6 +286,43 @@ pub fn check_command_guardrails(cmd_line: &str) -> Option<GuardrailViolation> {
         });
     }
 
+    // 5. Block Git execution-hook hijacks (`core.hooksPath`, `core.fsmonitor`, `core.sshCommand`,
+    //    `protocol.ext.allow`) and shell tampering/exfiltration targeting `.vault.key` or `.seal_locks`.
+    if let Some(reason) = detect_git_exec_or_vault_tamper_command(&cmd_low) {
+        return Some(GuardrailViolation {
+            rule: "no-git-exec-hijack-or-vault-tamper".to_owned(),
+            severity: "CRITICAL".to_owned(),
+            file: "<command>".to_owned(),
+            line: 1,
+            message: reason.to_owned(),
+            snippet: truncate_ascii_safe(trimmed, 100),
+        });
+    }
+
+    None
+}
+
+fn detect_git_exec_or_vault_tamper_command(cmd_low: &str) -> Option<&'static str> {
+    for pat in [
+        "core.hookspath",
+        "core.fsmonitor",
+        "core.sshcommand",
+        "git_ssh_command=",
+        "protocol.ext.allow",
+        "uploadpack=",
+        "receivepack=",
+    ] {
+        if cmd_low.contains(pat) {
+            return Some(
+                "Overriding Git execution hooks, fsmonitor, SSH command, or ext protocol via shell commands is prohibited.",
+            );
+        }
+    }
+    if cmd_low.contains(".vault.key") || cmd_low.contains(".seal_locks") {
+        return Some(
+            "Direct shell access to LibreDB '.vault.key' or '.seal_locks' security state is prohibited.",
+        );
+    }
     None
 }
 
@@ -315,13 +352,13 @@ pub fn audit_workspace_guardrails_with_prefixes(
     let mut violations = Vec::new();
 
     for path in candidate_files {
-        if !path.is_file() || should_skip_binary_ext(&path) {
-            continue;
-        }
-        let Ok(meta) = path.metadata() else {
+        let Ok(sym_meta) = fs::symlink_metadata(&path) else {
             continue;
         };
-        if meta.len() == 0 || meta.len() > 4 * 1024 * 1024 {
+        if sym_meta.file_type().is_symlink() || !sym_meta.is_file() || should_skip_binary_ext(&path) {
+            continue;
+        }
+        if sym_meta.len() == 0 || sym_meta.len() > 4 * 1024 * 1024 {
             continue;
         }
         let Ok(raw) = fs::read(&path) else {
@@ -621,6 +658,10 @@ fn collect_git_staged_files(project_dir: &Path) -> std::io::Result<Vec<PathBuf>>
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .map(|rel| project_dir.join(rel))
+        .filter(|p| {
+            fs::symlink_metadata(p)
+                .is_ok_and(|m| !m.file_type().is_symlink() && m.is_file())
+        })
         .collect())
 }
 
@@ -641,15 +682,21 @@ fn collect_workspace_text_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::
     ];
     for entry_res in fs::read_dir(dir)? {
         let entry = entry_res?;
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if ft.is_symlink() {
+            continue;
+        }
         let path = entry.path();
         let fname = entry.file_name();
         let name = fname.to_string_lossy();
-        if path.is_dir() {
+        if ft.is_dir() {
             if skip_dirs.iter().any(|&sd| name.eq_ignore_ascii_case(sd)) {
                 continue;
             }
             collect_workspace_text_files(&path, out)?;
-        } else if path.is_file() {
+        } else if ft.is_file() {
             out.push(path);
         }
     }
@@ -746,5 +793,46 @@ mod tests {
         assert!(is_sensitive_staged_file(".env.production", &[]).is_some());
         assert!(is_sensitive_staged_file(".env.example", &[]).is_none());
         assert!(is_sensitive_staged_file("certs/test.pem", &["certs/test.pem".to_owned()]).is_none());
+    }
+
+    #[test]
+    fn guardrail_blocks_git_exec_hijacks_vault_tamper_and_skips_symlink_loops() {
+        for bad_cmd in [
+            "git -c core.hooksPath=. status",
+            "git -c core.fsmonitor=./pwn.sh diff",
+            "git -c core.sshCommand=evil fetch",
+            "git -c protocol.ext.allow=always clone ext::sh",
+            "cat ~/.gemini/libredb/.vault.key",
+            "Remove-Item C:\\Users\\dev\\.gemini\\libredb\\.seal_locks\\ws_123.lock",
+        ] {
+            let v = check_command_guardrails(bad_cmd);
+            assert!(
+                v.is_some_and(|x| x.rule == "no-git-exec-hijack-or-vault-tamper"),
+                "expected command guardrail violation for '{bad_cmd}'"
+            );
+        }
+
+        let tmp = std::env::temp_dir().join(format!(
+            "libredb_guardrail_symlink_loop_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join("src")).unwrap();
+        fs::write(tmp.join("src").join("clean.rs"), "pub fn ok() -> u32 { 1 }\n").unwrap();
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&tmp, tmp.join("src").join("loop_dir")).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            // Directory symlink creation on Windows may require Developer Mode; ignore if unprivileged.
+            let _ = std::os::windows::fs::symlink_dir(&tmp, tmp.join("src").join("loop_dir"));
+        }
+
+        let report = audit_workspace_guardrails(&tmp, false).unwrap();
+        assert_eq!(report.files_checked, 1);
+        assert!(report.violations.is_empty());
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

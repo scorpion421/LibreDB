@@ -83,12 +83,58 @@ pub struct RoundtripReport {
     pub fts5_tables_verified: usize,
 }
 
+/// Hard safety ceiling (`128 MiB`) for imported SQLite database files so crafted oversized `.db`
+/// inputs cannot exhaust host memory during lossless table snapshotting.
+pub const MAX_SQLITE_IMPORT_BYTES: u64 = 128 * 1024 * 1024;
+
+static MIGRATE_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn reject_any_symlink_at_path(path: &Path, role: &str) -> Result<()> {
+    if let Ok(sym_meta) = std::fs::symlink_metadata(path) {
+        if sym_meta.file_type().is_symlink() {
+            return Err(BridgeError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("refusing symlinked {role} path '{}'", path.display()),
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_sqlite_source_file(sqlite_path: &Path) -> Result<u64> {
+    let sym_meta = std::fs::symlink_metadata(sqlite_path)?;
+    if sym_meta.file_type().is_symlink() {
+        return Err(BridgeError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("refusing symlinked SQLite source '{}'", sqlite_path.display()),
+        )));
+    }
+    if !sym_meta.is_file() {
+        return Err(BridgeError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("SQLite source '{}' is not a regular file", sqlite_path.display()),
+        )));
+    }
+    if sym_meta.len() > MAX_SQLITE_IMPORT_BYTES {
+        return Err(BridgeError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "SQLite source '{}' ({} bytes) exceeds 128 MiB import ceiling",
+                sqlite_path.display(),
+                sym_meta.len()
+            ),
+        )));
+    }
+    Ok(sym_meta.len())
+}
+
 /// Imports a `SkillsDB` SQLite database (`scope = "central"` or `"project"`) strictly READ-ONLY into `ldb`.
 pub fn import_sqlite_readonly(
     sqlite_path: &Path,
     ldb: &LibreDb,
     scope: &str,
 ) -> Result<ImportSummary> {
+    validate_sqlite_source_file(sqlite_path)?;
     let conn = Connection::open_with_flags(
         sqlite_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -129,16 +175,20 @@ pub fn open_or_auto_migrate(
     sqlite_override: Option<&Path>,
     scope: &str,
 ) -> Result<(Arc<LibreDb>, Option<ImportSummary>)> {
+    reject_any_symlink_at_path(ldb_path, "LibreDB")?;
     let default_sibling = ldb_path.with_extension("db");
     let sqlite_candidate = sqlite_override.unwrap_or(&default_sibling);
-    let has_legacy_sqlite = sqlite_candidate
-        .metadata()
-        .map(|m| m.is_file() && m.len() > 0)
+    let has_legacy_sqlite = std::fs::symlink_metadata(sqlite_candidate)
+        .map(|m| {
+            !m.file_type().is_symlink()
+                && m.is_file()
+                && m.len() > 0
+                && m.len() <= MAX_SQLITE_IMPORT_BYTES
+        })
         .unwrap_or(false);
 
-    let already_initialized = ldb_path
-        .metadata()
-        .map(|m| m.is_file() && m.len() >= 8192)
+    let already_initialized = std::fs::symlink_metadata(ldb_path)
+        .map(|m| !m.file_type().is_symlink() && m.is_file() && m.len() >= 8192)
         .unwrap_or(false);
     if already_initialized {
         let db = LibreDb::open(ldb_path)?;
@@ -161,11 +211,13 @@ pub fn open_or_auto_migrate(
     }
 
     let pid = std::process::id();
+    let seq = MIGRATE_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
+        .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let tmp_ldb = ldb_path.with_extension(format!("ldb.migrating.{pid}.{nanos}"));
+    let tmp_ldb = ldb_path.with_extension(format!("ldb.migrating.{pid}.{seq}.{nanos:x}"));
+    reject_any_symlink_at_path(&tmp_ldb, "LibreDB migration staging")?;
     let _ = std::fs::remove_file(&tmp_ldb);
 
     let migrate_res = (|| -> Result<ImportSummary> {
@@ -177,22 +229,36 @@ pub fn open_or_auto_migrate(
 
     match migrate_res {
         Ok(summary) => {
-            if ldb_path.exists() {
+            if std::fs::symlink_metadata(ldb_path).is_ok() {
                 let _ = std::fs::remove_file(&tmp_ldb);
+                reject_any_symlink_at_path(ldb_path, "LibreDB")?;
                 let db = LibreDb::open(ldb_path)?;
                 Ok((Arc::new(db), None))
             } else {
-                match std::fs::rename(&tmp_ldb, ldb_path) {
+                // Publish non-destructively via `hard_link` first (atomic no-overwrite on NTFS and POSIX),
+                // falling back to `rename` only if `ldb_path` still has no directory entry.
+                let published = match std::fs::hard_link(&tmp_ldb, ldb_path) {
                     Ok(()) => {
-                        let db = LibreDb::open(ldb_path)?;
-                        Ok((Arc::new(db), Some(summary)))
+                        let _ = std::fs::remove_file(&tmp_ldb);
+                        true
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        let _ = std::fs::remove_file(&tmp_ldb);
+                        false
                     }
                     Err(_) => {
-                        let _ = std::fs::remove_file(&tmp_ldb);
-                        let db = LibreDb::open(ldb_path)?;
-                        Ok((Arc::new(db), None))
+                        if std::fs::symlink_metadata(ldb_path).is_err() {
+                            std::fs::rename(&tmp_ldb, ldb_path).is_ok()
+                        } else {
+                            let _ = std::fs::remove_file(&tmp_ldb);
+                            false
+                        }
                     }
-                }
+                };
+                let _ = std::fs::remove_file(&tmp_ldb);
+                reject_any_symlink_at_path(ldb_path, "LibreDB")?;
+                let db = LibreDb::open(ldb_path)?;
+                Ok((Arc::new(db), if published { Some(summary) } else { None }))
             }
         }
         Err(err) => {
@@ -208,7 +274,10 @@ pub fn export_sqlite_database(
     ldb: &LibreDb,
     scope: &str,
     out_sqlite_path: &Path,
-) -> Result< usize > {
+) -> Result<usize> {
+    // Reject both live AND dangling symlinks before `exists()` or `Connection::open()` so an
+    // attacker-planted dangling symlink cannot create or clobber arbitrary external files.
+    reject_any_symlink_at_path(out_sqlite_path, "SQLite export")?;
     if out_sqlite_path.exists() {
         std::fs::remove_file(out_sqlite_path)?;
     }
@@ -217,6 +286,7 @@ pub fn export_sqlite_database(
             std::fs::create_dir_all(parent)?;
         }
     }
+    reject_any_symlink_at_path(out_sqlite_path, "SQLite export")?;
 
     let mirror_rec = ldb.get_by_key(NodeKind::Generic, &format!("sqlite_mirror::{scope}"))?;
     let bundle: SqliteMirrorBundle = serde_json::from_slice(&mirror_rec.payload)?;
@@ -299,6 +369,8 @@ pub fn verify_sqlite_equivalence(
     orig_sqlite: &Path,
     reconstructed_sqlite: &Path,
 ) -> Result<RoundtripReport> {
+    validate_sqlite_source_file(orig_sqlite)?;
+    validate_sqlite_source_file(reconstructed_sqlite)?;
     let conn_a = Connection::open_with_flags(
         orig_sqlite,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -1509,4 +1581,57 @@ fn list_table_names(conn: &Connection) -> Result<std::collections::HashSet<Strin
         out.insert(item?);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bridge_rejects_dangling_and_live_symlinks_on_import_and_export() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real_sql = tmp.path().join("real.db");
+        {
+            let conn = Connection::open(&real_sql).unwrap();
+            conn.execute_batch("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT); INSERT INTO items VALUES (1, 'alpha');")
+                .unwrap();
+        }
+
+        let ldb_path = tmp.path().join("store.ldb");
+        let ldb = LibreDb::open(&ldb_path).unwrap();
+        import_sqlite_readonly(&real_sql, &ldb, "project").unwrap();
+
+        let outside_victim = tmp.path().join("outside_victim.db");
+        let dangling_export = tmp.path().join("dangling_export.db");
+        let live_link_sql = tmp.path().join("live_link.db");
+
+        #[cfg(unix)]
+        let symlink_created = {
+            std::os::unix::fs::symlink(&outside_victim, &dangling_export).unwrap();
+            std::os::unix::fs::symlink(&real_sql, &live_link_sql).unwrap();
+            true
+        };
+        #[cfg(windows)]
+        let symlink_created = std::os::windows::fs::symlink_file(&outside_victim, &dangling_export)
+            .is_ok()
+            && std::os::windows::fs::symlink_file(&real_sql, &live_link_sql).is_ok();
+
+        if symlink_created {
+            let exp_res = export_sqlite_database(&ldb, "project", &dangling_export);
+            assert!(
+                exp_res.is_err(),
+                "export_sqlite_database MUST reject dangling symlinks instead of creating target file"
+            );
+            assert!(
+                !outside_victim.exists(),
+                "dangling symlink target MUST NOT be created on disk"
+            );
+
+            let imp_res = import_sqlite_readonly(&live_link_sql, &ldb, "project");
+            assert!(
+                imp_res.is_err(),
+                "import_sqlite_readonly MUST reject symlinked SQLite sources"
+            );
+        }
+    }
 }

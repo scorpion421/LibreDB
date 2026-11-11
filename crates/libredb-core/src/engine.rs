@@ -339,7 +339,27 @@ impl LibreDb {
         let mut reverse_keys: HashMap<u64, (NodeKind, String)> = HashMap::new();
 
         // 1. Load consolidated BaseSnapshot (`LDBS`) if present.
-        if sb.base_snapshot_offset >= DATA_REGION_START && sb.base_snapshot_len > 0 {
+        if sb.base_snapshot_len > 0 {
+            if sb.base_snapshot_offset < DATA_REGION_START {
+                return Err(LibreDbError::CorruptFormat(
+                    "superblock base_snapshot_offset below DATA_REGION_START",
+                ));
+            }
+            if sb.base_snapshot_len > MAX_EXTENT_PAYLOAD_BYTES as u64 {
+                return Err(LibreDbError::PayloadTooLarge {
+                    size: usize::try_from(sb.base_snapshot_len).unwrap_or(usize::MAX),
+                    max: MAX_EXTENT_PAYLOAD_BYTES,
+                });
+            }
+            let snap_end = sb
+                .base_snapshot_offset
+                .checked_add(sb.base_snapshot_len)
+                .ok_or(LibreDbError::CorruptFormat("base_snapshot bounds overflow"))?;
+            if snap_end > sb.delta_start_offset || snap_end > file_len {
+                return Err(LibreDbError::CorruptFormat(
+                    "base_snapshot exceeds file or delta bounds",
+                ));
+            }
             let mut snap_buf = vec![0u8; sb.base_snapshot_len as usize];
             backend.read_at(sb.base_snapshot_offset, &mut snap_buf)?;
             let (_seq, base_inodes, base_keys) = decode_metadata_frame(SNAPSHOT_MAGIC, &snap_buf)?;
@@ -355,7 +375,10 @@ impl LibreDb {
         // `[env_magic: "LDBE" (4B)][total_env_len: u32 (4B)][extents...][CommitFrame "LDBC"...]`
         let mut cursor = sb.delta_start_offset;
         while cursor < sb.data_tail_offset {
-            if cursor + 12 > sb.data_tail_offset {
+            if cursor
+                .checked_add(12)
+                .is_none_or(|end| end > sb.data_tail_offset || end > file_len)
+            {
                 return Err(LibreDbError::CorruptFormat("truncated delta envelope header"));
             }
             let mut hdr = [0u8; 12];
@@ -365,15 +388,26 @@ impl LibreDb {
             }
             let total_env_len = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as u64;
             let meta_rel_offset = u32::from_le_bytes(hdr[8..12].try_into().unwrap()) as u64;
+            let env_end = cursor
+                .checked_add(total_env_len)
+                .ok_or(LibreDbError::CorruptFormat("delta envelope offset overflow"))?;
             if total_env_len < 12
                 || meta_rel_offset < 12
                 || meta_rel_offset >= total_env_len
-                || cursor + total_env_len > sb.data_tail_offset
+                || env_end > sb.data_tail_offset
+                || env_end > file_len
             {
                 return Err(LibreDbError::CorruptFormat("invalid delta envelope bounds"));
             }
+            let meta_len_u64 = total_env_len - meta_rel_offset;
+            if meta_len_u64 > MAX_EXTENT_PAYLOAD_BYTES as u64 {
+                return Err(LibreDbError::PayloadTooLarge {
+                    size: usize::try_from(meta_len_u64).unwrap_or(usize::MAX),
+                    max: MAX_EXTENT_PAYLOAD_BYTES,
+                });
+            }
 
-            let meta_len = (total_env_len - meta_rel_offset) as usize;
+            let meta_len = meta_len_u64 as usize;
             let mut meta_buf = vec![0u8; meta_len];
             backend.read_at(cursor + meta_rel_offset, &mut meta_buf)?;
             let (_seq, delta_inodes, delta_keys) =
@@ -384,7 +418,7 @@ impl LibreDb {
             }
             apply_key_mutations(&mut key_dir, &mut reverse_keys, delta_keys);
 
-            cursor += total_env_len;
+            cursor = env_end;
         }
 
         // 3. Hydrate any overflow synapse extents (`> 4` edges) into RAM for `O(1)` graph traversal.
@@ -396,7 +430,12 @@ impl LibreDb {
                 ..
             } = inode.storage
             {
-                if edge_extent_offset >= DATA_REGION_START && edge_overflow_count > 0 {
+                if edge_overflow_count > 0 {
+                    if edge_extent_offset < DATA_REGION_START {
+                        return Err(LibreDbError::CorruptFormat(
+                            "overflow synapse offset below DATA_REGION_START",
+                        ));
+                    }
                     let syns = read_overflow_synapses(
                         backend,
                         edge_extent_offset,
@@ -772,7 +811,11 @@ impl LibreDb {
         }
 
         let new_seq = next_snap.superblock.commit_seq + 1;
-        let meta_rel_offset = envelope_buf.len() as u32;
+        let meta_rel_offset =
+            u32::try_from(envelope_buf.len()).map_err(|_| LibreDbError::PayloadTooLarge {
+                size: envelope_buf.len(),
+                max: u32::MAX as usize,
+            })?;
         let commit_frame = encode_metadata_frame(
             COMMIT_FRAME_MAGIC,
             new_seq,
@@ -780,7 +823,11 @@ impl LibreDb {
             &key_mutations,
         )?;
         envelope_buf.extend_from_slice(&commit_frame);
-        let total_env_len = envelope_buf.len() as u32;
+        let total_env_len =
+            u32::try_from(envelope_buf.len()).map_err(|_| LibreDbError::PayloadTooLarge {
+                size: envelope_buf.len(),
+                max: u32::MAX as usize,
+            })?;
 
         envelope_buf[0..4].copy_from_slice(b"LDBE");
         envelope_buf[4..8].copy_from_slice(&total_env_len.to_le_bytes());
@@ -971,11 +1018,19 @@ impl LibreDb {
         }
 
         let new_seq = next_snap.superblock.commit_seq + 1;
-        let meta_rel_offset = envelope_buf.len() as u32;
+        let meta_rel_offset =
+            u32::try_from(envelope_buf.len()).map_err(|_| LibreDbError::PayloadTooLarge {
+                size: envelope_buf.len(),
+                max: u32::MAX as usize,
+            })?;
         let commit_frame =
             encode_metadata_frame(COMMIT_FRAME_MAGIC, new_seq, &modified_inodes, &[])?;
         envelope_buf.extend_from_slice(&commit_frame);
-        let total_env_len = envelope_buf.len() as u32;
+        let total_env_len =
+            u32::try_from(envelope_buf.len()).map_err(|_| LibreDbError::PayloadTooLarge {
+                size: envelope_buf.len(),
+                max: u32::MAX as usize,
+            })?;
 
         envelope_buf[0..4].copy_from_slice(b"LDBE");
         envelope_buf[4..8].copy_from_slice(&total_env_len.to_le_bytes());
@@ -1196,11 +1251,19 @@ impl LibreDb {
         }
 
         let new_seq = next_snap.superblock.commit_seq + 1;
-        let meta_rel_offset = envelope_buf.len() as u32;
+        let meta_rel_offset =
+            u32::try_from(envelope_buf.len()).map_err(|_| LibreDbError::PayloadTooLarge {
+                size: envelope_buf.len(),
+                max: u32::MAX as usize,
+            })?;
         let commit_frame =
             encode_metadata_frame(COMMIT_FRAME_MAGIC, new_seq, &modified_inodes, &[])?;
         envelope_buf.extend_from_slice(&commit_frame);
-        let total_env_len = envelope_buf.len() as u32;
+        let total_env_len =
+            u32::try_from(envelope_buf.len()).map_err(|_| LibreDbError::PayloadTooLarge {
+                size: envelope_buf.len(),
+                max: u32::MAX as usize,
+            })?;
 
         envelope_buf[0..4].copy_from_slice(b"LDBE");
         envelope_buf[4..8].copy_from_slice(&total_env_len.to_le_bytes());
@@ -1265,8 +1328,16 @@ impl LibreDb {
         )?;
 
         let env_start = next_snap.superblock.data_tail_offset;
-        let total_env_len = (12 + commit_frame.len()) as u32;
-        let mut envelope_buf = Vec::with_capacity(total_env_len as usize);
+        let total_env_usize = commit_frame
+            .len()
+            .checked_add(12)
+            .ok_or(LibreDbError::CorruptFormat("deprecate_key envelope overflow"))?;
+        let total_env_len =
+            u32::try_from(total_env_usize).map_err(|_| LibreDbError::PayloadTooLarge {
+                size: total_env_usize,
+                max: u32::MAX as usize,
+            })?;
+        let mut envelope_buf = Vec::with_capacity(total_env_usize);
         envelope_buf.extend_from_slice(b"LDBE");
         envelope_buf.extend_from_slice(&total_env_len.to_le_bytes());
         envelope_buf.extend_from_slice(&12u32.to_le_bytes());
@@ -1312,7 +1383,7 @@ impl LibreDb {
             };
             if inode.flags.contains(NodeFlags::TOMBSTONE) {
                 continue;
-            }
+            };
             if inode.flags.is_live_active() {
                 next_snap.superblock.active_node_count =
                     next_snap.superblock.active_node_count.saturating_sub(1);
@@ -1344,8 +1415,16 @@ impl LibreDb {
         )?;
 
         let env_start = next_snap.superblock.data_tail_offset;
-        let total_env_len = (12 + commit_frame.len()) as u32;
-        let mut envelope_buf = Vec::with_capacity(total_env_len as usize);
+        let total_env_usize = commit_frame
+            .len()
+            .checked_add(12)
+            .ok_or(LibreDbError::CorruptFormat("deprecate_nodes envelope overflow"))?;
+        let total_env_len =
+            u32::try_from(total_env_usize).map_err(|_| LibreDbError::PayloadTooLarge {
+                size: total_env_usize,
+                max: u32::MAX as usize,
+            })?;
+        let mut envelope_buf = Vec::with_capacity(total_env_usize);
         envelope_buf.extend_from_slice(b"LDBE");
         envelope_buf.extend_from_slice(&total_env_len.to_le_bytes());
         envelope_buf.extend_from_slice(&12u32.to_le_bytes());
@@ -1592,52 +1671,73 @@ impl LibreDb {
 
     /// Traces temporal and causal lineage (`Supersedes`, `CausedBy`, `Governs`) starting at `root_id`.
     pub fn trace_lineage(&self, root_id: u64, max_depth: usize) -> Result<Vec<NodeSummary>> {
-        let snap = Arc::clone(&self.state.read());
-        if !snap.inodes.contains_key(&root_id) {
-            return Err(LibreDbError::NodeNotFound(root_id));
-        }
+        for attempt in 0..2usize {
+            let snap = Arc::clone(&self.state.read());
+            if !snap.inodes.contains_key(&root_id) {
+                if attempt == 0 && self.sync_from_disk_if_changed()? {
+                    continue;
+                }
+                return Err(LibreDbError::NodeNotFound(root_id));
+            }
 
-        let mut visited: HashSet<u64> = HashSet::new();
-        let mut queue: VecDeque<(u64, usize, Option<EdgeKind>)> = VecDeque::new();
-        visited.insert(root_id);
-        queue.push_back((root_id, 0, None));
+            let mut visited: HashSet<u64> = HashSet::new();
+            let mut queue: VecDeque<(u64, usize, Option<EdgeKind>)> = VecDeque::new();
+            visited.insert(root_id);
+            queue.push_back((root_id, 0, None));
 
-        let mut out = Vec::new();
-        while let Some((curr_id, depth, via)) = queue.pop_front() {
-            let Some(inode) = snap.inodes.get(&curr_id) else {
-                continue;
-            };
-            let payload = self.read_inode_payload(inode)?;
-            let preview_raw = String::from_utf8_lossy(&payload);
-            let preview: String = preview_raw.chars().take(120).collect();
-
-            out.push(NodeSummary {
-                depth,
-                via_edge: via,
-                node_id: curr_id,
-                kind: inode.kind,
-                is_active: inode.flags.is_live_active(),
-                is_superseded: inode.flags.contains(NodeFlags::SUPERSEDED),
-                token_count: inode.token_count,
-                importance: inode.importance,
-                updated_ns: inode.updated_ns,
-                payload_preview: preview,
-            });
-
-            if depth < max_depth {
-                for syn in collect_node_synapses(&snap, inode) {
-                    if matches!(
-                        syn.kind,
-                        EdgeKind::Supersedes | EdgeKind::CausedBy | EdgeKind::Governs
-                    ) && visited.insert(syn.target_id)
+            let mut out = Vec::new();
+            let mut stale_retry = false;
+            while let Some((curr_id, depth, via)) = queue.pop_front() {
+                let Some(inode) = snap.inodes.get(&curr_id) else {
+                    continue;
+                };
+                let payload = match self.read_inode_payload(inode) {
+                    Ok(p) => p,
+                    Err(LibreDbError::ChecksumMismatch { .. } | LibreDbError::Io(_))
+                        if attempt == 0 =>
                     {
-                        queue.push_back((syn.target_id, depth + 1, Some(syn.kind)));
+                        if self.sync_from_disk_if_changed()? {
+                            stale_retry = true;
+                            break;
+                        }
+                        return self.read_inode_payload(inode).map(|_| Vec::new());
+                    }
+                    Err(e) => return Err(e),
+                };
+                let preview_raw = String::from_utf8_lossy(&payload);
+                let preview: String = preview_raw.chars().take(120).collect();
+
+                out.push(NodeSummary {
+                    depth,
+                    via_edge: via,
+                    node_id: curr_id,
+                    kind: inode.kind,
+                    is_active: inode.flags.is_live_active(),
+                    is_superseded: inode.flags.contains(NodeFlags::SUPERSEDED),
+                    token_count: inode.token_count,
+                    importance: inode.importance,
+                    updated_ns: inode.updated_ns,
+                    payload_preview: preview,
+                });
+
+                if depth < max_depth {
+                    for syn in collect_node_synapses(&snap, inode) {
+                        if matches!(
+                            syn.kind,
+                            EdgeKind::Supersedes | EdgeKind::CausedBy | EdgeKind::Governs
+                        ) && visited.insert(syn.target_id)
+                        {
+                            queue.push_back((syn.target_id, depth + 1, Some(syn.kind)));
+                        }
                     }
                 }
             }
+            if stale_retry {
+                continue;
+            }
+            return Ok(out);
         }
-
-        Ok(out)
+        Err(LibreDbError::NodeNotFound(root_id))
     }
 
     /// Spreading-activation recall with strict `token_budget` packing and coalesced Gravity extent reads.
@@ -1662,128 +1762,157 @@ impl LibreDb {
             });
         }
 
-        let snap = Arc::clone(&self.state.read());
-        let mut activation: HashMap<u64, u64> = HashMap::new();
-        let mut queue: VecDeque<(u64, usize, u64)> = VecDeque::new();
+        for attempt in 0..2usize {
+            let snap = Arc::clone(&self.state.read());
+            let mut activation: HashMap<u64, u64> = HashMap::new();
+            let mut queue: VecDeque<(u64, usize, u64)> = VecDeque::new();
 
-        for &sid in seed_ids {
-            if snap.inodes.contains_key(&sid) {
-                activation.insert(sid, 10_000);
-                queue.push_back((sid, 0, 10_000));
+            for &sid in seed_ids {
+                if snap.inodes.contains_key(&sid) {
+                    activation.insert(sid, 10_000);
+                    queue.push_back((sid, 0, 10_000));
+                }
             }
-        }
 
-        while let Some((curr_id, hop, energy)) = queue.pop_front() {
-            if hop >= max_hops || energy < 50 {
-                continue;
-            }
-            if let Some(inode) = snap.inodes.get(&curr_id) {
-                for syn in collect_node_synapses(&snap, inode) {
-                    if !include_superseded && syn.kind == EdgeKind::Supersedes {
-                        continue;
-                    }
-                    let propagated = (energy * (syn.weight as u64).max(1)) / 320;
-                    if propagated >= 50 {
-                        let entry = activation.entry(syn.target_id).or_insert(0);
-                        if propagated > *entry {
-                            *entry = propagated;
-                            queue.push_back((syn.target_id, hop + 1, propagated));
+            while let Some((curr_id, hop, energy)) = queue.pop_front() {
+                if hop >= max_hops || energy < 50 {
+                    continue;
+                }
+                if let Some(inode) = snap.inodes.get(&curr_id) {
+                    for syn in collect_node_synapses(&snap, inode) {
+                        if !include_superseded && syn.kind == EdgeKind::Supersedes {
+                            continue;
+                        }
+                        let propagated = (energy * (syn.weight as u64).max(1)) / 320;
+                        if propagated >= 50 {
+                            let entry = activation.entry(syn.target_id).or_insert(0);
+                            if propagated > *entry {
+                                *entry = propagated;
+                                queue.push_back((syn.target_id, hop + 1, propagated));
+                            }
                         }
                     }
                 }
             }
-        }
 
-        // Rank candidate Inodes by `(score, importance, access_count, -node_id)`.
-        #[derive(Eq, PartialEq)]
-        struct ScoredCandidate {
-            utility: u64,
-            node_id: u64,
-        }
-        impl Ord for ScoredCandidate {
-            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-                self.utility
-                    .cmp(&other.utility)
-                    .then_with(|| other.node_id.cmp(&self.node_id))
+            // Rank candidate Inodes by `(score, importance, access_count, -node_id)`.
+            #[derive(Eq, PartialEq)]
+            struct ScoredCandidate {
+                utility: u64,
+                node_id: u64,
             }
-        }
-        impl PartialOrd for ScoredCandidate {
-            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-                Some(self.cmp(other))
-            }
-        }
-
-        let mut heap = BinaryHeap::with_capacity(activation.len());
-        for (&nid, &act) in &activation {
-            let Some(inode) = snap.inodes.get(&nid) else {
-                continue;
-            };
-            if inode.flags.contains(NodeFlags::TOMBSTONE) {
-                continue;
-            }
-            if !include_superseded && inode.flags.contains(NodeFlags::SUPERSEDED) {
-                continue;
-            }
-            let hits = inode
-                .access_count
-                .saturating_add(self.telemetry.pending_hits(nid)) as u64;
-            let utility = act
-                .saturating_mul((inode.importance as u64).max(1))
-                .saturating_add(hits.min(1_000) * 16);
-            heap.push(ScoredCandidate {
-                utility,
-                node_id: nid,
-            });
-        }
-
-        let mut selected_ids: Vec<u64> = Vec::new();
-        let mut used_tokens: u32 = 0;
-
-        while let Some(cand) = heap.pop() {
-            let inode = &snap.inodes[&cand.node_id];
-            let tok = inode.token_count.max(1);
-            if used_tokens.saturating_add(tok) <= token_budget || selected_ids.is_empty() && tok <= token_budget {
-                used_tokens += tok;
-                selected_ids.push(cand.node_id);
-                if used_tokens == token_budget {
-                    break;
+            impl Ord for ScoredCandidate {
+                fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                    self.utility
+                        .cmp(&other.utility)
+                        .then_with(|| other.node_id.cmp(&self.node_id))
                 }
             }
-        }
+            impl PartialOrd for ScoredCandidate {
+                fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                    Some(self.cmp(other))
+                }
+            }
 
-        // Coalesce adjacent or nearby extent ranges (`gap <= 4096 B`) into single sequential `read_at` calls!
-        let (payload_map, coalesced_reads) =
-            self.read_coalesced_extents(&snap, &selected_ids)?;
+            let mut heap = BinaryHeap::with_capacity(activation.len());
+            for (&nid, &act) in &activation {
+                let Some(inode) = snap.inodes.get(&nid) else {
+                    continue;
+                };
+                if inode.flags.contains(NodeFlags::TOMBSTONE) {
+                    continue;
+                }
+                if !include_superseded && inode.flags.contains(NodeFlags::SUPERSEDED) {
+                    continue;
+                }
+                let hits = inode
+                    .access_count
+                    .saturating_add(self.telemetry.pending_hits(nid)) as u64;
+                let utility = act
+                    .saturating_mul((inode.importance as u64).max(1))
+                    .saturating_add(hits.min(1_000) * 16);
+                heap.push(ScoredCandidate {
+                    utility,
+                    node_id: nid,
+                });
+            }
 
-        let mut records = Vec::with_capacity(selected_ids.len());
-        for nid in selected_ids {
-            let inode = &snap.inodes[&nid];
-            let synapses = collect_node_synapses(&snap, inode);
-            let payload = payload_map.get(&nid).cloned().unwrap_or_default();
-            self.telemetry.record_hit(nid);
-            let access_count = inode
-                .access_count
-                .saturating_add(self.telemetry.pending_hits(nid));
-            records.push(NodeRecord {
-                node_id: nid,
-                kind: inode.kind,
-                flags: inode.flags,
-                importance: inode.importance,
-                token_count: inode.token_count,
-                created_ns: inode.created_ns,
-                updated_ns: inode.updated_ns,
-                access_count,
-                generation: inode.generation,
-                synapses,
-                payload,
+            let mut selected_ids: Vec<u64> = Vec::new();
+            let mut used_tokens: u32 = 0;
+
+            while let Some(cand) = heap.pop() {
+                let inode = &snap.inodes[&cand.node_id];
+                let tok = inode.token_count.max(1);
+                if used_tokens.saturating_add(tok) <= token_budget
+                    || selected_ids.is_empty() && tok <= token_budget
+                {
+                    used_tokens += tok;
+                    selected_ids.push(cand.node_id);
+                    if used_tokens == token_budget {
+                        break;
+                    }
+                }
+            }
+
+            // Coalesce adjacent or nearby extent ranges (`gap <= 4096 B`) into single sequential `read_at` calls!
+            let (payload_map, coalesced_reads) =
+                match self.read_coalesced_extents(&snap, &selected_ids) {
+                    Ok(res) => res,
+                    Err(LibreDbError::ChecksumMismatch { .. } | LibreDbError::Io(_))
+                        if attempt == 0 =>
+                    {
+                        if self.sync_from_disk_if_changed()? {
+                            continue;
+                        }
+                        return self.read_coalesced_extents(&snap, &selected_ids).map(|_| {
+                            RecallBundle {
+                                records: Vec::new(),
+                                total_tokens: 0,
+                                token_budget,
+                                coalesced_io_reads: 0,
+                            }
+                        });
+                    }
+                    Err(e) => return Err(e),
+                };
+
+            let mut records = Vec::with_capacity(selected_ids.len());
+            for nid in selected_ids {
+                let inode = &snap.inodes[&nid];
+                let synapses = collect_node_synapses(&snap, inode);
+                let payload = payload_map.get(&nid).cloned().unwrap_or_default();
+                self.telemetry.record_hit(nid);
+                let access_count = inode
+                    .access_count
+                    .saturating_add(self.telemetry.pending_hits(nid));
+                records.push(NodeRecord {
+                    node_id: nid,
+                    kind: inode.kind,
+                    flags: inode.flags,
+                    importance: inode.importance,
+                    token_count: inode.token_count,
+                    created_ns: inode.created_ns,
+                    updated_ns: inode.updated_ns,
+                    access_count,
+                    generation: inode.generation,
+                    synapses,
+                    payload,
+                });
+            }
+
+            return Ok(RecallBundle {
+                records,
+                total_tokens: used_tokens,
+                token_budget,
+                coalesced_io_reads: coalesced_reads,
             });
         }
 
         Ok(RecallBundle {
-            records,
-            total_tokens: used_tokens,
+            records: Vec::new(),
+            total_tokens: 0,
             token_budget,
-            coalesced_io_reads: coalesced_reads,
+            coalesced_io_reads: 0,
         })
     }
 
@@ -1961,7 +2090,29 @@ impl LibreDb {
                     data_crc32,
                     ..
                 } => {
-                    let mut stored_bytes = vec![0u8; stored_len as usize];
+                    if data_offset < DATA_REGION_START {
+                        return Err(LibreDbError::CorruptFormat(
+                            "compaction extent offset overlaps superblock",
+                        ));
+                    }
+                    let stored_usize = stored_len as usize;
+                    if stored_usize > MAX_EXTENT_PAYLOAD_BYTES {
+                        return Err(LibreDbError::PayloadTooLarge {
+                            size: stored_usize,
+                            max: MAX_EXTENT_PAYLOAD_BYTES,
+                        });
+                    }
+                    let end_offset = data_offset
+                        .checked_add(stored_len as u64)
+                        .ok_or(LibreDbError::CorruptFormat(
+                            "compaction extent offset overflow",
+                        ))?;
+                    if end_offset > bytes_before {
+                        return Err(LibreDbError::CorruptFormat(
+                            "compaction extent exceeds file bounds",
+                        ));
+                    }
+                    let mut stored_bytes = vec![0u8; stored_usize];
                     self.backend.read_at(data_offset, &mut stored_bytes)?;
                     let actual_crc = crc32(&stored_bytes);
                     if actual_crc != data_crc32 {
@@ -2261,6 +2412,11 @@ impl LibreDb {
                 data_crc32,
                 ..
             } => {
+                if data_offset < DATA_REGION_START {
+                    return Err(LibreDbError::CorruptFormat(
+                        "extent offset overlaps superblock",
+                    ));
+                }
                 let raw_usize = raw_len as usize;
                 let stored_usize = stored_len as usize;
                 if raw_usize > MAX_EXTENT_PAYLOAD_BYTES {
@@ -2339,6 +2495,11 @@ impl LibreDb {
                     data_crc32,
                     ..
                 } => {
+                    if data_offset < DATA_REGION_START {
+                        return Err(LibreDbError::CorruptFormat(
+                            "extent offset overlaps superblock",
+                        ));
+                    }
                     if (raw_len as usize) > MAX_EXTENT_PAYLOAD_BYTES {
                         return Err(LibreDbError::PayloadTooLarge {
                             size: raw_len as usize,
@@ -2476,6 +2637,11 @@ fn read_overflow_synapses(
     offset: u64,
     count: usize,
 ) -> Result<Vec<Synapse>> {
+    if offset < DATA_REGION_START {
+        return Err(LibreDbError::CorruptFormat(
+            "overflow synapse offset overlaps superblock",
+        ));
+    }
     let byte_len = count
         .checked_mul(8)
         .and_then(|n| n.checked_add(4))
@@ -2559,6 +2725,139 @@ fn current_thread_lane_hint() -> usize {
 mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn forged_superblock_and_extent_bounds_fail_closed_without_oom() {
+        let tmp = std::env::temp_dir().join(format!(
+            "libredb_core_forged_bounds_{}_{}",
+            std::process::id(),
+            now_unix_ns()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // 1. Forged superblock claiming a multi-gigabyte `base_snapshot_len` with a valid CRC32
+        //    must be rejected deterministically BEFORE any allocation!
+        let oom_sb_path = tmp.join("forged_sb_oom.ldb");
+        {
+            let _init = LibreDb::open(&oom_sb_path).unwrap();
+        }
+        {
+            let forged_sb = Superblock {
+                version: crate::format::FORMAT_VERSION,
+                flags: 0,
+                commit_seq: 99,
+                next_node_id: 2,
+                active_node_count: 1,
+                base_snapshot_offset: DATA_REGION_START,
+                base_snapshot_len: (MAX_EXTENT_PAYLOAD_BYTES as u64) + 1_048_576,
+                delta_start_offset: DATA_REGION_START + (MAX_EXTENT_PAYLOAD_BYTES as u64) + 1_048_576,
+                data_tail_offset: DATA_REGION_START + (MAX_EXTENT_PAYLOAD_BYTES as u64) + 1_048_576,
+                created_ns: 1,
+                last_commit_ns: 2,
+                compaction_count: 1,
+            };
+            let encoded = forged_sb.encode();
+            let mut raw = std::fs::read(&oom_sb_path).unwrap();
+            raw[..4096].copy_from_slice(&encoded);
+            raw[4096..8192].copy_from_slice(&encoded);
+            std::fs::write(&oom_sb_path, &raw).unwrap();
+        }
+        assert!(
+            matches!(
+                LibreDb::open(&oom_sb_path),
+                Err(LibreDbError::NoValidSuperblock | LibreDbError::CorruptFormat(_))
+            ),
+            "Forged u32::MAX base_snapshot_len MUST fail closed in Superblock::decode without OOM"
+        );
+
+        // 1b. Forged Superblock with `base_snapshot_len = 64 MiB` (<= MAX_EXTENT_PAYLOAD_BYTES,
+        //     yet larger than the 8 KiB file on disk) MUST fail closed in `recover_existing`
+        //     with `CorruptFormat` BEFORE allocating the 64 MiB buffer!
+        {
+            let forged_sb2 = Superblock {
+                version: crate::format::FORMAT_VERSION,
+                flags: 0,
+                commit_seq: 99,
+                next_node_id: 2,
+                active_node_count: 1,
+                base_snapshot_offset: DATA_REGION_START,
+                base_snapshot_len: 64 * 1024 * 1024,
+                delta_start_offset: DATA_REGION_START + 64 * 1024 * 1024,
+                data_tail_offset: DATA_REGION_START + 64 * 1024 * 1024,
+                created_ns: 1,
+                last_commit_ns: 2,
+                compaction_count: 1,
+            };
+            let encoded2 = forged_sb2.encode();
+            let mut raw2 = std::fs::read(&oom_sb_path).unwrap();
+            raw2[..4096].copy_from_slice(&encoded2);
+            raw2[4096..8192].copy_from_slice(&encoded2);
+            std::fs::write(&oom_sb_path, &raw2).unwrap();
+        }
+        assert!(
+            matches!(
+                LibreDb::open(&oom_sb_path),
+                Err(LibreDbError::NoValidSuperblock | LibreDbError::CorruptFormat(_))
+            ),
+            "Forged 64 MiB base_snapshot_len exceeding file_len MUST fail closed without OOM"
+        );
+
+        // 2. Forged Inode extent pointing into Superblock Slot A (`data_offset = 0`) with valid
+        //    Inode CRC32 and valid delta frame CRC32 MUST fail closed on decode/recovery!
+        let sb_overlap_path = tmp.join("forged_extent_overlap.ldb");
+        {
+            let db = LibreDb::open(&sb_overlap_path).unwrap();
+            let big_payload = vec![b'X'; 256]; // > INLINE_PAYLOAD_CAP (48B) -> Extent storage
+            db.put(WriteRequest::new(NodeKind::Fact, big_payload).with_key("fact:big"))
+                .unwrap();
+        }
+        {
+            let mut raw = std::fs::read(&sb_overlap_path).unwrap();
+            let magic = crate::format::COMMIT_FRAME_MAGIC;
+            let delta_pos = raw[DATA_REGION_START as usize..]
+                .windows(4)
+                .position(|w| w == magic)
+                .map(|p| (DATA_REGION_START as usize) + p)
+                .expect("Delta frame magic present");
+            let frame_len =
+                u32::from_le_bytes(raw[delta_pos + 4..delta_pos + 8].try_into().unwrap()) as usize;
+            let ino_start = delta_pos + 24;
+            let mut ino = Inode::decode(
+                raw[ino_start..ino_start + crate::format::INODE_SIZE]
+                    .try_into()
+                    .unwrap(),
+            )
+            .unwrap();
+            match &mut ino.storage {
+                InodeStorage::Extent {
+                    data_offset,
+                    stored_len,
+                    data_crc32,
+                    ..
+                } => {
+                    *data_offset = 0;
+                    *data_crc32 = crc32(&raw[0..(*stored_len as usize)]);
+                }
+                _ => panic!("Expected Extent storage"),
+            }
+            let forged_ino_bytes = ino.encode();
+            raw[ino_start..ino_start + crate::format::INODE_SIZE]
+                .copy_from_slice(&forged_ino_bytes);
+            let frame_crc_pos = delta_pos + frame_len - 4;
+            let new_frame_crc = crc32(&raw[delta_pos..frame_crc_pos]);
+            raw[frame_crc_pos..frame_crc_pos + 4].copy_from_slice(&new_frame_crc.to_le_bytes());
+            std::fs::write(&sb_overlap_path, &raw).unwrap();
+        }
+        assert!(
+            matches!(
+                LibreDb::open(&sb_overlap_path),
+                Err(LibreDbError::CorruptFormat(_))
+            ),
+            "Forged Inode extent overlapping Superblock Slot A MUST fail closed with CorruptFormat"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
     #[test]
     fn transact_key_and_put_if_absent_serialize_across_handles_and_threads() {

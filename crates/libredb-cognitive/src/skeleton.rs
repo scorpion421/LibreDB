@@ -13,6 +13,51 @@ pub const SKELETON_KEY_PREFIX: &str = "skeleton::";
 /// Content-hash seed bumped whenever `FileSkeleton` extraction semantics upgrade (e.g. `container`
 /// qualification, `supertypes`, interface/abstract method contracts, and `Makefile` targets in v0.9.0).
 pub const SKELETON_HASH_SEED: u8 = 109;
+/// Hard safety cap (`16 MiB`) for individual source files read by `skeleton` and `fim` so oversized
+/// or special files cannot trigger unbounded memory allocations.
+pub const MAX_SKELETON_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Reads `path` only after verifying via `symlink_metadata` that it is a regular non-symlink file
+/// bounded by `MAX_SKELETON_FILE_BYTES` (`16 MiB`).
+pub fn read_bounded_source_file(path: &Path) -> Result<Vec<u8>> {
+    let sym_meta = std::fs::symlink_metadata(path).map_err(|e| {
+        LibreDbError::Io(std::io::Error::new(
+            e.kind(),
+            format!("{}: {e}", path.display()),
+        ))
+    })?;
+    if sym_meta.file_type().is_symlink() {
+        return Err(LibreDbError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("refusing symlinked source file '{}'", path.display()),
+        )));
+    }
+    if !sym_meta.is_file() {
+        return Err(LibreDbError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("'{}' is not a regular file", path.display()),
+        )));
+    }
+    if sym_meta.len() > MAX_SKELETON_FILE_BYTES {
+        return Err(LibreDbError::PayloadTooLarge {
+            size: usize::try_from(sym_meta.len()).unwrap_or(usize::MAX),
+            max: MAX_SKELETON_FILE_BYTES as usize,
+        });
+    }
+    let raw_bytes = std::fs::read(path).map_err(|e| {
+        LibreDbError::Io(std::io::Error::new(
+            e.kind(),
+            format!("{}: {e}", path.display()),
+        ))
+    })?;
+    if raw_bytes.len() > MAX_SKELETON_FILE_BYTES as usize {
+        return Err(LibreDbError::PayloadTooLarge {
+            size: raw_bytes.len(),
+            max: MAX_SKELETON_FILE_BYTES as usize,
+        });
+    }
+    Ok(raw_bytes)
+}
 
 /// Section boundary (e.g., `# SECTION: skillsdb.core.db` or `mod ...`) inside a source file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,16 +147,20 @@ impl FileSkeleton {
     /// Returns a cached `FileSkeleton` from `db` if the file's 64-bit content hash matches,
     /// or extracts and persists an updated skeleton when the file is new or modified!
     pub fn index_or_get_cached(db: &LibreDb, path: &Path, display_label: Option<&str>) -> Result<(Self, bool)> {
-        let raw_bytes = std::fs::read(path).map_err(|e| {
-            LibreDbError::Io(std::io::Error::new(
-                e.kind(),
-                format!("{}: {e}", path.display()),
-            ))
-        })?;
-        let current_hash = hash_key(SKELETON_HASH_SEED, &raw_bytes);
+        let raw_bytes = read_bounded_source_file(path)?;
         let label = display_label
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| path.to_string_lossy().replace('\\', "/"));
+        Self::index_or_get_cached_bytes(db, label, &raw_bytes)
+    }
+
+    /// Returns a cached `FileSkeleton` for an already-read `raw_bytes` buffer (avoiding duplicate disk reads).
+    pub fn index_or_get_cached_bytes(
+        db: &LibreDb,
+        label: String,
+        raw_bytes: &[u8],
+    ) -> Result<(Self, bool)> {
+        let current_hash = hash_key(SKELETON_HASH_SEED, raw_bytes);
         let key = format!("{SKELETON_KEY_PREFIX}{label}");
 
         if let Ok(rec) = db.get_by_key(NodeKind::WorkingSet, &key) {
@@ -122,7 +171,7 @@ impl FileSkeleton {
             }
         }
 
-        let text = String::from_utf8_lossy(&raw_bytes);
+        let text = String::from_utf8_lossy(raw_bytes);
         let skel = Self::extract(label, &text);
         let encoded = serde_json::to_vec(&skel)
             .map_err(|_| LibreDbError::CorruptFormat("skeleton json serialize"))?;
@@ -145,12 +194,7 @@ impl FileSkeleton {
         let mut pending_writes: Vec<libredb_core::PreparedWrite> = Vec::new();
 
         for (idx, &(path, display_label)) in items.iter().enumerate() {
-            let raw_bytes = std::fs::read(path).map_err(|e| {
-                LibreDbError::Io(std::io::Error::new(
-                    e.kind(),
-                    format!("{}: {e}", path.display()),
-                ))
-            })?;
+            let raw_bytes = read_bounded_source_file(path)?;
             let current_hash = hash_key(SKELETON_HASH_SEED, &raw_bytes);
             let label = display_label
                 .map(ToOwned::to_owned)

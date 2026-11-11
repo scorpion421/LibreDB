@@ -109,6 +109,7 @@ impl PyBrain {
     #[allow(clippy::too_many_arguments)]
     pub fn pulse(
         &self,
+        py: Python<'_>,
         query: &str,
         budget: u32,
         cid: Option<&str>,
@@ -118,111 +119,149 @@ impl PyBrain {
         error: Option<&str>,
         as_json: bool,
     ) -> PyResult<String> {
-        let mut req = PulseRequest::new(query, budget);
-        req.epoch = epoch;
-        if let Some(c) = cid {
-            req.conversation_id = Some(c.to_owned());
-            if let Some(tp) = transcript_path {
-                req.epoch =
-                    sync_transcript_epoch(&self.project_db, c, Path::new(tp)).map_err(to_py_err)?;
+        let query_owned = query.to_owned();
+        let cid_owned = cid.map(ToOwned::to_owned);
+        let tp_owned = transcript_path.map(PathBuf::from);
+        let cwd_owned = cwd.map(PathBuf::from);
+        let err_owned = error.map(ToOwned::to_owned);
+        py.allow_threads(|| {
+            let mut req = PulseRequest::new(&query_owned, budget);
+            req.epoch = epoch;
+            if let Some(c) = cid_owned {
+                if let Some(ref tp) = tp_owned {
+                    req.epoch =
+                        sync_transcript_epoch(&self.project_db, &c, tp).map_err(to_py_err)?;
+                }
+                req.conversation_id = Some(c);
             }
-        }
-        if let Some(d) = cwd {
-            req.workspace_dir = Some(PathBuf::from(d));
-        }
-        if let Some(e) = error {
-            req.error_context = Some(e.to_owned());
-        }
+            if let Some(d) = cwd_owned {
+                req.workspace_dir = Some(d);
+            }
+            if let Some(e) = err_owned {
+                req.error_context = Some(e);
+            }
 
-        let mut guard = self.cached_brain.lock();
-        if guard.is_none() {
-            *guard = Some(
-                OverlayBrain::open(self.global_db.clone(), Arc::clone(&self.project_db))
-                    .map_err(to_py_err)?,
-            );
-        } else {
-            guard.as_mut().unwrap().refresh_if_needed().map_err(to_py_err)?;
-        }
-        let resp = guard.as_ref().unwrap().pulse(&req).map_err(to_py_err)?;
-        if as_json {
-            serde_json::to_string(&resp).map_err(to_py_err)
-        } else {
-            Ok(resp.format_compact())
-        }
+            let mut guard = self.cached_brain.lock();
+            if guard.is_none() {
+                *guard = Some(
+                    OverlayBrain::open(self.global_db.clone(), Arc::clone(&self.project_db))
+                        .map_err(to_py_err)?,
+                );
+            } else {
+                guard
+                    .as_mut()
+                    .unwrap()
+                    .refresh_if_needed()
+                    .map_err(to_py_err)?;
+            }
+            let resp = guard.as_ref().unwrap().pulse(&req).map_err(to_py_err)?;
+            if as_json {
+                serde_json::to_string(&resp).map_err(to_py_err)
+            } else {
+                Ok(resp.format_compact())
+            }
+        })
     }
 
     /// Extracts or retrieves a hash-cached `[Lstart-Lend]` symbol contract skeleton.
     #[pyo3(signature = (file_path, filter=None))]
-    pub fn skeleton(&self, file_path: &str, filter: Option<&str>) -> PyResult<String> {
-        let (skel, _) = FileSkeleton::index_or_get_cached(&self.project_db, Path::new(file_path), None)
-            .map_err(to_py_err)?;
-        Ok(skel.render_compact(filter, filter.is_some()))
+    pub fn skeleton(
+        &self,
+        py: Python<'_>,
+        file_path: &str,
+        filter: Option<&str>,
+    ) -> PyResult<String> {
+        let fp = PathBuf::from(file_path);
+        let flt = filter.map(ToOwned::to_owned);
+        py.allow_threads(|| {
+            let (skel, _) =
+                FileSkeleton::index_or_get_cached(&self.project_db, &fp, None).map_err(to_py_err)?;
+            Ok(skel.render_compact(flt.as_deref(), flt.is_some()))
+        })
     }
 
     /// Extracts or retrieves hash-cached skeletons for a batch of files in a single `commit_batch` (`1` `fsync`).
     #[pyo3(signature = (file_paths, filter=None))]
     pub fn skeleton_batch(
         &self,
+        py: Python<'_>,
         file_paths: Vec<String>,
         filter: Option<&str>,
     ) -> PyResult<Vec<String>> {
-        let items: Vec<(&Path, Option<&str>)> = file_paths
-            .iter()
-            .map(|p| (Path::new(p.as_str()), None))
-            .collect();
-        let batch =
-            FileSkeleton::index_or_get_cached_batch(&self.project_db, &items).map_err(to_py_err)?;
-        Ok(batch
-            .into_iter()
-            .map(|(sk, _)| sk.render_compact(filter, filter.is_some()))
-            .collect())
+        let flt = filter.map(ToOwned::to_owned);
+        py.allow_threads(|| {
+            let items: Vec<(&Path, Option<&str>)> = file_paths
+                .iter()
+                .map(|p| (Path::new(p.as_str()), None))
+                .collect();
+            let batch =
+                FileSkeleton::index_or_get_cached_batch(&self.project_db, &items).map_err(to_py_err)?;
+            Ok(batch
+                .into_iter()
+                .map(|(sk, _)| sk.render_compact(flt.as_deref(), flt.is_some()))
+                .collect())
+        })
     }
 
     /// Indexes all non-binary source files under `root_dir` and wires call + governance synapses.
     #[pyo3(signature = (root_dir, force=false))]
-    pub fn index_workspace(&self, root_dir: &str, force: bool) -> PyResult<String> {
-        let rep = index_workspace(&self.project_db, Path::new(root_dir), force).map_err(to_py_err)?;
-        serde_json::to_string(&rep).map_err(to_py_err)
+    pub fn index_workspace(&self, py: Python<'_>, root_dir: &str, force: bool) -> PyResult<String> {
+        let root = PathBuf::from(root_dir);
+        py.allow_threads(|| {
+            let rep = index_workspace(&self.project_db, &root, force).map_err(to_py_err)?;
+            serde_json::to_string(&rep).map_err(to_py_err)
+        })
     }
 
     /// Queries bidirectional symbol blast-radius (`callers`, `callees`) and governing decisions.
-    pub fn impact(&self, symbol_query: &str) -> PyResult<String> {
-        let rep = query_symbol_impact(&self.project_db, symbol_query).map_err(to_py_err)?;
-        serde_json::to_string(&rep).map_err(to_py_err)
+    pub fn impact(&self, py: Python<'_>, symbol_query: &str) -> PyResult<String> {
+        let q = symbol_query.to_owned();
+        py.allow_threads(|| {
+            let rep = query_symbol_impact(&self.project_db, &q).map_err(to_py_err)?;
+            serde_json::to_string(&rep).map_err(to_py_err)
+        })
     }
 
     /// Extracts a surgical Fill-in-the-Middle edit window with blast-radius and governing decisions.
     #[pyo3(signature = (file_path, symbol=None, line=None, pad=12))]
     pub fn fim(
         &self,
+        py: Python<'_>,
         file_path: &str,
         symbol: Option<&str>,
         line: Option<usize>,
         pad: usize,
     ) -> PyResult<String> {
-        let bundle =
-            extract_fim_slice(&self.project_db, Path::new(file_path), symbol, line, pad)
-                .map_err(to_py_err)?;
-        Ok(bundle.format_compact())
+        let fp = PathBuf::from(file_path);
+        let sym = symbol.map(ToOwned::to_owned);
+        py.allow_threads(|| {
+            let bundle =
+                extract_fim_slice(&self.project_db, &fp, sym.as_deref(), line, pad)
+                    .map_err(to_py_err)?;
+            Ok(bundle.format_compact())
+        })
     }
 
     /// Commits multiple `(key, value)` facts, `(title, body)` decisions, and an optional snapshot atomically.
     #[pyo3(signature = (facts=None, decisions=None, tasks=None, snapshot=None))]
     pub fn batch(
         &self,
+        py: Python<'_>,
         facts: Option<Vec<(String, String)>>,
         decisions: Option<Vec<(String, String)>>,
         tasks: Option<Vec<(String, String, String, String)>>,
         snapshot: Option<String>,
     ) -> PyResult<String> {
-        let spec = AtomicBatchSpec {
-            facts: facts.unwrap_or_default(),
-            decisions: decisions.unwrap_or_default(),
-            tasks: tasks.unwrap_or_default(),
-            snapshot,
-        };
-        let rep = execute_atomic_batch(&self.project_db, &spec).map_err(to_py_err)?;
-        serde_json::to_string(&rep).map_err(to_py_err)
+        py.allow_threads(|| {
+            let spec = AtomicBatchSpec {
+                facts: facts.unwrap_or_default(),
+                decisions: decisions.unwrap_or_default(),
+                tasks: tasks.unwrap_or_default(),
+                snapshot,
+            };
+            let rep = execute_atomic_batch(&self.project_db, &spec).map_err(to_py_err)?;
+            serde_json::to_string(&rep).map_err(to_py_err)
+        })
     }
 
     /// Builds a deterministic subagent delegation block linked to `task_key`.
@@ -272,31 +311,43 @@ impl PyBrain {
 
     /// Imports an existing SQLite database (`central` or `project`) strictly read-only and saves an index snapshot.
     #[pyo3(signature = (sqlite_path, scope="central"))]
-    pub fn import_sqlite(&self, sqlite_path: &str, scope: &str) -> PyResult<String> {
-        let sum =
-            import_sqlite_readonly(Path::new(sqlite_path), &self.project_db, scope).map_err(to_py_err)?;
-        let mut cog = CognitiveEngine::open_db(Arc::clone(&self.project_db)).map_err(to_py_err)?;
-        cog.save_index_snapshot().map_err(to_py_err)?;
-        serde_json::to_string(&sum).map_err(to_py_err)
+    pub fn import_sqlite(&self, py: Python<'_>, sqlite_path: &str, scope: &str) -> PyResult<String> {
+        let sp = PathBuf::from(sqlite_path);
+        let sc = scope.to_owned();
+        py.allow_threads(|| {
+            let sum =
+                import_sqlite_readonly(&sp, &self.project_db, &sc).map_err(to_py_err)?;
+            let mut cog = CognitiveEngine::open_db(Arc::clone(&self.project_db)).map_err(to_py_err)?;
+            cog.save_index_snapshot().map_err(to_py_err)?;
+            serde_json::to_string(&sum).map_err(to_py_err)
+        })
     }
 
     /// Exports the lossless SQLite mirror back to `out_sqlite_path`.
     #[pyo3(signature = (out_sqlite_path, scope="central"))]
-    pub fn export_sqlite(&self, out_sqlite_path: &str, scope: &str) -> PyResult<usize> {
-        export_sqlite_database(&self.project_db, scope, Path::new(out_sqlite_path))
-            .map_err(to_py_err)
+    pub fn export_sqlite(
+        &self,
+        py: Python<'_>,
+        out_sqlite_path: &str,
+        scope: &str,
+    ) -> PyResult<usize> {
+        let op = PathBuf::from(out_sqlite_path);
+        let sc = scope.to_owned();
+        py.allow_threads(|| export_sqlite_database(&self.project_db, &sc, &op).map_err(to_py_err))
     }
 
     /// Runs Gravity locality compaction, refreshes the persistent index snapshot, and verifies CRC integrity.
     #[pyo3(signature = (prune=false))]
-    pub fn compact(&self, prune: bool) -> PyResult<String> {
-        let mut cog = CognitiveEngine::open_db(Arc::clone(&self.project_db)).map_err(to_py_err)?;
-        cog.save_index_snapshot().map_err(to_py_err)?;
-        let rep = self
-            .project_db
-            .compact_with_options(prune)
-            .map_err(to_py_err)?;
-        serde_json::to_string(&rep).map_err(to_py_err)
+    pub fn compact(&self, py: Python<'_>, prune: bool) -> PyResult<String> {
+        py.allow_threads(|| {
+            let mut cog = CognitiveEngine::open_db(Arc::clone(&self.project_db)).map_err(to_py_err)?;
+            cog.save_index_snapshot().map_err(to_py_err)?;
+            let rep = self
+                .project_db
+                .compact_with_options(prune)
+                .map_err(to_py_err)?;
+            serde_json::to_string(&rep).map_err(to_py_err)
+        })
     }
 
     /// Returns JSON database statistics.
@@ -309,26 +360,39 @@ impl PyBrain {
 /// Verifies lossless `SQLite -> LibreDB -> SQLite` parity on a temporary copy of `sqlite_path`.
 #[pyfunction]
 #[pyo3(signature = (sqlite_path, scope="central"))]
-pub fn verify_sqlite_roundtrip_json(sqlite_path: &str, scope: &str) -> PyResult<String> {
-    let pid = std::process::id();
-    let tmp_dir = std::env::temp_dir().join(format!("libredb_py_rt_{pid}"));
-    let _ = std::fs::remove_dir_all(&tmp_dir);
-    std::fs::create_dir_all(&tmp_dir).map_err(to_py_err)?;
+pub fn verify_sqlite_roundtrip_json(
+    py: Python<'_>,
+    sqlite_path: &str,
+    scope: &str,
+) -> PyResult<String> {
+    let sp = PathBuf::from(sqlite_path);
+    let sc = scope.to_owned();
+    py.allow_threads(move || {
+        let sym_meta = std::fs::symlink_metadata(&sp).map_err(to_py_err)?;
+        if sym_meta.file_type().is_symlink() {
+            return Err(PyRuntimeError::new_err(format!(
+                "refusing symlinked SQLite path '{}'",
+                sp.display()
+            )));
+        }
+        let tmp_dir = tempfile::Builder::new()
+            .prefix("libredb_py_rt_")
+            .tempdir()
+            .map_err(to_py_err)?;
+        let copy_src = tmp_dir.path().join("src.db");
+        let ldb_file = tmp_dir.path().join("mid.ldb");
+        let recon_db = tmp_dir.path().join("recon.db");
+        std::fs::copy(&sp, &copy_src).map_err(to_py_err)?;
 
-    let copy_src = tmp_dir.join("src.db");
-    let ldb_file = tmp_dir.join("mid.ldb");
-    let recon_db = tmp_dir.join("recon.db");
-    std::fs::copy(sqlite_path, &copy_src).map_err(to_py_err)?;
-
-    {
-        let ldb = LibreDb::open(&ldb_file).map_err(to_py_err)?;
-        import_sqlite_readonly(&copy_src, &ldb, scope).map_err(to_py_err)?;
-        ldb.compact_with_gravity().map_err(to_py_err)?;
-        export_sqlite_database(&ldb, scope, &recon_db).map_err(to_py_err)?;
-    }
-    let rep = verify_sqlite_equivalence(&copy_src, &recon_db).map_err(to_py_err)?;
-    let _ = std::fs::remove_dir_all(&tmp_dir);
-    serde_json::to_string(&rep).map_err(to_py_err)
+        {
+            let ldb = LibreDb::open(&ldb_file).map_err(to_py_err)?;
+            import_sqlite_readonly(&copy_src, &ldb, &sc).map_err(to_py_err)?;
+            ldb.compact_with_gravity().map_err(to_py_err)?;
+            export_sqlite_database(&ldb, &sc, &recon_db).map_err(to_py_err)?;
+        }
+        let rep = verify_sqlite_equivalence(&copy_src, &recon_db).map_err(to_py_err)?;
+        serde_json::to_string(&rep).map_err(to_py_err)
+    })
 }
 
 #[pymodule(name = "libredb")]

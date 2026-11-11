@@ -618,7 +618,7 @@ pub fn check_global_trust_sync(global_db: &LibreDb) -> Result<(), String> {
 
 /// Checks whether a `NodeKind::Config` key exists in `db`, treating ONLY `LibreDbError::KeyNotFound`
 /// as `Ok(false)` and propagating any storage/checksum/corruption error as `Err` (fail-closed).
-fn has_config_key_fail_closed(db: &LibreDb, key: &str) -> Result<bool, String> {
+pub(crate) fn has_config_key_fail_closed(db: &LibreDb, key: &str) -> Result<bool, String> {
     match db.get_by_key(NodeKind::Config, key) {
         Ok(_) => Ok(true),
         Err(LibreDbError::KeyNotFound { .. }) => Ok(false),
@@ -673,6 +673,28 @@ pub fn is_workspace_path_authorized(global_db: Option<&LibreDb>, ws_root: &Path)
     is_workspace_path_authorized_synced(gdb, ws_root)
 }
 
+/// Returns true if `key` addresses a security-critical internal configuration namespace
+/// (`sys::*`, `trust:*`, `workspace:*`, `workspace_id::*`) that must never be mutated via
+/// generic `libredb config set/unset`, `libredb put`, or `libredb deprecate`.
+pub fn is_reserved_security_config_key(key: &str) -> bool {
+    let low = key.trim().to_ascii_lowercase();
+    low.starts_with("sys::")
+        || low.starts_with("trust:")
+        || low.starts_with("workspace:")
+        || low.starts_with("workspace_id::")
+}
+
+/// Computes a deterministic collision-free `Config` key (`workspace_id::<16-hex>`) from a
+/// normalized workspace path so distinct repositories sharing the same folder basename never
+/// overwrite or revoke one another's learned workspace records.
+pub fn workspace_id_config_key(norm: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(b"LibreDB::WorkspaceIdKey::v1\0");
+    h.update(norm.as_bytes());
+    let digest = h.finalize();
+    format!("workspace_id::{}", hex_encode(&digest[..8]))
+}
+
 fn is_workspace_path_authorized_synced(gdb: &LibreDb, ws_root: &Path) -> bool {
     let norm = normalize_workspace_key(ws_root);
     match has_config_key_fail_closed(gdb, &format!("trust:revoked::{norm}")) {
@@ -686,7 +708,7 @@ fn is_workspace_path_authorized_synced(gdb: &LibreDb, ws_root: &Path) -> bool {
     }
     for (ino, key_opt, _) in gdb.list_inodes(Some(NodeKind::Config), false) {
         if let Some(k) = key_opt {
-            if k.starts_with("workspace:") {
+            if k.starts_with("workspace:") || k.starts_with("workspace_id::") {
                 let Ok(rec) = gdb.get(ino.node_id) else {
                     return false;
                 };
@@ -979,18 +1001,21 @@ pub fn is_unsealed_replacement_of_sealed_workspace(global_db: &LibreDb, ws_root:
     let Ok(true) = has_prior_workspace_seal_marker_norm_checked(global_db, &norm) else {
         return false;
     };
-    let ldb_path = ws_root.join(".agents").join("memory.ldb");
-    if !ldb_path.is_file() {
-        return true;
-    }
     let Ok(is_revoked) = has_config_key_fail_closed(global_db, &format!("trust:revoked::{norm}"))
     else {
         return false;
     };
+    if is_revoked {
+        return false;
+    }
+    let ldb_path = ws_root.join(".agents").join("memory.ldb");
+    if !ldb_path.is_file() {
+        return true;
+    }
     let Ok(pdb) = LibreDb::open(&ldb_path) else {
         return false;
     };
-    if !is_revoked && pdb.get_by_key(NodeKind::Config, TRUST_SEALS_KEY).is_err() {
+    if pdb.get_by_key(NodeKind::Config, TRUST_SEALS_KEY).is_err() {
         return true;
     }
     if has_config_key_fail_closed(global_db, &format!("trust:nonempty_sealed::{norm}"))
@@ -1451,7 +1476,7 @@ fn seal_workspace_memory_inner(
 /// clobbering intermediate unsealed mutations.
 pub struct PreMutationSealGuard {
     authorized_ws: Option<PathBuf>,
-    ws_lock: std::sync::Mutex<Option<WorkspaceTrustLockGuard>>,
+    _ws_lock: Option<WorkspaceTrustLockGuard>,
 }
 
 impl PreMutationSealGuard {
@@ -1459,14 +1484,21 @@ impl PreMutationSealGuard {
         global_db: Option<&LibreDb>,
         db_path: &Path,
     ) -> Result<Self, String> {
-        let Some(gdb) = global_db else {
-            return Ok(Self {
-                authorized_ws: None,
-                ws_lock: std::sync::Mutex::new(None),
-            });
-        };
-        check_global_trust_sync(gdb)?;
+        Self::verify_before_write_ext(global_db, db_path, false)
+    }
 
+    pub fn verify_before_write_allow_fresh_global_import(
+        global_db: Option<&LibreDb>,
+        db_path: &Path,
+    ) -> Result<Self, String> {
+        Self::verify_before_write_ext(global_db, db_path, true)
+    }
+
+    fn verify_before_write_ext(
+        global_db: Option<&LibreDb>,
+        db_path: &Path,
+        allow_fresh_global_import: bool,
+    ) -> Result<Self, String> {
         let joined_db = if db_path.is_relative() {
             std::env::current_dir()
                 .map(|cwd| cwd.join(db_path))
@@ -1475,22 +1507,59 @@ impl PreMutationSealGuard {
             db_path.to_path_buf()
         };
         let resolved_db = canonicalize_with_missing_tail(&joined_db).unwrap_or(joined_db);
+        let norm_db = normalize_workspace_key(&resolved_db);
+
+        let is_global_target = norm_db.ends_with("/.gemini/libredb/customizations.ldb")
+            || global_db
+                .and_then(LibreDb::path)
+                .is_some_and(|gp| normalize_workspace_key(gp) == norm_db);
+        if is_global_target && !(allow_fresh_global_import && !resolved_db.exists()) {
+            return Err(format!(
+                "Direct CLI mutation of global customizations.ldb ('{}') via low-level commands is blocked to protect sys::trust_anchor_secret and workspace trust ratchets; use 'libredb config' or 'libredb trust' instead.",
+                db_path.display()
+            ));
+        }
+
+        let Some(gdb) = global_db else {
+            return Ok(Self {
+                authorized_ws: None,
+                _ws_lock: None,
+            });
+        };
+        check_global_trust_sync(gdb)?;
+
         let Some(parent) = resolved_db.parent() else {
             return Ok(Self {
                 authorized_ws: None,
-                ws_lock: std::sync::Mutex::new(None),
+                _ws_lock: None,
             });
         };
-        if parent.file_name().and_then(|n| n.to_str()) != Some(".agents") {
+        if !parent
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case(".agents"))
+        {
             return Ok(Self {
                 authorized_ws: None,
-                ws_lock: std::sync::Mutex::new(None),
+                _ws_lock: None,
             });
-        };
+        }
+        let is_memory_ldb = resolved_db
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case("memory.ldb"));
+        if !is_memory_ldb {
+            // Non-`memory.ldb` scratch files inside `.agents/` must never re-seal over the real
+            // workspace `.agents/memory.ldb` or advance `trust:seal_rev::<ws>`.
+            return Ok(Self {
+                authorized_ws: None,
+                _ws_lock: None,
+            });
+        }
         let Some(ws_root) = parent.parent() else {
             return Ok(Self {
                 authorized_ws: None,
-                ws_lock: std::sync::Mutex::new(None),
+                _ws_lock: None,
             });
         };
         let norm = normalize_workspace_key(ws_root);
@@ -1511,7 +1580,7 @@ impl PreMutationSealGuard {
             // never auto-authorize or seal it, while still holding `lock_guard` across the write.
             return Ok(Self {
                 authorized_ws: None,
-                ws_lock: std::sync::Mutex::new(Some(lock_guard)),
+                _ws_lock: Some(lock_guard),
             });
         }
         if !is_workspace_memory_trusted(Some(gdb), ws_root) {
@@ -1546,7 +1615,7 @@ impl PreMutationSealGuard {
         }
         Ok(Self {
             authorized_ws: Some(ws_root.to_path_buf()),
-            ws_lock: std::sync::Mutex::new(Some(lock_guard)),
+            _ws_lock: Some(lock_guard),
         })
     }
 
@@ -1555,7 +1624,7 @@ impl PreMutationSealGuard {
         global_db: Option<&LibreDb>,
         proj_db: &LibreDb,
     ) -> Result<(), String> {
-        let res = if let (Some(gdb), Some(ref ws_root)) = (global_db, &self.authorized_ws) {
+        if let (Some(gdb), Some(ref ws_root)) = (global_db, &self.authorized_ws) {
             seal_workspace_memory(gdb, proj_db, ws_root).map_err(|err| {
                 format!(
                     "Workspace mutation succeeded, but updating hmac-sha256:v4 trust seal for '{}' failed: {err}",
@@ -1564,13 +1633,7 @@ impl PreMutationSealGuard {
             })
         } else {
             Ok(())
-        };
-        let _ = self
-            .ws_lock
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        res
+        }
     }
 }
 
@@ -1931,9 +1994,28 @@ pub fn revoke_workspace_trust(global_db: &LibreDb, ws_root: &Path) -> Result<(),
     let _ws_lock = WorkspaceTrustLockGuard::acquire_norm(global_db, &norm)?;
     check_global_trust_sync(global_db)?;
     deprecate_config_if_present(global_db, &format!("trust:allowed::{norm}"))?;
-    if let Some(name) = ws_root.file_name().and_then(|n| n.to_str()) {
-        deprecate_config_if_present(global_db, &format!("workspace:{name}"))?;
+    deprecate_config_if_present(global_db, &workspace_id_config_key(&norm))?;
+
+    // Only deprecate legacy `workspace:<basename>` entries whose normalized payload path
+    // matches `norm`, so same-basename repositories (e.g. `/org_a/app` vs `/org_b/app`)
+    // never revoke each other's discovery metadata.
+    let mut matching_legacy_keys = Vec::new();
+    for (ino, key_opt, _) in global_db.list_inodes(Some(NodeKind::Config), false) {
+        let Some(k) = key_opt else { continue };
+        if k.starts_with("workspace:") {
+            let rec = global_db
+                .get(ino.node_id)
+                .map_err(|e| format!("Failed to read Config '{k}': {e}"))?;
+            let raw = String::from_utf8_lossy(&rec.payload);
+            if normalize_workspace_key(Path::new(raw.trim())) == norm {
+                matching_legacy_keys.push(k);
+            }
+        }
     }
+    for leg_key in matching_legacy_keys {
+        deprecate_config_if_present(global_db, &leg_key)?;
+    }
+
     global_db
         .put(
             WriteRequest::new(NodeKind::Config, b"revoked".to_vec())
@@ -1969,7 +2051,7 @@ pub fn list_trusted_workspaces(global_db: &LibreDb) -> Result<Vec<(String, Strin
                 norm.to_owned(),
                 String::from_utf8_lossy(&rec.payload).trim().to_owned(),
             );
-        } else if k.starts_with("workspace:") {
+        } else if k.starts_with("workspace_id::") || k.starts_with("workspace:") {
             let rec = global_db
                 .get(ino.node_id)
                 .map_err(|e| format!("Failed to read Config '{k}': {e}"))?;
@@ -1994,7 +2076,8 @@ pub fn check_tool_write_path_policy(
     check_tool_write_path_policy_with_base(target_path, None, custom_protected)
 }
 
-/// Evaluates `PreToolUse` write path policy resolving relative paths and symlinks against `base_dir`.
+/// Evaluates `PreToolUse` write path policy resolving relative paths, NTFS Alternate Data Streams
+/// (`:stream` / `::$DATA`), Win32 trailing dots/spaces, and symlinks against `base_dir`.
 pub fn check_tool_write_path_policy_with_base(
     target_path: &str,
     base_dir: Option<&Path>,
@@ -2002,26 +2085,51 @@ pub fn check_tool_write_path_policy_with_base(
 ) -> Option<String> {
     let raw_p = Path::new(target_path.trim());
     for low in resolve_policy_candidate_paths(raw_p, base_dir) {
-        if low.contains("/.git/hooks/")
-            || low.ends_with("/.git/hooks")
-            || low.ends_with("/.git/config")
+        let slash_low = format!("/{}", low.trim_start_matches('/'));
+        if slash_low.contains("/.git/hooks/")
+            || slash_low.ends_with("/.git/hooks")
+            || slash_low.ends_with("/.git/config")
+            || slash_low.ends_with("/.git/info/attributes")
+            || slash_low.ends_with("/.gitmodules")
         {
             return Some(
-                "Modifying .git/hooks or .git/config via file tools is blocked to prevent Git hook execution hijacking."
+                "Modifying .git/hooks, .git/config, .git/info/attributes, or .gitmodules via file tools is blocked to prevent Git hook/filter/submodule execution hijacking."
                     .to_owned(),
             );
         }
-        if low.contains("/.gemini/")
-            && (low.ends_with("/hooks.json") || low.ends_with("/mcp_config.json"))
+        if slash_low.contains("/.gemini/")
+            && (slash_low.ends_with("/hooks.json") || slash_low.ends_with("/mcp_config.json"))
         {
             return Some(
                 "Direct agent modification of active Antigravity hooks.json or mcp_config.json is blocked; use user-approved deployment scripts."
                     .to_owned(),
             );
         }
-        if let Some(reason) = check_credential_store_path(&low, custom_protected) {
+        if slash_low.contains("/.gemini/libredb/")
+            || slash_low.ends_with("/.gemini/libredb")
+            || slash_low.contains("/.gemini/config/plugins/libredb/")
+            || slash_low.ends_with("/.gemini/config/plugins/libredb")
+            || slash_low.ends_with("/.gemini/antigravity/bin/libredb")
+            || slash_low.ends_with("/.gemini/antigravity/bin/libredb.exe")
+        {
+            return Some(
+                "Direct agent modification of active LibreDB control-plane files, binaries, or trust stores under ~/.gemini is blocked."
+                    .to_owned(),
+            );
+        }
+        if slash_low.ends_with("/.agents/memory.ldb")
+            || slash_low.ends_with("/.agents/memory.db")
+            || slash_low.contains("/.agents/memory.ldb.")
+            || slash_low.contains("/.agents/memory.db.")
+        {
+            return Some(
+                "Direct raw file writes to .agents/memory.ldb or .agents/memory.db are blocked to preserve workspace trust seals; use libredb_memorize or 'libredb batch'."
+                    .to_owned(),
+            );
+        }
+        if let Some(reason) = check_credential_store_path(&slash_low, custom_protected) {
             return Some(format!(
-                "Writing to sensitive credential/key path is blocked ({reason})."
+                "Writing to sensitive credential/key/control-plane path is blocked ({reason})."
             ));
         }
     }
@@ -2035,13 +2143,14 @@ pub fn check_mcp_read_path_policy(
     custom_protected: &[String],
 ) -> Option<String> {
     for low in resolve_policy_candidate_paths(target_path, None) {
-        if let Some(reason) = check_credential_store_path(&low, custom_protected) {
+        let slash_low = format!("/{}", low.trim_start_matches('/'));
+        if let Some(reason) = check_credential_store_path(&slash_low, custom_protected) {
             return Some(format!(
                 "LibreDB MCP access denied for protected path ({reason}): {}",
                 target_path.display()
             ));
         }
-        let fname = low.rsplit('/').next().unwrap_or(&low);
+        let fname = slash_low.rsplit('/').next().unwrap_or(&slash_low);
         if fname == ".env"
             || (fname.starts_with(".env.")
                 && !fname.ends_with(".example")
@@ -2058,34 +2167,121 @@ pub fn check_mcp_read_path_policy(
     None
 }
 
+/// Enforces workspace containment for `libredb-mcp` code inspection/indexing tools whenever an
+/// active workspace `ws_root` (`cwd`) is supplied, blocking both `../` traversal and symlinks
+/// inside the workspace that resolve outside `ws_root`.
+pub fn check_mcp_workspace_containment(
+    target_path: &Path,
+    ws_root: Option<&Path>,
+) -> Option<String> {
+    let root = ws_root?;
+    let root_canon = canonicalize_with_missing_tail(root).unwrap_or_else(|| root.to_path_buf());
+    let root_norm = normalize_workspace_key(&root_canon);
+    if root_norm.is_empty() {
+        return None;
+    }
+
+    let joined = if target_path.is_relative() {
+        root.join(target_path)
+    } else {
+        target_path.to_path_buf()
+    };
+    let target_canon = canonicalize_with_missing_tail(&joined).unwrap_or(joined);
+    let target_norm = normalize_workspace_key(&target_canon);
+    if target_norm != root_norm && !target_norm.starts_with(&format!("{root_norm}/")) {
+        return Some(format!(
+            "LibreDB MCP access denied: target '{}' resolves outside active workspace '{}'",
+            target_path.display(),
+            root.display()
+        ));
+    }
+    None
+}
+
+fn sanitize_policy_segment(seg: &str, is_drive_prefix: bool) -> String {
+    let low = seg.to_ascii_lowercase();
+    if low == "." || low == ".." {
+        return low;
+    }
+    let without_ads = if is_drive_prefix
+        && low.len() >= 2
+        && low.as_bytes()[0].is_ascii_alphabetic()
+        && low.as_bytes()[1] == b':'
+    {
+        match low[2..].find(':') {
+            Some(idx) => &low[..2 + idx],
+            None => low.as_str(),
+        }
+    } else {
+        low.split(':').next().unwrap_or(&low)
+    };
+    without_ads.trim_end_matches(['.', ' ']).to_owned()
+}
+
+fn sanitize_policy_path_str(raw: &str) -> String {
+    let unified = raw.trim().trim_start_matches(r"\\?\").replace('\\', "/");
+    let leading_slash = unified.starts_with('/');
+    let mut parts = Vec::new();
+    for (idx, part) in unified.split('/').enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        let cleaned = sanitize_policy_segment(part, idx == 0 && !leading_slash);
+        if !cleaned.is_empty() {
+            parts.push(cleaned);
+        }
+    }
+    let joined = parts.join("/");
+    if leading_slash {
+        format!("/{joined}")
+    } else {
+        joined
+    }
+}
+
 fn resolve_policy_candidate_paths(raw_path: &Path, base_dir: Option<&Path>) -> Vec<String> {
-    let mut out: Vec<String> = Vec::with_capacity(4);
+    let mut out: Vec<String> = Vec::with_capacity(6);
     let mut push_unique = |s: String| {
         if !s.is_empty() && !out.contains(&s) {
             out.push(s);
         }
     };
 
-    push_unique(raw_path.to_string_lossy().replace('\\', "/").to_ascii_lowercase());
+    let raw_lossy = raw_path.to_string_lossy();
+    let stripped_ads_raw = sanitize_policy_path_str(&raw_lossy);
+    push_unique(raw_lossy.replace('\\', "/").to_ascii_lowercase());
+    push_unique(stripped_ads_raw.clone());
     push_unique(lexical_normalize_lower(raw_path));
+    if !stripped_ads_raw.is_empty() {
+        push_unique(lexical_normalize_lower(Path::new(&stripped_ads_raw)));
+    }
 
-    if let Some(canon) = canonicalize_with_missing_tail(raw_path) {
-        let clean = crate::gitea::strip_verbatim_prefix(&canon);
-        push_unique(clean.to_string_lossy().replace('\\', "/").to_ascii_lowercase());
+    for cand_path in [raw_path, Path::new(stripped_ads_raw.as_str())] {
+        if cand_path.as_os_str().is_empty() {
+            continue;
+        }
+        if let Some(canon) = canonicalize_with_missing_tail(cand_path) {
+            let clean = crate::gitea::strip_verbatim_prefix(&canon);
+            push_unique(sanitize_policy_path_str(&clean.to_string_lossy()));
+        }
     }
 
     if raw_path.is_relative() {
         if let Some(base) = base_dir {
-            let joined = base.join(raw_path);
-            push_unique(lexical_normalize_lower(&joined));
-            if let Some(canon) = canonicalize_with_missing_tail(&joined) {
-                let clean = crate::gitea::strip_verbatim_prefix(&canon);
-                push_unique(clean.to_string_lossy().replace('\\', "/").to_ascii_lowercase());
+            for rel_p in [raw_path, Path::new(stripped_ads_raw.as_str())] {
+                if rel_p.as_os_str().is_empty() {
+                    continue;
+                }
+                let joined = base.join(rel_p);
+                push_unique(lexical_normalize_lower(&joined));
+                if let Some(canon) = canonicalize_with_missing_tail(&joined) {
+                    let clean = crate::gitea::strip_verbatim_prefix(&canon);
+                    push_unique(sanitize_policy_path_str(&clean.to_string_lossy()));
+                }
             }
         }
     }
 
-    // Expand `guardrail:protected_paths` symlink comparison by also resolving canonical custom entries at check time.
     out
 }
 
@@ -2096,13 +2292,12 @@ fn lexical_normalize_lower(path: &Path) -> String {
         match comp {
             Component::Prefix(p) => {
                 stack.clear();
-                stack.push(
-                    p.as_os_str()
-                        .to_string_lossy()
-                        .trim_start_matches(r"\\?\")
-                        .replace('\\', "/")
-                        .to_ascii_lowercase(),
-                );
+                let raw_pref = p
+                    .as_os_str()
+                    .to_string_lossy()
+                    .trim_start_matches(r"\\?\")
+                    .replace('\\', "/");
+                stack.push(sanitize_policy_segment(&raw_pref, true));
                 has_root = true;
             }
             Component::RootDir => {
@@ -2123,7 +2318,10 @@ fn lexical_normalize_lower(path: &Path) -> String {
                 }
             }
             Component::Normal(seg) => {
-                stack.push(seg.to_string_lossy().to_ascii_lowercase());
+                let cleaned = sanitize_policy_segment(&seg.to_string_lossy(), false);
+                if !cleaned.is_empty() {
+                    stack.push(cleaned);
+                }
             }
         }
     }
@@ -2184,10 +2382,11 @@ fn check_credential_store_path(low_norm: &str, custom_protected: &[String]) -> O
         "/.azure/",
         "/.kube/",
         "/.gemini/config/credentials/",
+        "/.gemini/libredb/.seal_locks/",
     ] {
         let trimmed_seg = seg.trim_end_matches('/');
         if low_norm.contains(seg) || low_norm.ends_with(trimmed_seg) {
-            return Some(format!("credential directory '{trimmed_seg}'"));
+            return Some(format!("credential/lock directory '{trimmed_seg}'"));
         }
     }
     let fname = low_norm.rsplit('/').next().unwrap_or(low_norm);
@@ -2197,39 +2396,42 @@ fn check_credential_store_path(low_norm: &str, custom_protected: &[String]) -> O
         || fname.ends_with(".pfx")
         || fname.ends_with(".jks")
         || fname.ends_with(".kdbx")
+        || fname == ".vault.key"
+        || fname.starts_with(".vault.key.")
         || matches!(
             fname,
-            ".vault.key"
-                | ".netrc"
+            ".netrc"
                 | "_netrc"
                 | ".git-credentials"
                 | "id_rsa"
                 | "id_ed25519"
                 | "id_ecdsa"
+                | "customizations.ldb"
+                | "customizations.db"
+                | "default_memory.ldb"
+                | "quarantined_workspace.ldb"
         )
     {
-        return Some(format!("credential/key file '{fname}'"));
+        return Some(format!("credential/key/control-plane file '{fname}'"));
     }
     for custom in custom_protected {
         let raw_c = custom.trim();
         if raw_c.is_empty() {
             continue;
         }
-        let mut c_variants = vec![raw_c.replace('\\', "/").to_ascii_lowercase()];
+        let mut c_variants = vec![sanitize_policy_path_str(raw_c)];
         if let Some(canon_c) = canonicalize_with_missing_tail(Path::new(raw_c)) {
-            let clean_c = crate::gitea::strip_verbatim_prefix(&canon_c)
-                .to_string_lossy()
-                .replace('\\', "/")
-                .to_ascii_lowercase();
+            let clean_c =
+                sanitize_policy_path_str(&crate::gitea::strip_verbatim_prefix(&canon_c).to_string_lossy());
             if !c_variants.contains(&clean_c) {
                 c_variants.push(clean_c);
             }
         }
         for c in c_variants {
-            let c_trim = c.trim_end_matches('/');
+            let c_trim = c.trim_matches('/');
             if !c_trim.is_empty()
-                && (low_norm == c_trim
-                    || low_norm.starts_with(&format!("{c_trim}/"))
+                && (low_norm == format!("/{c_trim}")
+                    || low_norm.starts_with(&format!("/{c_trim}/"))
                     || low_norm.contains(&format!("/{c_trim}/"))
                     || low_norm.ends_with(&format!("/{c_trim}")))
             {
@@ -2259,23 +2461,47 @@ pub fn sanitize_git_ref_for_prompt(raw_ref: &str) -> String {
     }
 }
 
-/// Returns true if `path` resides inside the current user's home directory (`%USERPROFILE%` / `$HOME`)
-/// or matches an already trusted workspace (`CVE-2022-24765`).
+/// Returns true ONLY if `project_root` (owned by the current effective UID on Unix) resides inside
+/// the current user's canonical home directory (`%USERPROFILE%` / `$HOME`) or has been EXPLICITLY
+/// authorized in `global_db` (`trust:allowed::<ws>`) AND passes `is_workspace_memory_trusted`
+/// (`CVE-2022-24765`). Never trusts spoofable `USERNAME`/`USER` path substrings or unapproved
+/// directories outside `$HOME` that merely lack `.agents/`.
 pub fn is_safe_auto_git_dir(global_db: Option<&LibreDb>, project_root: &Path) -> bool {
-    let norm = normalize_workspace_key(project_root);
-    let home_norm = normalize_workspace_key(&user_home_dir());
-    if norm == home_norm || norm.starts_with(&format!("{home_norm}/")) {
-        return true;
-    }
-    if let Ok(username) = std::env::var("USERNAME").or_else(|_| std::env::var("USER")) {
-        let u_low = username.trim().to_ascii_lowercase();
-        if u_low.len() >= 3
-            && (norm.contains(&format!("/{u_low}/")) || norm.ends_with(&format!("/{u_low}")))
-        {
-            return true;
+    let Some(canon_root) = canonicalize_with_missing_tail(project_root) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        extern "C" {
+            fn geteuid() -> u32;
+        }
+        let Ok(meta) = fs::metadata(&canon_root) else {
+            return false;
+        };
+        let euid = unsafe { geteuid() };
+        if meta.uid() != euid {
+            return false;
         }
     }
-    is_workspace_memory_trusted(global_db, project_root)
+    let norm = normalize_workspace_key(&canon_root);
+    let home_norm = normalize_workspace_key(&user_home_dir());
+    if !home_norm.is_empty() && (norm == home_norm || norm.starts_with(&format!("{home_norm}/"))) {
+        return true;
+    }
+    let Some(gdb) = global_db else {
+        return false;
+    };
+    if check_global_trust_sync(gdb).is_err() {
+        return false;
+    }
+    let Ok(false) = has_config_key_fail_closed(gdb, &format!("trust:revoked::{norm}")) else {
+        return false;
+    };
+    let Ok(true) = has_config_key_fail_closed(gdb, &format!("trust:allowed::{norm}")) else {
+        return false;
+    };
+    is_workspace_memory_trusted(Some(gdb), &canon_root)
 }
 
 fn decode_and_maybe_upgrade_trust_anchor_record(
@@ -4902,6 +5128,214 @@ mod tests {
             );
         }
 
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn pre_mutation_guard_enforces_case_insensitive_agents_rejects_customizations_ldb_and_ignores_other_ldb()
+    {
+        let tmp = std::env::temp_dir().join(format!(
+            "libredb_pre_mut_guard_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let ws = tmp.join("ws_case");
+        fs::create_dir_all(ws.join(".agents")).unwrap();
+        let global_path = tmp.join("customizations.ldb");
+        let pdb_path = ws.join(".agents").join("memory.ldb");
+
+        let gdb = LibreDb::open(&global_path).unwrap();
+        let pdb = LibreDb::open(&pdb_path).unwrap();
+        pdb.put(WriteRequest::new(NodeKind::Fact, b"k=1".to_vec()).with_key("fact:init"))
+            .unwrap();
+        seal_workspace_memory(&gdb, &pdb, &ws).unwrap();
+        let norm = normalize_workspace_key(&ws);
+        assert_eq!(read_global_seal_revision(&gdb, &norm).unwrap(), 1);
+
+        // 1. Direct low-level mutation of an existing `customizations.ldb` MUST fail closed!
+        assert!(
+            PreMutationSealGuard::verify_before_write(Some(&gdb), &global_path).is_err(),
+            "PreMutationSealGuard must block low-level CLI writes to customizations.ldb!"
+        );
+        assert!(
+            PreMutationSealGuard::verify_before_write_allow_fresh_global_import(
+                Some(&gdb),
+                &global_path
+            )
+            .is_err(),
+            "Even fresh-import helper must reject overwriting an already existing customizations.ldb!"
+        );
+        let fresh_global = tmp.join(".gemini").join("libredb").join("customizations.ldb");
+        assert!(
+            PreMutationSealGuard::verify_before_write_allow_fresh_global_import(
+                None,
+                &fresh_global
+            )
+            .is_ok(),
+            "Fresh installer SQLite import into non-existent customizations.ldb must be permitted!"
+        );
+
+        // 2. Writing to a non-`memory.ldb` scratch DB inside `.agents/` must NOT advance or clobber
+        //    the workspace's real `.agents/memory.ldb` trust seal!
+        let scratch_path = ws.join(".agents").join("scratch_notes.ldb");
+        {
+            let scratch_guard =
+                PreMutationSealGuard::verify_before_write(Some(&gdb), &scratch_path).unwrap();
+            let scratch_db = LibreDb::open(&scratch_path).unwrap();
+            scratch_db
+                .put(WriteRequest::new(NodeKind::Fact, b"tmp=1".to_vec()).with_key("tmp"))
+                .unwrap();
+            scratch_guard
+                .reseal_after_write(Some(&gdb), &scratch_db)
+                .unwrap();
+        }
+        assert_eq!(read_global_seal_revision(&gdb, &norm).unwrap(), 1);
+        assert!(is_workspace_memory_trusted(Some(&gdb), &ws));
+
+        // 3. Offline-tamper `.agents/memory.ldb` and verify mixed-case `.AGENTS/MEMORY.LDB` is caught!
+        pdb.put(WriteRequest::new(NodeKind::Rule, b"evil".to_vec()).with_key("rule:evil"))
+            .unwrap();
+        drop(pdb);
+        let upper_target = ws.join(".AGENTS").join("MEMORY.LDB");
+        assert!(
+            PreMutationSealGuard::verify_before_write(Some(&gdb), &upper_target).is_err(),
+            "Mixed-case .AGENTS/MEMORY.LDB must not bypass PreMutationSealGuard!"
+        );
+
+        drop(gdb);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn path_policy_blocks_ntfs_ads_trailing_dots_customizations_ldb_and_outside_workspace_paths() {
+        for blocked_write in [
+            r"C:\Users\alice\.gemini\hooks.json::$DATA",
+            r"C:\Users\alice\.gemini\mcp_config.json...",
+            r"C:\Users\alice\.ssh\id_ed25519:zone.identifier",
+            ".git/config::$DATA",
+            ".gitmodules",
+            ".git/info/attributes",
+            r"C:\Users\alice\.gemini\libredb\customizations.ldb",
+            r"C:\Users\alice\.gemini\antigravity\bin\libredb.exe",
+            ".agents/memory.ldb",
+            ".agents/memory.db",
+        ] {
+            assert!(
+                check_tool_write_path_policy(blocked_write, &[]).is_some(),
+                "Write policy MUST block '{blocked_write}'!"
+            );
+        }
+        assert!(check_tool_write_path_policy("src/lib.rs", &[]).is_none());
+
+        for blocked_mcp_read in [
+            "customizations.ldb",
+            ".vault.key.init.999",
+            "/home/alice/.gemini/libredb/.seal_locks/ws_123.lock",
+            ".env.production",
+        ] {
+            assert!(
+                check_mcp_read_path_policy(Path::new(blocked_mcp_read), &[]).is_some(),
+                "MCP read policy MUST block '{blocked_mcp_read}'!"
+            );
+        }
+        assert!(check_mcp_read_path_policy(Path::new(".env.example"), &[]).is_none());
+
+        let tmp = std::env::temp_dir().join(format!(
+            "libredb_policy_contain_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let ws = tmp.join("ws");
+        let outside = tmp.join("outside");
+        fs::create_dir_all(ws.join("src")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        assert!(check_mcp_workspace_containment(&ws.join("src").join("lib.rs"), Some(&ws)).is_none());
+        assert!(check_mcp_workspace_containment(Path::new("../outside/secret.rs"), Some(&ws)).is_some());
+        assert!(check_mcp_workspace_containment(&outside.join("secret.rs"), Some(&ws)).is_some());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn auto_git_safe_dir_rejects_username_substring_spoofing_and_revoke_isolates_basename_collisions()
+    {
+        let current_user = std::env::var("USERNAME")
+            .or_else(|_| std::env::var("USER"))
+            .unwrap_or_else(|_| "developer".to_owned());
+
+        #[cfg(unix)]
+        let spoof_base = PathBuf::from("/tmp").join(format!(
+            "libredb_spoof_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        #[cfg(windows)]
+        let spoof_base = PathBuf::from(r"C:\PublicSpoofTest_LibreDB").join(format!(
+            "run_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+
+        let spoof_repo = spoof_base.join(&current_user).join("untrusted_repo");
+        #[cfg(unix)]
+        fs::create_dir_all(&spoof_repo).unwrap();
+
+        assert!(
+            !is_safe_auto_git_dir(None, &spoof_repo),
+            "is_safe_auto_git_dir MUST NOT auto-trust paths outside $HOME merely because they contain '{current_user}'!"
+        );
+        #[cfg(unix)]
+        let _ = fs::remove_dir_all(&spoof_base);
+
+        // Verify `revoke_workspace_trust` isolates same-basename repositories (`org_a/app` vs `org_b/app`):
+        let tmp = std::env::temp_dir().join(format!(
+            "libredb_revoke_iso_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let app_a = tmp.join("org_a").join("app");
+        let app_b = tmp.join("org_b").join("app");
+        fs::create_dir_all(app_a.join(".agents")).unwrap();
+        fs::create_dir_all(app_b.join(".agents")).unwrap();
+        let gdb = LibreDb::open(tmp.join("customizations.ldb")).unwrap();
+
+        let pdb_a = LibreDb::open(app_a.join(".agents").join("memory.ldb")).unwrap();
+        seal_workspace_memory(&gdb, &pdb_a, &app_a).unwrap();
+        gdb.put(
+            WriteRequest::new(
+                NodeKind::Config,
+                app_a.to_string_lossy().into_owned().into_bytes(),
+            )
+            .with_key("workspace:app"),
+        )
+        .unwrap();
+
+        let pdb_b = LibreDb::open(app_b.join(".agents").join("memory.ldb")).unwrap();
+        seal_workspace_memory(&gdb, &pdb_b, &app_b).unwrap();
+
+        revoke_workspace_trust(&gdb, &app_b).unwrap();
+        assert!(
+            is_workspace_memory_trusted(Some(&gdb), &app_a),
+            "Revoking org_b/app MUST NOT affect org_a/app!"
+        );
+        assert!(
+            gdb.get_by_key(NodeKind::Config, "workspace:app").is_ok(),
+            "Legacy workspace:app entry pointing to org_a/app MUST NOT be deprecated when revoking org_b/app!"
+        );
+        assert!(!is_workspace_memory_trusted(Some(&gdb), &app_b));
+
+        drop(pdb_a);
+        drop(pdb_b);
+        drop(gdb);
         let _ = fs::remove_dir_all(&tmp);
     }
 }

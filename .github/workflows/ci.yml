@@ -1,5 +1,8 @@
 name: CI
 
+permissions:
+  contents: read
+
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
@@ -14,7 +17,7 @@ jobs:
     name: Linux source build, test & plugin install
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - name: Verify Makefile test, neutral install, benchmarks, and strict guardrails
         run: |
@@ -49,7 +52,7 @@ jobs:
     name: macOS source build, renamex_np test, neutral install & guardrails
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - name: Verify Makefile test (including renamex_np RENAME_EXCL), neutral install, benchmarks, and guardrails
         run: |
@@ -84,7 +87,7 @@ jobs:
     name: Windows build, test, neutral install, benchmarks & guardrails
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - name: Run release tests, neutral install, benchmarks, and strict guardrails
         shell: pwsh

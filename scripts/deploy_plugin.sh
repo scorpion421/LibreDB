@@ -1,5 +1,5 @@
 #!/bin/sh
-# POSIX / Linux / macOS Antigravity plugin installer for LibreDB (v0.9.9)
+# POSIX / Linux / macOS Antigravity plugin installer for LibreDB (v0.10.0)
 # Enterprise-neutral by default (never installs personal rules or imports legacy SQLite unless requested).
 set -eu
 
@@ -120,6 +120,7 @@ if [ ! -f "$GLOBAL_LDB" ]; then
         "$TARGET_EXE" init "$GLOBAL_LDB" >/dev/null
     fi
 fi
+chmod 600 "$GLOBAL_LDB" 2>/dev/null || true
 
 escape_json_str() {
     printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
@@ -133,7 +134,7 @@ cat > "$PLUGIN_DIR/plugin.json" <<'EOF'
 {
   "name": "libredb",
   "displayName": "LibreDB Cognitive Memory",
-  "version": "0.9.9",
+  "version": "0.10.0",
   "description": "Enterprise-ready Rust cognitive memory & MCP code graph: single-file LIBREDB1 storage, silent SQLite auto-porter, sub-2ms hooks, content-bound HMAC-SHA256 workspace trust seals, ChaCha20-Poly1305 OS credential vault, 20-language DI-aware causal code graph, and multi-remote Git/Gitea/GitHub automation.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
@@ -389,7 +390,7 @@ EOF
 
 # 7. Write user-facing README.md inside plugin bundle
 cat > "$PLUGIN_DIR/README.md" <<'EOF'
-# LibreDB cognitive memory plugin (v0.9.9)
+# LibreDB cognitive memory plugin (v0.10.0)
 
 Enterprise-ready standalone Rust cognitive memory & code-graph engine for `Antigravity`:
 - `libredb-mcp`: 3-tool multi-workspace cognitive memory & 20-language zero-hardcode heuristic DI code-graph server with interface/implementation resolution (`implementors`), zero-I/O RAM session delta, `[Zero-Repeat Skeleton]` deduplication, and corpus-`IDF` call-graph disambiguation.
@@ -398,23 +399,38 @@ Enterprise-ready standalone Rust cognitive memory & code-graph engine for `Antig
 - Compaction garbage collection (`compact_with_options`, `maybe_auto_compact`) and `INDEX_FORMAT_VERSION = 4` `HybridIndex` with dead-posting garbage collection across superseded Inodes.
 EOF
 
-# 8. Enable "libredb" in ~/.gemini/config/config.json if present and python3 or jq is available
+# 8. Enable "libredb" in ~/.gemini/config/config.json if present and python3 is available
 AGY_CONFIG="$GEMINI_DIR/config/config.json"
-if [ -f "$AGY_CONFIG" ]; then
+if [ -f "$AGY_CONFIG" ] && [ ! -L "$AGY_CONFIG" ]; then
     if command -v python3 >/dev/null 2>&1; then
         python3 - "$AGY_CONFIG" <<'PYEOF' 2>/dev/null || true
-import json, sys
+import json, os, stat, sys, tempfile
 p = sys.argv[1]
+st = os.lstat(p)
+if stat.S_ISLNK(st.st_mode):
+    sys.exit(0)
 with open(p, "r", encoding="utf-8") as f:
     cfg = json.load(f)
 if isinstance(cfg.get("plugins"), dict):
     cfg["plugins"].setdefault("libredb", {})["enabled"] = True
-    with open(p, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
+    d = os.path.dirname(os.path.abspath(p))
+    fd, tmp_p = tempfile.mkstemp(prefix=".config.json.tmp.", dir=d)
+    try:
+        os.chmod(tmp_p, stat.S_IMODE(st.st_mode))
+        with os.fdopen(fd, "w", encoding="utf-8") as tf:
+            json.dump(cfg, tf, indent=2)
+            tf.flush()
+            os.fsync(tf.fileno())
+        os.replace(tmp_p, p)
+    except Exception:
+        try:
+            os.unlink(tmp_p)
+        except OSError:
+            pass
 PYEOF
     fi
 fi
 
-echo "[OK] Deployed LibreDB v0.9.9 standalone binary to: $BIN_DIR (profile=$PROFILE)"
+echo "[OK] Deployed LibreDB v0.10.0 standalone binary to: $BIN_DIR (profile=$PROFILE)"
 echo "[OK] Hydrated and modernized global store at: $GLOBAL_LDB"
 echo "[OK] Installed complete Antigravity plugin at: $PLUGIN_DIR"

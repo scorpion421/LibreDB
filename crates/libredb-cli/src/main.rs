@@ -514,6 +514,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         return Err("Usage: libredb config set <key> <value> [--project <dir>] [--global <g.ldb>]".into());
                     }
                     let key = positional[0].trim();
+                    if security::is_reserved_security_config_key(key) {
+                        return Err(format!(
+                            "Refusing to modify reserved security configuration key '{key}' via 'libredb config'; use 'libredb trust' to manage workspace trust."
+                        )
+                        .into());
+                    }
                     let val = &positional[1];
                     let stored = if is_secret_key(key) {
                         security::protect_secret(val.trim())?
@@ -553,7 +559,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 "unset" => {
                     let key = positional
                         .first()
-                        .ok_or("Usage: libredb config unset <key> [--project <dir>] [--global <g.ldb>]")?;
+                        .ok_or("Usage: libredb config unset <key> [--project <dir>] [--global <g.ldb>]")?
+                        .trim();
+                    if security::is_reserved_security_config_key(key) {
+                        return Err(format!(
+                            "Refusing to remove reserved security configuration key '{key}' via 'libredb config'; use 'libredb trust --revoke' instead."
+                        )
+                        .into());
+                    }
                     if db.deprecate_key(NodeKind::Config, key)? {
                         if let Some(ref guard) = proj_seal_guard {
                             guard.reseal_after_write(gdb_for_proj_seal.as_deref(), &db)?;
@@ -835,16 +848,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     std::fs::create_dir_all(parent)?;
                 }
             }
-            let gdb = if personal || migrate_legacy {
+            let gdb = if migrate_legacy {
                 let central_sql = hooks::default_central_sqlite_path();
-                let sql_opt = if global_path.is_none() || migrate_legacy {
-                    Some(central_sql.as_path())
+                if !target_global.exists() && central_sql.is_file() {
+                    open_or_auto_migrate(&target_global, Some(central_sql.as_path()), "central")?.0
                 } else {
-                    None
-                };
-                open_or_auto_migrate(&target_global, sql_opt, "central")?.0
+                    let existing_gdb = hooks::open_global_ldb(Some(&target_global))?;
+                    if central_sql.is_file() {
+                        import_sqlite_readonly(&central_sql, &existing_gdb, "central")?;
+                    }
+                    existing_gdb
+                }
             } else {
-                Arc::new(LibreDb::open(&target_global)?)
+                hooks::open_global_ldb(Some(&target_global))?
             };
             modernize_global_db(&gdb, skill_md.as_deref(), personal)?;
         }
@@ -1105,13 +1121,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let t0 = Instant::now();
-            let (proj_db, _) = open_or_auto_migrate(Path::new(&args[1]), None, "project")?;
+            let proj_db = open_cli_verified_project_db(global_path.as_deref(), Path::new(&args[1]))?;
             if let (Some(ref cid), Some(ref tp)) = (&req.conversation_id, &transcript_path) {
                 req.epoch = sync_transcript_epoch(&proj_db, cid, tp)?;
             }
             let glob_db = match global_path {
-                Some(gp) => Some(open_or_auto_migrate(&gp, None, "central")?.0),
-                None => None,
+                Some(ref gp) => Some(hooks::open_global_ldb(Some(gp))?),
+                None => hooks::open_global_ldb_checked(None)?,
             };
             let brain = OverlayBrain::open(glob_db, proj_db)?;
             let resp = brain.pulse(&req)?;
@@ -1125,10 +1141,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             let force = args.get(3).map(String::as_str) == Some("--force");
             let t0 = Instant::now();
-            let (db, _) = hooks::open_project_ldb_silent(Path::new(&args[1]))?;
+            let db_path = Path::new(&args[1]);
+            let gdb_opt = hooks::open_global_ldb_checked(None)?;
+            let seal_guard =
+                security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
+            let db = Arc::new(LibreDb::open(db_path)?);
             let rep = index_workspace(&db, Path::new(&args[2]), force)?;
-            let mut cog = CognitiveEngine::open_db(db)?;
+            let mut cog = CognitiveEngine::open_db(Arc::clone(&db))?;
             cog.save_index_snapshot()?;
+            seal_guard.reseal_after_write(gdb_opt.as_deref(), &db)?;
             println!(
                 "[OK] Indexed workspace '{}' in {:.2} ms: {} files scanned ({} cached, {} reindexed, {} binaries skipped) -> {} symbols, {} call edges, {} governance edges",
                 args[2],
@@ -1151,7 +1172,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 filter = Some(args[4].clone());
             }
             let t0 = Instant::now();
-            let (db, _) = hooks::open_project_ldb_silent(Path::new(&args[1]))?;
+            let db = open_cli_verified_project_db(None, Path::new(&args[1]))?;
             let src_path = Path::new(&args[2]);
             let (skel, cache_hit) = FileSkeleton::index_or_get_cached(&db, src_path, None)?;
             let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -1171,7 +1192,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 return Err("Usage: libredb impact <db.ldb> <symbol_query>".into());
             }
             let t0 = Instant::now();
-            let (db, _) = hooks::open_project_ldb_silent(Path::new(&args[1]))?;
+            let db = open_cli_verified_project_db(None, Path::new(&args[1]))?;
             let reports = query_symbol_impact(&db, &args[2])?;
             println!(
                 "=== BLAST-RADIUS & CAUSAL IMPACT: '{}' ({} matches in {:.2} ms) ===",
@@ -1220,7 +1241,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     other => return Err(format!("Unknown flag '{other}'").into()),
                 }
             }
-            let (db, _) = hooks::open_project_ldb_silent(Path::new(&args[1]))?;
+            let db = open_cli_verified_project_db(None, Path::new(&args[1]))?;
             let bundle =
                 extract_fim_slice(&db, Path::new(&args[2]), symbol.as_deref(), line, pad)?;
             print!("{}", bundle.format_compact());
@@ -1269,7 +1290,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let gdb_opt = hooks::open_global_ldb_checked(None)?;
             let seal_guard =
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
-            let (db, _) = hooks::open_project_ldb_silent(db_path)?;
+            let db = Arc::new(LibreDb::open(db_path)?);
             let rep = execute_atomic_batch(&db, &spec)?;
             seal_guard.reseal_after_write(gdb_opt.as_deref(), &db)?;
             println!(
@@ -1292,7 +1313,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let gdb_opt = hooks::open_global_ldb_checked(None)?;
             let seal_guard =
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
-            let (db, _) = hooks::open_project_ldb_silent(db_path)?;
+            let db = Arc::new(LibreDb::open(db_path)?);
             let (_, block) = create_subagent_handoff(&db, &args[2], &args[3], &args[4], notes)?;
             seal_guard.reseal_after_write(gdb_opt.as_deref(), &db)?;
             print!("{block}");
@@ -1311,7 +1332,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let gdb_opt = hooks::open_global_ldb_checked(None)?;
             let seal_guard =
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
-            let (db, _) = hooks::open_project_ldb_silent(db_path)?;
+            let db = Arc::new(LibreDb::open(db_path)?);
             let mut cog = CognitiveEngine::open_db(Arc::clone(&db))?;
             let edges = cog.reinforce_association(&args[2], &target_ids)?;
             cog.save_index_snapshot()?;
@@ -1351,7 +1372,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let gdb_opt = hooks::open_global_ldb_checked(None)?;
             let seal_guard =
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
-            let (db, _) = hooks::open_project_ldb_silent(db_path)?;
+            let db = Arc::new(LibreDb::open(db_path)?);
             let nid = ReflexEngine::learn_reflex(&db, &rule)?;
             seal_guard.reseal_after_write(gdb_opt.as_deref(), &db)?;
             println!("Learned situational reflex '{}' as node #{nid}", rule.id);
@@ -1367,14 +1388,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let t0 = Instant::now();
             let db_path = Path::new(&args[1]);
             let gdb_opt = hooks::open_global_ldb_checked(None)?;
-            let seal_guard =
-                security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
+            let seal_guard = if scope == "central" {
+                security::PreMutationSealGuard::verify_before_write_allow_fresh_global_import(
+                    gdb_opt.as_deref(),
+                    db_path,
+                )?
+            } else {
+                security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?
+            };
             let db = Arc::new(LibreDb::open(db_path)?);
             let sum = import_sqlite_readonly(Path::new(&args[2]), &db, scope)?;
-            seal_guard.reseal_after_write(gdb_opt.as_deref(), &db)?;
-            // Pre-build and persist the inverted index snapshot so cold CLI `pulse` runs in <10 ms!
-            let mut cog = CognitiveEngine::open_db(db)?;
+            // Pre-build and persist the inverted index snapshot BEFORE sealing so cold CLI `pulse` runs in <10 ms!
+            let mut cog = CognitiveEngine::open_db(Arc::clone(&db))?;
             cog.save_index_snapshot()?;
+            seal_guard.reseal_after_write(gdb_opt.as_deref(), &db)?;
             println!(
                 "[OK] Imported SQLite '{}' + saved persistent index snapshot in {:.2} ms: {} tables ({} rows) -> {} cognitive capsules + {} synapses",
                 args[2],
@@ -1413,10 +1440,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 scope = &args[3];
             }
             let src_path = Path::new(&args[1]);
-            let pid = process::id();
-            let tmp_dir = env::temp_dir().join(format!("libredb_roundtrip_{pid}"));
-            let _ = std::fs::remove_dir_all(&tmp_dir);
-            std::fs::create_dir_all(&tmp_dir)?;
+            let src_meta = std::fs::symlink_metadata(src_path)?;
+            if src_meta.file_type().is_symlink() || !src_meta.file_type().is_file() {
+                return Err(format!(
+                    "Refusing symlink or non-regular source SQLite file '{}'",
+                    src_path.display()
+                )
+                .into());
+            }
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            let tmp_dir = env::temp_dir().join(format!(
+                "libredb_roundtrip_{}_{stamp}",
+                process::id()
+            ));
+            std::fs::create_dir(&tmp_dir)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&tmp_dir, std::fs::Permissions::from_mode(0o700));
+            }
 
             let copy_src = tmp_dir.join("source_snapshot.db");
             let temp_ldb = tmp_dir.join("bridge.tmp.ldb");
@@ -1454,7 +1498,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             if args.len() < 2 {
                 return Err("Usage: libredb init <db.ldb>".into());
             }
-            let db = LibreDb::open(&args[1])?;
+            let db_path = Path::new(&args[1]);
+            let gdb_opt = hooks::open_global_ldb_checked(None)?;
+            let _seal_guard =
+                security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
+            let db = LibreDb::open(db_path)?;
             let st = db.stats()?;
             println!(
                 "Initialized LibreDB at '{}' ({} bytes, commit_seq={})",
@@ -1468,11 +1516,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let kind = NodeKind::parse(&args[2])
                 .ok_or_else(|| format!("Unknown node kind '{}'", args[2]))?;
             let mut req = WriteRequest::new(kind, args[3].as_bytes().to_vec());
+            let mut explicit_key: Option<String> = None;
 
             let mut i = 4usize;
             while i < args.len() {
                 match args[i].as_str() {
                     "--key" if i + 1 < args.len() => {
+                        explicit_key = Some(args[i + 1].clone());
                         req = req.with_key(&args[i + 1]);
                         i += 2;
                     }
@@ -1485,6 +1535,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         i += 1;
                     }
                     other => return Err(format!("Unknown flag '{other}'").into()),
+                }
+            }
+            if kind == NodeKind::Config {
+                if let Some(ref k) = explicit_key {
+                    if security::is_reserved_security_config_key(k) {
+                        return Err(format!(
+                            "Refusing to write reserved cryptographic/trust Config key '{k}' via 'libredb put'; use 'libredb trust' instead."
+                        )
+                        .into());
+                    }
                 }
             }
 
@@ -1557,6 +1617,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             let kind = NodeKind::parse(&args[2])
                 .ok_or_else(|| format!("Unknown node kind '{}'", args[2]))?;
+            if kind == NodeKind::Config && security::is_reserved_security_config_key(&args[3]) {
+                return Err(format!(
+                    "Refusing to deprecate reserved cryptographic/trust Config key '{}' via 'libredb deprecate'; use 'libredb trust --revoke' instead.",
+                    args[3]
+                )
+                .into());
+            }
             let db_path = Path::new(&args[1]);
             let gdb_opt = hooks::open_global_ldb_checked(None)?;
             let seal_guard =
@@ -1650,9 +1717,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let gdb_opt = hooks::open_global_ldb_checked(None)?;
             let seal_guard =
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
-            let (db, _) = hooks::open_project_ldb_silent(db_path)?;
+            let db = Arc::new(LibreDb::open(db_path)?);
             let initial_bytes = db.stats()?.file_bytes;
-            seal_guard.reseal_after_write(gdb_opt.as_deref(), &db)?;
             let mut cog = CognitiveEngine::open_db(Arc::clone(&db))?;
             cog.save_index_snapshot()?;
             let rep = db.compact_with_options(prune)?;
@@ -2290,9 +2356,135 @@ fn modernize_global_db(
     Ok(())
 }
 
+/// Verifies workspace trust BEFORE read-only CLI commands (`pulse`, `skeleton`, `impact`, `fim`)
+/// open or auto-migrate a project `.agents/memory.ldb` (or legacy `.db`).
+fn open_cli_verified_project_db(
+    global_path_opt: Option<&Path>,
+    db_path: &Path,
+) -> Result<Arc<LibreDb>, Box<dyn std::error::Error>> {
+    let gdb_opt = hooks::open_global_ldb_checked(global_path_opt)?;
+    let joined_db = if db_path.is_relative() {
+        env::current_dir()
+            .map(|cwd| cwd.join(db_path))
+            .unwrap_or_else(|_| db_path.to_path_buf())
+    } else {
+        db_path.to_path_buf()
+    };
+    let resolved_db = security::canonicalize_with_missing_tail(&joined_db).unwrap_or(joined_db);
+    if let Some(parent) = resolved_db.parent() {
+        let is_agents = parent
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case(".agents"));
+        let is_mem = resolved_db
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| {
+                n.eq_ignore_ascii_case("memory.ldb") || n.eq_ignore_ascii_case("memory.db")
+            });
+        if is_agents && is_mem {
+            if let Some(ws_root) = parent.parent() {
+                if security::is_private_brain_workspace(ws_root) {
+                    let ldb_file = ws_root.join(".agents").join("memory.ldb");
+                    let leg_sql = ws_root.join(".agents").join("memory.db");
+                    let sql_opt = if !ldb_file.exists() && leg_sql.is_file() {
+                        Some(leg_sql.as_path())
+                    } else {
+                        None
+                    };
+                    return Ok(open_or_auto_migrate(&ldb_file, sql_opt, "project")?.0);
+                }
+                let Some(ref gdb) = gdb_opt else {
+                    return Err(format!(
+                        "Refusing to read workspace memory '{}' without an initialized global customizations.ldb trust anchor; run 'libredb trust \"{}\"' first.",
+                        db_path.display(),
+                        ws_root.display()
+                    )
+                    .into());
+                };
+                let _ws_lock = security::WorkspaceTrustLockGuard::acquire(gdb, ws_root)?;
+                let ldb_file = ws_root.join(".agents").join("memory.ldb");
+                let leg_sql = ws_root.join(".agents").join("memory.db");
+                if !ldb_file.exists() && leg_sql.is_file() {
+                    let norm = security::normalize_workspace_key(ws_root);
+                    if security::has_config_key_fail_closed(gdb, &format!("trust:revoked::{norm}"))?
+                        || !security::has_config_key_fail_closed(
+                            gdb,
+                            &format!("trust:allowed::{norm}"),
+                        )?
+                        || security::has_prior_workspace_seal_marker(gdb, ws_root)
+                        || security::is_git_index_tracking_agents_db(ws_root)
+                    {
+                        return Err(format!(
+                            "Refusing automatic legacy SQLite migration for untrusted workspace '{}'; inspect .agents/memory.db and run 'libredb trust \"{}\"' if trusted.",
+                            ws_root.display(),
+                            ws_root.display()
+                        )
+                        .into());
+                    }
+                    let (migrated_db, did_mig) =
+                        open_or_auto_migrate(&ldb_file, Some(leg_sql.as_path()), "project")?;
+                    if did_mig.is_some() {
+                        security::seal_workspace_memory(gdb, &migrated_db, ws_root)?;
+                    }
+                    return Ok(migrated_db);
+                }
+                if !security::is_workspace_memory_trusted(Some(gdb), ws_root) {
+                    return Err(format!(
+                        "Workspace memory at '{}' is untrusted, tampered, or rolled back; inspect the workspace and run 'libredb trust \"{}\"' before querying it.",
+                        db_path.display(),
+                        ws_root.display()
+                    )
+                    .into());
+                }
+                return Ok(Arc::new(LibreDb::open(&ldb_file)?));
+            }
+        }
+    }
+    Ok(Arc::new(LibreDb::open(&resolved_db)?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_verified_project_db_blocks_untrusted_workspace_memory_and_allows_sealed() {
+        let dir = std::env::temp_dir().join(format!(
+            "libredb_cli_read_gate_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let ws = dir.join("untrusted_repo");
+        std::fs::create_dir_all(ws.join(".agents")).unwrap();
+        let global_path = dir.join("customizations.ldb");
+        let gdb = LibreDb::open(&global_path).unwrap();
+
+        let pdb_path = ws.join(".agents").join("memory.ldb");
+        let pdb = LibreDb::open(&pdb_path).unwrap();
+        pdb.put(WriteRequest::new(NodeKind::Rule, b"poison".to_vec()).with_key("rule:poison"))
+            .unwrap();
+        drop(pdb);
+
+        assert!(
+            open_cli_verified_project_db(Some(&global_path), &pdb_path).is_err(),
+            "CLI read helper MUST refuse unsealed .agents/memory.ldb!"
+        );
+
+        let pdb = LibreDb::open(&pdb_path).unwrap();
+        security::seal_workspace_memory(&gdb, &pdb, &ws).unwrap();
+        drop(pdb);
+        drop(gdb);
+
+        assert!(
+            open_cli_verified_project_db(Some(&global_path), &pdb_path).is_ok(),
+            "CLI read helper MUST allow cryptographically sealed .agents/memory.ldb!"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn neutral_modernize_global_contains_zero_personal_rules_and_downgrades_cleanly() {

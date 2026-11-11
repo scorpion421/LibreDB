@@ -460,6 +460,23 @@ impl Inode {
             let data_crc32 = u32::from_le_bytes(buf[64..68].try_into().unwrap());
             let edge_extent_offset = u64::from_le_bytes(buf[68..76].try_into().unwrap());
             let edge_overflow_count = u32::from_le_bytes(buf[76..80].try_into().unwrap());
+            if data_offset < DATA_REGION_START {
+                return Err(LibreDbError::CorruptFormat(
+                    "inode extent data_offset below DATA_REGION_START",
+                ));
+            }
+            if (raw_len as usize) > MAX_EXTENT_PAYLOAD_BYTES
+                || (stored_len as usize) > MAX_EXTENT_PAYLOAD_BYTES
+            {
+                return Err(LibreDbError::CorruptFormat(
+                    "inode extent length exceeds MAX_EXTENT_PAYLOAD_BYTES",
+                ));
+            }
+            if edge_overflow_count > 0 && edge_extent_offset < DATA_REGION_START {
+                return Err(LibreDbError::CorruptFormat(
+                    "inode edge_extent_offset below DATA_REGION_START",
+                ));
+            }
             let mut vector_reserved = [0u8; 12];
             vector_reserved.copy_from_slice(&buf[80..92]);
             InodeStorage::Extent {
@@ -589,6 +606,28 @@ impl Superblock {
         if sb.delta_start_offset < DATA_REGION_START || sb.data_tail_offset < sb.delta_start_offset {
             return Err(LibreDbError::CorruptFormat("superblock offsets out of bounds"));
         }
+        if sb.base_snapshot_len > 0 {
+            if sb.base_snapshot_offset < DATA_REGION_START {
+                return Err(LibreDbError::CorruptFormat(
+                    "superblock base_snapshot_offset below DATA_REGION_START",
+                ));
+            }
+            if sb.base_snapshot_len > MAX_EXTENT_PAYLOAD_BYTES as u64 {
+                return Err(LibreDbError::PayloadTooLarge {
+                    size: usize::try_from(sb.base_snapshot_len).unwrap_or(usize::MAX),
+                    max: MAX_EXTENT_PAYLOAD_BYTES,
+                });
+            }
+            let snap_end = sb
+                .base_snapshot_offset
+                .checked_add(sb.base_snapshot_len)
+                .ok_or(LibreDbError::CorruptFormat("superblock base_snapshot overflow"))?;
+            if snap_end > sb.delta_start_offset {
+                return Err(LibreDbError::CorruptFormat(
+                    "superblock base_snapshot overlaps delta stream",
+                ));
+            }
+        }
         Ok(sb)
     }
 }
@@ -624,6 +663,10 @@ pub fn encode_metadata_frame(
     inodes: &[Inode],
     key_ops: &[KeyMutation],
 ) -> Result<Vec<u8>> {
+    let inode_cnt_u32 = u32::try_from(inodes.len())
+        .map_err(|_| LibreDbError::CorruptFormat("inode count exceeds u32::MAX"))?;
+    let key_op_cnt_u32 = u32::try_from(key_ops.len())
+        .map_err(|_| LibreDbError::CorruptFormat("key mutation count exceeds u32::MAX"))?;
     let key_bytes_est: usize = key_ops
         .iter()
         .map(|op| match op {
@@ -636,8 +679,8 @@ pub fn encode_metadata_frame(
     buf.extend_from_slice(&magic);
     buf.extend_from_slice(&0u32.to_le_bytes()); // placeholder for total_frame_bytes
     buf.extend_from_slice(&commit_seq.to_le_bytes());
-    buf.extend_from_slice(&(inodes.len() as u32).to_le_bytes());
-    buf.extend_from_slice(&(key_ops.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&inode_cnt_u32.to_le_bytes());
+    buf.extend_from_slice(&key_op_cnt_u32.to_le_bytes());
 
     for inode in inodes {
         buf.extend_from_slice(&inode.encode());
@@ -670,7 +713,14 @@ pub fn encode_metadata_frame(
         }
     }
 
-    let total_len = (buf.len() + 4) as u32;
+    let total_len_usize = buf
+        .len()
+        .checked_add(4)
+        .ok_or(LibreDbError::CorruptFormat("metadata frame length overflow"))?;
+    let total_len = u32::try_from(total_len_usize).map_err(|_| LibreDbError::PayloadTooLarge {
+        size: total_len_usize,
+        max: u32::MAX as usize,
+    })?;
     buf[4..8].copy_from_slice(&total_len.to_le_bytes());
 
     let frame_crc = crc32(&buf);

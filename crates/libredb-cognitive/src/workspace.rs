@@ -114,6 +114,15 @@ pub fn index_workspace(db: &LibreDb, root: &Path, force: bool) -> Result<Workspa
     let mut all_skeletons: Vec<(String, FileSkeleton, Option<String>)> = Vec::new();
 
     for (abs_path, rel_path) in source_files {
+        let Ok(sym_meta) = std::fs::symlink_metadata(&abs_path) else {
+            continue;
+        };
+        if sym_meta.file_type().is_symlink()
+            || !sym_meta.is_file()
+            || sym_meta.len() > scan_cfg.max_file_bytes as u64
+        {
+            continue;
+        }
         let raw_bytes = match std::fs::read(&abs_path) {
             Ok(b) => b,
             Err(_) => continue,
@@ -727,18 +736,13 @@ pub fn extract_fim_slice(
     center_line: Option<usize>,
     context_pad: usize,
 ) -> Result<FimSliceBundle> {
-    let raw_bytes = std::fs::read(file_path).map_err(|e| {
-        LibreDbError::Io(std::io::Error::new(
-            e.kind(),
-            format!("{}: {e}", file_path.display()),
-        ))
-    })?;
+    let raw_bytes = crate::skeleton::read_bounded_source_file(file_path)?;
     let text = String::from_utf8_lossy(&raw_bytes);
     let lines: Vec<&str> = text.lines().collect();
     let total_lines = lines.len();
     let label = file_path.to_string_lossy().replace('\\', "/");
 
-    let (skel, _) = FileSkeleton::index_or_get_cached(db, file_path, Some(&label))?;
+    let (skel, _) = FileSkeleton::index_or_get_cached_bytes(db, label.clone(), &raw_bytes)?;
 
     let (win_start, win_end, matched_sym) = if let Some(sym_q) = symbol_name {
         let q_low = sym_q.to_lowercase();
@@ -872,7 +876,8 @@ impl WorkspaceScanConfig {
             .get_by_key(NodeKind::Config, "index:max_file_bytes")
             .ok()
             .and_then(|r| String::from_utf8_lossy(&r.payload).trim().parse::<usize>().ok())
-            .unwrap_or(4 * 1024 * 1024);
+            .unwrap_or(4 * 1024 * 1024)
+            .min(crate::skeleton::MAX_SKELETON_FILE_BYTES as usize);
 
         Self {
             extra_extensions,

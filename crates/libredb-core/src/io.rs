@@ -190,11 +190,14 @@ impl OsFileBackend {
             }
         }
         let is_network = detect_network_path(&path_buf);
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(&path_buf)?;
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = opts.open(&path_buf)?;
 
         Ok(Self {
             file,
