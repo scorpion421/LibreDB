@@ -43,7 +43,7 @@ Antigravity Cognitive & Code-Graph Commands:
   libredb list-skills [--global <customizations.ldb>]
   libredb list-reflexes [--global <customizations.ldb>]
   libredb modernize-global [--global <customizations.ldb>] [--skill-md <SKILL.md>] [--profile neutral|personal] [--migrate-legacy]
-  libredb mcp-serve [<default_project.ldb>] [--global <customizations.ldb>]
+  libredb mcp-serve [<default_project.ldb>] [--global <customizations.ldb>] [--workspace-root <dir>]
 
 Security, Trust & Universal Configuration Commands:
   libredb trust [<dir>] [--revoke] [--list] [--reinit-lost] [--accept-rollback] [--migrate-v3 [--confirm-metadata]] [--migrate-v2] [--if-clean] [--global <customizations.ldb>]
@@ -102,6 +102,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "mcp-serve" => {
             let mut proj_path: Option<PathBuf> = None;
             let mut global_path: Option<PathBuf> = None;
+            let mut ws_root: Option<PathBuf> = None;
             let mut i = 1usize;
             while i < args.len() {
                 match args[i].as_str() {
@@ -113,6 +114,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         proj_path = Some(PathBuf::from(&args[i + 1]));
                         i += 2;
                     }
+                    "--workspace-root" if i + 1 < args.len() => {
+                        ws_root = Some(PathBuf::from(&args[i + 1]));
+                        i += 2;
+                    }
                     positional if !positional.starts_with("--") && proj_path.is_none() => {
                         proj_path = Some(PathBuf::from(positional));
                         i += 1;
@@ -120,7 +125,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     other => return Err(format!("Unknown mcp-serve argument '{other}'").into()),
                 }
             }
-            mcp::run_mcp_stdio_server(proj_path.as_deref(), global_path.as_deref())?;
+            mcp::run_mcp_stdio_server_with_workspace_root(
+                proj_path.as_deref(),
+                global_path.as_deref(),
+                ws_root.as_deref(),
+            )?;
         }
         "hook-pre-tool" => {
             let mut global_path: Option<PathBuf> = None;
@@ -1421,7 +1430,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 scope = &args[4];
             }
             let t0 = Instant::now();
-            let db = LibreDb::open(&args[1])?;
+            let db = open_cli_verified_project_db(None, Path::new(&args[1]))?;
             let rows = export_sqlite_database(&db, scope, Path::new(&args[2]))?;
             println!(
                 "[OK] Reconstructed SQLite '{}' (scope={}, {} rows + FTS5 indexes) in {:.2} ms",
@@ -1572,7 +1581,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             if args.len() < 3 {
                 return Err("Usage: libredb get <db.ldb> <node_id>".into());
             }
-            let db = LibreDb::open(&args[1])?;
+            let db = open_cli_verified_project_db(None, Path::new(&args[1]))?;
             let id: u64 = args[2].parse()?;
             let rec = db.get(id)?;
             print_record(&rec);
@@ -1583,7 +1592,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             let kind = NodeKind::parse(&args[2])
                 .ok_or_else(|| format!("Unknown node kind '{}'", args[2]))?;
-            let db = LibreDb::open(&args[1])?;
+            let db = open_cli_verified_project_db(None, Path::new(&args[1]))?;
             let rec = db.get_by_key(kind, &args[3])?;
             print_record(&rec);
         }
@@ -1649,7 +1658,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             if args.len() >= 5 && args[3] == "--depth" {
                 depth = args[4].parse()?;
             }
-            let db = LibreDb::open(&args[1])?;
+            let db = open_cli_verified_project_db(None, Path::new(&args[1]))?;
             let chain = db.trace_lineage(root_id, depth)?;
             println!(
                 "Causal & temporal lineage from node #{root_id} ({} steps):",
@@ -1691,7 +1700,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     other => return Err(format!("Unknown flag '{other}'").into()),
                 }
             }
-            let db = LibreDb::open(&args[1])?;
+            let db = open_cli_verified_project_db(None, Path::new(&args[1]))?;
             let bundle = db.recall_within_budget(&[seed_id], hops, budget, false)?;
             println!(
                 "Recall bundle: {} nodes, {}/{} tokens, {} coalesced I/O read(s)",

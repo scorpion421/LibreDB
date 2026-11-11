@@ -1,11 +1,11 @@
 # LibreDB
 
-[![Version](https://img.shields.io/badge/version-0.10.1-blue.svg)](CHANGELOG.md)
-[![Tests](https://img.shields.io/badge/tests-passing%20(70%20tests%20%2B%2010k%20crash%20sims)-brightgreen.svg)](crates/libredb-bridge/tests/)
+[![Version](https://img.shields.io/badge/version-0.10.2-blue.svg)](CHANGELOG.md)
+[![Tests](https://img.shields.io/badge/tests-passing%20(74%20tests%20%2B%2010k%20crash%20sims)-brightgreen.svg)](crates/libredb-bridge/tests/)
 [![Tech Stack](https://img.shields.io/badge/rust-1.89%2B%20%7C%20PyO3%20abi3%20%7C%20MCP-orange.svg)](Cargo.toml)
 [![License](https://img.shields.io/badge/license-AGPLv3%20%2B%20Commons%20Clause-purple.svg)](LICENSE)
 
-`LibreDB` is an enterprise-ready, local-first, zero-configuration, single-file cognitive database, lifecycle hook engine, dynamic multi-remote Git/Gitea automation suite, and multi-workspace `MCP` memory substrate (`*.ldb`) built in Rust for `Antigravity` and `MCP`-compatible `LLM` clients. It replaces `SQLite` + Python memory overhead with zero-I/O RAM-first `Zero-Repeat Delta` deduplication, cross-process-serialized revision-and-metadata-bound `HMAC-SHA256` workspace trust seals (`libredb trust`, `hmac-sha256:v4:r<rev>:` with crash-consistent CAS anti-rollback and anti-deletion ratchets), standards-compliant OS/AEAD secret protection (Windows `DPAPI` / RFC 8439 `ChaCha20-Poly1305` with single-winner `put_if_absent` anchor election, safe `vault:v1` -> `vault:v2` migration, and lock-synchronized non-overwriting atomic `.vault.key` init), OOM-bounded binary `LIBREDB1`/`MCP`/`SQLite` parsers, symlink-and-NTFS-ADS-canonicalized workspace containment guardrails, `< 2 ms` in-engine compiled `PreInvocation`/`PreToolUse` hooks (`< 5 ms` Linux / `< 15 ms` macOS / `< 25 ms` Windows CI gates), 15+ language heuristic Dependency-Injection-aware (`DI`) code-graph `FIM` slicing, and strictly neutral default installation across Windows, Linux, and macOS.
+`LibreDB` is an enterprise-ready, local-first, zero-configuration, single-file cognitive database, lifecycle hook engine, dynamic multi-remote Git/Gitea automation suite, and multi-workspace `MCP` memory substrate (`*.ldb`) built in Rust for `Antigravity` and `MCP`-compatible `LLM` clients. It replaces `SQLite` + Python memory overhead with zero-I/O RAM-first `Zero-Repeat Delta` deduplication, cross-process-serialized revision-and-metadata-bound `HMAC-SHA256` workspace trust seals (`libredb trust`, `hmac-sha256:v4:r<rev>:` with crash-consistent CAS anti-rollback and anti-deletion ratchets), standards-compliant OS/AEAD secret protection (Windows `DPAPI` / RFC 8439 `ChaCha20-Poly1305` with single-winner `put_if_absent` anchor election, safe `vault:v1` -> `vault:v2` migration, and lock-synchronized non-overwriting atomic `.vault.key` init), OOM-bounded binary `LIBREDB1`/`MCP`/`SQLite` parsers, server-enforced `MCP` workspace isolation (`--workspace-root` / `initialize` roots / `trust:allowed`) with symlink-and-NTFS-ADS-canonicalized containment guardrails, `< 2 ms` in-engine compiled `PreInvocation`/`PreToolUse` hooks (`< 5 ms` Linux / `< 15 ms` macOS / `< 25 ms` Windows CI gates), 15+ language heuristic Dependency-Injection-aware (`DI`) code-graph `FIM` slicing, and strictly neutral default installation across Windows, Linux, and macOS.
 
 ## Table of contents
 
@@ -17,7 +17,7 @@
 
 ## Executive summary and impact
 
-| Dimension | Legacy Python + `SQLite` (`SkillsDB`) | `LibreDB v0.10.1` (Pure `Rust` + `MCP` + `PyO3`) |
+| Dimension | Legacy Python + `SQLite` (`SkillsDB`) | `LibreDB v0.10.2` (Pure `Rust` + `MCP` + `PyO3`) |
 | :--- | :--- | :--- |
 | **Lifecycle hook latency** | `350-500 ms` Python startup + `SQLite` WAL per edit/turn | **`< 2 ms` in-engine (`~0.7 ms` Linux / `< 15 ms` macOS / `~5.5 ms` Windows CI median, hard CI gates)** |
 | **Turn 2+ recall & I/O** | `300-1500 ms` subprocess + repeated full text output | **`0` disk I/O reads (`~3 ms` `MCP` / `PyO3`) via RAM-first `Zero-Repeat Delta`** |
@@ -60,7 +60,7 @@ pwsh -ExecutionPolicy Bypass -File .\scripts\deploy_plugin.ps1 -Profile Personal
 | `libredb_pulse` (`MCP`) / `libredb pulse` | Dual-layer associative recall with hands-free `/compact` sync & zero-I/O `Zero-Repeat Delta` |
 | `libredb_code` (`MCP`) / `skeleton`, `impact`, `fim`, `index-workspace` | Heuristic syntactic + `DI` code graph joining `[Lstart-Lend]` slices, `implementors`, callers, and `Decisions` |
 | `libredb_memorize` (`MCP`) / `batch`, `learn-assoc`, `learn-reflex` | Atomic multi-capsule commits, tasks, language-agnostic Hebbian learning, and pitfall reflexes |
-| `libredb hook-pre-invocation` / `hook-pre-tool` / `guardrail check` | Sub-2ms Antigravity lifecycle hooks, symlink-resolved path protection & guardrail scanner |
+| `libredb mcp-serve` / `hook-pre-invocation` / `hook-pre-tool` / `guardrail check` | Multi-workspace or `--workspace-root`-pinned `MCP` server, sub-2ms lifecycle hooks, symlink-resolved path protection & guardrail scanner |
 | `libredb trust` / `libredb config` | Monotonic `HMAC-SHA256` (`v4:r<rev>`) workspace trust seals (`--accept-rollback`, `--reinit-lost`, `--migrate-v3`, `--migrate-v2`) & dynamic settings |
 | `libredb git-init` / `git-sync` / `git-release` (aliases: `gitea-*`) | Provider-aware multi-remote Git, Keep a Changelog release, and binary asset automation |
 | `libredb import-sqlite` / `export-sqlite` / `verify-roundtrip` | Explicit lossless `19`-table + `5`-`FTS5` `SQLite <-> LibreDB` migration and parity verification |
@@ -71,7 +71,7 @@ pwsh -ExecutionPolicy Bypass -File .\scripts\deploy_plugin.ps1 -Profile Personal
 LibreDB/
 |-- Cargo.toml                                     # Rust workspace (5 default CLI/MCP crates + optional PyO3 crate)
 |-- Makefile                                       # Zero-dependency POSIX/Linux/macOS source build & installer
-|-- VERSION                                        # Semantic Version (0.10.1)
+|-- VERSION                                        # Semantic Version (0.10.2)
 |-- CHANGELOG.md                                   # Keep a Changelog 1.1.0 release history
 |-- LICENSE                                        # Commons Clause v1.0 + full verbatim GNU AGPL v3.0 text
 |-- README.md                                      # 9-block standardized documentation

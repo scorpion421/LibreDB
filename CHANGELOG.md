@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.2] - 2026-11-11
+
+### Added
+
+- Added `--workspace-root <dir>` (and `LIBREDB_MCP_WORKSPACE_ROOT` environment support) to `libredb mcp-serve` (`crates/libredb-cli/src/main.rs` and `crates/libredb-cli/src/mcp.rs`) plus automatic `MCP` `"initialize"` `rootUri` / `rootPath` / `workspaceFolders` registration so single-tenant sessions can pin `libredb-mcp` to one canonical workspace while multi-workspace IDE sessions enforce strict server-side workspace authorization.
+- Added shared `is_reserved_security_config_key` and `is_reserved_sys_key` helpers in `crates/libredb-core/src/lib.rs`, `is_forbidden_mcp_workspace_root` and `is_mcp_workspace_authorized_in_global` in `crates/libredb-cli/src/security.rs`, and 4 dedicated security regression tests (`sqlite_import_strips_reserved_trust_and_sys_keys_while_preserving_lossless_mirror`, `mcp_sync_central_sqlite_is_blocked_by_default_and_never_overwrites_trust_keys`, `mcp_code_indexing_propagates_lock_failures_and_uses_canonical_workspace_lock_for_subdirs`, and `mcp_enforces_server_side_workspace_authorization_non_optional_containment_and_pinned_roots`, bringing the automated suite to 74 tests + 10k crash simulations).
+
+### Changed
+
+- Upgraded `check_mcp_workspace_containment` (`crates/libredb-cli/src/security.rs`) to require a mandatory non-optional `ws_root: &Path` (failing closed on filesystem roots, `$HOME`, `%TEMP%`/`/tmp`, and sensitive system/profile directories), removed caller-supplied `transcript_path` from `libredb_pulse` (`crates/libredb-cli/src/mcp.rs`), and routed `libredb export-sqlite`, `get`, `get-key`, `trace`, and `recall` through `open_cli_verified_project_db` (`crates/libredb-cli/src/main.rs`).
+
+### Security
+
+- Closed the `SQLite` reserved-key import bypass (`populate_cognitive_graph`, `import_sqlite_readonly`, and `export_sqlite_database` in `crates/libredb-bridge/src/lib.rs`, plus `libredb_memorize` in `crates/libredb-cli/src/mcp.rs`): `runtime_config` rows matching `sys::*`, `trust:*`, `workspace:*`, or `workspace_id::*` (and `sys::*` keys in rule/decision/fact tables) are now strictly stripped before materializing active `NodeKind::Config` capsules while keeping raw `SQLite` table payloads intact inside `sqlite_mirror::{scope}` (`NodeKind::Generic`) for 100% lossless round-trip parity, bridge `scope` is strictly validated (`"central"` or `"project"`), and `MCP` `libredb_memorize(sync_central_sqlite=true)` now fails closed by default unless `mcp:allow_central_sqlite_sync=true` is explicitly configured by the operator.
+- Enforced fail-closed workspace trust locking and canonical workspace-root lock resolution across all `MCP` code-graph indexing paths (`run_locked_workspace_index` and `resolve_canonical_workspace_lock_root` in `crates/libredb-cli/src/mcp.rs`): `libredb_code` `"impact"`, `"fim"`, and `"index"` now propagate `WorkspaceTrustLockGuard::acquire` errors via `?` instead of discarding `.ok()` and indexing unlocked, and subdirectory targets (such as `crates/sub`) acquire the owning `<ws_root>` lock of `<ws_root>/.agents/memory.ldb` so indexing never runs under a mismatched subdirectory lock key concurrently with workspace mutations.
+- Hardened `MCP` workspace containment and server-side workspace authorization (`authorize_mcp_workspace_path`, `resolve_authorized_code_workspace`, and `resolve_brain_with_seal_target` in `crates/libredb-cli/src/mcp.rs`): omitting `cwd` or supplying a non-existent `cwd` can no longer bypass containment (non-existent `cwd` fails closed, and omitted `cwd` derives and binds a single canonical workspace root across all target files), every `MCP` workspace root must be authorized by server-side state (`--workspace-root`, `MCP` `initialize` workspace folders, or `trust:allowed::<ws>` in `customizations.ldb`), and unapproved directories can no longer be self-initialized or self-sealed via `libredb_memorize`.
+
 ## [0.10.1] - 2026-11-11
 
 ### Fixed

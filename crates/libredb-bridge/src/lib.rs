@@ -9,7 +9,10 @@
 //!    all `FTS5` virtual tables so rolling back to `SQLite` loses zero bits of information.
 
 use libredb_core::crc::{crc32, hash_key};
-use libredb_core::{EdgeKind, LibreDb, NodeFlags, NodeKind, WriteRequest};
+use libredb_core::{
+    is_reserved_security_config_key, is_reserved_sys_key, EdgeKind, LibreDb, NodeFlags, NodeKind,
+    WriteRequest,
+};
 use rusqlite::{types::ValueRef, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -128,12 +131,24 @@ fn validate_sqlite_source_file(sqlite_path: &Path) -> Result<u64> {
     Ok(sym_meta.len())
 }
 
+fn validate_bridge_scope(scope: &str) -> Result<()> {
+    if matches!(scope, "central" | "project") {
+        Ok(())
+    } else {
+        Err(BridgeError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("unsupported SQLite bridge scope '{scope}' (expected 'central' or 'project')"),
+        )))
+    }
+}
+
 /// Imports a `SkillsDB` SQLite database (`scope = "central"` or `"project"`) strictly READ-ONLY into `ldb`.
 pub fn import_sqlite_readonly(
     sqlite_path: &Path,
     ldb: &LibreDb,
     scope: &str,
 ) -> Result<ImportSummary> {
+    validate_bridge_scope(scope)?;
     validate_sqlite_source_file(sqlite_path)?;
     let conn = Connection::open_with_flags(
         sqlite_path,
@@ -275,6 +290,7 @@ pub fn export_sqlite_database(
     scope: &str,
     out_sqlite_path: &Path,
 ) -> Result<usize> {
+    validate_bridge_scope(scope)?;
     // Reject both live AND dangling symlinks before `exists()` or `Connection::open()` so an
     // attacker-planted dangling symlink cannot create or clobber arbitrary external files.
     reject_any_symlink_at_path(out_sqlite_path, "SQLite export")?;
@@ -733,6 +749,9 @@ fn populate_cognitive_graph(conn: &Connection, ldb: &LibreDb) -> Result<(usize, 
         })?;
         for row in rows {
             let (key, name, cat, summary, content, is_active, scope) = row?;
+            if is_reserved_sys_key(&key) {
+                continue;
+            }
             let body = format!("[Rule: {name} | {cat} | scope={scope}]\nSummary: {summary}\n{content}");
             let idx = prepared.len();
             prepared.push(ldb.prepare(
@@ -840,6 +859,13 @@ fn populate_cognitive_graph(conn: &Connection, ldb: &LibreDb) -> Result<(usize, 
         })?;
         for row in rows {
             let (key, val, _upd) = row?;
+            // Never materialize security-critical internal trust or vault keys (`sys::*`,
+            // `trust:*`, `workspace:*`, `workspace_id::*`) from imported SQLite `runtime_config`
+            // rows into active `NodeKind::Config` capsules. Raw table cells remain preserved
+            // inside `sqlite_mirror::{scope}` for lossless SQLite round-trip reconstruction.
+            if is_reserved_security_config_key(&key) {
+                continue;
+            }
             let b_idx = prepared.len();
             prepared.push(ldb.prepare(
                 WriteRequest::new(NodeKind::Config, val.into_bytes())
@@ -1001,6 +1027,9 @@ fn populate_cognitive_graph(conn: &Connection, ldb: &LibreDb) -> Result<(usize, 
         let mut latest_dec_idx: HashMap<String, (usize, String, bool)> = HashMap::new();
         for row in rows {
             let (title, content, cat, is_active, upd) = row?;
+            if is_reserved_sys_key(&title) {
+                continue;
+            }
             let dt_tag = if upd.len() >= 10 {
                 format!(" [{}]", &upd[..10])
             } else {
@@ -1092,6 +1121,9 @@ fn populate_cognitive_graph(conn: &Connection, ldb: &LibreDb) -> Result<(usize, 
         let mut seeded_initial: HashSet<String> = HashSet::new();
         for row in rows {
             let (key, old_opt, new_val) = row?;
+            if is_reserved_sys_key(&key) {
+                continue;
+            }
             if !seeded_initial.contains(&key) {
                 seeded_initial.insert(key.clone());
                 if let Some(old_v) = old_opt.filter(|s| !s.is_empty()) {
@@ -1139,6 +1171,9 @@ fn populate_cognitive_graph(conn: &Connection, ldb: &LibreDb) -> Result<(usize, 
         })?;
         for row in rows {
             let (key, val, dep_opt, sup_opt, upd) = row?;
+            if is_reserved_sys_key(&key) {
+                continue;
+            }
             let body = if upd.len() >= 10 {
                 format!("{key} = {val} [{}]", &upd[..10])
             } else {
@@ -1633,5 +1668,103 @@ mod tests {
                 "import_sqlite_readonly MUST reject symlinked SQLite sources"
             );
         }
+    }
+
+    #[test]
+    fn sqlite_import_strips_reserved_trust_and_sys_keys_while_preserving_lossless_mirror() {
+        let tmp = tempfile::tempdir().unwrap();
+        let malicious_sql = tmp.path().join("crafted_customizations.db");
+        {
+            let conn = Connection::open(&malicious_sql).unwrap();
+            conn.execute_batch(
+                "
+                CREATE TABLE runtime_config (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT);
+                INSERT INTO runtime_config VALUES
+                    ('sys::trust_anchor_secret', 'attacker_forged_anchor_secret_000000000000000000000000', '2026-11-11'),
+                    ('SYS::trust_seals', 'hmac-sha256:v4:r1:deadbeef', '2026-11-11'),
+                    ('trust:seal_rev::/repo/victim', '1', '2026-11-11'),
+                    ('trust:allowed::/repo/evil', '/repo/evil', '2026-11-11'),
+                    ('Trust:Revoked::/repo/victim', '', '2026-11-11'),
+                    ('workspace:evil', '/repo/evil', '2026-11-11'),
+                    ('workspace_id::0123456789abcdef', '/repo/evil', '2026-11-11'),
+                    ('gitea_url', 'http://127.0.0.1:3000', '2026-11-11');
+                CREATE TABLE rules (id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT UNIQUE NOT NULL, name TEXT NOT NULL, category TEXT NOT NULL, scope TEXT NOT NULL, is_active INTEGER DEFAULT 1, summary TEXT, content TEXT NOT NULL);
+                INSERT INTO rules VALUES
+                    (1, 'sys::internal_override', 'Poison', 'sec', 'global', 1, 'bad', 'bad'),
+                    (2, 'fmt-ascii', 'ASCII', 'fmt', 'global', 1, 'ok', 'Use ASCII hyphens.');
+                ",
+            )
+            .unwrap();
+        }
+
+        let ldb_path = tmp.path().join("customizations.ldb");
+        let ldb = LibreDb::open(&ldb_path).unwrap();
+
+        // Pre-populate genuine host trust state in customizations.ldb:
+        ldb.put(
+            WriteRequest::new(NodeKind::Config, b"genuine_host_secret_hex".to_vec())
+                .with_key("sys::trust_anchor_secret"),
+        )
+        .unwrap();
+        ldb.put(
+            WriteRequest::new(NodeKind::Config, b"5".to_vec())
+                .with_key("trust:seal_rev::/repo/victim"),
+        )
+        .unwrap();
+
+        let sum = import_sqlite_readonly(&malicious_sql, &ldb, "central").unwrap();
+        assert_eq!(sum.total_sqlite_rows, 10);
+
+        // 1. Genuine trust anchor secret and monotonic seal revision MUST remain 100% untouched:
+        assert_eq!(
+            ldb.get_by_key(NodeKind::Config, "sys::trust_anchor_secret")
+                .unwrap()
+                .payload,
+            b"genuine_host_secret_hex"
+        );
+        assert_eq!(
+            ldb.get_by_key(NodeKind::Config, "trust:seal_rev::/repo/victim")
+                .unwrap()
+                .payload,
+            b"5"
+        );
+
+        // 2. Forged trust/workspace/sys keys from SQLite MUST NOT exist as active capsules:
+        for forbidden_cfg in [
+            "SYS::trust_seals",
+            "sys::trust_seals",
+            "trust:allowed::/repo/evil",
+            "Trust:Revoked::/repo/victim",
+            "workspace:evil",
+            "workspace_id::0123456789abcdef",
+        ] {
+            assert!(
+                ldb.get_by_key(NodeKind::Config, forbidden_cfg).is_err(),
+                "reserved SQLite runtime_config key '{forbidden_cfg}' MUST NOT materialize into NodeKind::Config"
+            );
+        }
+        assert!(
+            ldb.get_by_key(NodeKind::Rule, "sys::internal_override")
+                .is_err(),
+            "reserved sys::* rule key MUST NOT materialize into NodeKind::Rule"
+        );
+
+        // 3. Legitimate user config and rules still import normally:
+        assert_eq!(
+            ldb.get_by_key(NodeKind::Config, "gitea_url")
+                .unwrap()
+                .payload,
+            b"http://127.0.0.1:3000"
+        );
+        assert!(ldb.get_by_key(NodeKind::Rule, "fmt-ascii").is_ok());
+
+        // 4. Invalid bridge scopes are rejected cleanly:
+        assert!(import_sqlite_readonly(&malicious_sql, &ldb, "../bad").is_err());
+
+        // 5. Raw SQLite mirror inside `sqlite_mirror::central` still reconstructs 100% losslessly:
+        let recon_sql = tmp.path().join("reconstructed_customizations.db");
+        export_sqlite_database(&ldb, "central", &recon_sql).unwrap();
+        let rep = verify_sqlite_equivalence(&malicious_sql, &recon_sql).unwrap();
+        assert_eq!(rep.rows_verified, 10);
     }
 }

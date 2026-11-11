@@ -255,7 +255,7 @@ checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "libredb-bridge"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "libredb-cognitive",
  "libredb-core",
@@ -268,7 +268,7 @@ dependencies = [
 
 [[package]]
 name = "libredb-cli"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "chacha20poly1305",
  "hmac",
@@ -283,7 +283,7 @@ dependencies = [
 
 [[package]]
 name = "libredb-cognitive"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "libredb-core",
  "libredb-index",
@@ -293,7 +293,7 @@ dependencies = [
 
 [[package]]
 name = "libredb-core"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "crc32fast",
  "lz4_flex",
@@ -306,7 +306,7 @@ dependencies = [
 
 [[package]]
 name = "libredb-index"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "libredb-core",
  "parking_lot",
@@ -317,7 +317,7 @@ dependencies = [
 
 [[package]]
 name = "libredb-py"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "libredb-bridge",
  "libredb-cognitive",

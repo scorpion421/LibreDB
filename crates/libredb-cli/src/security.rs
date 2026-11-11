@@ -549,6 +549,15 @@ fn workspace_trust_lock_path(global_db: &LibreDb, norm: &str) -> Result<PathBuf,
     Ok(locks_dir.join(format!("ws_{}.lock", hex_encode(&digest[..16]))))
 }
 
+#[cfg(test)]
+pub(crate) fn workspace_trust_lock_path_for_root(
+    global_db: &LibreDb,
+    ws_root: &Path,
+) -> Result<PathBuf, String> {
+    let norm = normalize_workspace_key(ws_root);
+    workspace_trust_lock_path(global_db, &norm)
+}
+
 /// Atomically advances `trust:seal_rev::<norm>` in `global_db` strictly monotonically
 /// (`new_rev = max(cur_rev, target_rev)`) under `customizations.ldb`'s exclusive `IpcWriteGuard`.
 /// Guarantees that a delayed or concurrent writer can NEVER regress an already confirmed revision.
@@ -676,13 +685,9 @@ pub fn is_workspace_path_authorized(global_db: Option<&LibreDb>, ws_root: &Path)
 
 /// Returns true if `key` addresses a security-critical internal configuration namespace
 /// (`sys::*`, `trust:*`, `workspace:*`, `workspace_id::*`) that must never be mutated via
-/// generic `libredb config set/unset`, `libredb put`, or `libredb deprecate`.
+/// generic `libredb config set/unset`, `libredb put`, `libredb deprecate`, or SQLite imports.
 pub fn is_reserved_security_config_key(key: &str) -> bool {
-    let low = key.trim().to_ascii_lowercase();
-    low.starts_with("sys::")
-        || low.starts_with("trust:")
-        || low.starts_with("workspace:")
-        || low.starts_with("workspace_id::")
+    libredb_core::is_reserved_security_config_key(key)
 }
 
 /// Computes a deterministic collision-free `Config` key (`workspace_id::<16-hex>`) from a
@@ -721,6 +726,16 @@ fn is_workspace_path_authorized_synced(gdb: &LibreDb, ws_root: &Path) -> bool {
         }
     }
     false
+}
+
+/// Returns true if `ws_root` is authorized for `libredb-mcp` workspace operations according to
+/// an already-synchronized `global_db` (`trust:allowed::<ws>`, registered `workspace_id::*` /
+/// `workspace:*`, or explicit administrator opt-out `mcp:allow_untrusted_workspaces = true`).
+pub(crate) fn is_mcp_workspace_authorized_in_global(gdb: &LibreDb, ws_root: &Path) -> bool {
+    if is_workspace_path_authorized_synced(gdb, ws_root) {
+        return true;
+    }
+    load_bool_config(Some(gdb), None, "mcp:allow_untrusted_workspaces", false)
 }
 
 /// Returns true if `ws_root` resides inside an Antigravity per-conversation private brain folder
@@ -2168,22 +2183,77 @@ pub fn check_mcp_read_path_policy(
     None
 }
 
-/// Enforces workspace containment for `libredb-mcp` code inspection/indexing tools whenever an
-/// active workspace `ws_root` (`cwd`) is supplied, blocking both `../` traversal and symlinks
-/// inside the workspace that resolve outside `ws_root`.
-pub fn check_mcp_workspace_containment(
-    target_path: &Path,
-    ws_root: Option<&Path>,
-) -> Option<String> {
-    let root = ws_root?;
-    let root_canon = canonicalize_with_missing_tail(root).unwrap_or_else(|| root.to_path_buf());
+/// Returns true if `ws_root` is a filesystem root (`/` or `C:\`), broad shared container root
+/// (`$HOME`, `%TEMP%`, `/tmp`, `/var/tmp`, `$HOME/AppData`), or sensitive OS / LibreDB control-plane
+/// directory that must never be accepted as an `MCP` workspace boundary.
+pub fn is_forbidden_mcp_workspace_root(ws_root: &Path) -> bool {
+    if ws_root.as_os_str().is_empty() {
+        return true;
+    }
+    let canon = canonicalize_with_missing_tail(ws_root).unwrap_or_else(|| ws_root.to_path_buf());
+    if canon.parent().is_none() {
+        return true;
+    }
+    let norm = normalize_workspace_key(&canon);
+    if norm.is_empty() || norm == "/" {
+        return true;
+    }
+    let home_norm = normalize_workspace_key(&user_home_dir());
+    let temp_norm = normalize_workspace_key(&std::env::temp_dir());
+    if norm == home_norm || norm == temp_norm || norm == "/tmp" || norm == "/var/tmp" {
+        return true;
+    }
+    let low = norm.to_ascii_lowercase();
+    let home_low = home_norm.to_ascii_lowercase();
+    if low == format!("{home_low}/.gemini")
+        || low.starts_with(&format!("{home_low}/.gemini/libredb"))
+        || low.starts_with(&format!("{home_low}/.gemini/config"))
+        || low.starts_with(&format!("{home_low}/.gemini/database"))
+        || low == format!("{home_low}/appdata")
+        || low == format!("{home_low}/appdata/local")
+        || low == format!("{home_low}/appdata/roaming")
+    {
+        return true;
+    }
+    low == "/etc"
+        || low.starts_with("/etc/")
+        || low == "/usr"
+        || low.starts_with("/usr/")
+        || low == "/proc"
+        || low.starts_with("/proc/")
+        || low == "/sys"
+        || low.starts_with("/sys/")
+        || low == "/dev"
+        || low.starts_with("/dev/")
+        || low == "/run"
+        || low.starts_with("/run/")
+        || low.ends_with(":/windows")
+        || low.contains(":/windows/")
+        || low.contains(":/program files")
+}
+
+/// Enforces mandatory workspace containment for `libredb-mcp` code inspection/indexing tools against
+/// a resolved non-optional `ws_root`, failing closed on broad/root workspace boundaries and blocking
+/// both `../` traversal and symlinks inside the workspace that resolve outside `ws_root`.
+pub fn check_mcp_workspace_containment(target_path: &Path, ws_root: &Path) -> Option<String> {
+    if is_forbidden_mcp_workspace_root(ws_root) {
+        return Some(format!(
+            "LibreDB MCP access denied: invalid or overly broad workspace root '{}'",
+            ws_root.display()
+        ));
+    }
+    let root_canon =
+        canonicalize_with_missing_tail(ws_root).unwrap_or_else(|| ws_root.to_path_buf());
     let root_norm = normalize_workspace_key(&root_canon);
     if root_norm.is_empty() {
-        return None;
+        return Some(format!(
+            "LibreDB MCP access denied: empty workspace root '{}'",
+            ws_root.display()
+        ));
     }
 
     let joined = if target_path.is_relative() {
-        root.join(target_path)
+        ws_root.join(target_path)
     } else {
         target_path.to_path_buf()
     };
@@ -2193,7 +2263,7 @@ pub fn check_mcp_workspace_containment(
         return Some(format!(
             "LibreDB MCP access denied: target '{}' resolves outside active workspace '{}'",
             target_path.display(),
-            root.display()
+            ws_root.display()
         ));
     }
     None
@@ -5254,9 +5324,22 @@ mod tests {
         let outside = tmp.join("outside");
         fs::create_dir_all(ws.join("src")).unwrap();
         fs::create_dir_all(&outside).unwrap();
-        assert!(check_mcp_workspace_containment(&ws.join("src").join("lib.rs"), Some(&ws)).is_none());
-        assert!(check_mcp_workspace_containment(Path::new("../outside/secret.rs"), Some(&ws)).is_some());
-        assert!(check_mcp_workspace_containment(&outside.join("secret.rs"), Some(&ws)).is_some());
+        assert!(check_mcp_workspace_containment(&ws.join("src").join("lib.rs"), &ws).is_none());
+        assert!(check_mcp_workspace_containment(Path::new("../outside/secret.rs"), &ws).is_some());
+        assert!(check_mcp_workspace_containment(&outside.join("secret.rs"), &ws).is_some());
+        assert!(
+            check_mcp_workspace_containment(&ws.join("src").join("lib.rs"), Path::new("/"))
+                .is_some(),
+            "Filesystem root '/' MUST be rejected as an MCP workspace boundary"
+        );
+        assert!(
+            check_mcp_workspace_containment(
+                &ws.join("src").join("lib.rs"),
+                &std::env::temp_dir()
+            )
+            .is_some(),
+            "Shared temp_dir root MUST be rejected as an MCP workspace boundary"
+        );
         let _ = fs::remove_dir_all(&tmp);
     }
 

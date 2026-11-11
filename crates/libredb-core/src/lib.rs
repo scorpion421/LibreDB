@@ -21,3 +21,20 @@ pub use format::{
     INODE_SIZE, MAGIC,
 };
 pub use io::{FaultInjectingBackend, OsFileBackend, StorageBackend};
+
+/// Returns true if `key` addresses a security-critical internal configuration namespace
+/// (`sys::*`, `trust:*`, `workspace:*`, `workspace_id::*`) that must never be written,
+/// overwritten, or deprecated via generic configuration commands, low-level `put`/`deprecate`,
+/// or SQLite imports.
+pub fn is_reserved_security_config_key(key: &str) -> bool {
+    let low = key.trim().to_ascii_lowercase();
+    low.starts_with("sys::")
+        || low.starts_with("trust:")
+        || low.starts_with("workspace:")
+        || low.starts_with("workspace_id::")
+}
+
+/// Returns true if `key` starts with the reserved internal system prefix `sys::` (case-insensitive).
+pub fn is_reserved_sys_key(key: &str) -> bool {
+    key.trim().to_ascii_lowercase().starts_with("sys::")
+}
