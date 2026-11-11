@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.8] - 2026-11-11
+
+### Added
+
+- Added `--accept-rollback` to `libredb trust` (`detect_workspace_seal_rollback`, `SEAL_V4_REV_DOMAIN_SEP`, and `compute_workspace_seal_v4_rev` in `crates/libredb-cli/src/security.rs` and `crates/libredb-cli/src/main.rs`) to explicitly separate intentional backup restoration of an older non-empty `.agents/memory.ldb` snapshot from unauthorized historical snapshot replay.
+- Added a dedicated `macos` (`macos-latest`) job to `.github/workflows/ci.yml` alongside `linux` and `windows`, exercising `renamex_np(..., RENAME_EXCL)` on APFS, full release tests, neutral plugin installation, kernel benchmarks, hook latency gates, and strict guardrail checks on every push and release tag.
+
+### Fixed
+
+- Removed the `file_len < DATA_REGION_START` early-return bypass inside `LibreDb::sync_from_disk_if_changed` (`crates/libredb-core/src/engine.rs`) so external truncation of an already-open `.ldb` file below `8192` bytes fails closed with `LibreDbError::NoValidSuperblock` instead of silently retaining stale in-memory state.
+- Propagated `Result` errors from `check_global_trust_sync`, `open_global_ldb_checked`, and `list_trusted_workspaces` across `crates/libredb-cli/src/security.rs`, `crates/libredb-cli/src/hooks.rs`, `crates/libredb-cli/src/mcp.rs` (evicting cached `OverlayBrain` instances when `customizations.ldb` fails disk sync), and all CLI write/trust/config/guardrail entrypoints in `crates/libredb-cli/src/main.rs`.
+
+### Security
+
+- Closed historical non-empty snapshot rollback attacks on sealed workspaces (`seal_workspace_memory`, `is_workspace_memory_trusted`, `detect_workspace_seal_rollback`, and `PreMutationSealGuard` in `crates/libredb-cli/src/security.rs`, plus `libredb trust` in `crates/libredb-cli/src/main.rs`): workspace seals now authenticate a monotonically advancing per-workspace revision counter inside `HMAC-SHA256` (`hmac-sha256:v4:r<rev>:<64-hex>` under `LibreDB::WorkspaceTrustSeal::v4r\0`) paired with a crash-consistent two-phase commit to `trust:seal_rev::<ws>` in `customizations.ldb` (Phase 1 writes `.agents/memory.ldb` first so mid-commit crashes `proj_rev == global_rev + 1` stay valid without false quarantine, while Phase 2 advances `global_rev` so replaying any older captured non-empty `v4` snapshot `proj_rev < global_rev` fails closed across hooks, `MCP`, `CLI` writes, `libredb trust --if-clean`, and plain `libredb trust` until restored or explicitly accepted with `libredb trust --accept-rollback "<dir>"`).
+- Enforced strict fail-closed error handling on `customizations.ldb` disk synchronization and cold-open corruption (`check_global_trust_sync`, `has_config_key_fail_closed`, `ensure_trust_anchor_secret`, `is_workspace_memory_trusted`, `is_workspace_path_authorized`, `PreMutationSealGuard`, and `open_global_ldb_checked` in `crates/libredb-cli/src/security.rs`, `crates/libredb-cli/src/hooks.rs`, and `crates/libredb-cli/src/mcp.rs`): replacing discarded `let _ = gdb.sync_from_disk_if_changed()` calls and silent `Option<Arc<LibreDb>>` fallbacks guarantees that superblock corruption, truncation, or unreadable config records in `customizations.ldb` never fall back to stale in-RAM trust caches, never skip `PreMutationSealGuard`, and never overwrite `sys::trust_anchor_secret`.
+
 ## [0.9.7] - 2026-11-11
 
 ### Added

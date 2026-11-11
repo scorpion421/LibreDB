@@ -27,10 +27,36 @@ pub fn default_central_sqlite_path() -> PathBuf {
         .join("customizations.db")
 }
 
+const MIN_VALID_LDB_BYTES: u64 = 8192;
+
 pub fn open_global_ldb(override_path: Option<&Path>) -> Result<Arc<LibreDb>, String> {
     let target = override_path
         .map(Path::to_path_buf)
         .unwrap_or_else(default_global_ldb_path);
+    match std::fs::symlink_metadata(&target) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(format!(
+                    "Refusing to open symlinked global customizations.ldb at '{}'",
+                    target.display()
+                ));
+            }
+            if !meta.is_file() || meta.len() < MIN_VALID_LDB_BYTES {
+                return Err(format!(
+                    "Existing global customizations.ldb at '{}' is truncated or invalid (length {} bytes < {MIN_VALID_LDB_BYTES}); refusing to auto-reinitialize",
+                    target.display(),
+                    meta.len()
+                ));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "Failed to inspect global customizations.ldb metadata at '{}': {e}",
+                target.display()
+            ));
+        }
+    }
     let central_sql = default_central_sqlite_path();
     let sql_opt = if override_path.is_none() {
         Some(central_sql.as_path())
@@ -47,14 +73,43 @@ pub fn open_global_ldb(override_path: Option<&Path>) -> Result<Arc<LibreDb>, Str
     Ok(db)
 }
 
-pub fn open_global_ldb_if_exists(override_path: Option<&Path>) -> Option<Arc<LibreDb>> {
+/// Opens `customizations.ldb` when present on disk, returning `Ok(None)` ONLY when the file genuinely
+/// does not exist (`ErrorKind::NotFound`), and returning `Err` if `customizations.ldb` exists (or
+/// cannot be inspected) yet is symlinked, truncated (`< 8192` bytes), or fails `LibreDb::open`.
+/// Prevents a corrupted or 0-byte truncated `customizations.ldb` from masquerading as an unconfigured host.
+pub fn open_global_ldb_checked(override_path: Option<&Path>) -> Result<Option<Arc<LibreDb>>, String> {
     let target = override_path
         .map(Path::to_path_buf)
         .unwrap_or_else(default_global_ldb_path);
-    if target.is_file() {
-        LibreDb::open(&target).ok().map(Arc::new)
-    } else {
-        None
+    match std::fs::symlink_metadata(&target) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(format!(
+                    "Refusing to open symlinked global customizations.ldb at '{}'",
+                    target.display()
+                ));
+            }
+            if !meta.is_file() || meta.len() < MIN_VALID_LDB_BYTES {
+                return Err(format!(
+                    "Existing global customizations.ldb at '{}' is truncated or invalid (length {} bytes < {MIN_VALID_LDB_BYTES}); refusing to auto-reinitialize",
+                    target.display(),
+                    meta.len()
+                ));
+            }
+            LibreDb::open(&target)
+                .map(|db| Some(Arc::new(db)))
+                .map_err(|e| {
+                    format!(
+                        "Failed to open existing global customizations.ldb at '{}': {e}",
+                        target.display()
+                    )
+                })
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!(
+            "Failed to inspect global customizations.ldb metadata at '{}': {e}",
+            target.display()
+        )),
     }
 }
 
@@ -77,10 +132,10 @@ pub fn run_pre_tool_hook(global_ldb_opt: Option<&Path>) -> Result<(), Box<dyn st
     let payload: Value = serde_json::from_str(raw.trim()).unwrap_or_else(|_| json!({}));
 
     let (tool_name, args) = extract_pre_tool_name_and_args(&payload);
-    let mut global_db_cache: Option<Option<Arc<LibreDb>>> = None;
-    let mut get_global_db = || -> Option<Arc<LibreDb>> {
+    let mut global_db_cache: Option<Result<Option<Arc<LibreDb>>, String>> = None;
+    let mut get_global_db_checked = || -> Result<Option<Arc<LibreDb>>, String> {
         global_db_cache
-            .get_or_insert_with(|| open_global_ldb_if_exists(global_ldb_opt))
+            .get_or_insert_with(|| open_global_ldb_checked(global_ldb_opt))
             .clone()
     };
 
@@ -98,10 +153,11 @@ pub fn run_pre_tool_hook(global_ldb_opt: Option<&Path>) -> Result<(), Box<dyn st
                 .or_else(|| args.get("model"))
                 .and_then(Value::as_str)
                 .unwrap_or("inherit");
+            let gdb_opt = get_global_db_checked().ok().flatten();
             if !model_str.eq_ignore_ascii_case("flash")
                 && !model_str.eq_ignore_ascii_case("flash_lite")
                 && crate::security::load_bool_config(
-                    get_global_db().as_deref(),
+                    gdb_opt.as_deref(),
                     None,
                     "hook:subagent_flash_routing",
                     false,
@@ -132,9 +188,10 @@ pub fn run_pre_tool_hook(global_ldb_opt: Option<&Path>) -> Result<(), Box<dyn st
         }
 
         // Opt-in Subagent Firewall (`hook:exploratory_firewall = true`, off by default on neutral installs)
+        let gdb_opt = get_global_db_checked().ok().flatten();
         if is_exploratory_search_cmd(cmd_line)
             && crate::security::load_bool_config(
-                get_global_db().as_deref(),
+                gdb_opt.as_deref(),
                 None,
                 "hook:exploratory_firewall",
                 false,
@@ -173,8 +230,9 @@ pub fn run_pre_tool_hook(global_ldb_opt: Option<&Path>) -> Result<(), Box<dyn st
         || args.get("ReplacementChunks").is_some();
 
     if is_write_or_edit {
-        let global_db_ro = get_global_db();
-        let proj_db_ro = if target_file != "<tool_input>" {
+        let global_db_res = get_global_db_checked();
+        let global_db_ro = global_db_res.as_ref().ok().and_then(Clone::clone);
+        let proj_db_ro = if target_file != "<tool_input>" && global_db_res.is_ok() {
             find_workspace_root(Path::new(target_file)).and_then(|root| {
                 if crate::security::is_workspace_memory_trusted(global_db_ro.as_deref(), &root) {
                     let ldb_p = root.join(".agents").join("memory.ldb");
@@ -271,7 +329,7 @@ pub fn run_pre_tool_hook(global_ldb_opt: Option<&Path>) -> Result<(), Box<dyn st
             }
         }
 
-        if target_file != "<tool_input>" && !is_test_or_scratch_path(target_file) {
+        if target_file != "<tool_input>" && !is_test_or_scratch_path(target_file) && global_db_res.is_ok() {
             let target_path = Path::new(target_file);
             let _ = record_working_set_edit(target_path, global_db_ro.as_deref());
         }
@@ -333,9 +391,12 @@ pub(crate) fn evaluate_pre_invocation_payload(
 
     // Cryptographic workspace trust check BEFORE opening `.ldb` or migrating any C SQLite `.db` file!
     // Prevents cloned repositories carrying poisoned `.agents/memory.*` payloads from injecting
-    // `<SYSTEM_MESSAGE>` prompt overrides or triggering untrusted SQLite deserialization.
+    // `<SYSTEM_MESSAGE>` prompt overrides or triggering untrusted SQLite deserialization, and fails
+    // closed immediately if an existing `customizations.ldb` is corrupted/unreadable on disk.
     if let Some(ref root) = ws_root {
-        let global_db_ro = open_global_ldb_if_exists(global_ldb_opt);
+        let Ok(global_db_ro) = open_global_ldb_checked(global_ldb_opt) else {
+            return Ok(json!({ "injectSteps": [] }));
+        };
         if !crate::security::is_workspace_memory_trusted(global_db_ro.as_deref(), root) {
             return Ok(json!({ "injectSteps": [] }));
         }
@@ -346,7 +407,7 @@ pub(crate) fn evaluate_pre_invocation_payload(
     };
 
     // Strict fail-closed post-migration sealing: if an authorized legacy `.agents/memory.db` was just
-    // migrated into `.agents/memory.ldb`, it MUST be cryptographically sealed with `hmac-sha256:v3:`
+    // migrated into `.agents/memory.ldb`, it MUST be cryptographically sealed with `hmac-sha256:v4:r<rev>:`
     // BEFORE recording any dedup cursor or reading/injecting a single capsule from `proj_db`.
     // If sealing fails for any reason, emit ONLY the quarantine diagnostic and zero project content.
     if did_migrate {
@@ -354,26 +415,31 @@ pub(crate) fn evaluate_pre_invocation_payload(
             if !crate::security::is_private_brain_workspace(root) {
                 let seal_outcome: Result<(), String> = if is_protected_profile_dir(root) {
                     Err("workspace resolves to a protected profile directory".to_owned())
-                } else if let Some(global_db) = open_global_ldb_if_exists(global_ldb_opt) {
-                    crate::security::seal_workspace_memory(&global_db, &proj_db, root).map(|()| {
-                        if let Some(name) = root.file_name().and_then(|n| n.to_str()) {
-                            let ws_cfg_key = format!("workspace:{name}");
-                            let root_str = root.to_string_lossy().into_owned();
-                            let already_same = global_db
-                                .get_by_key(NodeKind::Config, &ws_cfg_key)
-                                .map(|r| r.payload == root_str.as_bytes())
-                                .unwrap_or(false);
-                            if !already_same {
-                                let _ = global_db.put(
-                                    WriteRequest::new(NodeKind::Config, root_str.into_bytes())
-                                        .with_key(ws_cfg_key)
-                                        .with_importance(170),
-                                );
-                            }
-                        }
-                    })
                 } else {
-                    Err("global customizations.ldb is unavailable".to_owned())
+                    match open_global_ldb_checked(global_ldb_opt) {
+                        Ok(Some(global_db)) => crate::security::seal_workspace_memory(
+                            &global_db, &proj_db, root,
+                        )
+                        .map(|()| {
+                            if let Some(name) = root.file_name().and_then(|n| n.to_str()) {
+                                let ws_cfg_key = format!("workspace:{name}");
+                                let root_str = root.to_string_lossy().into_owned();
+                                let already_same = global_db
+                                    .get_by_key(NodeKind::Config, &ws_cfg_key)
+                                    .map(|r| r.payload == root_str.as_bytes())
+                                    .unwrap_or(false);
+                                if !already_same {
+                                    let _ = global_db.put(
+                                        WriteRequest::new(NodeKind::Config, root_str.into_bytes())
+                                            .with_key(ws_cfg_key)
+                                            .with_importance(170),
+                                    );
+                                }
+                            }
+                        }),
+                        Ok(None) => Err("global customizations.ldb is unavailable".to_owned()),
+                        Err(e) => Err(e),
+                    }
                 };
 
                 if let Err(err) = seal_outcome {
@@ -382,7 +448,7 @@ pub(crate) fn evaluate_pre_invocation_payload(
                         root.display()
                     );
                     let diag = format!(
-                        "[WARN] Quarantined migrated workspace '{}': post-migration hmac-sha256:v3 workspace seal failed ({err}); project memory context suppressed.",
+                        "[WARN] Quarantined migrated workspace '{}': post-migration hmac-sha256:v4 workspace seal failed ({err}); project memory context suppressed.",
                         root.display()
                     );
                     return Ok(json!({
@@ -448,7 +514,7 @@ pub(crate) fn evaluate_pre_invocation_payload(
         if let Some(ref root) = ws_root {
             if !is_protected_profile_dir(root) {
                 if let Some(name) = root.file_name().and_then(|n| n.to_str()) {
-                    if let Some(global_db) = open_global_ldb_if_exists(global_ldb_opt) {
+                    if let Ok(Some(global_db)) = open_global_ldb_checked(global_ldb_opt) {
                         let ws_cfg_key = format!("workspace:{name}");
                         let root_str = root.to_string_lossy().into_owned();
                         let already_same = global_db

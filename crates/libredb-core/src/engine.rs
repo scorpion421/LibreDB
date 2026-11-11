@@ -440,9 +440,6 @@ impl LibreDb {
     /// cache), and transparently reloads `SnapshotState` if `commit_seq` or `compaction_count` advanced.
     pub fn sync_from_disk_if_changed(&self) -> Result<bool> {
         let file_len = self.backend.len()?;
-        if file_len < DATA_REGION_START {
-            return Ok(false);
-        }
         let disk_sb = Self::read_disk_superblock(&*self.backend, file_len)?;
         let mem_sb = self.state.read().superblock;
         if disk_sb.commit_seq == mem_sb.commit_seq

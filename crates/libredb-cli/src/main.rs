@@ -46,7 +46,7 @@ Antigravity Cognitive & Code-Graph Commands:
   libredb mcp-serve [<default_project.ldb>] [--global <customizations.ldb>]
 
 Security, Trust & Universal Configuration Commands:
-  libredb trust [<dir>] [--revoke] [--list] [--reinit-lost] [--migrate-v3 [--confirm-metadata]] [--migrate-v2] [--if-clean] [--global <customizations.ldb>]
+  libredb trust [<dir>] [--revoke] [--list] [--reinit-lost] [--accept-rollback] [--migrate-v3 [--confirm-metadata]] [--migrate-v2] [--if-clean] [--global <customizations.ldb>]
   libredb config <get|set|unset|list> [<key>] [<value>] [--project <dir>] [--global <customizations.ldb>]
   libredb guardrail check [--path <dir>] [--staged] [--strict]
   libredb hook-pre-tool [--global <customizations.ldb>]
@@ -174,8 +174,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     other => return Err(format!("Unknown guardrail flag '{other}'").into()),
                 }
             }
-            let gdb_opt = hooks::open_global_ldb_if_exists(None);
-            let pdb_opt = if security::is_workspace_memory_trusted(gdb_opt.as_deref(), &dir) {
+            let gdb_res = hooks::open_global_ldb_checked(None);
+            let gdb_opt = gdb_res.as_ref().ok().and_then(Clone::clone);
+            let pdb_opt = if gdb_res.is_ok()
+                && security::is_workspace_memory_trusted(gdb_opt.as_deref(), &dir)
+            {
                 let p = dir.join(".agents").join("memory.ldb");
                 p.is_file().then(|| LibreDb::open(&p).ok()).flatten()
             } else {
@@ -214,6 +217,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let mut migrate_v3 = false;
             let mut confirm_metadata = false;
             let mut reinit_lost = false;
+            let mut accept_rollback = false;
             let mut if_clean = false;
             let mut global_path: Option<PathBuf> = None;
             let mut i = 1usize;
@@ -243,6 +247,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         reinit_lost = true;
                         i += 1;
                     }
+                    "--accept-rollback" => {
+                        accept_rollback = true;
+                        i += 1;
+                    }
                     "--if-clean" => {
                         if_clean = true;
                         i += 1;
@@ -260,7 +268,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             let gdb = hooks::open_global_ldb(global_path.as_deref())?;
             if list {
-                let items = security::list_trusted_workspaces(&gdb);
+                let items = security::list_trusted_workspaces(&gdb)?;
                 println!("=== Trusted Workspaces ({}) ===", items.len());
                 for (_, display_path) in items {
                     println!("  * {display_path}");
@@ -284,7 +292,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let mut migrated = 0usize;
                     let mut already_valid = 0usize;
                     let mut rejected = 0usize;
-                    for (_, raw_ws) in security::list_trusted_workspaces(&gdb) {
+                    for (_, raw_ws) in security::list_trusted_workspaces(&gdb)? {
                         let ws_path = PathBuf::from(raw_ws.trim());
                         if !ws_path.is_dir()
                             || (!ws_path.join(".agents").join("memory.ldb").is_file()
@@ -337,7 +345,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let mut migrated = 0usize;
                     let mut already_valid = 0usize;
                     let mut rejected = 0usize;
-                    for (_, raw_ws) in security::list_trusted_workspaces(&gdb) {
+                    for (_, raw_ws) in security::list_trusted_workspaces(&gdb)? {
                         let ws_path = PathBuf::from(raw_ws.trim());
                         if !ws_path.is_dir()
                             || (!ws_path.join(".agents").join("memory.ldb").is_file()
@@ -362,6 +370,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             } else {
+                security::check_global_trust_sync(&gdb)?;
                 let target_dir = dir_opt.unwrap_or(env::current_dir()?);
                 let abs = std::fs::canonicalize(&target_dir).unwrap_or(target_dir);
                 let clean = gitea::strip_verbatim_prefix(&abs);
@@ -383,6 +392,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             clean.display(),
                             clean.display()
                         );
+                    } else if let Some((proj_rev, global_rev)) =
+                        security::detect_workspace_seal_rollback(&gdb, &clean)?
+                    {
+                        println!(
+                            "[WARN] Skipping automatic workspace trust for '{}': .agents/memory.ldb carries older seal revision r{proj_rev} while host customizations.ldb requires at least r{global_rev} (historical snapshot rollback detected); restore the latest database or run 'libredb trust --accept-rollback \"{}\"' if intentionally restoring a backup.",
+                            clean.display(),
+                            clean.display()
+                        );
                     } else {
                         println!(
                             "[WARN] Skipping automatic workspace trust for '{}': pre-existing .agents database has an unverified or modified seal; inspect and run 'libredb trust \"{}\"' manually if trusted.",
@@ -399,6 +416,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         clean.display()
                     )
                     .into());
+                } else if !accept_rollback && !reinit_lost {
+                    if let Some((proj_rev, global_rev)) =
+                        security::detect_workspace_seal_rollback(&gdb, &clean)?
+                    {
+                        return Err(format!(
+                            "Workspace '{}' carries an older valid seal revision r{proj_rev} while host customizations.ldb requires at least r{global_rev} (historical snapshot rollback detected). Restore the latest .agents/memory.ldb or pass '--accept-rollback' ('libredb trust --accept-rollback \"{}\"') to explicitly adopt this older backup.",
+                            clean.display(),
+                            clean.display()
+                        )
+                        .into());
+                    }
+                    let ldb_path = clean.join(".agents").join("memory.ldb");
+                    let (pdb, _) = hooks::open_project_ldb_silent(&ldb_path)?;
+                    security::seal_workspace_memory(&gdb, &pdb, &clean)?;
+                    println!(
+                        "[OK] Trusted and cryptographically sealed workspace '{}'",
+                        clean.display()
+                    );
                 } else {
                     let ldb_path = clean.join(".agents").join("memory.ldb");
                     let (pdb, _) = hooks::open_project_ldb_silent(&ldb_path)?;
@@ -406,6 +441,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     if reinit_lost {
                         println!(
                             "[OK] Re-initialized and cryptographically sealed workspace '{}' after database loss (--reinit-lost)",
+                            clean.display()
+                        );
+                    } else if accept_rollback {
+                        println!(
+                            "[OK] Adopted backup snapshot and advanced monotonic seal revision for workspace '{}' (--accept-rollback)",
                             clean.display()
                         );
                     } else {
@@ -441,7 +481,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             let gdb_for_proj_seal = if proj_dir.is_some() && matches!(action, "set" | "unset") {
-                hooks::open_global_ldb_if_exists(global_path.as_deref())
+                hooks::open_global_ldb_checked(global_path.as_deref())?
             } else {
                 None
             };
@@ -529,6 +569,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         let Some(k) = k_opt else { continue };
                         if k == "sys::trust_anchor_secret"
                             || k.starts_with("trust:sealed::")
+                            || k.starts_with("trust:seal_rev::")
                             || k.starts_with("trust:nonempty_sealed::")
                             || k.starts_with("trust:v3_upgraded::")
                             || k.starts_with("trust:v4_upgraded::")
@@ -1225,7 +1266,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             let t0 = Instant::now();
             let db_path = Path::new(&args[1]);
-            let gdb_opt = hooks::open_global_ldb_if_exists(None);
+            let gdb_opt = hooks::open_global_ldb_checked(None)?;
             let seal_guard =
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
             let (db, _) = hooks::open_project_ldb_silent(db_path)?;
@@ -1248,7 +1289,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 notes = &args[6];
             }
             let db_path = Path::new(&args[1]);
-            let gdb_opt = hooks::open_global_ldb_if_exists(None);
+            let gdb_opt = hooks::open_global_ldb_checked(None)?;
             let seal_guard =
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
             let (db, _) = hooks::open_project_ldb_silent(db_path)?;
@@ -1267,7 +1308,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .collect();
             let target_ids = target_ids?;
             let db_path = Path::new(&args[1]);
-            let gdb_opt = hooks::open_global_ldb_if_exists(None);
+            let gdb_opt = hooks::open_global_ldb_checked(None)?;
             let seal_guard =
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
             let (db, _) = hooks::open_project_ldb_silent(db_path)?;
@@ -1307,7 +1348,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 i += 2;
             }
             let db_path = Path::new(&args[1]);
-            let gdb_opt = hooks::open_global_ldb_if_exists(None);
+            let gdb_opt = hooks::open_global_ldb_checked(None)?;
             let seal_guard =
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
             let (db, _) = hooks::open_project_ldb_silent(db_path)?;
@@ -1325,7 +1366,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             let t0 = Instant::now();
             let db_path = Path::new(&args[1]);
-            let gdb_opt = hooks::open_global_ldb_if_exists(None);
+            let gdb_opt = hooks::open_global_ldb_checked(None)?;
             let seal_guard =
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
             let db = Arc::new(LibreDb::open(db_path)?);
@@ -1448,7 +1489,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let db_path = Path::new(&args[1]);
-            let gdb_opt = hooks::open_global_ldb_if_exists(None);
+            let gdb_opt = hooks::open_global_ldb_checked(None)?;
             let seal_guard =
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
             let db = LibreDb::open(db_path)?;
@@ -1496,7 +1537,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 weight = args[6].parse()?;
             }
             let db_path = Path::new(&args[1]);
-            let gdb_opt = hooks::open_global_ldb_if_exists(None);
+            let gdb_opt = hooks::open_global_ldb_checked(None)?;
             let seal_guard =
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
             let db = LibreDb::open(db_path)?;
@@ -1517,7 +1558,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let kind = NodeKind::parse(&args[2])
                 .ok_or_else(|| format!("Unknown node kind '{}'", args[2]))?;
             let db_path = Path::new(&args[1]);
-            let gdb_opt = hooks::open_global_ldb_if_exists(None);
+            let gdb_opt = hooks::open_global_ldb_checked(None)?;
             let seal_guard =
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
             let db = LibreDb::open(db_path)?;
@@ -1606,7 +1647,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let prune = args.iter().skip(2).any(|a| a == "--prune");
             let t0 = Instant::now();
             let db_path = Path::new(&args[1]);
-            let gdb_opt = hooks::open_global_ldb_if_exists(None);
+            let gdb_opt = hooks::open_global_ldb_checked(None)?;
             let seal_guard =
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
             let (db, _) = hooks::open_project_ldb_silent(db_path)?;
@@ -2187,7 +2228,7 @@ fn modernize_global_db(
     // unverified or offline-modified `.agents/memory.ldb` databases during global upgrades!
     let mut verified_workspaces = 0usize;
     let mut quarantined_workspaces = 0usize;
-    for (_, raw_ws) in security::list_trusted_workspaces(gdb) {
+    for (_, raw_ws) in security::list_trusted_workspaces(gdb)? {
         let ws_path = PathBuf::from(raw_ws.trim());
         let ldb_p = ws_path.join(".agents").join("memory.ldb");
         if ws_path.is_dir()
@@ -2200,6 +2241,14 @@ fn modernize_global_db(
                 if security::is_unsealed_replacement_of_sealed_workspace(gdb, &ws_path) {
                     println!(
                         "[WARN] Quarantined workspace '{}': previously sealed .agents/memory.ldb is missing, unsealed, or rolled back to empty; restore from backup or run 'libredb trust --reinit-lost \"{}\"' to re-initialize.",
+                        ws_path.display(),
+                        ws_path.display()
+                    );
+                } else if let Some((proj_rev, global_rev)) =
+                    security::detect_workspace_seal_rollback(gdb, &ws_path)?
+                {
+                    println!(
+                        "[WARN] Quarantined workspace '{}': .agents/memory.ldb carries older seal revision r{proj_rev} while host customizations.ldb requires at least r{global_rev} (historical snapshot rollback detected); restore latest .agents/memory.ldb or run 'libredb trust --accept-rollback \"{}\"' to accept.",
                         ws_path.display(),
                         ws_path.display()
                     );

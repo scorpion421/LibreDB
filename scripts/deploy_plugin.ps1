@@ -97,7 +97,7 @@ $PluginJson = @'
 {
   "name": "libredb",
   "displayName": "LibreDB Cognitive Memory",
-  "version": "0.9.7",
+  "version": "0.9.8",
   "description": "Enterprise-ready Rust cognitive memory & MCP code graph: single-file LIBREDB1 storage, silent SQLite auto-porter, sub-2ms hooks, content-bound HMAC-SHA256 workspace trust seals, DPAPI / ChaCha20-Poly1305 credential vault, 20-language DI-aware causal code graph, and multi-remote Git/Gitea/GitHub automation.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
@@ -338,7 +338,7 @@ description: >-
 
 - **Guardrails:** `libredb guardrail check --path "<dir>" [--staged] [--strict]`
 - **Workspace trust & universal config:**
-  - `libredb trust [<dir>] [--revoke] [--list] [--reinit-lost] [--migrate-v3 [--confirm-metadata]] [--migrate-v2] [--if-clean]`
+  - `libredb trust [<dir>] [--revoke] [--list] [--accept-rollback] [--reinit-lost] [--migrate-v3 [--confirm-metadata]] [--migrate-v2] [--if-clean]`
   - `libredb config <get|set|unset|list> [<key>] [<value>] [--project "<dir>"]`
 - **Compaction & GC:** `libredb compact <db.ldb> [--prune]`
 - **Rules, skills & reflexes:**
@@ -405,11 +405,11 @@ $LogoSvg = @'
 
 # 7. Write user-facing README.md inside plugin bundle
 $PluginReadme = @'
-# LibreDB cognitive memory plugin (v0.9.7)
+# LibreDB cognitive memory plugin (v0.9.8)
 
 Enterprise-ready standalone Rust cognitive memory & code-graph engine for `Antigravity`:
 - `libredb-mcp`: 3-tool multi-workspace cognitive memory & 20-language zero-hardcode heuristic DI code-graph server with interface/implementation resolution (`implementors`), zero-I/O RAM session delta, `[Zero-Repeat Skeleton]` deduplication, and corpus-`IDF` call-graph disambiguation.
-- Standards-compliant security: content-bound RFC 2104 `HMAC-SHA256` (`v3`) workspace trust seals (`libredb trust`), Windows `DPAPI` (`CryptProtectData`) and POSIX RFC 8439 `ChaCha20-Poly1305` AEAD OS credential vault, symlink-canonicalized control-plane & credential path protection (`hooks.json`, `mcp_config.json`, `.git/hooks/*`, `.env`), and universal `libredb config` customization.
+- Standards-compliant security: monotonic content-and-metadata-bound RFC 2104 `HMAC-SHA256` (`v4:r<rev>`) workspace trust seals (`libredb trust`), Windows `DPAPI` (`CryptProtectData`) and POSIX RFC 8439 `ChaCha20-Poly1305` AEAD OS credential vault, symlink-canonicalized control-plane & credential path protection (`hooks.json`, `mcp_config.json`, `.git/hooks/*`, `.env`), and universal `libredb config` customization.
 - Strictly neutral by default: `deploy_plugin.ps1` (`-Profile Neutral`, default) installs `libredb-mcp` and security guardrails with `0` personal rules, `0` implicit legacy DB imports, and preserved corporate `git config` identity; pass `-Profile Personal` for maintainer rules, `-MigrateLegacy` to import legacy `customizations.db`, or `-NoHooks` for MCP-only evaluation.
 - Compaction garbage collection (`compact_with_options`, `maybe_auto_compact`) and `INDEX_FORMAT_VERSION = 4` `HybridIndex` with dead-posting garbage collection across superseded Inodes.
 '@
@@ -434,6 +434,6 @@ if (Test-Path $AgyConfigPath) {
     }
 }
 
-Write-Output "[OK] Deployed LibreDB v0.9.7 standalone binaries to: $BinDir (Profile=$Profile)"
+Write-Output "[OK] Deployed LibreDB v0.9.8 standalone binaries to: $BinDir (Profile=$Profile)"
 Write-Output "[OK] Hydrated and modernized global store at: $GlobalLdb"
 Write-Output "[OK] Installed complete Antigravity plugin at: $PluginDir"

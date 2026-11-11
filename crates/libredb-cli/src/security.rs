@@ -1,7 +1,7 @@
 //! Standards-compliant OS secret vault (Windows DPAPI `CryptProtectData` / POSIX `0600` keyfile
 //! with RFC 8439 `ChaCha20-Poly1305` AEAD and safe read-only `vault:v1:` -> `vault:v2:` migration),
-//! content-authenticated RFC 2104 `HMAC-SHA256` workspace trust seals (`hmac-sha256:v3:`),
-//! and canonical/symlink-aware control-plane & credential path policies.
+//! revision-monotonic metadata-and-content-authenticated RFC 2104 `HMAC-SHA256` workspace trust seals
+//! (`hmac-sha256:v4:r<rev>:`), and canonical/symlink-aware control-plane & credential path policies.
 
 use crate::hooks::user_home_dir;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
@@ -9,7 +9,8 @@ use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use hmac::{Hmac, Mac};
 use libredb_core::crc::{count_tokens_exact, hash_key};
 use libredb_core::{
-    EdgeKind, LibreDb, NodeFlags, NodeKind, OsFileBackend, StorageBackend, WriteRequest,
+    EdgeKind, LibreDb, LibreDbError, NodeFlags, NodeKind, OsFileBackend, StorageBackend,
+    WriteRequest,
 };
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -26,6 +27,7 @@ const CONTENT_DIGEST_DOMAIN: &[u8] = b"LibreDB::CognitiveContent::v4\0";
 const SEAL_V2_DOMAIN_SEP: &[u8] = b"LibreDB::WorkspaceTrustSeal::v2\0";
 const SEAL_V3_DOMAIN_SEP: &[u8] = b"LibreDB::WorkspaceTrustSeal::v3\0";
 const SEAL_V4_DOMAIN_SEP: &[u8] = b"LibreDB::WorkspaceTrustSeal::v4\0";
+const SEAL_V4_REV_DOMAIN_SEP: &[u8] = b"LibreDB::WorkspaceTrustSeal::v4r\0";
 const TRUST_SECRET_KEY: &str = "sys::trust_anchor_secret";
 const TRUST_SEALS_KEY: &str = "sys::trust_seals";
 
@@ -376,32 +378,94 @@ pub fn normalize_workspace_key(path: &Path) -> String {
     }
 }
 
+/// Synchronizes external cross-process commits to `customizations.ldb` and fails closed if the
+/// global database file on disk cannot be stat'd, read, or decoded (e.g. superblock/delta corruption).
+/// Prevents long-lived processes (`libredb-mcp`) or multi-handle callers from consulting stale RAM trust!
+pub fn check_global_trust_sync(global_db: &LibreDb) -> Result<(), String> {
+    global_db.sync_from_disk_if_changed().map(|_| ()).map_err(|e| {
+        format!(
+            "Failed to synchronize global customizations.ldb from disk (failing closed): {e}"
+        )
+    })
+}
+
+/// Checks whether a `NodeKind::Config` key exists in `db`, treating ONLY `LibreDbError::KeyNotFound`
+/// as `Ok(false)` and propagating any storage/checksum/corruption error as `Err` (fail-closed).
+fn has_config_key_fail_closed(db: &LibreDb, key: &str) -> Result<bool, String> {
+    match db.get_by_key(NodeKind::Config, key) {
+        Ok(_) => Ok(true),
+        Err(LibreDbError::KeyNotFound { .. }) => Ok(false),
+        Err(e) => Err(format!(
+            "Corrupt or unreadable Config key '{key}' in LibreDB (failing closed): {e}"
+        )),
+    }
+}
+
+fn deprecate_config_if_present(db: &LibreDb, key: &str) -> Result<(), String> {
+    db.deprecate_key(NodeKind::Config, key)
+        .map(|_| ())
+        .map_err(|e| format!("Failed to update Config key '{key}': {e}"))
+}
+
+fn read_global_seal_revision(global_db: &LibreDb, norm: &str) -> Result<u64, String> {
+    let rev_key = format!("trust:seal_rev::{norm}");
+    match global_db.get_by_key(NodeKind::Config, &rev_key) {
+        Ok(rec) => {
+            let raw = std::str::from_utf8(&rec.payload)
+                .map_err(|e| {
+                    format!("Corrupt UTF-8 in '{rev_key}' inside customizations.ldb: {e}")
+                })?
+                .trim();
+            let parsed = raw.parse::<u64>().map_err(|e| {
+                format!("Corrupt seal revision '{raw}' in '{rev_key}' inside customizations.ldb: {e}")
+            })?;
+            if parsed == 0 || parsed.to_string() != raw {
+                return Err(format!(
+                    "Non-canonical seal revision '{raw}' in '{rev_key}' inside customizations.ldb"
+                ));
+            }
+            Ok(parsed)
+        }
+        Err(LibreDbError::KeyNotFound { .. }) => Ok(0),
+        Err(e) => Err(format!(
+            "Failed to read '{rev_key}' from customizations.ldb (failing closed): {e}"
+        )),
+    }
+}
+
 /// Returns true if `ws_root` is recorded as an authorized workspace path in `global_db` (and not revoked).
+/// Fails closed (`false`) if `global_db` cannot synchronize from disk or encounters any storage corruption.
+#[cfg(test)]
 pub fn is_workspace_path_authorized(global_db: Option<&LibreDb>, ws_root: &Path) -> bool {
     let Some(gdb) = global_db else {
         return false;
     };
-    let norm = normalize_workspace_key(ws_root);
-    if gdb
-        .get_by_key(NodeKind::Config, &format!("trust:revoked::{norm}"))
-        .is_ok()
-    {
+    if check_global_trust_sync(gdb).is_err() {
         return false;
     }
-    if gdb
-        .get_by_key(NodeKind::Config, &format!("trust:allowed::{norm}"))
-        .is_ok()
-    {
-        return true;
+    is_workspace_path_authorized_synced(gdb, ws_root)
+}
+
+fn is_workspace_path_authorized_synced(gdb: &LibreDb, ws_root: &Path) -> bool {
+    let norm = normalize_workspace_key(ws_root);
+    match has_config_key_fail_closed(gdb, &format!("trust:revoked::{norm}")) {
+        Ok(false) => {}
+        _ => return false,
+    }
+    match has_config_key_fail_closed(gdb, &format!("trust:allowed::{norm}")) {
+        Ok(true) => return true,
+        Ok(false) => {}
+        Err(_) => return false,
     }
     for (ino, key_opt, _) in gdb.list_inodes(Some(NodeKind::Config), false) {
         if let Some(k) = key_opt {
             if k.starts_with("workspace:") {
-                if let Ok(rec) = gdb.get(ino.node_id) {
-                    let existing_p = PathBuf::from(String::from_utf8_lossy(&rec.payload).trim());
-                    if normalize_workspace_key(&existing_p) == norm {
-                        return true;
-                    }
+                let Ok(rec) = gdb.get(ino.node_id) else {
+                    return false;
+                };
+                let existing_p = PathBuf::from(String::from_utf8_lossy(&rec.payload).trim());
+                if normalize_workspace_key(&existing_p) == norm {
+                    return true;
                 }
             }
         }
@@ -648,25 +712,26 @@ pub(crate) fn compute_legacy_cognitive_content_digest_v3(
 }
 
 /// Returns `true` if `global_db` (`customizations.ldb`) records that `ws_root` has ever been
-/// cryptographically sealed (`trust:sealed::<ws>`, `trust:v4_upgraded::<ws>`, or `trust:v3_upgraded::<ws>`).
-/// Once set, deleting `.agents/memory.ldb` or replacing it with an unsealed database MUST fail closed
-/// until explicitly re-initialized via `libredb trust --reinit-lost "<dir>"`.
+/// cryptographically sealed (`trust:sealed::<ws>`, `trust:seal_rev::<ws>`, `trust:v4_upgraded::<ws>`,
+/// or `trust:v3_upgraded::<ws>`). Conservative fail-closed: if `global_db` cannot synchronize from
+/// disk or read its config keys cleanly, returns `true` so missing/unsealed workspace DBs are never
+/// misclassified as fresh first-time setups.
 pub fn has_prior_workspace_seal_marker(global_db: &LibreDb, ws_root: &Path) -> bool {
-    let _ = global_db.sync_from_disk_if_changed();
+    if check_global_trust_sync(global_db).is_err() {
+        return true;
+    }
     let norm = normalize_workspace_key(ws_root);
-    has_prior_workspace_seal_marker_norm(global_db, &norm)
+    has_prior_workspace_seal_marker_norm_checked(global_db, &norm).unwrap_or(true)
 }
 
-fn has_prior_workspace_seal_marker_norm(global_db: &LibreDb, norm: &str) -> bool {
-    global_db
-        .get_by_key(NodeKind::Config, &format!("trust:sealed::{norm}"))
-        .is_ok()
-        || global_db
-            .get_by_key(NodeKind::Config, &format!("trust:v4_upgraded::{norm}"))
-            .is_ok()
-        || global_db
-            .get_by_key(NodeKind::Config, &format!("trust:v3_upgraded::{norm}"))
-            .is_ok()
+fn has_prior_workspace_seal_marker_norm_checked(
+    global_db: &LibreDb,
+    norm: &str,
+) -> Result<bool, String> {
+    Ok(has_config_key_fail_closed(global_db, &format!("trust:sealed::{norm}"))?
+        || has_config_key_fail_closed(global_db, &format!("trust:seal_rev::{norm}"))?
+        || has_config_key_fail_closed(global_db, &format!("trust:v4_upgraded::{norm}"))?
+        || has_config_key_fail_closed(global_db, &format!("trust:v3_upgraded::{norm}"))?)
 }
 
 /// Returns `true` when `ws_root` was previously sealed on this host, yet `.agents/memory.ldb` is now
@@ -674,27 +739,29 @@ fn has_prior_workspace_seal_marker_norm(global_db: &LibreDb, norm: &str) -> bool
 /// cognitive capsules after previously sealing `>= 1` cognitive capsules (`trust:nonempty_sealed::<ws>`).
 /// Used to enforce explicit separation between initial workspace setup and post-loss recovery (`--reinit-lost`).
 pub fn is_unsealed_replacement_of_sealed_workspace(global_db: &LibreDb, ws_root: &Path) -> bool {
-    let _ = global_db.sync_from_disk_if_changed();
-    let norm = normalize_workspace_key(ws_root);
-    if !has_prior_workspace_seal_marker_norm(global_db, &norm) {
+    if check_global_trust_sync(global_db).is_err() {
         return false;
     }
+    let norm = normalize_workspace_key(ws_root);
+    let Ok(true) = has_prior_workspace_seal_marker_norm_checked(global_db, &norm) else {
+        return false;
+    };
     let ldb_path = ws_root.join(".agents").join("memory.ldb");
     if !ldb_path.is_file() {
         return true;
     }
-    let is_revoked = global_db
-        .get_by_key(NodeKind::Config, &format!("trust:revoked::{norm}"))
-        .is_ok();
+    let Ok(is_revoked) = has_config_key_fail_closed(global_db, &format!("trust:revoked::{norm}"))
+    else {
+        return false;
+    };
     let Ok(pdb) = LibreDb::open(&ldb_path) else {
         return false;
     };
     if !is_revoked && pdb.get_by_key(NodeKind::Config, TRUST_SEALS_KEY).is_err() {
         return true;
     }
-    if global_db
-        .get_by_key(NodeKind::Config, &format!("trust:nonempty_sealed::{norm}"))
-        .is_ok()
+    if has_config_key_fail_closed(global_db, &format!("trust:nonempty_sealed::{norm}"))
+        .unwrap_or(false)
     {
         if let Ok((_, capsule_count)) = compute_cognitive_content_digest(&pdb) {
             if capsule_count == 0 {
@@ -705,22 +772,76 @@ pub fn is_unsealed_replacement_of_sealed_workspace(global_db: &LibreDb, ws_root:
     false
 }
 
+/// Detects whether `<ws_root>/.agents/memory.ldb` carries an authentic `HMAC-SHA256` seal for this
+/// host whose authenticated revision `proj_rev` is strictly older than `global_rev` recorded in
+/// `customizations.ldb` (`trust:seal_rev::<ws>`), returning `Ok(Some((proj_rev, global_rev)))` when
+/// a historical snapshot rollback is detected and propagating any `global_db` sync/read failure as `Err`.
+pub fn detect_workspace_seal_rollback(
+    global_db: &LibreDb,
+    ws_root: &Path,
+) -> Result<Option<(u64, u64)>, String> {
+    check_global_trust_sync(global_db)?;
+    let norm = normalize_workspace_key(ws_root);
+    let global_rev = read_global_seal_revision(global_db, &norm)?;
+    if global_rev == 0 {
+        return Ok(None);
+    }
+    let ldb_path = ws_root.join(".agents").join("memory.ldb");
+    if !ldb_path.is_file() {
+        return Ok(None);
+    }
+    let Ok(pdb) = LibreDb::open(&ldb_path) else {
+        return Ok(None);
+    };
+    let Ok((content_digest, capsule_count)) = compute_cognitive_content_digest(&pdb) else {
+        return Ok(None);
+    };
+    let nonempty_ratcheted =
+        has_config_key_fail_closed(global_db, &format!("trust:nonempty_sealed::{norm}"))?;
+    if nonempty_ratcheted && capsule_count == 0 {
+        // 0-capsule wipe of a previously populated workspace is classified under `--reinit-lost`.
+        return Ok(None);
+    }
+    let Ok(rec) = pdb.get_by_key(NodeKind::Config, TRUST_SEALS_KEY) else {
+        return Ok(None);
+    };
+    let already_v4_ratcheted =
+        has_config_key_fail_closed(global_db, &format!("trust:v4_upgraded::{norm}"))?;
+    let mut secret = ensure_trust_anchor_secret(global_db)?;
+    let seals_txt = String::from_utf8_lossy(&rec.payload);
+    let proj_rev_opt = verify_and_extract_host_seal_rev(
+        &secret,
+        &norm,
+        &content_digest,
+        &seals_txt,
+        already_v4_ratcheted,
+    );
+    secure_zero(&mut secret);
+    if let Some(proj_rev) = proj_rev_opt {
+        if proj_rev < global_rev {
+            return Ok(Some((proj_rev, global_rev)));
+        }
+    }
+    Ok(None)
+}
+
 /// Returns `true` strictly for diagnostic classification when `<ws_root>/.agents/memory.ldb`
 /// has NOT yet been upgraded to `v4` on this host and carries an authentic `v0.9.1..v0.9.3`
 /// `hmac-sha256:v3:` tag over `CognitiveContent::v3`. Never grants runtime trust on its own.
 pub fn has_valid_legacy_v3_content_seal(global_db: &LibreDb, ws_root: &Path) -> bool {
-    let _ = global_db.sync_from_disk_if_changed();
+    if check_global_trust_sync(global_db).is_err() {
+        return false;
+    }
     let norm = normalize_workspace_key(ws_root);
-    if global_db
-        .get_by_key(NodeKind::Config, &format!("trust:revoked::{norm}"))
-        .is_ok()
-        || global_db
-            .get_by_key(NodeKind::Config, &format!("trust:v4_upgraded::{norm}"))
-            .is_ok()
+    if has_config_key_fail_closed(global_db, &format!("trust:revoked::{norm}")).unwrap_or(true)
+        || has_config_key_fail_closed(global_db, &format!("trust:v4_upgraded::{norm}"))
+            .unwrap_or(true)
+        || has_config_key_fail_closed(global_db, &format!("trust:seal_rev::{norm}"))
+            .unwrap_or(true)
     {
         return false;
     }
-    if !is_workspace_path_authorized(Some(global_db), ws_root) {
+    if !is_workspace_path_authorized_synced(global_db, ws_root) {
         return false;
     }
     let ldb_path = ws_root.join(".agents").join("memory.ldb");
@@ -755,16 +876,17 @@ pub fn has_valid_legacy_v3_content_seal(global_db: &LibreDb, ws_root: &Path) -> 
     })
 }
 
-/// Determines whether `<ws_root>/.agents/memory.ldb` (or `.db`) is trusted AND untampered:
+/// Determines whether `<ws_root>/.agents/memory.ldb` (or `.db`) is trusted, untampered, AND at the
+/// current monotonic workspace revision (`proj_rev >= global_rev`):
 /// 1. Private Antigravity conversation brain (`~/.gemini/antigravity*/brain/<cid>`) -> `true`.
-/// 2. Explicit revocation (`trust:revoked::<ws>`) -> `false`.
-/// 3. Git-tracked `.agents/memory.*` inside `.git/index` -> `false` unless explicitly sealed via `libredb trust`.
-/// 4. Brand-new workspace where neither `.ldb` nor `.db` exists yet AND no prior seal marker exists -> `true`.
-///    (Once a workspace has been sealed on this host, deleting `.agents/memory.ldb`, replacing it with an
-///    empty unsealed `.agents/memory.ldb`, or rolling a populated database back to `0` capsules fails closed!)
-/// 5. Existing `.agents/memory.ldb` with cognitive capsules (or any previously sealed workspace) MUST carry a
-///    valid `v4`-digest HMAC seal authenticating both `normalized_ws_key` AND `compute_cognitive_content_digest(&pdb)`.
-///    Legacy `v0.9.3` (`CognitiveContent::v3`) databases fail closed until migrated via `libredb trust --migrate-v3`.
+/// 2. `global_db` disk synchronization or config read failure -> `false` (strict fail-closed).
+/// 3. Explicit revocation (`trust:revoked::<ws>`) -> `false`.
+/// 4. Git-tracked `.agents/memory.*` inside `.git/index` -> `false` unless explicitly sealed via `libredb trust`.
+/// 5. Brand-new workspace where neither `.ldb` nor `.db` exists yet AND no prior seal marker exists -> `true`.
+/// 6. Existing `.agents/memory.ldb` MUST carry a valid `v4` HMAC seal authenticating `(norm, content_digest, proj_rev)`
+///    with `proj_rev >= global_rev` (`trust:seal_rev::<ws>`). Replaying any older non-empty `v4`-sealed snapshot
+///    (`proj_rev < global_rev`) fails closed until restored or explicitly accepted via `libredb trust --accept-rollback`,
+///    while a mid-commit crash after Phase 1 (`proj_rev == global_rev + 1`) remains seamlessly valid (`N + 1 >= N`).
 pub fn is_workspace_memory_trusted(global_db: Option<&LibreDb>, ws_root: &Path) -> bool {
     if is_private_brain_workspace(ws_root) {
         return true;
@@ -775,29 +897,40 @@ pub fn is_workspace_memory_trusted(global_db: Option<&LibreDb>, ws_root: &Path) 
         let agents_dir = ws_root.join(".agents");
         return !agents_dir.join("memory.ldb").exists() && !agents_dir.join("memory.db").exists();
     };
-    let _ = gdb.sync_from_disk_if_changed();
-
-    if gdb
-        .get_by_key(NodeKind::Config, &format!("trust:revoked::{norm}"))
-        .is_ok()
-    {
+    if check_global_trust_sync(gdb).is_err() {
         return false;
     }
-    let explicitly_allowed = gdb
-        .get_by_key(NodeKind::Config, &format!("trust:allowed::{norm}"))
-        .is_ok();
+
+    match has_config_key_fail_closed(gdb, &format!("trust:revoked::{norm}")) {
+        Ok(false) => {}
+        _ => return false,
+    }
+    let Ok(explicitly_allowed) =
+        has_config_key_fail_closed(gdb, &format!("trust:allowed::{norm}"))
+    else {
+        return false;
+    };
 
     if is_git_index_tracking_agents_db(ws_root) && !explicitly_allowed {
         return false;
     }
 
-    let has_prior_seal = has_prior_workspace_seal_marker_norm(gdb, &norm);
-    let already_v4_ratcheted = gdb
-        .get_by_key(NodeKind::Config, &format!("trust:v4_upgraded::{norm}"))
-        .is_ok();
-    let nonempty_ratcheted = gdb
-        .get_by_key(NodeKind::Config, &format!("trust:nonempty_sealed::{norm}"))
-        .is_ok();
+    let Ok(has_prior_seal) = has_prior_workspace_seal_marker_norm_checked(gdb, &norm) else {
+        return false;
+    };
+    let Ok(already_v4_ratcheted) =
+        has_config_key_fail_closed(gdb, &format!("trust:v4_upgraded::{norm}"))
+    else {
+        return false;
+    };
+    let Ok(nonempty_ratcheted) =
+        has_config_key_fail_closed(gdb, &format!("trust:nonempty_sealed::{norm}"))
+    else {
+        return false;
+    };
+    let Ok(global_rev) = read_global_seal_revision(gdb, &norm) else {
+        return false;
+    };
 
     let agents_dir = ws_root.join(".agents");
     let ldb_path = agents_dir.join("memory.ldb");
@@ -805,14 +938,15 @@ pub fn is_workspace_memory_trusted(global_db: Option<&LibreDb>, ws_root: &Path) 
     if !ldb_path.exists() && !db_path.exists() {
         // Once a workspace has been sealed on this host, external deletion of `.agents/memory.ldb`
         // MUST fail closed rather than silently re-authorizing a blank replacement database.
-        return !has_prior_seal;
+        return !has_prior_seal && global_rev == 0;
     }
 
-    let path_authorized = explicitly_allowed || is_workspace_path_authorized(Some(gdb), ws_root);
+    let path_authorized =
+        explicitly_allowed || is_workspace_path_authorized_synced(gdb, ws_root);
     if !ldb_path.is_file() {
         // Monotonic anti-downgrade guard: if this workspace was already sealed on this host,
         // deleting `.agents/memory.ldb` and planting a legacy `.agents/memory.db` must NOT bypass seal checks.
-        if has_prior_seal {
+        if has_prior_seal || global_rev > 0 {
             return false;
         }
         return path_authorized;
@@ -831,60 +965,95 @@ pub fn is_workspace_memory_trusted(global_db: Option<&LibreDb>, ws_root: &Path) 
     let Ok(mut secret) = ensure_trust_anchor_secret(gdb) else {
         return false;
     };
-    let host_tag = compute_host_seal_slot_id(&secret, &norm);
-    let expected_v4 = compute_workspace_seal_v4(&secret, &norm, &content_digest);
-    let expected_slot_v4 = format!("{host_tag}={expected_v4}");
-    let expected_v3_over_v4 = compute_workspace_seal_v3(&secret, &norm, &content_digest);
-    let expected_slot_v3_over_v4 = format!("{host_tag}={expected_v3_over_v4}");
-    secure_zero(&mut secret);
 
-    if let Ok(rec) = pdb.get_by_key(NodeKind::Config, TRUST_SEALS_KEY) {
-        let seals = String::from_utf8_lossy(&rec.payload);
-        let has_host_v4_slot = seals
-            .lines()
-            .any(|l| l.trim().starts_with(&format!("{host_tag}=hmac-sha256:v4:")));
-        if seals.lines().any(|line| {
-            let trimmed = line.trim().as_bytes();
-            constant_time_eq(trimmed, expected_v4.as_bytes())
-                || constant_time_eq(trimmed, expected_slot_v4.as_bytes())
-        }) {
-            return true;
+    match pdb.get_by_key(NodeKind::Config, TRUST_SEALS_KEY) {
+        Ok(rec) => {
+            let seals = String::from_utf8_lossy(&rec.payload);
+            let proj_rev_opt = verify_and_extract_host_seal_rev(
+                &secret,
+                &norm,
+                &content_digest,
+                &seals,
+                already_v4_ratcheted,
+            );
+            secure_zero(&mut secret);
+            matches!(proj_rev_opt, Some(proj_rev) if proj_rev >= global_rev)
         }
-        // Seamless compatibility for `v0.9.4`/`v0.9.5` workspaces (which already hashed `CognitiveContent::v4`
-        // under `hmac-sha256:v3:`) prior to their first `v4` ratchet write on this host:
-        if !already_v4_ratcheted
-            && !has_host_v4_slot
-            && seals.lines().any(|line| {
-                let trimmed = line.trim().as_bytes();
-                constant_time_eq(trimmed, expected_v3_over_v4.as_bytes())
-                    || constant_time_eq(trimmed, expected_slot_v3_over_v4.as_bytes())
-            })
-        {
-            return true;
+        Err(LibreDbError::KeyNotFound { .. }) => {
+            secure_zero(&mut secret);
+            // Allow cache-only `.agents/memory.ldb` (0 cognitive capsules, e.g. fresh `index-workspace` symbols only)
+            // ONLY when the workspace has NEVER been sealed before on this host.
+            !has_prior_seal && global_rev == 0 && capsule_count == 0 && path_authorized
         }
-        return false;
+        Err(_) => {
+            secure_zero(&mut secret);
+            false
+        }
     }
-
-    // Allow cache-only `.agents/memory.ldb` (0 cognitive capsules, e.g. fresh `index-workspace` symbols only)
-    // ONLY when the workspace has NEVER been sealed before on this host. Once sealed, an unsealed replacement
-    // `.agents/memory.ldb` lacking `sys::trust_seals` MUST fail closed!
-    !has_prior_seal && capsule_count == 0 && path_authorized
 }
 
-/// Cryptographically seals both `ws_root` and the `v4` SHA-256 content+metadata+synapse digest of `proj_db`'s
-/// cognitive capsules via RFC 2104 `HMAC-SHA256` (`hmac-sha256:v4:<64-hex>`), replacing any stale seal for
-/// this host's secret while preserving up to 7 roaming workstation seals on shared drives (`Q:\`).
+/// Cryptographically seals `ws_root`, the `v4` SHA-256 content+metadata+synapse digest of `proj_db`'s
+/// cognitive capsules, AND a monotonically advancing per-workspace seal revision `r<rev>` (`>= 1`) via
+/// RFC 2104 `HMAC-SHA256` (`hmac-sha256:v4:r<rev>:<64-hex>`), using a crash-consistent two-phase commit:
+/// - **Phase 1 (`proj_db`):** Commits + `fsync`s `hmac-sha256:v4:r<target_rev>:<hex>` into `sys::trust_seals`.
+///   (If the process crashes right after Phase 1, `proj_rev (N+1) >= global_rev (N)` stays valid!)
+/// - **Phase 2 (`global_db`):** Commits + `fsync`s `trust:seal_rev::<ws> = <target_rev>` into `customizations.ldb`,
+///   invalidating any older captured non-empty `.agents/memory.ldb` snapshot (`proj_rev < global_rev`).
 pub fn seal_workspace_memory(
     global_db: &LibreDb,
     proj_db: &LibreDb,
     ws_root: &Path,
 ) -> Result<(), String> {
-    let _ = global_db.sync_from_disk_if_changed();
+    check_global_trust_sync(global_db)?;
     let norm = normalize_workspace_key(ws_root);
+    let global_rev = read_global_seal_revision(global_db, &norm)?;
+    let already_v4_ratcheted =
+        has_config_key_fail_closed(global_db, &format!("trust:v4_upgraded::{norm}"))?;
     let (content_digest, capsule_count) = compute_cognitive_content_digest(proj_db)?;
+
+    let existing_seals_txt = match proj_db.get_by_key(NodeKind::Config, TRUST_SEALS_KEY) {
+        Ok(rec) => String::from_utf8_lossy(&rec.payload).into_owned(),
+        Err(LibreDbError::KeyNotFound { .. }) => String::new(),
+        Err(e) => {
+            return Err(format!(
+                "Failed to read existing sys::trust_seals in workspace memory: {e}"
+            ));
+        }
+    };
+
     let mut secret = ensure_trust_anchor_secret(global_db)?;
     let host_tag = compute_host_seal_slot_id(&secret, &norm);
-    let bare_seal = compute_workspace_seal_v4(&secret, &norm, &content_digest);
+    let existing_valid_rev = if existing_seals_txt.is_empty() {
+        None
+    } else {
+        verify_and_extract_host_seal_rev(
+            &secret,
+            &norm,
+            &content_digest,
+            &existing_seals_txt,
+            already_v4_ratcheted,
+        )
+    };
+    let target_rev = match existing_valid_rev {
+        Some(r) if r >= 1 && r >= global_rev => r,
+        _ => {
+            let prev_slot_rev = extract_syntactic_host_slot_rev(&existing_seals_txt, &host_tag);
+            let bounded_prev = if prev_slot_rev <= global_rev.saturating_add(1024) {
+                prev_slot_rev
+            } else {
+                0
+            };
+            let next_res = global_rev.max(bounded_prev).checked_add(1);
+            match next_res {
+                Some(next_rev) => next_rev,
+                None => {
+                    secure_zero(&mut secret);
+                    return Err("Workspace seal revision counter overflowed u64".to_owned());
+                }
+            }
+        }
+    };
+    let bare_seal = compute_workspace_seal_v4_rev(&secret, &norm, &content_digest, target_rev);
     let seal_line = format!("{host_tag}={bare_seal}");
     secure_zero(&mut secret);
 
@@ -892,28 +1061,24 @@ pub fn seal_workspace_memory(
     // or running `libredb trust --reinit-lost`), clear `trust:nonempty_sealed` BEFORE writing `proj_db`
     // so concurrent readers never observe `nonempty_ratcheted && capsule_count == 0`.
     let nonempty_key = format!("trust:nonempty_sealed::{norm}");
-    if capsule_count == 0 && global_db.get_by_key(NodeKind::Config, &nonempty_key).is_ok() {
-        let _ = global_db.deprecate_key(NodeKind::Config, &nonempty_key);
+    if capsule_count == 0 && has_config_key_fail_closed(global_db, &nonempty_key)? {
+        deprecate_config_if_present(global_db, &nonempty_key)?;
     }
 
-    let mut seals: Vec<String> = proj_db
-        .get_by_key(NodeKind::Config, TRUST_SEALS_KEY)
-        .ok()
-        .map(|r| {
-            String::from_utf8_lossy(&r.payload)
-                .lines()
-                .map(str::trim)
-                .filter(|s| {
-                    !s.is_empty()
-                        && !s.starts_with(&format!("{host_tag}="))
-                        && !s.starts_with("hmac-sha256:v2:")
-                        && !s.starts_with("hmac-sha256:v3:")
-                        && !s.starts_with("hmac-sha256:v4:")
-                })
-                .map(ToOwned::to_owned)
-                .collect()
+    // Phase 1: Write and fsync `hmac-sha256:v4:r<target_rev>:<hex>` into `proj_db` FIRST so any
+    // concurrent reader or mid-commit crash observes `proj_rev >= global_rev` (zero false quarantine).
+    let mut seals: Vec<String> = existing_seals_txt
+        .lines()
+        .map(str::trim)
+        .filter(|s| {
+            !s.is_empty()
+                && !s.starts_with(&format!("{host_tag}="))
+                && !s.starts_with("hmac-sha256:v2:")
+                && !s.starts_with("hmac-sha256:v3:")
+                && !s.starts_with("hmac-sha256:v4:")
         })
-        .unwrap_or_default();
+        .map(ToOwned::to_owned)
+        .collect();
 
     seals.push(bare_seal);
     seals.push(seal_line);
@@ -922,11 +1087,7 @@ pub fn seal_workspace_memory(
         seals.drain(0..drain_cnt);
     }
     let body = seals.join("\n");
-    let unchanged = proj_db
-        .get_by_key(NodeKind::Config, TRUST_SEALS_KEY)
-        .map(|r| r.payload == body.as_bytes())
-        .unwrap_or(false);
-    if !unchanged {
+    if existing_seals_txt.as_bytes() != body.as_bytes() {
         proj_db
             .put(
                 WriteRequest::new(NodeKind::Config, body.into_bytes())
@@ -936,15 +1097,17 @@ pub fn seal_workspace_memory(
             .map_err(|e| e.to_string())?;
     }
 
-    let _ = global_db.deprecate_key(NodeKind::Config, &format!("trust:revoked::{norm}"));
+    // Phase 2: Commit monotonic `trust:seal_rev::<ws>` and ratchets into `global_db`.
+    deprecate_config_if_present(global_db, &format!("trust:revoked::{norm}"))?;
     let clean_display = crate::gitea::strip_verbatim_prefix(ws_root)
         .to_string_lossy()
         .into_owned();
     let allow_key = format!("trust:allowed::{norm}");
-    let already_recorded = global_db
-        .get_by_key(NodeKind::Config, &allow_key)
-        .map(|r| r.payload == clean_display.as_bytes())
-        .unwrap_or(false);
+    let already_recorded = match global_db.get_by_key(NodeKind::Config, &allow_key) {
+        Ok(r) => r.payload == clean_display.as_bytes(),
+        Err(LibreDbError::KeyNotFound { .. }) => false,
+        Err(e) => return Err(e.to_string()),
+    };
     if !already_recorded {
         global_db
             .put(
@@ -959,7 +1122,7 @@ pub fn seal_workspace_memory(
         (format!("trust:v3_upgraded::{norm}"), b"v3".as_slice()),
         (format!("trust:v4_upgraded::{norm}"), b"v4".as_slice()),
     ] {
-        if global_db.get_by_key(NodeKind::Config, &ratchet_key).is_err() {
+        if !has_config_key_fail_closed(global_db, &ratchet_key)? {
             global_db
                 .put(
                     WriteRequest::new(NodeKind::Config, marker.to_vec())
@@ -969,7 +1132,17 @@ pub fn seal_workspace_memory(
                 .map_err(|e| e.to_string())?;
         }
     }
-    if capsule_count > 0 && global_db.get_by_key(NodeKind::Config, &nonempty_key).is_err() {
+    if global_rev != target_rev {
+        let rev_key = format!("trust:seal_rev::{norm}");
+        global_db
+            .put(
+                WriteRequest::new(NodeKind::Config, target_rev.to_string().into_bytes())
+                    .with_key(rev_key)
+                    .with_importance(185),
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    if capsule_count > 0 && !has_config_key_fail_closed(global_db, &nonempty_key)? {
         global_db
             .put(
                 WriteRequest::new(NodeKind::Config, b"1".to_vec())
@@ -983,7 +1156,7 @@ pub fn seal_workspace_memory(
 
 /// Type-enforced pre-mutation trust guard whose private `authorized_ws` field can ONLY be
 /// populated by verifying `is_workspace_memory_trusted` BEFORE mutating `proj_db`.
-/// Prevents post-hoc re-sealing ("trust laundering") of offline-tampered workspace databases.
+/// Prevents post-hoc re-sealing ("trust laundering") of offline-tampered or rolled-back databases.
 pub struct PreMutationSealGuard {
     authorized_ws: Option<PathBuf>,
 }
@@ -998,6 +1171,8 @@ impl PreMutationSealGuard {
                 authorized_ws: None,
             });
         };
+        check_global_trust_sync(gdb)?;
+
         let joined_db = if db_path.is_relative() {
             std::env::current_dir()
                 .map(|cwd| cwd.join(db_path))
@@ -1021,8 +1196,19 @@ impl PreMutationSealGuard {
                 authorized_ws: None,
             });
         };
-        if !is_workspace_path_authorized(Some(gdb), ws_root) {
-            // Workspace is not registered as trusted in `global_db`; never auto-authorize or seal it.
+        let norm = normalize_workspace_key(ws_root);
+        if has_config_key_fail_closed(gdb, &format!("trust:revoked::{norm}"))? {
+            return Err(format!(
+                "Workspace memory at '{}' belongs to an explicitly revoked workspace '{}'; run 'libredb trust \"{}\"' to re-authorize before writing to it.",
+                db_path.display(),
+                ws_root.display(),
+                ws_root.display()
+            ));
+        }
+        let has_prior_seal = has_prior_workspace_seal_marker_norm_checked(gdb, &norm)?;
+        if !has_prior_seal && !is_workspace_path_authorized_synced(gdb, ws_root) {
+            // Workspace was never sealed, never revoked, and is not registered as trusted in `global_db`;
+            // never auto-authorize or seal it.
             return Ok(Self {
                 authorized_ws: None,
             });
@@ -1031,6 +1217,13 @@ impl PreMutationSealGuard {
             if is_unsealed_replacement_of_sealed_workspace(gdb, ws_root) {
                 return Err(format!(
                     "Workspace memory at '{}' was previously sealed on this host, but .agents/memory.ldb is now missing, unsealed, or rolled back to empty. Restore .agents/memory.ldb from backup or explicitly run 'libredb trust --reinit-lost \"{}\"' before writing to it.",
+                    db_path.display(),
+                    ws_root.display()
+                ));
+            }
+            if let Some((proj_rev, global_rev)) = detect_workspace_seal_rollback(gdb, ws_root)? {
+                return Err(format!(
+                    "Workspace memory at '{}' carries older seal revision r{proj_rev} while host customizations.ldb requires at least r{global_rev} (historical snapshot rollback detected). Restore the latest .agents/memory.ldb or explicitly run 'libredb trust --accept-rollback \"{}\"' before writing to it.",
                     db_path.display(),
                     ws_root.display()
                 ));
@@ -1081,28 +1274,23 @@ pub fn migrate_workspace_seal_v2_to_v3(
     global_db: &LibreDb,
     ws_root: &Path,
 ) -> Result<bool, String> {
-    let _ = global_db.sync_from_disk_if_changed();
+    check_global_trust_sync(global_db)?;
     let norm = normalize_workspace_key(ws_root);
-    if global_db
-        .get_by_key(NodeKind::Config, &format!("trust:revoked::{norm}"))
-        .is_ok()
-    {
+    if has_config_key_fail_closed(global_db, &format!("trust:revoked::{norm}"))? {
         return Err(format!(
             "Workspace '{}' has been explicitly revoked; run 'libredb trust \"{}\"' to re-authorize.",
             ws_root.display(),
             ws_root.display()
         ));
     }
-    if !is_workspace_path_authorized(Some(global_db), ws_root) {
+    if !is_workspace_path_authorized_synced(global_db, ws_root) {
         return Err(format!(
             "Workspace '{}' is not registered as trusted in customizations.ldb.",
             ws_root.display()
         ));
     }
     if is_git_index_tracking_agents_db(ws_root)
-        && global_db
-            .get_by_key(NodeKind::Config, &format!("trust:allowed::{norm}"))
-            .is_err()
+        && !has_config_key_fail_closed(global_db, &format!("trust:allowed::{norm}"))?
     {
         return Err(format!(
             "Workspace '{}' tracks .agents/memory.* inside .git/index; refusing automatic v2 seal migration.",
@@ -1115,7 +1303,7 @@ pub fn migrate_workspace_seal_v2_to_v3(
 
     let ldb_path = ws_root.join(".agents").join("memory.ldb");
     if !ldb_path.is_file() {
-        if has_prior_workspace_seal_marker_norm(global_db, &norm) {
+        if has_prior_workspace_seal_marker_norm_checked(global_db, &norm)? {
             return Err(format!(
                 "Previously sealed workspace '{}' is missing .agents/memory.ldb; restore from backup or run 'libredb trust --reinit-lost \"{}\"'.",
                 ws_root.display(),
@@ -1139,7 +1327,8 @@ pub fn migrate_workspace_seal_v2_to_v3(
     secure_zero(&mut secret);
 
     let seals_txt = String::from_utf8_lossy(&rec.payload);
-    let already_upgraded_in_global = has_prior_workspace_seal_marker_norm(global_db, &norm);
+    let already_upgraded_in_global =
+        has_prior_workspace_seal_marker_norm_checked(global_db, &norm)?;
     let has_failed_host_slot = seals_txt.lines().any(|l| {
         let t = l.trim();
         t.starts_with(&format!("{host_tag}=hmac-sha256:v3:"))
@@ -1168,7 +1357,7 @@ pub fn migrate_workspace_seal_v2_to_v3(
 }
 
 /// Explicitly migrates a `v0.9.1..v0.9.3` `CognitiveContent::v3` workspace seal (`hmac-sha256:v3:`)
-/// to a `v4` metadata-and-synapse-authenticated seal (`hmac-sha256:v4:`) WITHOUT silent trust laundering:
+/// to a `v4` metadata-and-synapse-authenticated seal (`hmac-sha256:v4:r<rev>:`) WITHOUT silent trust laundering:
 /// 1. Rejects revoked, unauthorized, git-tracked, or already-`v4`-upgraded workspaces (anti-downgrade ratchet).
 /// 2. Verifies the existing `hmac-sha256:v3:` tag in constant time against the exact `v0.9.3`
 ///    `CognitiveContent::v3` digest (`kind`, `key`, `payload`), rejecting any payload/key tampering.
@@ -1187,28 +1376,23 @@ pub fn migrate_workspace_seal_v3_to_v4(
     ws_root: &Path,
     confirm_unauthenticated_metadata: bool,
 ) -> Result<bool, String> {
-    let _ = global_db.sync_from_disk_if_changed();
+    check_global_trust_sync(global_db)?;
     let norm = normalize_workspace_key(ws_root);
-    if global_db
-        .get_by_key(NodeKind::Config, &format!("trust:revoked::{norm}"))
-        .is_ok()
-    {
+    if has_config_key_fail_closed(global_db, &format!("trust:revoked::{norm}"))? {
         return Err(format!(
             "Workspace '{}' has been explicitly revoked; run 'libredb trust \"{}\"' to re-authorize.",
             ws_root.display(),
             ws_root.display()
         ));
     }
-    if !is_workspace_path_authorized(Some(global_db), ws_root) {
+    if !is_workspace_path_authorized_synced(global_db, ws_root) {
         return Err(format!(
             "Workspace '{}' is not registered as trusted in customizations.ldb.",
             ws_root.display()
         ));
     }
     if is_git_index_tracking_agents_db(ws_root)
-        && global_db
-            .get_by_key(NodeKind::Config, &format!("trust:allowed::{norm}"))
-            .is_err()
+        && !has_config_key_fail_closed(global_db, &format!("trust:allowed::{norm}"))?
     {
         return Err(format!(
             "Workspace '{}' tracks .agents/memory.* inside .git/index; refusing v3->v4 seal migration.",
@@ -1218,7 +1402,7 @@ pub fn migrate_workspace_seal_v3_to_v4(
 
     let ldb_path = ws_root.join(".agents").join("memory.ldb");
     if !ldb_path.is_file() {
-        if has_prior_workspace_seal_marker_norm(global_db, &norm) {
+        if has_prior_workspace_seal_marker_norm_checked(global_db, &norm)? {
             return Err(format!(
                 "Previously sealed workspace '{}' is missing .agents/memory.ldb; restore from backup or run 'libredb trust --reinit-lost \"{}\"'.",
                 ws_root.display(),
@@ -1229,18 +1413,26 @@ pub fn migrate_workspace_seal_v3_to_v4(
     }
     let pdb = LibreDb::open(&ldb_path).map_err(|e| e.to_string())?;
 
-    // If the workspace already passes `v4` verification (including `v0.9.4`/`v0.9.5` `v3`-over-`v4` seals,
-    // which ALREADY cryptographically authenticated `CognitiveContent::v4` metadata & synapses), ensure its
-    // `hmac-sha256:v4:` tag and `trust:v4_upgraded` ratchet are recorded cleanly.
+    // If the workspace already passes `v4` verification (including `v0.9.4`/`v0.9.5` `v3`-over-`v4` seals
+    // or pre-`v0.9.8` `r0` `v4` seals), ensure its `hmac-sha256:v4:r<rev>:` tag and `trust:v4_upgraded`
+    // ratchet are recorded cleanly.
     if is_workspace_memory_trusted(Some(global_db), ws_root) {
-        let already_v4_ratcheted = global_db
-            .get_by_key(NodeKind::Config, &format!("trust:v4_upgraded::{norm}"))
-            .is_ok();
-        if !already_v4_ratcheted {
+        let already_v4_ratcheted =
+            has_config_key_fail_closed(global_db, &format!("trust:v4_upgraded::{norm}"))?;
+        let global_rev = read_global_seal_revision(global_db, &norm)?;
+        if !already_v4_ratcheted || global_rev == 0 {
             seal_workspace_memory(global_db, &pdb, ws_root)?;
             return Ok(true);
         }
         return Ok(false);
+    }
+
+    if let Some((proj_rev, global_rev)) = detect_workspace_seal_rollback(global_db, ws_root)? {
+        return Err(format!(
+            "Workspace memory at '{}' carries older seal revision r{proj_rev} while host customizations.ldb requires at least r{global_rev} (historical snapshot rollback detected); refusing v3->v4 migration. Restore the latest .agents/memory.ldb or run 'libredb trust --accept-rollback \"{}\"'.",
+            ldb_path.display(),
+            ws_root.display()
+        ));
     }
 
     let rec = pdb.get_by_key(NodeKind::Config, TRUST_SEALS_KEY).map_err(|_| {
@@ -1259,9 +1451,9 @@ pub fn migrate_workspace_seal_v3_to_v4(
     secure_zero(&mut secret);
 
     let seals_txt = String::from_utf8_lossy(&rec.payload);
-    let already_v4_in_global = global_db
-        .get_by_key(NodeKind::Config, &format!("trust:v4_upgraded::{norm}"))
-        .is_ok();
+    let already_v4_in_global =
+        has_config_key_fail_closed(global_db, &format!("trust:v4_upgraded::{norm}"))?
+            || read_global_seal_revision(global_db, &norm)? > 0;
     let has_failed_host_v4 = seals_txt
         .lines()
         .any(|l| l.trim().starts_with(&format!("{host_tag}=hmac-sha256:v4:")));
@@ -1423,10 +1615,11 @@ pub fn migrate_workspace_seal_v3_to_v4(
 
 /// Revokes workspace trust in `global_db` and removes `sys::trust_seals` from `<ws_root>/.agents/memory.ldb` if present.
 pub fn revoke_workspace_trust(global_db: &LibreDb, ws_root: &Path) -> Result<(), String> {
+    check_global_trust_sync(global_db)?;
     let norm = normalize_workspace_key(ws_root);
-    let _ = global_db.deprecate_key(NodeKind::Config, &format!("trust:allowed::{norm}"));
+    deprecate_config_if_present(global_db, &format!("trust:allowed::{norm}"))?;
     if let Some(name) = ws_root.file_name().and_then(|n| n.to_str()) {
-        let _ = global_db.deprecate_key(NodeKind::Config, &format!("workspace:{name}"));
+        deprecate_config_if_present(global_db, &format!("workspace:{name}"))?;
     }
     global_db
         .put(
@@ -1445,8 +1638,10 @@ pub fn revoke_workspace_trust(global_db: &LibreDb, ws_root: &Path) -> Result<(),
     Ok(())
 }
 
-/// Lists all explicitly trusted and learned workspaces from `global_db`.
-pub fn list_trusted_workspaces(global_db: &LibreDb) -> Vec<(String, String)> {
+/// Lists all explicitly trusted and learned workspaces from `global_db`, synchronizing from disk
+/// first and failing closed with `Err` on any storage or payload corruption.
+pub fn list_trusted_workspaces(global_db: &LibreDb) -> Result<Vec<(String, String)>, String> {
+    check_global_trust_sync(global_db)?;
     let mut map = std::collections::BTreeMap::new();
     let mut revoked = std::collections::HashSet::new();
     for (ino, key_opt, _) in global_db.list_inodes(Some(NodeKind::Config), false) {
@@ -1454,23 +1649,26 @@ pub fn list_trusted_workspaces(global_db: &LibreDb) -> Vec<(String, String)> {
         if let Some(norm) = k.strip_prefix("trust:revoked::") {
             revoked.insert(norm.to_owned());
         } else if let Some(norm) = k.strip_prefix("trust:allowed::") {
-            if let Ok(rec) = global_db.get(ino.node_id) {
-                map.insert(
-                    norm.to_owned(),
-                    String::from_utf8_lossy(&rec.payload).trim().to_owned(),
-                );
-            }
+            let rec = global_db
+                .get(ino.node_id)
+                .map_err(|e| format!("Failed to read Config '{k}': {e}"))?;
+            map.insert(
+                norm.to_owned(),
+                String::from_utf8_lossy(&rec.payload).trim().to_owned(),
+            );
         } else if k.starts_with("workspace:") {
-            if let Ok(rec) = global_db.get(ino.node_id) {
-                let raw = String::from_utf8_lossy(&rec.payload).trim().to_owned();
-                let norm = normalize_workspace_key(Path::new(&raw));
-                map.entry(norm).or_insert(raw);
-            }
+            let rec = global_db
+                .get(ino.node_id)
+                .map_err(|e| format!("Failed to read Config '{k}': {e}"))?;
+            let raw = String::from_utf8_lossy(&rec.payload).trim().to_owned();
+            let norm = normalize_workspace_key(Path::new(&raw));
+            map.entry(norm).or_insert(raw);
         }
     }
-    map.into_iter()
+    Ok(map
+        .into_iter()
         .filter(|(norm, _)| !revoked.contains(norm))
-        .collect()
+        .collect())
 }
 
 /// Evaluates whether `PreToolUse` (`write_file`, `edit_file`, etc.) must block modifying `target_path`
@@ -1768,34 +1966,42 @@ pub fn is_safe_auto_git_dir(global_db: Option<&LibreDb>, project_root: &Path) ->
 }
 
 fn ensure_trust_anchor_secret(global_db: &LibreDb) -> Result<[u8; 32], String> {
-    if let Ok(rec) = global_db.get_by_key(NodeKind::Config, TRUST_SECRET_KEY) {
-        let raw = String::from_utf8_lossy(&rec.payload).into_owned();
-        let (mut hex_str, needs_upgrade) = unprotect_secret(&raw)?;
-        let decoded = hex_decode(hex_str.trim());
-        if let Some(mut bytes) = decoded {
-            if bytes.len() == 32 {
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&bytes);
-                secure_zero(&mut bytes);
-                if needs_upgrade {
-                    if let Ok(enc) = protect_secret(hex_str.trim()) {
-                        let _ = global_db.put(
-                            WriteRequest::new(NodeKind::Config, enc.into_bytes())
-                                .with_key(TRUST_SECRET_KEY)
-                                .with_importance(240),
-                        );
+    match global_db.get_by_key(NodeKind::Config, TRUST_SECRET_KEY) {
+        Ok(rec) => {
+            let raw = String::from_utf8_lossy(&rec.payload).into_owned();
+            let (mut hex_str, needs_upgrade) = unprotect_secret(&raw)?;
+            let decoded = hex_decode(hex_str.trim());
+            if let Some(mut bytes) = decoded {
+                if bytes.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&bytes);
+                    secure_zero(&mut bytes);
+                    if needs_upgrade {
+                        if let Ok(enc) = protect_secret(hex_str.trim()) {
+                            let _ = global_db.put(
+                                WriteRequest::new(NodeKind::Config, enc.into_bytes())
+                                    .with_key(TRUST_SECRET_KEY)
+                                    .with_importance(240),
+                            );
+                        }
                     }
+                    secure_zero(unsafe { hex_str.as_bytes_mut() });
+                    return Ok(arr);
                 }
-                secure_zero(unsafe { hex_str.as_bytes_mut() });
-                return Ok(arr);
+                secure_zero(&mut bytes);
             }
-            secure_zero(&mut bytes);
+            secure_zero(unsafe { hex_str.as_bytes_mut() });
+            return Err(
+                "Existing sys::trust_anchor_secret is invalid (expected 32-byte hex); refusing to overwrite"
+                    .to_owned(),
+            );
         }
-        secure_zero(unsafe { hex_str.as_bytes_mut() });
-        return Err(
-            "Existing sys::trust_anchor_secret is invalid (expected 32-byte hex); refusing to overwrite"
-                .to_owned(),
-        );
+        Err(LibreDbError::KeyNotFound { .. }) => {}
+        Err(e) => {
+            return Err(format!(
+                "Failed to read existing sys::trust_anchor_secret from customizations.ldb (refusing to overwrite): {e}"
+            ));
+        }
     }
 
     let mut secret = [0u8; 32];
@@ -1854,6 +2060,123 @@ pub(crate) fn compute_workspace_seal_v4(
     mac.update(content_digest);
     let tag = mac.finalize().into_bytes();
     format!("hmac-sha256:v4:{}", hex_encode(tag.as_slice()))
+}
+
+pub(crate) fn compute_workspace_seal_v4_rev(
+    secret: &[u8; 32],
+    normalized_ws_key: &str,
+    content_digest: &[u8; 32],
+    seal_rev: u64,
+) -> String {
+    let mut mac =
+        <HmacSha256 as Mac>::new_from_slice(secret).expect("HMAC-SHA256 accepts 256-bit keys");
+    mac.update(SEAL_V4_REV_DOMAIN_SEP);
+    mac.update((normalized_ws_key.len() as u32).to_le_bytes().as_slice());
+    mac.update(normalized_ws_key.as_bytes());
+    mac.update(content_digest);
+    mac.update(seal_rev.to_le_bytes().as_slice());
+    let tag = mac.finalize().into_bytes();
+    format!("hmac-sha256:v4:r{seal_rev}:{}", hex_encode(tag.as_slice()))
+}
+
+fn parse_strict_seal_rev_prefix(line: &str, prefix: &str) -> Option<u64> {
+    let after_prefix = line.strip_prefix(prefix)?;
+    let after_r = after_prefix.strip_prefix('r')?;
+    let (rev_str, tag_hex) = after_r.split_once(':')?;
+    if tag_hex.len() != 64 || !tag_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let rev = rev_str.parse::<u64>().ok()?;
+    if rev == 0 || rev.to_string() != rev_str {
+        return None;
+    }
+    Some(rev)
+}
+
+fn extract_syntactic_host_slot_rev(seals_txt: &str, host_tag: &str) -> u64 {
+    let slot_v4_prefix = format!("{host_tag}=hmac-sha256:v4:");
+    let host_eq = format!("{host_tag}=");
+    let has_host_slot = seals_txt.lines().any(|l| l.trim().starts_with(&host_eq));
+    let mut max_rev = 0u64;
+    for line in seals_txt.lines() {
+        let t = line.trim();
+        if let Some(r) = parse_strict_seal_rev_prefix(t, &slot_v4_prefix) {
+            max_rev = max_rev.max(r);
+        } else if !has_host_slot {
+            if let Some(r) = parse_strict_seal_rev_prefix(t, "hmac-sha256:v4:") {
+                max_rev = max_rev.max(r);
+            }
+        }
+    }
+    max_rev
+}
+
+fn verify_and_extract_host_seal_rev(
+    secret: &[u8; 32],
+    norm: &str,
+    content_digest: &[u8; 32],
+    seals_txt: &str,
+    already_v4_ratcheted: bool,
+) -> Option<u64> {
+    let host_tag = compute_host_seal_slot_id(secret, norm);
+    let host_eq = format!("{host_tag}=");
+    let slot_v4_prefix = format!("{host_tag}=hmac-sha256:v4:");
+    let has_host_slot = seals_txt.lines().any(|l| l.trim().starts_with(&host_eq));
+    let has_host_v4_slot = seals_txt
+        .lines()
+        .any(|l| l.trim().starts_with(&slot_v4_prefix));
+
+    // 1. Verify revision-bound `hmac-sha256:v4:r<rev>:<64-hex>` (`rev >= 1`):
+    let mut best_v4r: Option<u64> = None;
+    for line in seals_txt.lines() {
+        let trimmed = line.trim();
+        if let Some(rev) = parse_strict_seal_rev_prefix(trimmed, &slot_v4_prefix) {
+            let expected_bare = compute_workspace_seal_v4_rev(secret, norm, content_digest, rev);
+            let expected_slot = format!("{host_tag}={expected_bare}");
+            if constant_time_eq(trimmed.as_bytes(), expected_slot.as_bytes()) {
+                best_v4r = Some(best_v4r.map_or(rev, |b| b.max(rev)));
+            }
+        } else if !has_host_slot {
+            if let Some(rev) = parse_strict_seal_rev_prefix(trimmed, "hmac-sha256:v4:") {
+                let expected_bare =
+                    compute_workspace_seal_v4_rev(secret, norm, content_digest, rev);
+                if constant_time_eq(trimmed.as_bytes(), expected_bare.as_bytes()) {
+                    best_v4r = Some(best_v4r.map_or(rev, |b| b.max(rev)));
+                }
+            }
+        }
+    }
+    if best_v4r.is_some() {
+        return best_v4r;
+    }
+
+    // 2. Seamless read compatibility for pre-v0.9.8 `hmac-sha256:v4:<64-hex>` (`rev == 0`):
+    let expected_v4 = compute_workspace_seal_v4(secret, norm, content_digest);
+    let expected_slot_v4 = format!("{host_tag}={expected_v4}");
+    let v4_matches = seals_txt.lines().any(|line| {
+        let trimmed = line.trim().as_bytes();
+        constant_time_eq(trimmed, expected_slot_v4.as_bytes())
+            || (!has_host_slot && constant_time_eq(trimmed, expected_v4.as_bytes()))
+    });
+    if v4_matches {
+        return Some(0);
+    }
+
+    // 3. Seamless read compatibility for `v0.9.4`/`v0.9.5` unratcheted `v3`-over-`v4` (`rev == 0`):
+    if !already_v4_ratcheted && !has_host_v4_slot {
+        let expected_v3_over_v4 = compute_workspace_seal_v3(secret, norm, content_digest);
+        let expected_slot_v3_over_v4 = format!("{host_tag}={expected_v3_over_v4}");
+        let v3_over_v4_matches = seals_txt.lines().any(|line| {
+            let trimmed = line.trim().as_bytes();
+            constant_time_eq(trimmed, expected_slot_v3_over_v4.as_bytes())
+                || (!has_host_slot && constant_time_eq(trimmed, expected_v3_over_v4.as_bytes()))
+        });
+        if v3_over_v4_matches {
+            return Some(0);
+        }
+    }
+
+    None
 }
 
 fn compute_host_seal_slot_id(secret: &[u8; 32], normalized_ws_key: &str) -> String {
@@ -3705,6 +4028,263 @@ mod tests {
             b"bad_ext_key",
             "atomic_rename_noreplace MUST NOT overwrite a concurrently created corrupt .vault.key!"
         );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn nonempty_sealed_workspace_rejects_historical_rollback_and_preserves_mid_crash_consistency() {
+        let tmp = std::env::temp_dir().join(format!(
+            "libredb_seal_rev_rollback_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let global_path = tmp.join("customizations.ldb");
+        let repo = tmp.join("repo");
+        fs::create_dir_all(repo.join(".agents")).unwrap();
+        let pdb_path = repo.join(".agents").join("memory.ldb");
+
+        let gdb = LibreDb::open(&global_path).unwrap();
+        let norm = normalize_workspace_key(&repo);
+
+        // 1. Seal populated workspace with `Fact A` at `r1` and copy `.agents/memory.ldb`:
+        let pdb = LibreDb::open(&pdb_path).unwrap();
+        pdb.put(
+            WriteRequest::new(NodeKind::Fact, b"Require canary rollout".to_vec())
+                .with_key("fact:deploy_policy"),
+        )
+        .unwrap();
+        seal_workspace_memory(&gdb, &pdb, &repo).unwrap();
+        drop(pdb);
+        assert_eq!(read_global_seal_revision(&gdb, &norm).unwrap(), 1);
+        assert!(is_workspace_memory_trusted(Some(&gdb), &repo));
+        assert_eq!(detect_workspace_seal_rollback(&gdb, &repo).unwrap(), None);
+        let snapshot_r1_bytes = fs::read(&pdb_path).unwrap();
+
+        // 2. Append critical `Fact B` and reseal (`r2`):
+        let pdb = LibreDb::open(&pdb_path).unwrap();
+        let guard = PreMutationSealGuard::verify_before_write(Some(&gdb), &pdb_path).unwrap();
+        pdb.put(
+            WriteRequest::new(
+                NodeKind::Fact,
+                b"Freeze production deploys until security sign-off".to_vec(),
+            )
+            .with_key("fact:prod_freeze"),
+        )
+        .unwrap();
+        guard.reseal_after_write(Some(&gdb), &pdb).unwrap();
+        drop(pdb);
+        assert_eq!(read_global_seal_revision(&gdb, &norm).unwrap(), 2);
+        assert!(is_workspace_memory_trusted(Some(&gdb), &repo));
+        let snapshot_r2_bytes = fs::read(&pdb_path).unwrap();
+
+        // 3. ATTACK VECTOR (Befund A): Externally overwrite `.agents/memory.ldb` with the older,
+        //    non-empty, authentically `v4:r1`-sealed snapshot (silently erasing `Fact B`):
+        fs::write(&pdb_path, &snapshot_r1_bytes).unwrap();
+        assert!(
+            !is_workspace_memory_trusted(Some(&gdb), &repo),
+            "Replaying an older non-empty v4:r1 snapshot over r2 MUST fail closed!"
+        );
+        assert!(
+            !is_unsealed_replacement_of_sealed_workspace(&gdb, &repo),
+            "Non-empty historical rollback must be classified as rollback, not empty replacement"
+        );
+        assert_eq!(
+            detect_workspace_seal_rollback(&gdb, &repo).unwrap(),
+            Some((1, 2))
+        );
+        let rb_err = PreMutationSealGuard::verify_before_write(Some(&gdb), &pdb_path)
+            .err()
+            .expect("PreMutationSealGuard must block writes over a rolled-back r1 snapshot");
+        assert!(rb_err.contains("r1") && rb_err.contains("r2"));
+        assert!(rb_err.contains("--accept-rollback"));
+
+        // 4. Pre-`v0.9.8` `r0` (`hmac-sha256:v4:<hex>`) replay against `global_rev == 2` also fails closed:
+        {
+            let pdb_r0 = LibreDb::open(&pdb_path).unwrap();
+            let (dig_r0, _) = compute_cognitive_content_digest(&pdb_r0).unwrap();
+            let secret = ensure_trust_anchor_secret(&gdb).unwrap();
+            let host_tag = compute_host_seal_slot_id(&secret, &norm);
+            let bare_r0 = compute_workspace_seal_v4(&secret, &norm, &dig_r0);
+            let body_r0 = format!("{bare_r0}\n{host_tag}={bare_r0}");
+            pdb_r0
+                .put(
+                    WriteRequest::new(NodeKind::Config, body_r0.into_bytes())
+                        .with_key(TRUST_SEALS_KEY)
+                        .with_importance(200),
+                )
+                .unwrap();
+        }
+        assert!(!is_workspace_memory_trusted(Some(&gdb), &repo));
+        assert_eq!(
+            detect_workspace_seal_rollback(&gdb, &repo).unwrap(),
+            Some((0, 2))
+        );
+
+        // 5. Restore genuine `r2` snapshot, then simulate a mid-commit crash right after Phase 1
+        //    (`proj_db` sealed at `r3` with `Fact C`, before Phase 2 updates `global_db` from `2`):
+        fs::write(&pdb_path, &snapshot_r2_bytes).unwrap();
+        assert!(is_workspace_memory_trusted(Some(&gdb), &repo));
+        {
+            let pdb_crash = LibreDb::open(&pdb_path).unwrap();
+            pdb_crash
+                .put(
+                    WriteRequest::new(NodeKind::Fact, b"Mid-crash capsule".to_vec())
+                        .with_key("fact:mid_crash"),
+                )
+                .unwrap();
+            let (dig_r3, _) = compute_cognitive_content_digest(&pdb_crash).unwrap();
+            let secret = ensure_trust_anchor_secret(&gdb).unwrap();
+            let host_tag = compute_host_seal_slot_id(&secret, &norm);
+            let bare_r3 = compute_workspace_seal_v4_rev(&secret, &norm, &dig_r3, 3);
+            let body_r3 = format!("{bare_r3}\n{host_tag}={bare_r3}");
+            pdb_crash
+                .put(
+                    WriteRequest::new(NodeKind::Config, body_r3.into_bytes())
+                        .with_key(TRUST_SEALS_KEY)
+                        .with_importance(200),
+                )
+                .unwrap();
+        }
+        assert_eq!(read_global_seal_revision(&gdb, &norm).unwrap(), 2);
+        assert!(
+            is_workspace_memory_trusted(Some(&gdb), &repo),
+            "Mid-commit crash after Phase 1 (proj_rev=3 >= global_rev=2) MUST remain trusted without false quarantine!"
+        );
+        assert_eq!(detect_workspace_seal_rollback(&gdb, &repo).unwrap(), None);
+        {
+            let pdb_heal = LibreDb::open(&pdb_path).unwrap();
+            seal_workspace_memory(&gdb, &pdb_heal, &repo).unwrap();
+        }
+        assert_eq!(
+            read_global_seal_revision(&gdb, &norm).unwrap(),
+            3,
+            "Re-running seal_workspace_memory after Phase-1 crash must idempotently heal global_rev to 3"
+        );
+
+        // 6. Explicit `--accept-rollback` re-authorization advances `r1` backup cleanly to `r4`:
+        fs::write(&pdb_path, &snapshot_r1_bytes).unwrap();
+        assert_eq!(
+            detect_workspace_seal_rollback(&gdb, &repo).unwrap(),
+            Some((1, 3))
+        );
+        {
+            let pdb_accept = LibreDb::open(&pdb_path).unwrap();
+            seal_workspace_memory(&gdb, &pdb_accept, &repo).unwrap();
+        }
+        assert_eq!(read_global_seal_revision(&gdb, &norm).unwrap(), 4);
+        assert!(is_workspace_memory_trusted(Some(&gdb), &repo));
+        assert_eq!(detect_workspace_seal_rollback(&gdb, &repo).unwrap(), None);
+
+        drop(gdb);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn failed_global_db_sync_fails_closed_instead_of_using_stale_ram_trust() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let tmp = std::env::temp_dir().join(format!(
+            "libredb_global_sync_failclosed_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let global_path = tmp.join("customizations.ldb");
+        let repo = tmp.join("repo");
+        fs::create_dir_all(repo.join(".agents")).unwrap();
+        let pdb_path = repo.join(".agents").join("memory.ldb");
+
+        // Open two distinct `LibreDb` handles to `customizations.ldb`:
+        // - `gdb_stale`: long-lived MCP / daemon handle caching state in RAM
+        // - `gdb_admin`: external CLI process modifying `customizations.ldb` on disk
+        let gdb_stale = LibreDb::open(&global_path).unwrap();
+        let gdb_admin = LibreDb::open(&global_path).unwrap();
+
+        let pdb = LibreDb::open(&pdb_path).unwrap();
+        pdb.put(
+            WriteRequest::new(NodeKind::Fact, b"Trusted fact".to_vec()).with_key("fact:one"),
+        )
+        .unwrap();
+        seal_workspace_memory(&gdb_admin, &pdb, &repo).unwrap();
+        drop(pdb);
+
+        // `gdb_stale` synchronizes cleanly from disk and caches `trusted == true` in RAM:
+        assert!(is_workspace_memory_trusted(Some(&gdb_stale), &repo));
+        assert!(is_workspace_path_authorized(Some(&gdb_stale), &repo));
+        assert_eq!(list_trusted_workspaces(&gdb_stale).unwrap().len(), 1);
+
+        // `gdb_admin` revokes `repo` on disk, advancing file length/generation, and then the on-disk
+        // superblocks of `customizations.ldb` suffer corruption before `gdb_stale` syncs:
+        revoke_workspace_trust(&gdb_admin, &repo).unwrap();
+        drop(gdb_admin);
+        {
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .open(&global_path)
+                .unwrap();
+            f.seek(SeekFrom::Start(0)).unwrap();
+            f.write_all(&[0xFFu8; 8192]).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        // Every trust/security check on `gdb_stale` MUST fail closed instead of falling back to its
+        // pre-revocation RAM cache:
+        assert!(
+            !is_workspace_memory_trusted(Some(&gdb_stale), &repo),
+            "is_workspace_memory_trusted MUST return false when customizations.ldb sync_from_disk_if_changed fails!"
+        );
+        assert!(
+            !is_workspace_path_authorized(Some(&gdb_stale), &repo),
+            "is_workspace_path_authorized MUST return false when customizations.ldb sync_from_disk_if_changed fails!"
+        );
+        assert!(
+            has_prior_workspace_seal_marker(&gdb_stale, &repo),
+            "has_prior_workspace_seal_marker MUST conservatively return true on global sync error!"
+        );
+        assert!(PreMutationSealGuard::verify_before_write(Some(&gdb_stale), &pdb_path).is_err());
+        assert!(detect_workspace_seal_rollback(&gdb_stale, &repo).is_err());
+        assert!(list_trusted_workspaces(&gdb_stale).is_err());
+        assert!(revoke_workspace_trust(&gdb_stale, &repo).is_err());
+        {
+            let pdb_ro = LibreDb::open(&pdb_path).unwrap();
+            assert!(seal_workspace_memory(&gdb_stale, &pdb_ro, &repo).is_err());
+        }
+        // Cold-opening a corrupted `customizations.ldb` via `open_global_ldb_checked` MUST also fail closed (`Err`),
+        // never returning `Ok(None)` as if no `customizations.ldb` existed:
+        assert!(crate::hooks::open_global_ldb_checked(Some(&global_path)).is_err());
+        drop(gdb_stale);
+
+        // Also verify external truncation below `DATA_REGION_START` (0 bytes) on an open handle fails closed:
+        let global_trunc_path = tmp.join("customizations_trunc.ldb");
+        let repo2 = tmp.join("repo2");
+        fs::create_dir_all(repo2.join(".agents")).unwrap();
+        let pdb2_path = repo2.join(".agents").join("memory.ldb");
+        let gdb_trunc = LibreDb::open(&global_trunc_path).unwrap();
+        let pdb2 = LibreDb::open(&pdb2_path).unwrap();
+        pdb2.put(WriteRequest::new(NodeKind::Fact, b"Fact 2".to_vec()).with_key("fact:two"))
+            .unwrap();
+        seal_workspace_memory(&gdb_trunc, &pdb2, &repo2).unwrap();
+        drop(pdb2);
+        assert!(is_workspace_memory_trusted(Some(&gdb_trunc), &repo2));
+
+        fs::write(&global_trunc_path, b"").unwrap();
+        assert!(check_global_trust_sync(&gdb_trunc).is_err());
+        assert!(
+            !is_workspace_memory_trusted(Some(&gdb_trunc), &repo2),
+            "0-byte external truncation of customizations.ldb MUST fail closed instead of returning Ok(false)!"
+        );
+        assert!(crate::hooks::open_global_ldb_checked(Some(&global_trunc_path)).is_err());
+        drop(gdb_trunc);
 
         let _ = fs::remove_dir_all(&tmp);
     }

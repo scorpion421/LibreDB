@@ -11,7 +11,7 @@
 
 use crate::hooks::{
     default_global_ldb_path, find_workspace_root, is_protected_profile_dir, open_global_ldb,
-    open_global_ldb_if_exists, open_project_ldb_silent, resolve_brain_conv_dir, user_home_dir,
+    open_global_ldb_checked, open_project_ldb_silent, resolve_brain_conv_dir, user_home_dir,
 };
 use libredb_bridge::import_sqlite_readonly;
 use libredb_cognitive::{
@@ -60,7 +60,7 @@ impl McpServerState {
             });
         let global_db = match global_path {
             Some(gp) => Some(open_global_ldb(Some(gp))?),
-            None => open_global_ldb_if_exists(None),
+            None => open_global_ldb_checked(None)?,
         };
 
         Ok(Self {
@@ -104,6 +104,38 @@ impl McpServerState {
         cid_opt: Option<&str>,
         is_explicit_memorize: bool,
     ) -> Result<(Option<PathBuf>, &mut OverlayBrain), String> {
+        // Synchronize `customizations.ldb` from disk BEFORE trusting any cached `OverlayBrain` or
+        // evaluating workspace seals; fail closed and purge RAM brains on any global DB corruption.
+        if let Some(ref gdb) = self.global_db {
+            if let Err(sync_err) = crate::security::check_global_trust_sync(gdb) {
+                self.brains.clear();
+                return Err(sync_err);
+            }
+        } else if let Some(ref gp) = self.global_path {
+            match open_global_ldb_checked(Some(gp)) {
+                Ok(Some(gdb)) => {
+                    self.global_db = Some(gdb);
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    self.brains.clear();
+                    return Err(err);
+                }
+            }
+        } else {
+            match open_global_ldb_checked(None) {
+                Ok(Some(gdb)) => {
+                    self.global_path = Some(default_global_ldb_path());
+                    self.global_db = Some(gdb);
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    self.brains.clear();
+                    return Err(err);
+                }
+            }
+        }
+
         let candidate_path = match hint_path {
             Some(raw) if !raw.trim().is_empty() => {
                 resolve_workspace_ldb_path(Path::new(raw.trim()), &self.default_project_path)
@@ -129,7 +161,7 @@ impl McpServerState {
                     self.brains.remove(&candidate_cache_key);
                     if is_explicit_memorize {
                         return Err(format!(
-                            "Workspace memory at '{}' is quarantined because a pre-existing unsealed, tampered, or Git-tracked .agents database was detected. Run 'libredb trust \"{}\"' in a terminal if you trust this repository.",
+                            "Workspace memory at '{}' is quarantined because a pre-existing unsealed, tampered, rolled-back, or Git-tracked .agents database was detected. Run 'libredb trust \"{}\"' (or '--reinit-lost' / '--accept-rollback' if recovering) in a terminal if you trust this repository.",
                             candidate_path.display(),
                             ws_root.display()
                         ));
@@ -163,7 +195,7 @@ impl McpServerState {
                             ready_db = None;
                             if is_explicit_memorize {
                                 return Err(format!(
-                                    "Post-migration hmac-sha256:v3 workspace seal failed for '{}': {err}",
+                                    "Post-migration hmac-sha256:v4 workspace seal failed for '{}': {err}",
                                     mig_ws.display()
                                 ));
                             }

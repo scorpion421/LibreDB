@@ -42,6 +42,41 @@ jobs:
           '
           make guardrail
 
+  macos:
+    name: macOS source build, renamex_np test, neutral install & guardrails
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify Makefile test (including renamex_np RENAME_EXCL), neutral install, benchmarks, and guardrails
+        run: |
+          make test
+          make install
+          test ! -f "$HOME/.gemini/config/plugins/libredb/rules/AGENTS.md"
+          "$HOME/.local/bin/libredb" --version
+          "$HOME/.local/bin/libredb" list-rules | grep -F "Active Rules (0)"
+          "$HOME/.local/bin/libredb" list-reflexes | grep -F "Active Situational Reflexes (3)"
+          "$HOME/.local/bin/libredb" trust --list
+          make bench
+          python3 -c '
+          import subprocess, statistics, time, os
+          exe = os.path.expanduser("~/.local/bin/libredb")
+          for hook, payload in [
+              ("hook-pre-invocation", b"{\"conversationId\":\"ci-bench\",\"cwd\":\".\"}"),
+              ("hook-pre-tool", b"{\"toolName\":\"run_command\",\"toolArgs\":{\"CommandLine\":\"cargo --version\"}}"),
+          ]:
+              samples = []
+              for _ in range(25):
+                  t0 = time.perf_counter()
+                  subprocess.run([exe, hook], input=payload, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                  samples.append((time.perf_counter() - t0) * 1000.0)
+              samples.sort()
+              med = statistics.median(samples)
+              print(f"[CI Hook Benchmark] {hook}: min={samples[0]:.2f} ms | median={med:.2f} ms | p95={samples[int(len(samples)*0.95)]:.2f} ms")
+              assert med < 15.0, f"{hook} median latency {med:.2f} ms exceeded 15.0 ms macOS Mach-O spawn ceiling"
+          '
+          make guardrail
+
   windows:
     name: Windows build, test, neutral install, benchmarks & guardrails
     runs-on: windows-latest
