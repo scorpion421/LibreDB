@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.9] - 2026-11-11
+
+### Added
+
+- Added atomic cross-process and intra-process conditional mutation primitives `LibreDb::transact_key` and `LibreDb::put_if_absent` (plus `LibreDb::path`) in `crates/libredb-core/src/engine.rs`, executing compare-and-swap and insert-if-absent operations inside `commit_lock` + OS `IpcWriteGuard` after `sync_from_disk_if_changed`.
+
+### Fixed
+
+- Configured `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"` in `.github/workflows/ci.yml` to run GitHub Actions steps directly on Node.js 24 without runner deprecation warnings across `linux`, `macos`, and `windows`.
+
+### Security
+
+- Closed concurrent multi-process two-phase workspace sealing and mutation races (`WorkspaceTrustLockGuard`, `PreMutationSealGuard`, `seal_workspace_memory`, and `advance_global_seal_revision_monotonic` in `crates/libredb-cli/src/security.rs`, plus `McpServerState` in `crates/libredb-cli/src/mcp.rs` and `crates/libredb-cli/src/gitea.rs`): workspace verification, capsule mutations, Phase 1 (`sys::trust_seals` CAS via `proj_db.transact_key` with post-commit digest verification), and Phase 2 (`trust:seal_rev::<ws>` strictly monotonic `max(cur_rev, target_rev)` ratchet via `global_db.transact_key`) are now serialized across OS processes (`OsFileBackend::lock_write_region` on `.seal_locks/ws_<hash>.lock`) and intra-process threads (reentrant `Mutex + Condvar`), ensuring concurrent writers can never regress `trust:seal_rev::<ws>` to a smaller revision or expose transient unsealed mutations to concurrent readers.
+- Eliminated the concurrent first-initialization race in `ensure_trust_anchor_secret` (`crates/libredb-cli/src/security.rs`): first-time `sys::trust_anchor_secret` creation now uses `LibreDb::put_if_absent` (and `vault:v1` -> `vault:v2` upgrades use generation-checked `LibreDb::transact_key`), guaranteeing a single atomic winner (`generation == 1`) so all concurrent processes and threads adopt the identical 32-byte trust anchor secret without overwriting early workspace seals.
+
 ## [0.9.8] - 2026-11-11
 
 ### Added

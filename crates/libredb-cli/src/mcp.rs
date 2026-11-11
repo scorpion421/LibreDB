@@ -103,7 +103,14 @@ impl McpServerState {
         hint_path: Option<&str>,
         cid_opt: Option<&str>,
         is_explicit_memorize: bool,
-    ) -> Result<(Option<PathBuf>, &mut OverlayBrain), String> {
+    ) -> Result<
+        (
+            Option<crate::security::WorkspaceTrustLockGuard>,
+            Option<PathBuf>,
+            &mut OverlayBrain,
+        ),
+        String,
+    > {
         // Synchronize `customizations.ldb` from disk BEFORE trusting any cached `OverlayBrain` or
         // evaluating workspace seals; fail closed and purge RAM brains on any global DB corruption.
         if let Some(ref gdb) = self.global_db {
@@ -147,9 +154,17 @@ impl McpServerState {
         };
         let candidate_cache_key = canonical_brain_cache_key(&candidate_path);
 
+        let mut ws_write_lock: Option<crate::security::WorkspaceTrustLockGuard> = None;
         let mut ws_root_to_seal: Option<PathBuf> = None;
         let (mut db_path, mut cache_key) =
             if let Some(ws_root) = workspace_root_from_agents_ldb(&candidate_path) {
+                if is_explicit_memorize && !crate::security::is_private_brain_workspace(&ws_root) {
+                    if let Some(ref gdb) = self.global_db {
+                        ws_write_lock = Some(crate::security::WorkspaceTrustLockGuard::acquire(
+                            gdb, &ws_root,
+                        )?);
+                    }
+                }
                 if crate::security::is_workspace_memory_trusted(self.global_db.as_deref(), &ws_root)
                 {
                     if is_explicit_memorize {
@@ -221,7 +236,7 @@ impl McpServerState {
 
         let brain = self.brains.get_mut(&cache_key).unwrap();
         brain.refresh_if_needed().map_err(|e| e.to_string())?;
-        Ok((ws_root_to_seal, brain))
+        Ok((ws_write_lock, ws_root_to_seal, brain))
     }
 
     fn resolve_brain_mut(
@@ -230,7 +245,7 @@ impl McpServerState {
         cid_opt: Option<&str>,
         is_explicit_memorize: bool,
     ) -> Result<&mut OverlayBrain, String> {
-        let (_, brain) =
+        let (_, _, brain) =
             self.resolve_brain_with_seal_target(hint_path, cid_opt, is_explicit_memorize)?;
         Ok(brain)
     }
@@ -680,10 +695,10 @@ fn dispatch_tool(
                 }
             }
 
-            let (ws_root_to_seal, proj_db) = {
-                let (ws_opt, brain) =
+            let (ws_write_lock, ws_root_to_seal, proj_db) = {
+                let (lock_opt, ws_opt, brain) =
                     state.resolve_brain_with_seal_target(cwd_hint, cid_arg, true)?;
-                (ws_opt, Arc::clone(brain.project_db()))
+                (lock_opt, ws_opt, Arc::clone(brain.project_db()))
             };
 
             let mut spec = AtomicBatchSpec::default();
@@ -772,7 +787,9 @@ fn dispatch_tool(
                 }
             }
 
-            state.seal_project_db_if_authorized(ws_root_to_seal.as_deref(), &proj_db)?;
+            let seal_res = state.seal_project_db_if_authorized(ws_root_to_seal.as_deref(), &proj_db);
+            drop(ws_write_lock);
+            seal_res?;
             let brain = state.resolve_brain_mut(cwd_hint, cid_arg, false)?;
             brain.refresh_if_needed()?;
             if outputs.is_empty() {
@@ -845,13 +862,15 @@ fn dispatch_tool(
             let tkey = args.get("task_key").and_then(Value::as_str).ok_or("Missing task_key")?;
             let role = args.get("role").and_then(Value::as_str).ok_or("Missing role")?;
             let notes = args.get("instructions").and_then(Value::as_str).unwrap_or("");
-            let (ws_root_to_seal, proj_db) = {
-                let (ws_opt, brain) =
+            let (ws_write_lock, ws_root_to_seal, proj_db) = {
+                let (lock_opt, ws_opt, brain) =
                     state.resolve_brain_with_seal_target(cwd_hint, cid_arg, true)?;
-                (ws_opt, Arc::clone(brain.project_db()))
+                (lock_opt, ws_opt, Arc::clone(brain.project_db()))
             };
             let (_, block) = create_subagent_handoff(&proj_db, hid, tkey, role, notes)?;
-            state.seal_project_db_if_authorized(ws_root_to_seal.as_deref(), &proj_db)?;
+            let seal_res = state.seal_project_db_if_authorized(ws_root_to_seal.as_deref(), &proj_db);
+            drop(ws_write_lock);
+            seal_res?;
             let brain = state.resolve_brain_mut(cwd_hint, cid_arg, false)?;
             brain.refresh_if_needed()?;
             Ok(block)
@@ -986,11 +1005,12 @@ mod tests {
 
         // Populate cache via `sub/../.agents/memory.ldb` non-canonical path:
         let hint_non_canon = dotdot_ldb.to_string_lossy().to_string();
-        let (ws_seal_opt, brain) = state
+        let (ws_write_lock, ws_seal_opt, brain) = state
             .resolve_brain_with_seal_target(Some(&hint_non_canon), None, true)
             .unwrap();
         assert!(ws_seal_opt.is_some());
         let proj_arc = std::sync::Arc::clone(brain.project_db());
+        drop(ws_write_lock);
         assert_eq!(state.brains.len(), 1);
 
         // Corrupt the global trust secret so `seal_project_db_if_authorized` fails after mutation,

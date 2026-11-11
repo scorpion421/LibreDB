@@ -13,7 +13,7 @@ use crate::io::{OsFileBackend, StorageBackend};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -230,6 +230,7 @@ impl AccessTelemetry {
 
 /// Thread-safe (`Send + Sync`) single-file Chaos-Extent-Inode cognitive database engine.
 pub struct LibreDb {
+    file_path: Option<PathBuf>,
     backend: Arc<dyn StorageBackend>,
     state: RwLock<Arc<SnapshotState>>,
     /// Serializes physical tail append & superblock flips while allowing 100% parallel preparation & reads.
@@ -242,8 +243,16 @@ pub struct LibreDb {
 impl LibreDb {
     /// Opens an existing `.ldb` file or initializes a new single-file database at `path`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let backend = Arc::new(OsFileBackend::open(path)?);
-        Self::open_with_backend(backend)
+        let resolved_path = path.as_ref().to_path_buf();
+        let backend = Arc::new(OsFileBackend::open(&resolved_path)?);
+        let mut db = Self::open_with_backend(backend)?;
+        db.file_path = Some(resolved_path);
+        Ok(db)
+    }
+
+    /// Returns the filesystem path when opened via `LibreDb::open`, or `None` for custom backends.
+    pub fn path(&self) -> Option<&Path> {
+        self.file_path.as_deref()
     }
 
     /// Opens or initializes a database on any `StorageBackend` (OS file or fault simulator).
@@ -262,6 +271,7 @@ impl LibreDb {
         };
 
         Ok(Self {
+            file_path: None,
             backend,
             state: RwLock::new(Arc::new(snapshot)),
             commit_lock: Mutex::new(()),
@@ -538,6 +548,64 @@ impl LibreDb {
         Ok(ids[0])
     }
 
+    /// Executes an atomic cross-process and intra-process conditional read-modify-write on `(kind, key)`
+    /// while holding both `commit_lock` and the OS-level `IpcWriteGuard`.
+    /// Reloads external commits via `sync_from_disk_if_changed` inside the lock before reading `existing`,
+    /// guaranteeing single-winner `put_if_absent` election and strictly monotonic counter ratchets.
+    pub fn transact_key<F>(
+        &self,
+        kind: NodeKind,
+        key: &str,
+        f: F,
+    ) -> Result<(Option<NodeRecord>, bool)>
+    where
+        F: FnOnce(Option<&NodeRecord>) -> Result<Option<WriteRequest>>,
+    {
+        let _guard = self.commit_lock.lock();
+        let _ipc_guard = IpcWriteGuard::acquire(&*self.backend)?;
+        self.sync_from_disk_if_changed()?;
+
+        let existing = match self.get_by_key(kind, key) {
+            Ok(rec) => Some(rec),
+            Err(LibreDbError::KeyNotFound { .. }) => None,
+            Err(e) => return Err(e),
+        };
+
+        match f(existing.as_ref())? {
+            None => Ok((existing, false)),
+            Some(mut req) => {
+                req.kind = kind;
+                req.key = Some(key.to_owned());
+                let prepared = self.prepare(req, current_thread_lane_hint())?;
+                let ids = self.commit_batch_locked(std::slice::from_ref(&prepared))?;
+                let committed = self.get(ids[0])?;
+                Ok((Some(committed), true))
+            }
+        }
+    }
+
+    /// Atomically inserts `req` if and only if `(req.kind, key)` does not yet exist on disk or in RAM,
+    /// returning `(record, true)` for the single winner and `(existing_record, false)` for all other
+    /// concurrent contenders without overwriting the winner's committed record.
+    pub fn put_if_absent(&self, req: WriteRequest) -> Result<(NodeRecord, bool)> {
+        let kind = req.kind;
+        let key = req
+            .key
+            .clone()
+            .ok_or(LibreDbError::CorruptFormat(
+                "put_if_absent requires a keyed WriteRequest",
+            ))?;
+        let (rec_opt, inserted) = self.transact_key(kind, &key, move |existing| {
+            if existing.is_some() {
+                Ok(None)
+            } else {
+                Ok(Some(req))
+            }
+        })?;
+        let rec = rec_opt.ok_or(LibreDbError::KeyNotFound { kind, key })?;
+        Ok((rec, inserted))
+    }
+
     /// Commits a batch of pre-encoded `PreparedWrite` items in a single atomic `fsync` + superblock flip.
     pub fn commit_batch(&self, batch: &[PreparedWrite]) -> Result<Vec<u64>> {
         if batch.is_empty() {
@@ -547,6 +615,10 @@ impl LibreDb {
         let _guard = self.commit_lock.lock();
         let _ipc_guard = IpcWriteGuard::acquire(&*self.backend)?;
         self.sync_from_disk_if_changed()?;
+        self.commit_batch_locked(batch)
+    }
+
+    fn commit_batch_locked(&self, batch: &[PreparedWrite]) -> Result<Vec<u64>> {
         let old_snap = Arc::clone(&self.state.read());
         let mut next_snap = SnapshotState {
             superblock: old_snap.superblock,
@@ -2481,4 +2553,119 @@ fn current_thread_lane_hint() -> usize {
     let local_var = 0u8;
     let addr = (&local_var as *const u8) as usize;
     (addr >> 12) ^ (addr >> 20)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn transact_key_and_put_if_absent_serialize_across_handles_and_threads() {
+        let tmp = std::env::temp_dir().join(format!(
+            "libredb_core_transact_key_{}_{}",
+            std::process::id(),
+            now_unix_ns()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let db_path = tmp.join("shared.ldb");
+        {
+            let _init = LibreDb::open(&db_path).unwrap();
+        }
+
+        let threads = 8usize;
+        let barrier = Arc::new(Barrier::new(threads));
+        let mut handles = Vec::with_capacity(threads);
+        for tid in 0..threads {
+            let p = db_path.clone();
+            let b = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let db = LibreDb::open(&p).unwrap();
+                b.wait();
+                db.put_if_absent(
+                    WriteRequest::new(NodeKind::Config, format!("winner-{tid}").into_bytes())
+                        .with_key("sys::init_once")
+                        .with_importance(240),
+                )
+                .unwrap()
+            }));
+        }
+
+        let results: Vec<(NodeRecord, bool)> =
+            handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let winners: Vec<&NodeRecord> = results
+            .iter()
+            .filter_map(|(r, ins)| if *ins { Some(r) } else { None })
+            .collect();
+        assert_eq!(
+            winners.len(),
+            1,
+            "put_if_absent MUST elect strictly one winner across concurrent handles"
+        );
+        let winning_payload = winners[0].payload.clone();
+        let winning_id = winners[0].node_id;
+        assert_eq!(winners[0].generation, 1);
+        for (rec, _) in &results {
+            assert_eq!(rec.node_id, winning_id);
+            assert_eq!(rec.generation, 1);
+            assert_eq!(rec.payload, winning_payload);
+        }
+
+        // Verify strictly serialized cross-handle increments + monotonic stale rejection via transact_key:
+        let barrier2 = Arc::new(Barrier::new(threads));
+        let mut inc_handles = Vec::with_capacity(threads);
+        for _ in 0..threads {
+            let p = db_path.clone();
+            let b = Arc::clone(&barrier2);
+            inc_handles.push(std::thread::spawn(move || {
+                let db = LibreDb::open(&p).unwrap();
+                b.wait();
+                for _ in 0..16 {
+                    let (_, committed) = db
+                        .transact_key(NodeKind::Config, "counter:rev", |cur| {
+                            let prev: u64 = cur
+                                .and_then(|r| std::str::from_utf8(&r.payload).ok())
+                                .and_then(|s| s.trim().parse::<u64>().ok())
+                                .unwrap_or(0);
+                            let next = prev + 1;
+                            Ok(Some(WriteRequest::new(
+                                NodeKind::Config,
+                                next.to_string().into_bytes(),
+                            )))
+                        })
+                        .unwrap();
+                    assert!(committed);
+                }
+                // Delayed stale write attempting to regress to 1 MUST be rejected inside transact_key:
+                let (_, regressed) = db
+                    .transact_key(NodeKind::Config, "counter:rev", |cur| {
+                        let prev: u64 = cur
+                            .and_then(|r| std::str::from_utf8(&r.payload).ok())
+                            .and_then(|s| s.trim().parse::<u64>().ok())
+                            .unwrap_or(0);
+                        if 1 > prev {
+                            Ok(Some(WriteRequest::new(NodeKind::Config, b"1".to_vec())))
+                        } else {
+                            Ok(None)
+                        }
+                    })
+                    .unwrap();
+                assert!(!regressed);
+            }));
+        }
+        for h in inc_handles {
+            h.join().unwrap();
+        }
+
+        let verifier = LibreDb::open(&db_path).unwrap();
+        let final_rec = verifier
+            .get_by_key(NodeKind::Config, "counter:rev")
+            .unwrap();
+        assert_eq!(
+            std::str::from_utf8(&final_rec.payload).unwrap(),
+            (threads * 16).to_string()
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

@@ -378,6 +378,233 @@ pub fn normalize_workspace_key(path: &Path) -> String {
     }
 }
 
+struct WsLockSlot {
+    owner: Option<std::thread::ThreadId>,
+    depth: usize,
+    os_backend: Option<OsFileBackend>,
+}
+
+type WsLockPair = (std::sync::Mutex<WsLockSlot>, std::sync::Condvar);
+
+/// Cross-process (`OsFileBackend::lock_write_region`) and thread-reentrant intra-process
+/// (`Mutex + Condvar`) lock serializing workspace trust verification, workspace memory mutations,
+/// and two-phase `(proj_db, global_db)` seal updates for a given `(global_db, ws_root)` pair.
+pub struct WorkspaceTrustLockGuard {
+    slot: std::sync::Arc<WsLockPair>,
+}
+
+impl WorkspaceTrustLockGuard {
+    pub fn acquire(global_db: &LibreDb, ws_root: &Path) -> Result<Self, String> {
+        let norm = normalize_workspace_key(ws_root);
+        Self::acquire_norm(global_db, &norm)
+    }
+
+    pub(crate) fn acquire_norm(global_db: &LibreDb, norm: &str) -> Result<Self, String> {
+        static REGISTRY: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<WsLockPair>>>,
+        > = std::sync::OnceLock::new();
+
+        let lock_path = workspace_trust_lock_path(global_db, norm)?;
+        let canon_key =
+            canonicalize_with_missing_tail(&lock_path).unwrap_or_else(|| lock_path.clone());
+        let slot = {
+            let map_mtx =
+                REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+            let mut map = map_mtx.lock().unwrap_or_else(|e| e.into_inner());
+            std::sync::Arc::clone(map.entry(canon_key).or_insert_with(|| {
+                std::sync::Arc::new((
+                    std::sync::Mutex::new(WsLockSlot {
+                        owner: None,
+                        depth: 0,
+                        os_backend: None,
+                    }),
+                    std::sync::Condvar::new(),
+                ))
+            }))
+        };
+
+        let tid = std::thread::current().id();
+        let mut st = slot.0.lock().unwrap_or_else(|e| e.into_inner());
+        while st.owner.is_some_and(|o| o != tid) {
+            st = slot.1.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
+        if st.depth > 0 {
+            st.depth += 1;
+            drop(st);
+            return Ok(Self { slot });
+        }
+
+        // Reserve intra-process ownership while blocking on the OS cross-process file lock;
+        // `PendingReset` guarantees cleanup even if opening/locking errors or unwinds.
+        st.owner = Some(tid);
+        st.depth = 1;
+        drop(st);
+
+        struct PendingReset<'a> {
+            slot: &'a WsLockPair,
+            armed: bool,
+        }
+        impl Drop for PendingReset<'_> {
+            fn drop(&mut self) {
+                if self.armed {
+                    let mut st = self.slot.0.lock().unwrap_or_else(|e| e.into_inner());
+                    st.owner = None;
+                    st.depth = 0;
+                    st.os_backend = None;
+                    self.slot.1.notify_all();
+                }
+            }
+        }
+        let mut reset_guard = PendingReset {
+            slot: &slot,
+            armed: true,
+        };
+
+        if let Ok(meta) = fs::symlink_metadata(&lock_path) {
+            if meta.file_type().is_symlink() {
+                return Err(format!(
+                    "Refusing to use symlinked workspace trust lockfile at '{}'",
+                    lock_path.display()
+                ));
+            }
+        }
+        let backend = OsFileBackend::open(&lock_path).map_err(|e| {
+            format!(
+                "Failed to open workspace trust lockfile '{}': {e}",
+                lock_path.display()
+            )
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600));
+        }
+        backend.lock_write_region().map_err(|e| {
+            format!(
+                "Failed to acquire workspace trust lock '{}': {e}",
+                lock_path.display()
+            )
+        })?;
+
+        {
+            let mut st = slot.0.lock().unwrap_or_else(|e| e.into_inner());
+            st.os_backend = Some(backend);
+        }
+        reset_guard.armed = false;
+        drop(reset_guard);
+
+        Ok(Self { slot })
+    }
+}
+
+impl Drop for WorkspaceTrustLockGuard {
+    fn drop(&mut self) {
+        let mut st = self.slot.0.lock().unwrap_or_else(|e| e.into_inner());
+        st.depth = st.depth.saturating_sub(1);
+        if st.depth == 0 {
+            if let Some(backend) = st.os_backend.take() {
+                let _ = backend.unlock_write_region();
+            }
+            st.owner = None;
+            self.slot.1.notify_all();
+        }
+    }
+}
+
+fn workspace_trust_lock_path(global_db: &LibreDb, norm: &str) -> Result<PathBuf, String> {
+    let base_dir = global_db
+        .path()
+        .and_then(Path::parent)
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("libredb_mem_seal_locks_{}", std::process::id()))
+        });
+    let locks_dir = base_dir.join(".seal_locks");
+    if let Ok(meta) = fs::symlink_metadata(&locks_dir) {
+        if meta.file_type().is_symlink() {
+            return Err(format!(
+                "Refusing to use symlinked workspace seal lock directory '{}'",
+                locks_dir.display()
+            ));
+        }
+    } else {
+        fs::create_dir_all(&locks_dir).map_err(|e| {
+            format!(
+                "Failed to create workspace seal lock directory '{}': {e}",
+                locks_dir.display()
+            )
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&locks_dir, fs::Permissions::from_mode(0o700));
+        }
+    }
+    let mut h = Sha256::new();
+    h.update(b"LibreDB::WorkspaceTrustLock::v1\0");
+    h.update(norm.as_bytes());
+    let digest = h.finalize();
+    Ok(locks_dir.join(format!("ws_{}.lock", hex_encode(&digest[..16]))))
+}
+
+/// Atomically advances `trust:seal_rev::<norm>` in `global_db` strictly monotonically
+/// (`new_rev = max(cur_rev, target_rev)`) under `customizations.ldb`'s exclusive `IpcWriteGuard`.
+/// Guarantees that a delayed or concurrent writer can NEVER regress an already confirmed revision.
+fn advance_global_seal_revision_monotonic(
+    global_db: &LibreDb,
+    norm: &str,
+    target_rev: u64,
+) -> Result<u64, String> {
+    let rev_key = format!("trust:seal_rev::{norm}");
+    let (rec_opt, _) = global_db
+        .transact_key(NodeKind::Config, &rev_key, |existing| {
+            let cur_rev = match existing {
+                None => 0u64,
+                Some(rec) => {
+                    let raw = std::str::from_utf8(&rec.payload)
+                        .map_err(|_| {
+                            LibreDbError::CorruptFormat(
+                                "Corrupt UTF-8 in trust:seal_rev inside customizations.ldb",
+                            )
+                        })?
+                        .trim();
+                    let parsed = raw.parse::<u64>().map_err(|_| {
+                        LibreDbError::CorruptFormat(
+                            "Corrupt non-numeric trust:seal_rev inside customizations.ldb",
+                        )
+                    })?;
+                    if parsed == 0 || parsed.to_string() != raw {
+                        return Err(LibreDbError::CorruptFormat(
+                            "Non-canonical trust:seal_rev inside customizations.ldb",
+                        ));
+                    }
+                    parsed
+                }
+            };
+            if target_rev > cur_rev {
+                Ok(Some(
+                    WriteRequest::new(NodeKind::Config, target_rev.to_string().into_bytes())
+                        .with_key(rev_key.clone())
+                        .with_importance(185),
+                ))
+            } else {
+                Ok(None)
+            }
+        })
+        .map_err(|e| format!("Failed to advance '{rev_key}' monotonically: {e}"))?;
+
+    match rec_opt {
+        Some(r) => {
+            let s = String::from_utf8_lossy(&r.payload);
+            s.trim()
+                .parse::<u64>()
+                .map_err(|e| format!("Failed to decode committed '{rev_key}': {e}"))
+        }
+        None => Ok(0),
+    }
+}
+
 /// Synchronizes external cross-process commits to `customizations.ldb` and fails closed if the
 /// global database file on disk cannot be stat'd, read, or decoded (e.g. superblock/delta corruption).
 /// Prevents long-lived processes (`libredb-mcp`) or multi-handle callers from consulting stale RAM trust!
@@ -743,6 +970,12 @@ pub fn is_unsealed_replacement_of_sealed_workspace(global_db: &LibreDb, ws_root:
         return false;
     }
     let norm = normalize_workspace_key(ws_root);
+    let Ok(_ws_lock) = WorkspaceTrustLockGuard::acquire_norm(global_db, &norm) else {
+        return false;
+    };
+    if check_global_trust_sync(global_db).is_err() {
+        return false;
+    }
     let Ok(true) = has_prior_workspace_seal_marker_norm_checked(global_db, &norm) else {
         return false;
     };
@@ -782,6 +1015,8 @@ pub fn detect_workspace_seal_rollback(
 ) -> Result<Option<(u64, u64)>, String> {
     check_global_trust_sync(global_db)?;
     let norm = normalize_workspace_key(ws_root);
+    let _ws_lock = WorkspaceTrustLockGuard::acquire_norm(global_db, &norm)?;
+    check_global_trust_sync(global_db)?;
     let global_rev = read_global_seal_revision(global_db, &norm)?;
     if global_rev == 0 {
         return Ok(None);
@@ -833,6 +1068,12 @@ pub fn has_valid_legacy_v3_content_seal(global_db: &LibreDb, ws_root: &Path) -> 
         return false;
     }
     let norm = normalize_workspace_key(ws_root);
+    let Ok(_ws_lock) = WorkspaceTrustLockGuard::acquire_norm(global_db, &norm) else {
+        return false;
+    };
+    if check_global_trust_sync(global_db).is_err() {
+        return false;
+    }
     if has_config_key_fail_closed(global_db, &format!("trust:revoked::{norm}")).unwrap_or(true)
         || has_config_key_fail_closed(global_db, &format!("trust:v4_upgraded::{norm}"))
             .unwrap_or(true)
@@ -896,6 +1137,12 @@ pub fn is_workspace_memory_trusted(global_db: Option<&LibreDb>, ws_root: &Path) 
     let Some(gdb) = global_db else {
         let agents_dir = ws_root.join(".agents");
         return !agents_dir.join("memory.ldb").exists() && !agents_dir.join("memory.db").exists();
+    };
+    if check_global_trust_sync(gdb).is_err() {
+        return false;
+    }
+    let Ok(_ws_lock) = WorkspaceTrustLockGuard::acquire_norm(gdb, &norm) else {
+        return false;
     };
     if check_global_trust_sync(gdb).is_err() {
         return false;
@@ -994,171 +1241,217 @@ pub fn is_workspace_memory_trusted(global_db: Option<&LibreDb>, ws_root: &Path) 
 
 /// Cryptographically seals `ws_root`, the `v4` SHA-256 content+metadata+synapse digest of `proj_db`'s
 /// cognitive capsules, AND a monotonically advancing per-workspace seal revision `r<rev>` (`>= 1`) via
-/// RFC 2104 `HMAC-SHA256` (`hmac-sha256:v4:r<rev>:<64-hex>`), using a crash-consistent two-phase commit:
-/// - **Phase 1 (`proj_db`):** Commits + `fsync`s `hmac-sha256:v4:r<target_rev>:<hex>` into `sys::trust_seals`.
-///   (If the process crashes right after Phase 1, `proj_rev (N+1) >= global_rev (N)` stays valid!)
-/// - **Phase 2 (`global_db`):** Commits + `fsync`s `trust:seal_rev::<ws> = <target_rev>` into `customizations.ldb`,
-///   invalidating any older captured non-empty `.agents/memory.ldb` snapshot (`proj_rev < global_rev`).
+/// RFC 2104 `HMAC-SHA256` (`hmac-sha256:v4:r<rev>:<64-hex>`), protected by BOTH:
+/// 1. Cross-process + reentrant intra-process `WorkspaceTrustLockGuard` across the entire operation, AND
+/// 2. Kernel-locked CAS checks (`proj_db.transact_key` + `advance_global_seal_revision_monotonic`) so
+///    even uncooperative concurrent writers can NEVER clobber a newer seal or regress `trust:seal_rev::<ws>`.
 pub fn seal_workspace_memory(
     global_db: &LibreDb,
     proj_db: &LibreDb,
     ws_root: &Path,
 ) -> Result<(), String> {
+    seal_workspace_memory_inner(global_db, proj_db, ws_root, true, None)
+}
+
+fn seal_workspace_memory_inner(
+    global_db: &LibreDb,
+    proj_db: &LibreDb,
+    ws_root: &Path,
+    acquire_ws_lock: bool,
+    after_phase1_hook: Option<&dyn Fn()>,
+) -> Result<(), String> {
     check_global_trust_sync(global_db)?;
     let norm = normalize_workspace_key(ws_root);
-    let global_rev = read_global_seal_revision(global_db, &norm)?;
-    let already_v4_ratcheted =
-        has_config_key_fail_closed(global_db, &format!("trust:v4_upgraded::{norm}"))?;
-    let (content_digest, capsule_count) = compute_cognitive_content_digest(proj_db)?;
-
-    let existing_seals_txt = match proj_db.get_by_key(NodeKind::Config, TRUST_SEALS_KEY) {
-        Ok(rec) => String::from_utf8_lossy(&rec.payload).into_owned(),
-        Err(LibreDbError::KeyNotFound { .. }) => String::new(),
-        Err(e) => {
-            return Err(format!(
-                "Failed to read existing sys::trust_seals in workspace memory: {e}"
-            ));
-        }
-    };
-
-    let mut secret = ensure_trust_anchor_secret(global_db)?;
-    let host_tag = compute_host_seal_slot_id(&secret, &norm);
-    let existing_valid_rev = if existing_seals_txt.is_empty() {
-        None
+    let _ws_lock = if acquire_ws_lock {
+        Some(WorkspaceTrustLockGuard::acquire_norm(global_db, &norm)?)
     } else {
-        verify_and_extract_host_seal_rev(
-            &secret,
-            &norm,
-            &content_digest,
-            &existing_seals_txt,
-            already_v4_ratcheted,
-        )
+        None
     };
-    let target_rev = match existing_valid_rev {
-        Some(r) if r >= 1 && r >= global_rev => r,
-        _ => {
-            let prev_slot_rev = extract_syntactic_host_slot_rev(&existing_seals_txt, &host_tag);
-            let bounded_prev = if prev_slot_rev <= global_rev.saturating_add(1024) {
-                prev_slot_rev
-            } else {
-                0
+
+    for _attempt in 0..4 {
+        check_global_trust_sync(global_db)?;
+        proj_db.sync_from_disk_if_changed().map_err(|e| {
+            format!("Failed to synchronize workspace memory from disk before sealing: {e}")
+        })?;
+        let global_rev = read_global_seal_revision(global_db, &norm)?;
+        let already_v4_ratcheted =
+            has_config_key_fail_closed(global_db, &format!("trust:v4_upgraded::{norm}"))?;
+        let (content_digest, capsule_count) = compute_cognitive_content_digest(proj_db)?;
+
+        let (expected_seal_ver, existing_seals_txt) =
+            match proj_db.get_by_key(NodeKind::Config, TRUST_SEALS_KEY) {
+                Ok(rec) => (
+                    Some((rec.node_id, rec.generation)),
+                    String::from_utf8_lossy(&rec.payload).into_owned(),
+                ),
+                Err(LibreDbError::KeyNotFound { .. }) => (None, String::new()),
+                Err(e) => {
+                    return Err(format!(
+                        "Failed to read existing sys::trust_seals in workspace memory: {e}"
+                    ));
+                }
             };
-            let next_res = global_rev.max(bounded_prev).checked_add(1);
-            match next_res {
-                Some(next_rev) => next_rev,
-                None => {
-                    secure_zero(&mut secret);
-                    return Err("Workspace seal revision counter overflowed u64".to_owned());
+
+        let mut secret = ensure_trust_anchor_secret(global_db)?;
+        let host_tag = compute_host_seal_slot_id(&secret, &norm);
+        let existing_valid_rev = if existing_seals_txt.is_empty() {
+            None
+        } else {
+            verify_and_extract_host_seal_rev(
+                &secret,
+                &norm,
+                &content_digest,
+                &existing_seals_txt,
+                already_v4_ratcheted,
+            )
+        };
+        let target_rev = match existing_valid_rev {
+            Some(r) if r >= 1 && r >= global_rev => r,
+            _ => {
+                let prev_slot_rev = extract_syntactic_host_slot_rev(&existing_seals_txt, &host_tag);
+                let bounded_prev = if prev_slot_rev <= global_rev.saturating_add(1024) {
+                    prev_slot_rev
+                } else {
+                    0
+                };
+                let next_res = global_rev.max(bounded_prev).checked_add(1);
+                match next_res {
+                    Some(next_rev) => next_rev,
+                    None => {
+                        secure_zero(&mut secret);
+                        return Err("Workspace seal revision counter overflowed u64".to_owned());
+                    }
                 }
             }
+        };
+        let bare_seal = compute_workspace_seal_v4_rev(&secret, &norm, &content_digest, target_rev);
+        let seal_line = format!("{host_tag}={bare_seal}");
+        secure_zero(&mut secret);
+
+        // If an authorized transition reduces `capsule_count` back to `0` (e.g. deprecating the last capsule
+        // or running `libredb trust --reinit-lost`), clear `trust:nonempty_sealed` BEFORE writing `proj_db`
+        // so concurrent readers never observe `nonempty_ratcheted && capsule_count == 0`.
+        let nonempty_key = format!("trust:nonempty_sealed::{norm}");
+        if capsule_count == 0 && has_config_key_fail_closed(global_db, &nonempty_key)? {
+            deprecate_config_if_present(global_db, &nonempty_key)?;
         }
-    };
-    let bare_seal = compute_workspace_seal_v4_rev(&secret, &norm, &content_digest, target_rev);
-    let seal_line = format!("{host_tag}={bare_seal}");
-    secure_zero(&mut secret);
 
-    // If an authorized transition reduces `capsule_count` back to `0` (e.g. deprecating the last capsule
-    // or running `libredb trust --reinit-lost`), clear `trust:nonempty_sealed` BEFORE writing `proj_db`
-    // so concurrent readers never observe `nonempty_ratcheted && capsule_count == 0`.
-    let nonempty_key = format!("trust:nonempty_sealed::{norm}");
-    if capsule_count == 0 && has_config_key_fail_closed(global_db, &nonempty_key)? {
-        deprecate_config_if_present(global_db, &nonempty_key)?;
-    }
+        // Phase 1: Conditionally commit `hmac-sha256:v4:r<target_rev>:<hex>` into `proj_db` via CAS
+        // so concurrent uncooperative writes are detected and retried cleanly instead of clobbered.
+        let mut seals: Vec<String> = existing_seals_txt
+            .lines()
+            .map(str::trim)
+            .filter(|s| {
+                !s.is_empty()
+                    && !s.starts_with(&format!("{host_tag}="))
+                    && !s.starts_with("hmac-sha256:v2:")
+                    && !s.starts_with("hmac-sha256:v3:")
+                    && !s.starts_with("hmac-sha256:v4:")
+            })
+            .map(ToOwned::to_owned)
+            .collect();
 
-    // Phase 1: Write and fsync `hmac-sha256:v4:r<target_rev>:<hex>` into `proj_db` FIRST so any
-    // concurrent reader or mid-commit crash observes `proj_rev >= global_rev` (zero false quarantine).
-    let mut seals: Vec<String> = existing_seals_txt
-        .lines()
-        .map(str::trim)
-        .filter(|s| {
-            !s.is_empty()
-                && !s.starts_with(&format!("{host_tag}="))
-                && !s.starts_with("hmac-sha256:v2:")
-                && !s.starts_with("hmac-sha256:v3:")
-                && !s.starts_with("hmac-sha256:v4:")
-        })
-        .map(ToOwned::to_owned)
-        .collect();
+        seals.push(bare_seal);
+        seals.push(seal_line);
+        if seals.len() > 16 {
+            let drain_cnt = seals.len() - 16;
+            seals.drain(0..drain_cnt);
+        }
+        let body = seals.join("\n");
+        if existing_seals_txt.as_bytes() != body.as_bytes() {
+            let body_bytes = body.into_bytes();
+            let (_, committed) = proj_db
+                .transact_key(NodeKind::Config, TRUST_SEALS_KEY, |cur_opt| {
+                    let cur_ver = cur_opt.map(|r| (r.node_id, r.generation));
+                    if cur_ver != expected_seal_ver {
+                        return Ok(None);
+                    }
+                    Ok(Some(
+                        WriteRequest::new(NodeKind::Config, body_bytes)
+                            .with_key(TRUST_SEALS_KEY)
+                            .with_importance(200),
+                    ))
+                })
+                .map_err(|e| e.to_string())?;
+            if !committed {
+                // Concurrent uncooperative writer updated `sys::trust_seals`; reload and retry.
+                continue;
+            }
+            let (post_digest, _) = compute_cognitive_content_digest(proj_db)?;
+            if post_digest != content_digest {
+                // Concurrent uncooperative writer mutated project capsules during digest calculation; retry.
+                continue;
+            }
+        }
 
-    seals.push(bare_seal);
-    seals.push(seal_line);
-    if seals.len() > 16 {
-        let drain_cnt = seals.len() - 16;
-        seals.drain(0..drain_cnt);
-    }
-    let body = seals.join("\n");
-    if existing_seals_txt.as_bytes() != body.as_bytes() {
-        proj_db
-            .put(
-                WriteRequest::new(NodeKind::Config, body.into_bytes())
-                    .with_key(TRUST_SEALS_KEY)
-                    .with_importance(200),
-            )
-            .map_err(|e| e.to_string())?;
-    }
+        if let Some(hook) = after_phase1_hook {
+            hook();
+        }
 
-    // Phase 2: Commit monotonic `trust:seal_rev::<ws>` and ratchets into `global_db`.
-    deprecate_config_if_present(global_db, &format!("trust:revoked::{norm}"))?;
-    let clean_display = crate::gitea::strip_verbatim_prefix(ws_root)
-        .to_string_lossy()
-        .into_owned();
-    let allow_key = format!("trust:allowed::{norm}");
-    let already_recorded = match global_db.get_by_key(NodeKind::Config, &allow_key) {
-        Ok(r) => r.payload == clean_display.as_bytes(),
-        Err(LibreDbError::KeyNotFound { .. }) => false,
-        Err(e) => return Err(e.to_string()),
-    };
-    if !already_recorded {
+        // Phase 2: Commit ratchets via `put_if_absent` and strictly monotonic `trust:seal_rev::<ws>`
+        // (`new_rev = max(cur_rev, target_rev)`) so delayed writers can NEVER regress `global_rev`.
+        deprecate_config_if_present(global_db, &format!("trust:revoked::{norm}"))?;
+        let clean_display = crate::gitea::strip_verbatim_prefix(ws_root)
+            .to_string_lossy()
+            .into_owned();
+        let allow_key = format!("trust:allowed::{norm}");
+        let allow_payload = clean_display.into_bytes();
         global_db
-            .put(
-                WriteRequest::new(NodeKind::Config, clean_display.into_bytes())
-                    .with_key(allow_key)
-                    .with_importance(185),
-            )
+            .transact_key(NodeKind::Config, &allow_key, |existing| {
+                if existing.is_some_and(|r| r.payload == allow_payload) {
+                    Ok(None)
+                } else {
+                    Ok(Some(
+                        WriteRequest::new(NodeKind::Config, allow_payload)
+                            .with_key(allow_key.clone())
+                            .with_importance(185),
+                    ))
+                }
+            })
             .map_err(|e| e.to_string())?;
-    }
-    for (ratchet_key, marker) in [
-        (format!("trust:sealed::{norm}"), b"1".as_slice()),
-        (format!("trust:v3_upgraded::{norm}"), b"v3".as_slice()),
-        (format!("trust:v4_upgraded::{norm}"), b"v4".as_slice()),
-    ] {
-        if !has_config_key_fail_closed(global_db, &ratchet_key)? {
+
+        for (ratchet_key, marker) in [
+            (format!("trust:sealed::{norm}"), b"1".as_slice()),
+            (format!("trust:v3_upgraded::{norm}"), b"v3".as_slice()),
+            (format!("trust:v4_upgraded::{norm}"), b"v4".as_slice()),
+        ] {
             global_db
-                .put(
+                .put_if_absent(
                     WriteRequest::new(NodeKind::Config, marker.to_vec())
                         .with_key(ratchet_key)
                         .with_importance(180),
                 )
                 .map_err(|e| e.to_string())?;
         }
+
+        advance_global_seal_revision_monotonic(global_db, &norm, target_rev)?;
+
+        if capsule_count > 0 {
+            global_db
+                .put_if_absent(
+                    WriteRequest::new(NodeKind::Config, b"1".to_vec())
+                        .with_key(nonempty_key)
+                        .with_importance(180),
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        return Ok(());
     }
-    if global_rev != target_rev {
-        let rev_key = format!("trust:seal_rev::{norm}");
-        global_db
-            .put(
-                WriteRequest::new(NodeKind::Config, target_rev.to_string().into_bytes())
-                    .with_key(rev_key)
-                    .with_importance(185),
-            )
-            .map_err(|e| e.to_string())?;
-    }
-    if capsule_count > 0 && !has_config_key_fail_closed(global_db, &nonempty_key)? {
-        global_db
-            .put(
-                WriteRequest::new(NodeKind::Config, b"1".to_vec())
-                    .with_key(nonempty_key)
-                    .with_importance(180),
-            )
-            .map_err(|e| e.to_string())?;
-    }
-    Ok(())
+
+    Err(format!(
+        "Failed to seal workspace '{}' due to sustained uncooperative concurrent modifications across 4 retries.",
+        ws_root.display()
+    ))
 }
 
-/// Type-enforced pre-mutation trust guard whose private `authorized_ws` field can ONLY be
-/// populated by verifying `is_workspace_memory_trusted` BEFORE mutating `proj_db`.
-/// Prevents post-hoc re-sealing ("trust laundering") of offline-tampered or rolled-back databases.
+/// Type-enforced pre-mutation trust guard holding `WorkspaceTrustLockGuard` continuously from
+/// BEFORE verifying `is_workspace_memory_trusted`, across project capsule mutations, through
+/// Phase 1 + Phase 2 of `reseal_after_write`.
+/// Prevents post-hoc trust laundering AND prevents concurrent writers/readers from observing or
+/// clobbering intermediate unsealed mutations.
 pub struct PreMutationSealGuard {
     authorized_ws: Option<PathBuf>,
+    ws_lock: std::sync::Mutex<Option<WorkspaceTrustLockGuard>>,
 }
 
 impl PreMutationSealGuard {
@@ -1169,6 +1462,7 @@ impl PreMutationSealGuard {
         let Some(gdb) = global_db else {
             return Ok(Self {
                 authorized_ws: None,
+                ws_lock: std::sync::Mutex::new(None),
             });
         };
         check_global_trust_sync(gdb)?;
@@ -1184,19 +1478,25 @@ impl PreMutationSealGuard {
         let Some(parent) = resolved_db.parent() else {
             return Ok(Self {
                 authorized_ws: None,
+                ws_lock: std::sync::Mutex::new(None),
             });
         };
         if parent.file_name().and_then(|n| n.to_str()) != Some(".agents") {
             return Ok(Self {
                 authorized_ws: None,
+                ws_lock: std::sync::Mutex::new(None),
             });
         };
         let Some(ws_root) = parent.parent() else {
             return Ok(Self {
                 authorized_ws: None,
+                ws_lock: std::sync::Mutex::new(None),
             });
         };
         let norm = normalize_workspace_key(ws_root);
+        let lock_guard = WorkspaceTrustLockGuard::acquire_norm(gdb, &norm)?;
+        check_global_trust_sync(gdb)?;
+
         if has_config_key_fail_closed(gdb, &format!("trust:revoked::{norm}"))? {
             return Err(format!(
                 "Workspace memory at '{}' belongs to an explicitly revoked workspace '{}'; run 'libredb trust \"{}\"' to re-authorize before writing to it.",
@@ -1208,9 +1508,10 @@ impl PreMutationSealGuard {
         let has_prior_seal = has_prior_workspace_seal_marker_norm_checked(gdb, &norm)?;
         if !has_prior_seal && !is_workspace_path_authorized_synced(gdb, ws_root) {
             // Workspace was never sealed, never revoked, and is not registered as trusted in `global_db`;
-            // never auto-authorize or seal it.
+            // never auto-authorize or seal it, while still holding `lock_guard` across the write.
             return Ok(Self {
                 authorized_ws: None,
+                ws_lock: std::sync::Mutex::new(Some(lock_guard)),
             });
         }
         if !is_workspace_memory_trusted(Some(gdb), ws_root) {
@@ -1245,6 +1546,7 @@ impl PreMutationSealGuard {
         }
         Ok(Self {
             authorized_ws: Some(ws_root.to_path_buf()),
+            ws_lock: std::sync::Mutex::new(Some(lock_guard)),
         })
     }
 
@@ -1253,15 +1555,22 @@ impl PreMutationSealGuard {
         global_db: Option<&LibreDb>,
         proj_db: &LibreDb,
     ) -> Result<(), String> {
-        if let (Some(gdb), Some(ref ws_root)) = (global_db, &self.authorized_ws) {
+        let res = if let (Some(gdb), Some(ref ws_root)) = (global_db, &self.authorized_ws) {
             seal_workspace_memory(gdb, proj_db, ws_root).map_err(|err| {
                 format!(
                     "Workspace mutation succeeded, but updating hmac-sha256:v4 trust seal for '{}' failed: {err}",
                     ws_root.display()
                 )
-            })?;
-        }
-        Ok(())
+            })
+        } else {
+            Ok(())
+        };
+        let _ = self
+            .ws_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        res
     }
 }
 
@@ -1276,6 +1585,8 @@ pub fn migrate_workspace_seal_v2_to_v3(
 ) -> Result<bool, String> {
     check_global_trust_sync(global_db)?;
     let norm = normalize_workspace_key(ws_root);
+    let _ws_lock = WorkspaceTrustLockGuard::acquire_norm(global_db, &norm)?;
+    check_global_trust_sync(global_db)?;
     if has_config_key_fail_closed(global_db, &format!("trust:revoked::{norm}"))? {
         return Err(format!(
             "Workspace '{}' has been explicitly revoked; run 'libredb trust \"{}\"' to re-authorize.",
@@ -1376,8 +1687,9 @@ pub fn migrate_workspace_seal_v3_to_v4(
     ws_root: &Path,
     confirm_unauthenticated_metadata: bool,
 ) -> Result<bool, String> {
-    check_global_trust_sync(global_db)?;
     let norm = normalize_workspace_key(ws_root);
+    let _ws_lock = WorkspaceTrustLockGuard::acquire_norm(global_db, &norm)?;
+    check_global_trust_sync(global_db)?;
     if has_config_key_fail_closed(global_db, &format!("trust:revoked::{norm}"))? {
         return Err(format!(
             "Workspace '{}' has been explicitly revoked; run 'libredb trust \"{}\"' to re-authorize.",
@@ -1615,8 +1927,9 @@ pub fn migrate_workspace_seal_v3_to_v4(
 
 /// Revokes workspace trust in `global_db` and removes `sys::trust_seals` from `<ws_root>/.agents/memory.ldb` if present.
 pub fn revoke_workspace_trust(global_db: &LibreDb, ws_root: &Path) -> Result<(), String> {
-    check_global_trust_sync(global_db)?;
     let norm = normalize_workspace_key(ws_root);
+    let _ws_lock = WorkspaceTrustLockGuard::acquire_norm(global_db, &norm)?;
+    check_global_trust_sync(global_db)?;
     deprecate_config_if_present(global_db, &format!("trust:allowed::{norm}"))?;
     if let Some(name) = ws_root.file_name().and_then(|n| n.to_str()) {
         deprecate_config_if_present(global_db, &format!("workspace:{name}"))?;
@@ -1965,37 +2278,55 @@ pub fn is_safe_auto_git_dir(global_db: Option<&LibreDb>, project_root: &Path) ->
     is_workspace_memory_trusted(global_db, project_root)
 }
 
-fn ensure_trust_anchor_secret(global_db: &LibreDb) -> Result<[u8; 32], String> {
-    match global_db.get_by_key(NodeKind::Config, TRUST_SECRET_KEY) {
-        Ok(rec) => {
-            let raw = String::from_utf8_lossy(&rec.payload).into_owned();
-            let (mut hex_str, needs_upgrade) = unprotect_secret(&raw)?;
-            let decoded = hex_decode(hex_str.trim());
-            if let Some(mut bytes) = decoded {
-                if bytes.len() == 32 {
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&bytes);
-                    secure_zero(&mut bytes);
-                    if needs_upgrade {
-                        if let Ok(enc) = protect_secret(hex_str.trim()) {
-                            let _ = global_db.put(
-                                WriteRequest::new(NodeKind::Config, enc.into_bytes())
-                                    .with_key(TRUST_SECRET_KEY)
-                                    .with_importance(240),
-                            );
+fn decode_and_maybe_upgrade_trust_anchor_record(
+    global_db: &LibreDb,
+    rec: &libredb_core::NodeRecord,
+) -> Result<[u8; 32], String> {
+    let raw = String::from_utf8_lossy(&rec.payload).into_owned();
+    let (mut hex_str, needs_upgrade) = unprotect_secret(&raw)?;
+    let decoded = hex_decode(hex_str.trim());
+    if let Some(mut bytes) = decoded {
+        if bytes.len() == 32 {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            secure_zero(&mut bytes);
+            if needs_upgrade {
+                if let Ok(enc) = protect_secret(hex_str.trim()) {
+                    let expected_id = rec.node_id;
+                    let expected_gen = rec.generation;
+                    let _ = global_db.transact_key(NodeKind::Config, TRUST_SECRET_KEY, |cur| {
+                        match cur {
+                            Some(cur_rec)
+                                if cur_rec.node_id == expected_id
+                                    && cur_rec.generation == expected_gen =>
+                            {
+                                Ok(Some(
+                                    WriteRequest::new(NodeKind::Config, enc.into_bytes())
+                                        .with_key(TRUST_SECRET_KEY)
+                                        .with_importance(240),
+                                ))
+                            }
+                            _ => Ok(None),
                         }
-                    }
-                    secure_zero(unsafe { hex_str.as_bytes_mut() });
-                    return Ok(arr);
+                    });
                 }
-                secure_zero(&mut bytes);
             }
             secure_zero(unsafe { hex_str.as_bytes_mut() });
-            return Err(
-                "Existing sys::trust_anchor_secret is invalid (expected 32-byte hex); refusing to overwrite"
-                    .to_owned(),
-            );
+            return Ok(arr);
         }
+        secure_zero(&mut bytes);
+    }
+    secure_zero(unsafe { hex_str.as_bytes_mut() });
+    Err(
+        "Existing sys::trust_anchor_secret is invalid (expected 32-byte hex); refusing to overwrite"
+            .to_owned(),
+    )
+}
+
+fn ensure_trust_anchor_secret(global_db: &LibreDb) -> Result<[u8; 32], String> {
+    check_global_trust_sync(global_db)?;
+    match global_db.get_by_key(NodeKind::Config, TRUST_SECRET_KEY) {
+        Ok(rec) => return decode_and_maybe_upgrade_trust_anchor_record(global_db, &rec),
         Err(LibreDbError::KeyNotFound { .. }) => {}
         Err(e) => {
             return Err(format!(
@@ -2004,20 +2335,36 @@ fn ensure_trust_anchor_secret(global_db: &LibreDb) -> Result<[u8; 32], String> {
         }
     }
 
-    let mut secret = [0u8; 32];
-    fill_csprng(&mut secret)?;
-    let mut hex_secret = hex_encode(&secret);
+    let mut candidate_secret = [0u8; 32];
+    fill_csprng(&mut candidate_secret)?;
+    let mut hex_secret = hex_encode(&candidate_secret);
     let protected_res = protect_secret(&hex_secret);
     secure_zero(unsafe { hex_secret.as_bytes_mut() });
-    let protected = protected_res?;
-    global_db
-        .put(
-            WriteRequest::new(NodeKind::Config, protected.into_bytes())
-                .with_key(TRUST_SECRET_KEY)
-                .with_importance(240),
-        )
-        .map_err(|e| e.to_string())?;
-    Ok(secret)
+    let protected = match protected_res {
+        Ok(p) => p,
+        Err(e) => {
+            secure_zero(&mut candidate_secret);
+            return Err(e);
+        }
+    };
+
+    match global_db.put_if_absent(
+        WriteRequest::new(NodeKind::Config, protected.into_bytes())
+            .with_key(TRUST_SECRET_KEY)
+            .with_importance(240),
+    ) {
+        Ok((_rec, true)) => Ok(candidate_secret),
+        Ok((winner_rec, false)) => {
+            secure_zero(&mut candidate_secret);
+            decode_and_maybe_upgrade_trust_anchor_record(global_db, &winner_rec)
+        }
+        Err(e) => {
+            secure_zero(&mut candidate_secret);
+            Err(format!(
+                "Failed to persist sys::trust_anchor_secret in customizations.ldb: {e}"
+            ))
+        }
+    }
 }
 
 pub(crate) fn compute_legacy_workspace_seal_v2(
@@ -4285,6 +4632,275 @@ mod tests {
         );
         assert!(crate::hooks::open_global_ldb_checked(Some(&global_trunc_path)).is_err());
         drop(gdb_trunc);
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn concurrent_seal_phase1_phase2_interleaving_never_regresses_global_revision() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        let tmp = std::env::temp_dir().join(format!(
+            "libredb_concurrent_seal_interleave_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+        let global_path = tmp.join("customizations.ldb");
+        let repo = tmp.join("repo");
+        fs::create_dir_all(repo.join(".agents")).unwrap();
+        let pdb_path = repo.join(".agents").join("memory.ldb");
+        let norm = normalize_workspace_key(&repo);
+
+        // Step 0: Seed workspace at r1 (proj_rev == 1, global_rev == 1).
+        {
+            let gdb = LibreDb::open(&global_path).unwrap();
+            let pdb = LibreDb::open(&pdb_path).unwrap();
+            pdb.put(WriteRequest::new(NodeKind::Fact, b"Fact 0".to_vec()).with_key("fact:0"))
+                .unwrap();
+            seal_workspace_memory(&gdb, &pdb, &repo).unwrap();
+            assert_eq!(read_global_seal_revision(&gdb, &norm).unwrap(), 1);
+            assert!(is_workspace_memory_trusted(Some(&gdb), &repo));
+        }
+
+        // Part (a): Deterministic 8-step Phase-1 / Phase-2 interleaving across independent LibreDb handles.
+        // Thread A pauses right after committing Phase 1 (proj r2, global still r1) while Thread B commits
+        // Fact B + seal r3 (proj r3, global r3). When Thread A resumes Phase 2 with target_rev=2,
+        // trust:seal_rev::<ws> MUST stay at 3 (never regressing to 2), and replaying snapshot_r2 MUST fail closed!
+        let phase1_done = Arc::new(Barrier::new(2));
+        let phase2_allow = Arc::new(Barrier::new(2));
+
+        let g_a = global_path.clone();
+        let p_a = pdb_path.clone();
+        let r_a = repo.clone();
+        let p1_a = Arc::clone(&phase1_done);
+        let p2_a = Arc::clone(&phase2_allow);
+
+        let thread_a = std::thread::spawn(move || {
+            let gdb_a = LibreDb::open(&g_a).unwrap();
+            let pdb_a = LibreDb::open(&p_a).unwrap();
+            pdb_a
+                .put(WriteRequest::new(NodeKind::Fact, b"Fact A".to_vec()).with_key("fact:a"))
+                .unwrap();
+            let hook = || {
+                p1_a.wait();
+                p2_a.wait();
+            };
+            seal_workspace_memory_inner(&gdb_a, &pdb_a, &r_a, false, Some(&hook)).unwrap();
+        });
+
+        // Wait until Thread A has durably written Phase 1 (r2) to proj_db, before Phase 2 touches global_db:
+        phase1_done.wait();
+        let snapshot_r2 = fs::read(&pdb_path).unwrap();
+        let snapshot_r3 = {
+            let gdb_b = LibreDb::open(&global_path).unwrap();
+            let pdb_b = LibreDb::open(&pdb_path).unwrap();
+            assert_eq!(read_global_seal_revision(&gdb_b, &norm).unwrap(), 1);
+            assert!(
+                is_workspace_memory_trusted(Some(&gdb_b), &repo),
+                "Crash-window state (proj r2 >= global r1) must remain valid while Phase 2 is pending"
+            );
+
+            // Thread B advances workspace to r3 and commits global_rev = 3:
+            pdb_b
+                .put(WriteRequest::new(NodeKind::Fact, b"Fact B".to_vec()).with_key("fact:b"))
+                .unwrap();
+            seal_workspace_memory(&gdb_b, &pdb_b, &repo).unwrap();
+            assert_eq!(read_global_seal_revision(&gdb_b, &norm).unwrap(), 3);
+            fs::read(&pdb_path).unwrap()
+        };
+
+        // Release Thread A to run its delayed Phase 2 (target_rev = 2):
+        phase2_allow.wait();
+        thread_a.join().unwrap();
+
+        {
+            let gdb_check = LibreDb::open(&global_path).unwrap();
+            assert_eq!(
+                read_global_seal_revision(&gdb_check, &norm).unwrap(),
+                3,
+                "Delayed Phase 2 (target_rev=2) MUST NEVER regress trust:seal_rev::<ws> below 3!"
+            );
+            assert!(is_workspace_memory_trusted(Some(&gdb_check), &repo));
+
+            // Replaying the captured r2 snapshot MUST now be rejected as a historical rollback (2 < 3):
+            fs::write(&pdb_path, &snapshot_r2).unwrap();
+            assert!(
+                !is_workspace_memory_trusted(Some(&gdb_check), &repo),
+                "Captured r2 snapshot replay MUST fail closed because global_rev remained at 3!"
+            );
+            assert_eq!(
+                detect_workspace_seal_rollback(&gdb_check, &repo).unwrap(),
+                Some((2, 3))
+            );
+
+            // Restore genuine r3 snapshot before Part (b):
+            fs::write(&pdb_path, &snapshot_r3).unwrap();
+            assert!(is_workspace_memory_trusted(Some(&gdb_check), &repo));
+        }
+
+        // Part (b): Cooperative PreMutationSealGuard + WorkspaceTrustLockGuard 8-writer + 2-reader stress test.
+        let writer_count = 8usize;
+        let writes_per_thread = 2usize;
+        let start_barrier = Arc::new(Barrier::new(writer_count + 2));
+        let stop_readers = Arc::new(AtomicBool::new(false));
+
+        let mut reader_handles = Vec::with_capacity(2);
+        for _ in 0..2 {
+            let g_r = global_path.clone();
+            let r_r = repo.clone();
+            let sb = Arc::clone(&start_barrier);
+            let stop = Arc::clone(&stop_readers);
+            reader_handles.push(std::thread::spawn(move || {
+                let gdb_r = LibreDb::open(&g_r).unwrap();
+                sb.wait();
+                while !stop.load(Ordering::Acquire) {
+                    assert!(
+                        is_workspace_memory_trusted(Some(&gdb_r), &r_r),
+                        "Concurrent reader MUST never observe unsealed intermediate state!"
+                    );
+                    std::thread::yield_now();
+                }
+                assert!(is_workspace_memory_trusted(Some(&gdb_r), &r_r));
+            }));
+        }
+
+        let mut writer_handles = Vec::with_capacity(writer_count);
+        for tid in 0..writer_count {
+            let g_w = global_path.clone();
+            let p_w = pdb_path.clone();
+            let sb = Arc::clone(&start_barrier);
+            writer_handles.push(std::thread::spawn(move || {
+                let gdb_w = LibreDb::open(&g_w).unwrap();
+                let pdb_w = LibreDb::open(&p_w).unwrap();
+                sb.wait();
+                for iter in 0..writes_per_thread {
+                    let guard =
+                        PreMutationSealGuard::verify_before_write(Some(&gdb_w), &p_w).unwrap();
+                    pdb_w.sync_from_disk_if_changed().unwrap();
+                    pdb_w
+                        .put(
+                            WriteRequest::new(
+                                NodeKind::Fact,
+                                format!("Concurrent fact {tid}:{iter}").into_bytes(),
+                            )
+                            .with_key(format!("fact:concurrent:{tid}:{iter}")),
+                        )
+                        .unwrap();
+                    guard.reseal_after_write(Some(&gdb_w), &pdb_w).unwrap();
+                }
+            }));
+        }
+
+        for wh in writer_handles {
+            wh.join().unwrap();
+        }
+        stop_readers.store(true, Ordering::Release);
+        for rh in reader_handles {
+            rh.join().unwrap();
+        }
+
+        let expected_final_rev = 3 + (writer_count * writes_per_thread) as u64;
+        {
+            let gdb_final = LibreDb::open(&global_path).unwrap();
+            let pdb_final = LibreDb::open(&pdb_path).unwrap();
+            assert_eq!(
+                read_global_seal_revision(&gdb_final, &norm).unwrap(),
+                expected_final_rev
+            );
+            assert!(is_workspace_memory_trusted(Some(&gdb_final), &repo));
+            for tid in 0..writer_count {
+                for iter in 0..writes_per_thread {
+                    let key = format!("fact:concurrent:{tid}:{iter}");
+                    assert!(pdb_final.get_by_key(NodeKind::Fact, &key).is_ok());
+                }
+            }
+            fs::write(&pdb_path, &snapshot_r2).unwrap();
+            assert_eq!(
+                detect_workspace_seal_rollback(&gdb_final, &repo).unwrap(),
+                Some((2, expected_final_rev))
+            );
+        }
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn concurrent_trust_anchor_secret_first_init_elects_single_winner() {
+        use std::sync::{Arc, Barrier};
+
+        let tmp = std::env::temp_dir().join(format!(
+            "libredb_concurrent_anchor_init_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+        let global_path = tmp.join("customizations.ldb");
+        {
+            let gdb_empty = LibreDb::open(&global_path).unwrap();
+            assert!(gdb_empty
+                .get_by_key(NodeKind::Config, TRUST_SECRET_KEY)
+                .is_err());
+        }
+
+        let threads = 8usize;
+        let mut ws_roots = Vec::with_capacity(threads);
+        for tid in 0..threads {
+            let ws = tmp.join(format!("ws_{tid}"));
+            fs::create_dir_all(ws.join(".agents")).unwrap();
+            let pdb = LibreDb::open(ws.join(".agents").join("memory.ldb")).unwrap();
+            pdb.put(
+                WriteRequest::new(NodeKind::Fact, format!("Seed {tid}").into_bytes())
+                    .with_key(format!("fact:seed:{tid}")),
+            )
+            .unwrap();
+            ws_roots.push(ws);
+        }
+
+        let barrier = Arc::new(Barrier::new(threads));
+        let mut handles = Vec::with_capacity(threads);
+        for ws in ws_roots.iter().cloned() {
+            let gp = global_path.clone();
+            let b = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let gdb = LibreDb::open(&gp).unwrap();
+                let pdb = LibreDb::open(ws.join(".agents").join("memory.ldb")).unwrap();
+                b.wait();
+                seal_workspace_memory(&gdb, &pdb, &ws).unwrap();
+                ensure_trust_anchor_secret(&gdb).unwrap()
+            }));
+        }
+
+        let secrets: Vec<[u8; 32]> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let first_secret = secrets[0];
+        assert_ne!(first_secret, [0u8; 32]);
+        for s in &secrets[1..] {
+            assert_eq!(
+                *s, first_secret,
+                "All concurrent threads MUST observe the single winning sys::trust_anchor_secret!"
+            );
+        }
+
+        let gdb_verify = LibreDb::open(&global_path).unwrap();
+        let anchor_rec = gdb_verify
+            .get_by_key(NodeKind::Config, TRUST_SECRET_KEY)
+            .unwrap();
+        assert_eq!(
+            anchor_rec.generation, 1,
+            "sys::trust_anchor_secret MUST be written strictly once (generation == 1, zero overwrites)!"
+        );
+        for ws in &ws_roots {
+            assert!(
+                is_workspace_memory_trusted(Some(&gdb_verify), ws),
+                "Workspace '{}' sealed during concurrent first-init MUST verify cleanly!",
+                ws.display()
+            );
+        }
 
         let _ = fs::remove_dir_all(&tmp);
     }
