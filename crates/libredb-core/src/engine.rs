@@ -255,6 +255,17 @@ impl LibreDb {
         self.file_path.as_deref()
     }
 
+    /// Opens or initializes a database on any `StorageBackend` while associating a logical
+    /// filesystem `path` (useful for fault-injection tests exercising workspace-scoped layers).
+    pub fn open_with_backend_and_path(
+        backend: Arc<dyn StorageBackend>,
+        path: impl AsRef<Path>,
+    ) -> Result<Self> {
+        let mut db = Self::open_with_backend(backend)?;
+        db.file_path = Some(path.as_ref().to_path_buf());
+        Ok(db)
+    }
+
     /// Opens or initializes a database on any `StorageBackend` (OS file or fault simulator).
     pub fn open_with_backend(backend: Arc<dyn StorageBackend>) -> Result<Self> {
         let file_len = backend.len()?;

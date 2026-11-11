@@ -1,7 +1,7 @@
 # LibreDB
 
-[![Version](https://img.shields.io/badge/version-0.10.5-blue.svg)](CHANGELOG.md)
-[![Tests](https://img.shields.io/badge/tests-passing%20(87%20tests%20%2B%2010k%20crash%20sims)-brightgreen.svg)](crates/libredb-cli/tests/)
+[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)](CHANGELOG.md)
+[![Tests](https://img.shields.io/badge/tests-passing%20(92%20tests%20%2B%2010k%20crash%20sims)-brightgreen.svg)](crates/libredb-cli/tests/)
 [![Tech Stack](https://img.shields.io/badge/rust-1.89%2B%20%7C%20PyO3%20abi3%20%7C%20MCP-orange.svg)](Cargo.toml)
 [![License](https://img.shields.io/badge/license-AGPLv3%20%2B%20Commons%20Clause-purple.svg)](LICENSE)
 
@@ -17,7 +17,7 @@
 
 ## Executive summary and impact
 
-| Dimension | Legacy Python + `SQLite` (`SkillsDB`) | `LibreDB v0.10.5` (Pure `Rust` + `MCP` + `PyO3`) |
+| Dimension | Legacy Python + `SQLite` (`SkillsDB`) | `LibreDB v1.0.0` (Pure `Rust` + `MCP` + `PyO3`) |
 | :--- | :--- | :--- |
 | **Lifecycle hook latency** | `350-500 ms` Python startup + `SQLite` WAL per edit/turn | **`< 2 ms` in-engine (`~0.7 ms` Linux / `< 15 ms` macOS / `~5.5 ms` Windows CI median, hard CI gates)** |
 | **Turn 2+ recall & I/O** | `300-1500 ms` subprocess + repeated full text output | **`0` disk I/O reads (`~3 ms` `MCP` / `PyO3`) via RAM-first `Zero-Repeat Delta`** |
@@ -71,7 +71,7 @@ pwsh -ExecutionPolicy Bypass -File .\scripts\deploy_plugin.ps1 -Profile Personal
 LibreDB/
 |-- Cargo.toml                                     # Rust workspace (5 default CLI/MCP crates + optional PyO3 crate)
 |-- Makefile                                       # Zero-dependency POSIX/Linux/macOS source build & installer
-|-- VERSION                                        # Semantic Version (0.10.5)
+|-- VERSION                                        # Semantic Version (1.0.0)
 |-- CHANGELOG.md                                   # Keep a Changelog 1.1.0 release history
 |-- LICENSE                                        # Commons Clause v1.0 + full verbatim GNU AGPL v3.0 text
 |-- README.md                                      # 9-block standardized documentation
@@ -80,10 +80,16 @@ LibreDB/
 |   |-- deploy_plugin.sh                           # POSIX/Linux/macOS installer (--profile neutral|personal, --no-hooks, --migrate-legacy)
 |-- crates/
     |-- libredb-core/                              # Frozen single-file LIBREDB1 storage kernel (Inodes, Extents, MVCC)
-    |-- libredb-index/                             # Language-agnostic IDF n-grams, Hebbian learner & persistent index snapshot
+    |-- libredb-index/                             # Language-agnostic IDF n-grams, alphanumeric v5 tokens & Hebbian learner
     |-- libredb-cognitive/                         # OverlayBrain, Session Delta, Guardrails, Reflexes, DI WorkspaceGraph & FIM
     |-- libredb-bridge/                            # Zero-amnesia 19-table SQLite migrator & parity verifier
-    |-- libredb-cli/                               # CLI, Multi-Workspace MCP Server, DPAPI/ChaCha20-Poly1305 Vault & Gitea Suite
+    |-- libredb-cli/                               # Modular CLI, MCP Server, DPAPI/ChaCha20-Poly1305 Vault & Gitea Suite
+    |   |-- src/cli_args.rs                        # Deterministic zero-dependency CLI flag & positional parser (CliSpec)
+    |   |-- src/mcp/                               # Modular MCP server (mod, protocol, authz, tools, tests)
+    |   |-- src/security/                          # Modular security suite (mod, ephemeral, vault, seals, path_policy, tests)
+    |   |-- src/hooks.rs                           # Sub-2ms PreInvocation & PreToolUse lifecycle hooks
+    |   |-- src/gitea.rs                           # Provider-aware multi-remote Git, Gitea & GitHub release automation
+    |   |-- tests/military_grade_mcp_security.rs   # Multi-process OS SIGKILL, root-refresh & boundary isolation E2E suite
     |-- libredb-py/                                # Optional PyO3 abi3 Python extension (`libredb.pyd` / `.so`)
 ```
 

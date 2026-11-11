@@ -52,20 +52,15 @@ pub fn sync_transcript_epoch(
 ) -> Result<u32> {
     let cursor_key = format!("sys::transcript_epoch::{conversation_id}");
     let mut state = match db.get_by_key(NodeKind::TranscriptCursor, &cursor_key) {
-        Ok(rec) => serde_json::from_slice::<TranscriptEpochState>(&rec.payload).unwrap_or(
-            TranscriptEpochState {
-                conversation_id: conversation_id.to_owned(),
-                last_byte_offset: 0,
-                checkpoint_count: 0,
-                active_epoch: 1,
-            },
-        ),
-        Err(_) => TranscriptEpochState {
+        Ok(rec) => serde_json::from_slice::<TranscriptEpochState>(&rec.payload)
+            .map_err(|_| LibreDbError::CorruptFormat("corrupt transcript_epoch json"))?,
+        Err(LibreDbError::KeyNotFound { .. }) => TranscriptEpochState {
             conversation_id: conversation_id.to_owned(),
             last_byte_offset: 0,
             checkpoint_count: 0,
             active_epoch: 1,
         },
+        Err(other) => return Err(other),
     };
 
     if !transcript_jsonl.exists() {

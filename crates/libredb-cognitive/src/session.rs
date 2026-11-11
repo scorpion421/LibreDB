@@ -42,7 +42,7 @@ impl SessionState {
         match db.get_by_key(NodeKind::TranscriptCursor, &storage_key) {
             Ok(rec) => {
                 let mut parsed: SessionState = serde_json::from_slice(&rec.payload)
-                    .unwrap_or_else(|_| SessionState::new(conversation_id, current_epoch));
+                    .map_err(|_| LibreDbError::CorruptFormat("corrupt session_delta json"))?;
                 if current_epoch != parsed.active_epoch {
                     parsed.active_epoch = current_epoch;
                     parsed.delivered_generations.clear();

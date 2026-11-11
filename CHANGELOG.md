@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0] - 2026-11-11
+
+### Added
+
+- Added structured zero-dependency CLI flag and positional validation (`CliSpec` and `ParsedCli` in `crates/libredb-cli/src/cli_args.rs`), modular `MCP` and security subsystem layouts (`crates/libredb-cli/src/mcp/` and `crates/libredb-cli/src/security/`), `LibreDb::open_with_backend_and_path` (`crates/libredb-core/src/engine.rs`), bounded in-RAM `Zero-Repeat` session fallback (`McpServerState.ram_session_fallback`, max `64` sessions, in `crates/libredb-cli/src/mcp/mod.rs` and `crates/libredb-cli/src/mcp/tools.rs`), and 5 new regression tests (`mcp_skeleton_handles_simulated_session_write_failures_and_propagates_corrupt_session_loads`, `alphanumeric_technical_tokens_and_snapshot_v5_upgrade_preserve_version_and_id_precision`, `cli_spec_rejects_trailing_missing_values_and_unknown_flags`, `cli_spec_handles_aliases_multi_values_optional_bools_and_double_dash`, and `cli_subcommands_reject_unknown_flags_missing_values_and_malformed_batch_specs`, bringing the automated suite to 92 tests + 10k crash simulations across Linux, macOS, and Windows).
+
+### Changed
+
+- Modularized `libredb-cli` (`crates/libredb-cli/src/`) out of single-file monoliths into clean, focused submodules with explicit `pub(super)` / `pub(crate)` visibility boundaries: split `mcp.rs` into `mcp/{mod.rs, protocol.rs, authz.rs, tools.rs, tests.rs}`, split `security.rs` into `security/{mod.rs, ephemeral.rs, vault.rs, seals.rs, path_policy.rs, tests.rs}`, and extracted unified command-line parsing into `cli_args.rs`.
+- Upgraded `HybridIndex` tokenization to `INDEX_FORMAT_VERSION = 5` (`segment_universal_tokens` and `push_if_meaningful` in `crates/libredb-index/src/lib.rs`): contiguous alphanumeric technical identifiers (`v3`, `v4`, `r12`, `k8s`, `e2e`, `lz4`, `sha256`, `oauth2`, `SealV4`) are now preserved intact as high-`IDF` whole tokens alongside `>= 3`-char alphabetic/numeric sub-runs instead of splitting letter-digit transitions and dropping `< 3`-char version/revision stems, with automatic persistent `sys::index_snapshot` rebuild on open.
+- Replaced ad-hoc `while i + 1 < args.len()` and positional slice checks across all 40 `CLI` subcommands in `crates/libredb-cli/src/main.rs` (`run_with_args`) with `CliSpec`, rejecting trailing missing option values (`--budget`, `--filter`, `--global`), unknown flags (`--prun`, `--bogus`), unexpected extra positionals, and malformed `batch` `--fact` / `--decision` / `--task` entries deterministically while supporting `--` end-of-options and hyphen-prefixed literal query/payload slots.
+
+### Fixed
+
+- Resolved the `Zero-Repeat` session persistence and load-error handling finding from the fourteenth external review (`execute_skeleton_with_zero_repeat` in `crates/libredb-cli/src/mcp/tools.rs`, `SessionState::load_or_init` in `crates/libredb-cognitive/src/session.rs`, and `sync_transcript_epoch` in `crates/libredb-cognitive/src/transcript.rs`): eliminated `SessionState::load_or_init(...).ok()`, `sync_transcript_epoch(...).unwrap_or(1)`, and `let _ = sess.save(&proj_db);`, wired `SessionState` deduplication into the legacy `libredb_skeleton` alias as well as `libredb_code(action="skeleton")`, propagated corrupt `session_delta::<cid>` JSON and storage read errors fail-closed (`Err`), and degraded transient/simulated disk write failures (`LibreDbError::Io` / `SimulatedPowerLoss`) to bounded in-RAM session continuity (`ram_session_fallback`, automatically flushed and cleared once disk writes recover) with an explicit `[WARN: Zero-Repeat persistence degraded to in-RAM session mode; disk save failed: ...]` notice.
+
 ## [0.10.5] - 2026-11-11
 
 ### Added

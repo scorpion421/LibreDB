@@ -21,9 +21,10 @@ use std::collections::{HashMap, HashSet};
 pub const HEBBIAN_KEY_PREFIX: &str = "hebbian::";
 pub const INDEX_SNAPSHOT_KEY: &str = "sys::index_snapshot";
 /// Binary schema/filtering version for `sys::index_snapshot`. Bumping this automatically
-/// rebuilds any older bloated snapshot (e.g. v1 with `Symbol`/`QuotaEvent` postings or v3 with
-/// retained dead postings from superseded Inodes) on open.
-pub const INDEX_FORMAT_VERSION: u32 = 4;
+/// rebuilds any older snapshot (e.g. v1 with `Symbol`/`QuotaEvent` postings, v3 with
+/// retained dead postings from superseded Inodes, or v4 before alphanumeric technical token
+/// preservation) on open.
+pub const INDEX_FORMAT_VERSION: u32 = 5;
 
 /// Ranked search hit produced by `HybridIndex::search`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -717,12 +718,6 @@ pub fn segment_universal_tokens(input: &str) -> Vec<String> {
                 prev_kind = ScriptKind::AlphabeticUpper;
             }
             ScriptKind::AlphabeticOther | ScriptKind::Digit => {
-                if (prev_kind == ScriptKind::Digit) != (kind == ScriptKind::Digit)
-                    && !current.is_empty()
-                {
-                    push_if_meaningful(&mut tokens, &current);
-                    current.clear();
-                }
                 for low in ch.to_lowercase() {
                     current.push(low);
                 }
@@ -742,6 +737,28 @@ fn push_if_meaningful(out: &mut Vec<String>, candidate: &str) {
     let char_cnt = candidate.chars().count();
     if char_cnt >= 2 || (char_cnt == 1 && !candidate.is_ascii()) {
         out.push(candidate.to_owned());
+    }
+    let has_alpha = candidate.chars().any(|c| c.is_alphabetic());
+    let has_digit = candidate.chars().any(|c| c.is_numeric());
+    if has_alpha && has_digit {
+        let mut sub = String::new();
+        let mut sub_is_digit: Option<bool> = None;
+        for ch in candidate.chars() {
+            let is_d = ch.is_numeric();
+            if sub_is_digit == Some(is_d) {
+                sub.push(ch);
+            } else {
+                if sub.chars().count() >= 3 && sub != candidate {
+                    out.push(sub.clone());
+                }
+                sub.clear();
+                sub.push(ch);
+                sub_is_digit = Some(is_d);
+            }
+        }
+        if sub.chars().count() >= 3 && sub != candidate {
+            out.push(sub);
+        }
     }
 }
 
@@ -867,12 +884,81 @@ mod tests {
         );
         reconciled.save_snapshot(&db).unwrap();
 
-        // Reload persisted v4 snapshot and verify clean search results:
+        // Reload persisted v5 snapshot and verify clean search results:
         let reloaded = HybridIndex::load_or_build(&db).unwrap();
         assert!(!reloaded.word_postings.contains_key("xylophonequasar"));
         assert!(reloaded.search("xylophonequasar", None, 5).is_empty());
         let hits = reloaded.search("zephyrnebula", None, 5);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].node_id, second_id);
+    }
+
+    #[test]
+    fn alphanumeric_technical_tokens_and_snapshot_v5_upgrade_preserve_version_and_id_precision() {
+        assert_eq!(segment_universal_tokens("v4"), vec!["v4"]);
+        assert_eq!(segment_universal_tokens("K8S e2e"), vec!["k8s", "e2e"]);
+        assert_eq!(
+            segment_universal_tokens("hmac-sha256:v4:r12"),
+            vec!["hmac", "sha256", "sha", "256", "v4", "r12"]
+        );
+        assert_eq!(
+            segment_universal_tokens("SealV4 oauth2Client"),
+            vec!["seal", "v4", "oauth2client", "oauth", "client"]
+        );
+
+        let dir = tempdir().unwrap();
+        let db = LibreDb::open(dir.path().join("alphanumeric_v5.ldb")).unwrap();
+
+        let v3_id = db
+            .put(
+                WriteRequest::new(
+                    NodeKind::Decision,
+                    b"Legacy v3 seal format with r1 revision.".to_vec(),
+                )
+                .with_key("seal-v3"),
+            )
+            .unwrap();
+        let v4_id = db
+            .put(
+                WriteRequest::new(
+                    NodeKind::Decision,
+                    b"Active v4 seal format with r2 revision and k8s lz4 sha256.".to_vec(),
+                )
+                .with_key("seal-v4"),
+            )
+            .unwrap();
+
+        // Simulate a stale v4 snapshot missing short alphanumeric tokens (`v3`, `v4`, `r1`, `r2`, `k8s`):
+        let mut stale = HybridIndex::build_from_db(&db).unwrap();
+        stale.word_postings.remove("v3");
+        stale.word_postings.remove("v4");
+        stale.format_version = 4;
+        let stale_bytes = serde_json::to_vec(&stale).unwrap();
+        db.put(
+            WriteRequest::new(NodeKind::WorkingSet, stale_bytes)
+                .with_key(INDEX_SNAPSHOT_KEY)
+                .with_importance(255),
+        )
+        .unwrap();
+
+        // `load_or_build` must detect `format_version != 5` and automatically rebuild with full precision:
+        let upgraded = HybridIndex::load_or_build(&db).unwrap();
+        assert_eq!(upgraded.format_version, INDEX_FORMAT_VERSION);
+
+        let v4_hits = upgraded.search("v4", None, 5);
+        assert!(!v4_hits.is_empty());
+        assert_eq!(v4_hits[0].node_id, v4_id);
+
+        let v3_hits = upgraded.search("v3", None, 5);
+        assert!(!v3_hits.is_empty());
+        assert_eq!(v3_hits[0].node_id, v3_id);
+
+        let k8s_hits = upgraded.search("k8s", None, 5);
+        assert!(!k8s_hits.is_empty());
+        assert_eq!(k8s_hits[0].node_id, v4_id);
+
+        let sha_stem_hits = upgraded.search("sha", None, 5);
+        assert!(!sha_stem_hits.is_empty());
+        assert_eq!(sha_stem_hits[0].node_id, v4_id);
     }
 }

@@ -1,9 +1,12 @@
 //! Command-line interface, lifecycle hooks, Gitea automation, and native MCP server for `LibreDB`.
 
+mod cli_args;
 mod gitea;
 mod hooks;
 mod mcp;
 mod security;
+
+use cli_args::CliSpec;
 
 use libredb_bridge::{
     export_sqlite_database, import_sqlite_readonly, open_or_auto_migrate, verify_sqlite_equivalence,
@@ -80,30 +83,6 @@ Core Storage & Graph Commands:
     );
 }
 
-fn extract_cli_global_flag(
-    raw_args: &[String],
-    min_positional: usize,
-) -> Result<(Option<PathBuf>, Vec<String>), String> {
-    let mut global_override: Option<PathBuf> = None;
-    let mut cleaned = Vec::with_capacity(raw_args.len());
-    let head = min_positional.min(raw_args.len());
-    cleaned.extend_from_slice(&raw_args[..head]);
-    let mut i = head;
-    while i < raw_args.len() {
-        if raw_args[i] == "--global" {
-            if i + 1 >= raw_args.len() {
-                return Err("Missing path argument after '--global'".to_owned());
-            }
-            global_override = Some(PathBuf::from(&raw_args[i + 1]));
-            i += 2;
-        } else {
-            cleaned.push(raw_args[i].clone());
-            i += 1;
-        }
-    }
-    Ok((global_override, cleaned))
-}
-
 fn main() {
     if let Err(err) = run() {
         eprintln!("Error: {err}");
@@ -113,6 +92,10 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
+    run_with_args(&args)
+}
+
+fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if args.is_empty() || args[0] == "--help" || args[0] == "-h" {
         print_usage();
         return Ok(());
@@ -122,93 +105,76 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    let sub_args = &args[1..];
     match args[0].as_str() {
         "mcp-serve" => {
-            let mut proj_path: Option<PathBuf> = None;
-            let mut global_path: Option<PathBuf> = None;
-            let mut ws_root: Option<PathBuf> = None;
-            let mut i = 1usize;
-            while i < args.len() {
-                match args[i].as_str() {
-                    "--global" if i + 1 < args.len() => {
-                        global_path = Some(PathBuf::from(&args[i + 1]));
-                        i += 2;
-                    }
-                    "--project" if i + 1 < args.len() => {
-                        proj_path = Some(PathBuf::from(&args[i + 1]));
-                        i += 2;
-                    }
-                    "--workspace-root" if i + 1 < args.len() => {
-                        ws_root = Some(PathBuf::from(&args[i + 1]));
-                        i += 2;
-                    }
-                    positional if !positional.starts_with("--") && proj_path.is_none() => {
-                        proj_path = Some(PathBuf::from(positional));
-                        i += 1;
-                    }
-                    other => return Err(format!("Unknown mcp-serve argument '{other}'").into()),
-                }
+            let cli = CliSpec::new(
+                "mcp-serve",
+                "libredb mcp-serve [<default_project.ldb>] [--global <customizations.ldb>] [--workspace-root <dir>]",
+            )
+            .positionals(0, Some(1))
+            .allow_global()
+            .values(&["--project", "--workspace-root"])
+            .parse(sub_args)?;
+            if cli.value("--project").is_some() && !cli.positionals.is_empty() {
+                return Err(
+                    "Cannot specify both positional <default_project.ldb> and '--project' in 'mcp-serve'"
+                        .into(),
+                );
             }
+            let proj_path = cli
+                .path_value("--project")
+                .or_else(|| cli.positionals.first().map(PathBuf::from));
+            let ws_root = cli.path_value("--workspace-root");
             mcp::run_mcp_stdio_server_with_workspace_root(
                 proj_path.as_deref(),
-                global_path.as_deref(),
+                cli.global_deref(),
                 ws_root.as_deref(),
             )?;
         }
         "hook-pre-tool" => {
-            let mut global_path: Option<PathBuf> = None;
-            let mut i = 1usize;
-            while i + 1 < args.len() {
-                if args[i] == "--global" {
-                    global_path = Some(PathBuf::from(&args[i + 1]));
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            hooks::run_pre_tool_hook(global_path.as_deref())?;
+            let cli = CliSpec::new(
+                "hook-pre-tool",
+                "libredb hook-pre-tool [--global <customizations.ldb>]",
+            )
+            .positionals(0, Some(0))
+            .allow_global()
+            .parse(sub_args)?;
+            hooks::run_pre_tool_hook(cli.global_deref())?;
         }
         "hook-pre-invocation" => {
-            let mut global_path: Option<PathBuf> = None;
-            let mut i = 1usize;
-            while i + 1 < args.len() {
-                if args[i] == "--global" {
-                    global_path = Some(PathBuf::from(&args[i + 1]));
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            hooks::run_pre_invocation_hook(global_path.as_deref())?;
+            let cli = CliSpec::new(
+                "hook-pre-invocation",
+                "libredb hook-pre-invocation [--global <customizations.ldb>]",
+            )
+            .positionals(0, Some(0))
+            .allow_global()
+            .parse(sub_args)?;
+            hooks::run_pre_invocation_hook(cli.global_deref())?;
         }
         "guardrail" => {
-            let (global_override, args) = extract_cli_global_flag(&args, 2)?;
-            let sub = args.get(1).map(String::as_str).unwrap_or("check");
+            let cli = CliSpec::new(
+                "guardrail",
+                "libredb guardrail check [--path <dir>] [--staged] [--strict] [--global <customizations.ldb>]",
+            )
+            .positionals(0, Some(1))
+            .allow_global()
+            .switches(&["--staged", "--strict"])
+            .values(&["--path"])
+            .parse(sub_args)?;
+            let sub = cli.positionals.first().map(String::as_str).unwrap_or("check");
             if sub != "check" {
-                return Err("Usage: libredb guardrail check [--path <dir>] [--staged] [--strict]".into());
+                return Err(
+                    "Usage: libredb guardrail check [--path <dir>] [--staged] [--strict]".into(),
+                );
             }
-            let mut dir = env::current_dir()?;
-            let mut staged = false;
-            let mut strict = false;
-            let mut i = 2usize;
-            while i < args.len() {
-                match args[i].as_str() {
-                    "--path" if i + 1 < args.len() => {
-                        dir = PathBuf::from(&args[i + 1]);
-                        i += 2;
-                    }
-                    "--staged" => {
-                        staged = true;
-                        i += 1;
-                    }
-                    "--strict" => {
-                        strict = true;
-                        i += 1;
-                    }
-                    other => return Err(format!("Unknown guardrail flag '{other}'").into()),
-                }
-            }
-            let gdb_res = hooks::open_global_ldb_checked(global_override.as_deref());
+            let dir = cli
+                .path_value("--path")
+                .map(Ok)
+                .unwrap_or_else(env::current_dir)?;
+            let staged = cli.has_switch("--staged");
+            let strict = cli.has_switch("--strict");
+            let gdb_res = hooks::open_global_ldb_checked(cli.global_deref());
             let gdb_opt = gdb_res.as_ref().ok().and_then(Clone::clone);
             let pdb_opt = if gdb_res.is_ok()
                 && security::is_workspace_memory_trusted(gdb_opt.as_deref(), &dir)
@@ -244,63 +210,33 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         "trust" => {
-            let mut dir_opt: Option<PathBuf> = None;
-            let mut revoke = false;
-            let mut list = false;
-            let mut migrate_v2 = false;
-            let mut migrate_v3 = false;
-            let mut confirm_metadata = false;
-            let mut reinit_lost = false;
-            let mut accept_rollback = false;
-            let mut if_clean = false;
-            let mut global_path: Option<PathBuf> = None;
-            let mut i = 1usize;
-            while i < args.len() {
-                match args[i].as_str() {
-                    "--revoke" => {
-                        revoke = true;
-                        i += 1;
-                    }
-                    "--list" => {
-                        list = true;
-                        i += 1;
-                    }
-                    "--migrate-v2" => {
-                        migrate_v2 = true;
-                        i += 1;
-                    }
-                    "--migrate-v3" => {
-                        migrate_v3 = true;
-                        i += 1;
-                    }
-                    "--confirm-metadata" => {
-                        confirm_metadata = true;
-                        i += 1;
-                    }
-                    "--reinit-lost" => {
-                        reinit_lost = true;
-                        i += 1;
-                    }
-                    "--accept-rollback" => {
-                        accept_rollback = true;
-                        i += 1;
-                    }
-                    "--if-clean" => {
-                        if_clean = true;
-                        i += 1;
-                    }
-                    "--global" if i + 1 < args.len() => {
-                        global_path = Some(PathBuf::from(&args[i + 1]));
-                        i += 2;
-                    }
-                    pos if !pos.starts_with('-') && dir_opt.is_none() => {
-                        dir_opt = Some(PathBuf::from(pos));
-                        i += 1;
-                    }
-                    other => return Err(format!("Unknown trust flag '{other}'").into()),
-                }
-            }
-            let gdb = hooks::open_global_ldb(global_path.as_deref())?;
+            let cli = CliSpec::new(
+                "trust",
+                "libredb trust [<dir>] [--revoke] [--list] [--reinit-lost] [--accept-rollback] [--migrate-v3 [--confirm-metadata]] [--migrate-v2] [--if-clean] [--global <customizations.ldb>]",
+            )
+            .positionals(0, Some(1))
+            .allow_global()
+            .switches(&[
+                "--revoke",
+                "--list",
+                "--migrate-v2",
+                "--migrate-v3",
+                "--confirm-metadata",
+                "--reinit-lost",
+                "--accept-rollback",
+                "--if-clean",
+            ])
+            .parse(sub_args)?;
+            let dir_opt = cli.positionals.first().map(PathBuf::from);
+            let revoke = cli.has_switch("--revoke");
+            let list = cli.has_switch("--list");
+            let migrate_v2 = cli.has_switch("--migrate-v2");
+            let migrate_v3 = cli.has_switch("--migrate-v3");
+            let confirm_metadata = cli.has_switch("--confirm-metadata");
+            let reinit_lost = cli.has_switch("--reinit-lost");
+            let accept_rollback = cli.has_switch("--accept-rollback");
+            let if_clean = cli.has_switch("--if-clean");
+            let gdb = hooks::open_global_ldb(cli.global_deref())?;
             if list {
                 let items = security::list_trusted_workspaces(&gdb)?;
                 println!("=== Trusted Workspaces ({}) ===", items.len());
@@ -492,30 +428,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         "config" => {
-            let action = args.get(1).map(String::as_str).unwrap_or("list");
-            let mut positional: Vec<String> = Vec::new();
-            let mut proj_dir: Option<PathBuf> = None;
-            let mut global_path: Option<PathBuf> = None;
-            let mut i = 2usize;
-            while i < args.len() {
-                match args[i].as_str() {
-                    "--project" if i + 1 < args.len() => {
-                        proj_dir = Some(PathBuf::from(&args[i + 1]));
-                        i += 2;
-                    }
-                    "--global" if i + 1 < args.len() => {
-                        global_path = Some(PathBuf::from(&args[i + 1]));
-                        i += 2;
-                    }
-                    other if !other.starts_with("--") => {
-                        positional.push(other.to_owned());
-                        i += 1;
-                    }
-                    other => return Err(format!("Unknown config flag '{other}'").into()),
-                }
-            }
+            let cli = CliSpec::new(
+                "config",
+                "libredb config <get|set|unset|list> [<key>] [<value>] [--project <dir>] [--global <customizations.ldb>]",
+            )
+            .positionals(0, Some(3))
+            .raw_value_slots(&[2])
+            .allow_global()
+            .values(&["--project"])
+            .parse(sub_args)?;
+            let action = cli.positionals.first().map(String::as_str).unwrap_or("list");
+            let positional = if cli.positionals.len() > 1 {
+                &cli.positionals[1..]
+            } else {
+                &[]
+            };
+            let proj_dir = cli.path_value("--project");
             let gdb_for_proj_seal = if proj_dir.is_some() && matches!(action, "set" | "unset") {
-                hooks::open_global_ldb_checked(global_path.as_deref())?
+                hooks::open_global_ldb_checked(cli.global_deref())?
             } else {
                 None
             };
@@ -533,7 +463,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let (pdb, _) = hooks::open_project_ldb_silent(&ldb_p)?;
                 pdb
             } else {
-                hooks::open_global_ldb(global_path.as_deref())?
+                hooks::open_global_ldb(cli.global_deref())?
             };
             let is_secret_key = |k: &str| -> bool {
                 let low = k.to_ascii_lowercase();
@@ -544,7 +474,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             };
             match action {
                 "set" => {
-                    if positional.len() < 2 {
+                    if positional.len() != 2 {
                         return Err("Usage: libredb config set <key> <value> [--project <dir>] [--global <g.ldb>]".into());
                     }
                     let key = positional[0].trim();
@@ -588,9 +518,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
                 "get" => {
-                    let key = positional
-                        .first()
-                        .ok_or("Usage: libredb config get <key> [--project <dir>] [--global <g.ldb>]")?;
+                    if positional.len() != 1 {
+                        return Err(
+                            "Usage: libredb config get <key> [--project <dir>] [--global <g.ldb>]"
+                                .into(),
+                        );
+                    }
+                    let key = &positional[0];
                     let rec = db.get_by_key(NodeKind::Config, key)?;
                     let raw = String::from_utf8_lossy(&rec.payload);
                     if is_secret_key(key) || security::is_ciphertext_envelope(&raw) {
@@ -600,10 +534,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 "unset" => {
-                    let key = positional
-                        .first()
-                        .ok_or("Usage: libredb config unset <key> [--project <dir>] [--global <g.ldb>]")?
-                        .trim();
+                    if positional.len() != 1 {
+                        return Err("Usage: libredb config unset <key> [--project <dir>] [--global <g.ldb>]".into());
+                    }
+                    let key = positional[0].trim();
                     if security::is_reserved_security_config_key(key) {
                         return Err(format!(
                             "Refusing to remove reserved security configuration key '{key}' via 'libredb config'; use 'libredb trust --revoke' instead."
@@ -629,6 +563,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 "list" => {
+                    if !positional.is_empty() {
+                        return Err(
+                            "Usage: libredb config list [--project <dir>] [--global <g.ldb>]"
+                                .into(),
+                        );
+                    }
                     let mut rows: Vec<(String, String)> = Vec::new();
                     for (ino, k_opt, _) in db.list_inodes(Some(NodeKind::Config), false) {
                         let Some(k) = k_opt else { continue };
@@ -661,28 +601,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         "get-skill" => {
-            if args.len() < 2 {
-                return Err("Usage: libredb get-skill <skill_name> [--section <title>] [--global <customizations.ldb>]".into());
-            }
-            let skill_name = &args[1];
-            let mut section: Option<String> = None;
-            let mut global_path: Option<PathBuf> = None;
-            let mut i = 2usize;
-            while i + 1 < args.len() {
-                match args[i].as_str() {
-                    "--section" => {
-                        section = Some(args[i + 1].clone());
-                        i += 2;
-                    }
-                    "--global" => {
-                        global_path = Some(PathBuf::from(&args[i + 1]));
-                        i += 2;
-                    }
-                    other => return Err(format!("Unknown flag '{other}'").into()),
-                }
-            }
-            let gdb = hooks::open_global_ldb(global_path.as_deref())?;
-            if let Some(sec_title) = section {
+            let cli = CliSpec::new(
+                "get-skill",
+                "libredb get-skill <skill_name> [--section <title>] [--global <customizations.ldb>]",
+            )
+            .positionals(1, Some(1))
+            .allow_global()
+            .values(&["--section"])
+            .parse(sub_args)?;
+            let skill_name = &cli.positionals[0];
+            let gdb = hooks::open_global_ldb(cli.global_deref())?;
+            if let Some(sec_title) = cli.value("--section") {
                 let exact_key = format!("{skill_name}::{sec_title}");
                 if let Ok(rec) = gdb.get_by_key(NodeKind::SkillSection, &exact_key) {
                     println!("{}", String::from_utf8_lossy(&rec.payload));
@@ -716,19 +645,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         "list-rules" => {
-            let mut global_path: Option<PathBuf> = None;
-            let mut i = 1usize;
-            while i < args.len() {
-                if (args[i] == "--global" || args[i] == "--db") && i + 1 < args.len() {
-                    global_path = Some(PathBuf::from(&args[i + 1]));
-                    i += 2;
-                } else if !args[i].starts_with('-') && global_path.is_none() {
-                    global_path = Some(PathBuf::from(&args[i]));
-                    i += 1;
-                } else {
-                    return Err(format!("Unknown list-rules flag '{}'", args[i]).into());
-                }
-            }
+            let cli = CliSpec::new(
+                "list-rules",
+                "libredb list-rules [--global <customizations.ldb>]",
+            )
+            .positionals(0, Some(1))
+            .allow_global()
+            .alias("--db", "--global")
+            .parse(sub_args)?;
+            let global_path = cli
+                .global_path
+                .clone()
+                .or_else(|| cli.positionals.first().map(PathBuf::from));
             let gdb = hooks::open_global_ldb(global_path.as_deref())?;
             let mut inodes: Vec<_> = gdb
                 .list_inodes(Some(NodeKind::Rule), false)
@@ -750,19 +678,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         "list-skills" => {
-            let mut global_path: Option<PathBuf> = None;
-            let mut i = 1usize;
-            while i < args.len() {
-                if (args[i] == "--global" || args[i] == "--db") && i + 1 < args.len() {
-                    global_path = Some(PathBuf::from(&args[i + 1]));
-                    i += 2;
-                } else if !args[i].starts_with('-') && global_path.is_none() {
-                    global_path = Some(PathBuf::from(&args[i]));
-                    i += 1;
-                } else {
-                    return Err(format!("Unknown list-skills flag '{}'", args[i]).into());
-                }
-            }
+            let cli = CliSpec::new(
+                "list-skills",
+                "libredb list-skills [--global <customizations.ldb>]",
+            )
+            .positionals(0, Some(1))
+            .allow_global()
+            .alias("--db", "--global")
+            .parse(sub_args)?;
+            let global_path = cli
+                .global_path
+                .clone()
+                .or_else(|| cli.positionals.first().map(PathBuf::from));
             let gdb = hooks::open_global_ldb(global_path.as_deref())?;
             let sec_inodes = gdb.list_inodes(Some(NodeKind::SkillSection), false);
             let mut skill_inodes = gdb.list_inodes(Some(NodeKind::Skill), false);
@@ -789,19 +716,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         "list-reflexes" => {
-            let mut global_path: Option<PathBuf> = None;
-            let mut i = 1usize;
-            while i < args.len() {
-                if (args[i] == "--global" || args[i] == "--db") && i + 1 < args.len() {
-                    global_path = Some(PathBuf::from(&args[i + 1]));
-                    i += 2;
-                } else if !args[i].starts_with('-') && global_path.is_none() {
-                    global_path = Some(PathBuf::from(&args[i]));
-                    i += 1;
-                } else {
-                    return Err(format!("Unknown list-reflexes flag '{}'", args[i]).into());
-                }
-            }
+            let cli = CliSpec::new(
+                "list-reflexes",
+                "libredb list-reflexes [--global <customizations.ldb>]",
+            )
+            .positionals(0, Some(1))
+            .allow_global()
+            .alias("--db", "--global")
+            .parse(sub_args)?;
+            let global_path = cli
+                .global_path
+                .clone()
+                .or_else(|| cli.positionals.first().map(PathBuf::from));
             let gdb = hooks::open_global_ldb(global_path.as_deref())?;
             let mut inodes: Vec<_> = gdb
                 .list_inodes(Some(NodeKind::Rule), false)
@@ -824,28 +750,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         "sync-skill" => {
-            if args.len() < 2 {
-                return Err("Usage: libredb sync-skill <SKILL.md> [--name <skill_name>] [--global <customizations.ldb>]".into());
-            }
-            let md_path = PathBuf::from(&args[1]);
-            let mut explicit_name: Option<String> = None;
-            let mut global_path: Option<PathBuf> = None;
-            let mut i = 2usize;
-            while i + 1 < args.len() {
-                match args[i].as_str() {
-                    "--name" => {
-                        explicit_name = Some(args[i + 1].clone());
-                        i += 2;
-                    }
-                    "--global" => {
-                        global_path = Some(PathBuf::from(&args[i + 1]));
-                        i += 2;
-                    }
-                    other => return Err(format!("Unknown sync-skill flag '{other}'").into()),
-                }
-            }
-            let gdb = hooks::open_global_ldb(global_path.as_deref())?;
-            let (sname, sec_cnt) = sync_skill_markdown(&gdb, &md_path, explicit_name.as_deref())?;
+            let cli = CliSpec::new(
+                "sync-skill",
+                "libredb sync-skill <SKILL.md> [--name <skill_name>] [--global <customizations.ldb>]",
+            )
+            .positionals(1, Some(1))
+            .allow_global()
+            .values(&["--name"])
+            .parse(sub_args)?;
+            let md_path = PathBuf::from(&cli.positionals[0]);
+            let gdb = hooks::open_global_ldb(cli.global_deref())?;
+            let (sname, sec_cnt) = sync_skill_markdown(&gdb, &md_path, cli.value("--name"))?;
             let mut cog = CognitiveEngine::open_db(gdb)?;
             cog.save_index_snapshot()?;
             println!(
@@ -853,46 +768,33 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         "modernize-global" => {
-            let mut global_path: Option<PathBuf> = None;
-            let mut skill_md: Option<PathBuf> = None;
-            let mut personal = false;
-            let mut migrate_legacy = false;
-            let mut i = 1usize;
-            while i < args.len() {
-                match args[i].as_str() {
-                    "--global" if i + 1 < args.len() => {
-                        global_path = Some(PathBuf::from(&args[i + 1]));
-                        i += 2;
+            let cli = CliSpec::new(
+                "modernize-global",
+                "libredb modernize-global [--global <customizations.ldb>] [--skill-md <SKILL.md>] [--profile neutral|personal] [--migrate-legacy]",
+            )
+            .positionals(0, Some(0))
+            .allow_global()
+            .switches(&["--personal", "--migrate-legacy"])
+            .alias("--personal-rules", "--personal")
+            .values(&["--skill-md", "--profile"])
+            .parse(sub_args)?;
+            let mut personal = cli.has_switch("--personal");
+            if let Some(prof) = cli.value("--profile") {
+                match prof.trim().to_ascii_lowercase().as_str() {
+                    "personal" => personal = true,
+                    "neutral" => personal = false,
+                    other => {
+                        return Err(format!(
+                            "Invalid --profile '{other}'; expected 'neutral' or 'personal'"
+                        )
+                        .into());
                     }
-                    "--skill-md" if i + 1 < args.len() => {
-                        skill_md = Some(PathBuf::from(&args[i + 1]));
-                        i += 2;
-                    }
-                    "--profile" if i + 1 < args.len() => {
-                        match args[i + 1].trim().to_ascii_lowercase().as_str() {
-                            "personal" => personal = true,
-                            "neutral" => personal = false,
-                            other => {
-                                return Err(format!(
-                                    "Invalid --profile '{other}'; expected 'neutral' or 'personal'"
-                                )
-                                .into());
-                            }
-                        }
-                        i += 2;
-                    }
-                    "--personal" | "--personal-rules" => {
-                        personal = true;
-                        i += 1;
-                    }
-                    "--migrate-legacy" => {
-                        migrate_legacy = true;
-                        i += 1;
-                    }
-                    other => return Err(format!("Unknown modernize-global flag '{other}'").into()),
                 }
             }
-            let target_global = global_path
+            let skill_md = cli.path_value("--skill-md");
+            let migrate_legacy = cli.has_switch("--migrate-legacy");
+            let target_global = cli
+                .global_path
                 .clone()
                 .unwrap_or_else(hooks::default_global_ldb_path);
             if let Some(parent) = target_global.parent() {
@@ -917,268 +819,165 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             modernize_global_db(&gdb, skill_md.as_deref(), personal)?;
         }
         "gitea-credential-helper" => {
-            let action = args.get(1).map(String::as_str).unwrap_or("get");
-            gitea::cmd_gitea_credential_helper(action, None)?;
+            let cli = CliSpec::new(
+                "gitea-credential-helper",
+                "libredb gitea-credential-helper [get] [--global <customizations.ldb>]",
+            )
+            .positionals(0, Some(1))
+            .allow_global()
+            .parse(sub_args)?;
+            let action = cli.positionals.first().map(String::as_str).unwrap_or("get");
+            gitea::cmd_gitea_credential_helper(action, cli.global_deref())?;
         }
-        "gitea-status" | "git-status" => {
-            let mut global_path: Option<PathBuf> = None;
-            if args.len() >= 3 && args[1] == "--global" {
-                global_path = Some(PathBuf::from(&args[2]));
-            }
-            gitea::cmd_gitea_status(global_path.as_deref())?;
+        cmd @ ("gitea-status" | "git-status") => {
+            let cli = CliSpec::new(cmd, "libredb gitea-status [--global <customizations.ldb>]")
+                .positionals(0, Some(0))
+                .allow_global()
+                .parse(sub_args)?;
+            gitea::cmd_gitea_status(cli.global_deref())?;
         }
         "gitea-config" => {
-            let mut url: Option<String> = None;
-            let mut user: Option<String> = None;
-            let mut token: Option<String> = None;
-            let mut token_stdin = false;
-            let mut allow_insecure_http: Option<bool> = None;
-            let mut global_path: Option<PathBuf> = None;
-            let mut reg_helper = false;
-            let mut i = 1usize;
-            while i < args.len() {
-                match args[i].as_str() {
-                    "--url" if i + 1 < args.len() => {
-                        url = Some(args[i + 1].clone());
-                        i += 2;
-                    }
-                    "--user" if i + 1 < args.len() => {
-                        user = Some(args[i + 1].clone());
-                        i += 2;
-                    }
-                    "--token" if i + 1 < args.len() => {
-                        token = Some(args[i + 1].clone());
-                        i += 2;
-                    }
-                    "--token-stdin" => {
-                        token_stdin = true;
-                        i += 1;
-                    }
-                    "--allow-insecure-http" => {
-                        if i + 1 < args.len() && !args[i + 1].starts_with("--") {
-                            let low = args[i + 1].trim().to_ascii_lowercase();
-                            allow_insecure_http = Some(matches!(low.as_str(), "1" | "true" | "yes" | "on"));
-                            i += 2;
-                        } else {
-                            allow_insecure_http = Some(true);
-                            i += 1;
-                        }
-                    }
-                    "--global" if i + 1 < args.len() => {
-                        global_path = Some(PathBuf::from(&args[i + 1]));
-                        i += 2;
-                    }
-                    "--register-helper" => {
-                        reg_helper = true;
-                        i += 1;
-                    }
-                    other => return Err(format!("Unknown gitea-config flag '{other}'").into()),
-                }
-            }
-            if token_stdin {
+            let cli = CliSpec::new(
+                "gitea-config",
+                "libredb gitea-config [--url <u>] [--user <usr>] [--token <tok> | --token-stdin] [--allow-insecure-http <bool>] [--register-helper] [--global <customizations.ldb>]",
+            )
+            .positionals(0, Some(0))
+            .allow_global()
+            .switches(&["--token-stdin", "--register-helper"])
+            .values(&["--url", "--user", "--token"])
+            .optional_bools(&["--allow-insecure-http"])
+            .parse(sub_args)?;
+            let mut token = cli.value("--token").map(ToOwned::to_owned);
+            if cli.has_switch("--token-stdin") {
                 let mut stdin_tok = String::new();
                 std::io::stdin().read_to_string(&mut stdin_tok)?;
                 token = Some(stdin_tok.trim_end_matches(['\r', '\n']).to_owned());
             }
             gitea::cmd_gitea_config(
-                global_path.as_deref(),
-                url.as_deref(),
-                user.as_deref(),
+                cli.global_deref(),
+                cli.value("--url"),
+                cli.value("--user"),
                 token.as_deref(),
-                allow_insecure_http,
-                reg_helper,
+                cli.optional_bool("--allow-insecure-http"),
+                cli.has_switch("--register-helper"),
             )?;
         }
-        "gitea-init" | "git-init" => {
-            let mut dir = env::current_dir()?;
-            let mut name: Option<String> = None;
-            let mut use_existing = false;
-            let mut overwrite = false;
-            let mut global_path: Option<PathBuf> = None;
-            let mut i = 1usize;
-            while i < args.len() {
-                match args[i].as_str() {
-                    "--name" if i + 1 < args.len() => {
-                        name = Some(args[i + 1].clone());
-                        i += 2;
-                    }
-                    "--global" if i + 1 < args.len() => {
-                        global_path = Some(PathBuf::from(&args[i + 1]));
-                        i += 2;
-                    }
-                    "--use-existing" => {
-                        use_existing = true;
-                        i += 1;
-                    }
-                    "--overwrite" => {
-                        overwrite = true;
-                        i += 1;
-                    }
-                    pos if !pos.starts_with("--") => {
-                        dir = PathBuf::from(pos);
-                        i += 1;
-                    }
-                    other => return Err(format!("Unknown git-init flag '{other}'").into()),
-                }
-            }
-            gitea::cmd_gitea_init(&dir, name.as_deref(), use_existing, overwrite, global_path.as_deref())?;
+        cmd @ ("gitea-init" | "git-init") => {
+            let cli = CliSpec::new(
+                cmd,
+                "libredb git-init [<dir>] [--name <repo>] [--use-existing] [--overwrite] [--global <customizations.ldb>]",
+            )
+            .positionals(0, Some(1))
+            .allow_global()
+            .switches(&["--use-existing", "--overwrite"])
+            .values(&["--name"])
+            .parse(sub_args)?;
+            let dir = cli
+                .positionals
+                .first()
+                .map(PathBuf::from)
+                .map(Ok)
+                .unwrap_or_else(env::current_dir)?;
+            gitea::cmd_gitea_init(
+                &dir,
+                cli.value("--name"),
+                cli.has_switch("--use-existing"),
+                cli.has_switch("--overwrite"),
+                cli.global_deref(),
+            )?;
         }
-        "gitea-sync" | "git-sync" => {
-            let mut dir = env::current_dir()?;
-            let mut msg = "Synchronize workspace".to_owned();
-            let mut releases = false;
-            let mut allow_unversioned = false;
-            let mut target_remote: Option<String> = None;
-            let mut all_remotes = false;
-            let mut github = false;
-            let mut global_path: Option<PathBuf> = None;
-            let mut i = 1usize;
-            while i < args.len() {
-                match args[i].as_str() {
-                    "-m" | "--message" if i + 1 < args.len() => {
-                        msg = args[i + 1].clone();
-                        i += 2;
-                    }
-                    "--project" if i + 1 < args.len() => {
-                        dir = PathBuf::from(&args[i + 1]);
-                        i += 2;
-                    }
-                    "--remote" if i + 1 < args.len() => {
-                        target_remote = Some(args[i + 1].clone());
-                        i += 2;
-                    }
-                    "--global" if i + 1 < args.len() => {
-                        global_path = Some(PathBuf::from(&args[i + 1]));
-                        i += 2;
-                    }
-                    "--all-remotes" => {
-                        all_remotes = true;
-                        i += 1;
-                    }
-                    "--github" => {
-                        github = true;
-                        i += 1;
-                    }
-                    "--releases" => {
-                        releases = true;
-                        i += 1;
-                    }
-                    "--allow-unversioned" => {
-                        allow_unversioned = true;
-                        i += 1;
-                    }
-                    other => return Err(format!("Unknown git-sync flag '{other}'").into()),
-                }
-            }
+        cmd @ ("gitea-sync" | "git-sync") => {
+            let cli = CliSpec::new(
+                cmd,
+                "libredb git-sync [-m <msg>] [--project <dir>] [--remote <r>] [--all-remotes] [--github] [--releases] [--allow-unversioned] [--global <customizations.ldb>]",
+            )
+            .positionals(0, Some(0))
+            .allow_global()
+            .switches(&[
+                "--all-remotes",
+                "--github",
+                "--releases",
+                "--allow-unversioned",
+            ])
+            .values(&["--message", "--project", "--remote"])
+            .alias("-m", "--message")
+            .parse(sub_args)?;
+            let dir = cli
+                .path_value("--project")
+                .map(Ok)
+                .unwrap_or_else(env::current_dir)?;
+            let msg = cli.value("--message").unwrap_or("Synchronize workspace");
             gitea::cmd_gitea_sync(
                 &dir,
-                &msg,
-                releases,
-                allow_unversioned,
-                target_remote.as_deref(),
-                all_remotes,
-                github,
-                global_path.as_deref(),
+                msg,
+                cli.has_switch("--releases"),
+                cli.has_switch("--allow-unversioned"),
+                cli.value("--remote"),
+                cli.has_switch("--all-remotes"),
+                cli.has_switch("--github"),
+                cli.global_deref(),
             )?;
         }
-        "gitea-release" | "git-release" => {
-            let mut dir = env::current_dir()?;
-            let mut tag: Option<String> = None;
-            let mut target_remote: Option<String> = None;
-            let mut all_remotes = false;
-            let mut github = false;
-            let mut global_path: Option<PathBuf> = None;
-            let mut i = 1usize;
-            while i < args.len() {
-                match args[i].as_str() {
-                    "--project" if i + 1 < args.len() => {
-                        dir = PathBuf::from(&args[i + 1]);
-                        i += 2;
-                    }
-                    "--remote" if i + 1 < args.len() => {
-                        target_remote = Some(args[i + 1].clone());
-                        i += 2;
-                    }
-                    "--global" if i + 1 < args.len() => {
-                        global_path = Some(PathBuf::from(&args[i + 1]));
-                        i += 2;
-                    }
-                    "--all-remotes" => {
-                        all_remotes = true;
-                        i += 1;
-                    }
-                    "--github" => {
-                        github = true;
-                        i += 1;
-                    }
-                    pos if !pos.starts_with("--") && tag.is_none() => {
-                        tag = Some(pos.to_owned());
-                        i += 1;
-                    }
-                    other => return Err(format!("Unknown git-release flag '{other}'").into()),
-                }
-            }
+        cmd @ ("gitea-release" | "git-release") => {
+            let cli = CliSpec::new(
+                cmd,
+                "libredb git-release [vX.Y.Z] [--project <dir>] [--remote <r>] [--all-remotes] [--github] [--global <customizations.ldb>]",
+            )
+            .positionals(0, Some(1))
+            .allow_global()
+            .switches(&["--all-remotes", "--github"])
+            .values(&["--project", "--remote"])
+            .parse(sub_args)?;
+            let dir = cli
+                .path_value("--project")
+                .map(Ok)
+                .unwrap_or_else(env::current_dir)?;
             gitea::cmd_gitea_release(
                 &dir,
-                tag.as_deref(),
-                target_remote.as_deref(),
-                all_remotes,
-                github,
-                global_path.as_deref(),
+                cli.positionals.first().map(String::as_str),
+                cli.value("--remote"),
+                cli.has_switch("--all-remotes"),
+                cli.has_switch("--github"),
+                cli.global_deref(),
             )?;
         }
         "pulse" => {
-            if args.len() < 3 {
-                return Err(
-                    "Usage: libredb pulse <db.ldb> <query> [--global <g.ldb>] [--cid <id>] [--transcript <t.jsonl>] [--epoch <n>] [--budget <tok>] [--cwd <dir>] [--err <msg>]".into(),
-                );
+            let cli = CliSpec::new(
+                "pulse",
+                "libredb pulse <db.ldb> <query> [--global <g.ldb>] [--cid <id>] [--transcript <t.jsonl>] [--epoch <n>] [--budget <tok>] [--cwd <dir>] [--err <msg>]",
+            )
+            .positionals(2, Some(2))
+            .raw_value_slots(&[1])
+            .allow_global()
+            .values(&[
+                "--cid",
+                "--transcript",
+                "--epoch",
+                "--budget",
+                "--cwd",
+                "--err",
+            ])
+            .parse(sub_args)?;
+            let mut req = PulseRequest::new(&cli.positionals[1], 800);
+            req.conversation_id = cli.value("--cid").map(ToOwned::to_owned);
+            let transcript_path = cli.path_value("--transcript");
+            if let Some(ep) = cli.parse_value::<u32>("--epoch")? {
+                req.epoch = ep;
             }
-            let mut req = PulseRequest::new(&args[2], 800);
-            let mut global_path: Option<PathBuf> = None;
-            let mut transcript_path: Option<PathBuf> = None;
-
-            let mut i = 3usize;
-            while i + 1 < args.len() {
-                match args[i].as_str() {
-                    "--global" => {
-                        global_path = Some(PathBuf::from(&args[i + 1]));
-                        i += 2;
-                    }
-                    "--cid" => {
-                        req.conversation_id = Some(args[i + 1].clone());
-                        i += 2;
-                    }
-                    "--transcript" => {
-                        transcript_path = Some(PathBuf::from(&args[i + 1]));
-                        i += 2;
-                    }
-                    "--epoch" => {
-                        req.epoch = args[i + 1].parse()?;
-                        i += 2;
-                    }
-                    "--budget" => {
-                        req.token_budget = args[i + 1].parse()?;
-                        i += 2;
-                    }
-                    "--cwd" => {
-                        req.workspace_dir = Some(PathBuf::from(&args[i + 1]));
-                        i += 2;
-                    }
-                    "--err" => {
-                        req.error_context = Some(args[i + 1].clone());
-                        i += 2;
-                    }
-                    other => return Err(format!("Unknown flag '{other}'").into()),
-                }
+            if let Some(b) = cli.parse_value::<u32>("--budget")? {
+                req.token_budget = b;
             }
+            req.workspace_dir = cli.path_value("--cwd");
+            req.error_context = cli.value("--err").map(ToOwned::to_owned);
 
             let t0 = Instant::now();
-            let proj_db = open_cli_verified_project_db(global_path.as_deref(), Path::new(&args[1]))?;
+            let proj_db =
+                open_cli_verified_project_db(cli.global_deref(), Path::new(&cli.positionals[0]))?;
             if let (Some(ref cid), Some(ref tp)) = (&req.conversation_id, &transcript_path) {
                 req.epoch = sync_transcript_epoch(&proj_db, cid, tp)?;
             }
-            let glob_db = match global_path {
-                Some(ref gp) => Some(hooks::open_global_ldb(Some(gp))?),
+            let glob_db = match cli.global_deref() {
+                Some(gp) => Some(hooks::open_global_ldb(Some(gp))?),
                 None => hooks::open_global_ldb_checked(None)?,
             };
             let brain = OverlayBrain::open(glob_db, proj_db)?;
@@ -1188,25 +987,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("[Completed in {elapsed_ms:.2} ms]");
         }
         "index-workspace" => {
-            let (global_override, args) = extract_cli_global_flag(&args, 3)?;
-            if args.len() < 3 {
-                return Err("Usage: libredb index-workspace <db.ldb> <workspace_dir> [--force] [--global <customizations.ldb>]".into());
-            }
-            let mut force = false;
-            for flag in &args[3..] {
-                if flag == "--force" {
-                    force = true;
-                } else {
-                    return Err(format!("Unknown index-workspace flag '{flag}'").into());
-                }
-            }
+            let cli = CliSpec::new(
+                "index-workspace",
+                "libredb index-workspace <db.ldb> <workspace_dir> [--force] [--global <customizations.ldb>]",
+            )
+            .positionals(2, Some(2))
+            .allow_global()
+            .switches(&["--force"])
+            .parse(sub_args)?;
+            let force = cli.has_switch("--force");
             let t0 = Instant::now();
-            let db_path = Path::new(&args[1]);
-            let gdb_opt = hooks::open_global_ldb_checked(global_override.as_deref())?;
+            let db_path = Path::new(&cli.positionals[0]);
+            let gdb_opt = hooks::open_global_ldb_checked(cli.global_deref())?;
             let seal_guard =
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
             let db = Arc::new(LibreDb::open(db_path)?);
-            let ws_arg = Path::new(&args[2]);
+            let ws_arg = Path::new(&cli.positionals[1]);
             let ws_canon = std::fs::canonicalize(ws_arg).unwrap_or_else(|_| ws_arg.to_path_buf());
             let ws_norm = security::normalize_workspace_key(&ws_canon);
             let ws_prefix = format!("{ws_norm}/");
@@ -1226,7 +1022,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             seal_guard.reseal_after_write(gdb_opt.as_deref(), &db)?;
             println!(
                 "[OK] Indexed workspace '{}' in {:.2} ms: {} files scanned ({} cached, {} reindexed, {} binaries skipped) -> {} symbols, {} call edges, {} governance edges",
-                args[2],
+                cli.positionals[1],
                 t0.elapsed().as_secs_f64() * 1000.0,
                 rep.files_scanned,
                 rep.files_unchanged_cached,
@@ -1238,20 +1034,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         "skeleton" => {
-            let (global_override, args) = extract_cli_global_flag(&args, 3)?;
-            if args.len() < 3 {
-                return Err("Usage: libredb skeleton <db.ldb> <source_file> [--filter <substr>]".into());
-            }
-            let mut filter: Option<String> = None;
-            if args.len() >= 5 && args[3] == "--filter" {
-                filter = Some(args[4].clone());
-            }
+            let cli = CliSpec::new(
+                "skeleton",
+                "libredb skeleton <db.ldb> <source_file> [--filter <substr>] [--global <customizations.ldb>]",
+            )
+            .positionals(2, Some(2))
+            .allow_global()
+            .values(&["--filter"])
+            .parse(sub_args)?;
+            let filter = cli.value("--filter");
             let t0 = Instant::now();
-            let db = open_cli_verified_project_db(global_override.as_deref(), Path::new(&args[1]))?;
-            let src_path = Path::new(&args[2]);
+            let db =
+                open_cli_verified_project_db(cli.global_deref(), Path::new(&cli.positionals[0]))?;
+            let src_path = Path::new(&cli.positionals[1]);
             let (skel, cache_hit) = FileSkeleton::index_or_get_cached(&db, src_path, None)?;
             let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-            print!("{}", skel.render_compact(filter.as_deref(), filter.is_some()));
+            print!("{}", skel.render_compact(filter, filter.is_some()));
             println!(
                 "[Skeleton {} in {:.2} ms]",
                 if cache_hit {
@@ -1263,16 +1061,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         "impact" => {
-            let (global_override, args) = extract_cli_global_flag(&args, 3)?;
-            if args.len() < 3 {
-                return Err("Usage: libredb impact <db.ldb> <symbol_query>".into());
-            }
+            let cli = CliSpec::new(
+                "impact",
+                "libredb impact <db.ldb> <symbol_query> [--global <customizations.ldb>]",
+            )
+            .positionals(2, Some(2))
+            .raw_value_slots(&[1])
+            .allow_global()
+            .parse(sub_args)?;
             let t0 = Instant::now();
-            let db = open_cli_verified_project_db(global_override.as_deref(), Path::new(&args[1]))?;
-            let reports = query_symbol_impact(&db, &args[2])?;
+            let db =
+                open_cli_verified_project_db(cli.global_deref(), Path::new(&cli.positionals[0]))?;
+            let reports = query_symbol_impact(&db, &cli.positionals[1])?;
             println!(
                 "=== BLAST-RADIUS & CAUSAL IMPACT: '{}' ({} matches in {:.2} ms) ===",
-                args[2],
+                cli.positionals[1],
                 reports.len(),
                 t0.elapsed().as_secs_f64() * 1000.0
             );
@@ -1293,79 +1096,94 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         "fim" => {
-            let (global_override, args) = extract_cli_global_flag(&args, 3)?;
-            if args.len() < 3 {
-                return Err("Usage: libredb fim <db.ldb> <source_file> [--symbol <name> | --line <n>] [--pad <lines>]".into());
-            }
-            let mut symbol: Option<String> = None;
-            let mut line: Option<usize> = None;
-            let mut pad = 12usize;
-            let mut i = 3usize;
-            while i + 1 < args.len() {
-                match args[i].as_str() {
-                    "--symbol" => {
-                        symbol = Some(args[i + 1].clone());
-                        i += 2;
-                    }
-                    "--line" => {
-                        line = Some(args[i + 1].parse()?);
-                        i += 2;
-                    }
-                    "--pad" => {
-                        pad = args[i + 1].parse()?;
-                        i += 2;
-                    }
-                    other => return Err(format!("Unknown flag '{other}'").into()),
-                }
-            }
-            let db = open_cli_verified_project_db(global_override.as_deref(), Path::new(&args[1]))?;
-            let bundle =
-                extract_fim_slice(&db, Path::new(&args[2]), symbol.as_deref(), line, pad)?;
+            let cli = CliSpec::new(
+                "fim",
+                "libredb fim <db.ldb> <source_file> [--symbol <name> | --line <n>] [--pad <lines>] [--global <customizations.ldb>]",
+            )
+            .positionals(2, Some(2))
+            .allow_global()
+            .values(&["--symbol", "--line", "--pad"])
+            .parse(sub_args)?;
+            let line = cli.parse_value::<usize>("--line")?;
+            let pad = cli.parse_value::<usize>("--pad")?.unwrap_or(12);
+            let db =
+                open_cli_verified_project_db(cli.global_deref(), Path::new(&cli.positionals[0]))?;
+            let bundle = extract_fim_slice(
+                &db,
+                Path::new(&cli.positionals[1]),
+                cli.value("--symbol"),
+                line,
+                pad,
+            )?;
             print!("{}", bundle.format_compact());
         }
         "batch" => {
-            let (global_override, args) = extract_cli_global_flag(&args, 2)?;
-            if args.len() < 3 {
-                return Err("Usage: libredb batch <db.ldb> [--fact k=v] [--decision Title::Body] [--task key::title::status::prio] [--snapshot <text>]".into());
-            }
+            let cli = CliSpec::new(
+                "batch",
+                "libredb batch <db.ldb> [--fact k=v] [--decision Title::Body] [--task key::title::status::prio] [--snapshot <text>] [--global <customizations.ldb>]",
+            )
+            .positionals(1, Some(1))
+            .allow_global()
+            .multi_values(&["--fact", "--decision", "--task"])
+            .values(&["--snapshot"])
+            .parse(sub_args)?;
             let mut spec = AtomicBatchSpec::default();
-            let mut i = 2usize;
-            while i + 1 < args.len() {
-                match args[i].as_str() {
-                    "--fact" => {
-                        if let Some((k, v)) = args[i + 1].split_once('=') {
-                            spec.facts.push((k.trim().to_owned(), v.trim().to_owned()));
-                        }
-                        i += 2;
-                    }
-                    "--decision" => {
-                        if let Some((t, b)) = args[i + 1].split_once("::") {
-                            spec.decisions.push((t.trim().to_owned(), b.trim().to_owned()));
-                        }
-                        i += 2;
-                    }
-                    "--task" => {
-                        let parts: Vec<&str> = args[i + 1].splitn(4, "::").collect();
-                        if parts.len() == 4 {
-                            spec.tasks.push((
-                                parts[0].trim().to_owned(),
-                                parts[1].trim().to_owned(),
-                                parts[2].trim().to_owned(),
-                                parts[3].trim().to_owned(),
-                            ));
-                        }
-                        i += 2;
-                    }
-                    "--snapshot" => {
-                        spec.snapshot = Some(args[i + 1].clone());
-                        i += 2;
-                    }
-                    other => return Err(format!("Unknown flag '{other}'").into()),
+            for raw_f in cli.values_list("--fact") {
+                let Some((k, v)) = raw_f.split_once('=') else {
+                    return Err(format!(
+                        "Invalid --fact '{raw_f}'; expected 'key=value' in 'batch'"
+                    )
+                    .into());
+                };
+                if k.trim().is_empty() {
+                    return Err(format!("Invalid --fact '{raw_f}'; key cannot be empty").into());
                 }
+                spec.facts.push((k.trim().to_owned(), v.trim().to_owned()));
+            }
+            for raw_d in cli.values_list("--decision") {
+                let Some((t, b)) = raw_d.split_once("::") else {
+                    return Err(format!(
+                        "Invalid --decision '{raw_d}'; expected 'Title::Body' in 'batch'"
+                    )
+                    .into());
+                };
+                if t.trim().is_empty() {
+                    return Err(
+                        format!("Invalid --decision '{raw_d}'; title cannot be empty").into(),
+                    );
+                }
+                spec.decisions
+                    .push((t.trim().to_owned(), b.trim().to_owned()));
+            }
+            for raw_t in cli.values_list("--task") {
+                let parts: Vec<&str> = raw_t.splitn(4, "::").collect();
+                if parts.len() != 4 || parts[0].trim().is_empty() {
+                    return Err(format!(
+                        "Invalid --task '{raw_t}'; expected 'key::title::status::prio' in 'batch'"
+                    )
+                    .into());
+                }
+                spec.tasks.push((
+                    parts[0].trim().to_owned(),
+                    parts[1].trim().to_owned(),
+                    parts[2].trim().to_owned(),
+                    parts[3].trim().to_owned(),
+                ));
+            }
+            spec.snapshot = cli.value("--snapshot").map(ToOwned::to_owned);
+            if spec.facts.is_empty()
+                && spec.decisions.is_empty()
+                && spec.tasks.is_empty()
+                && spec.snapshot.is_none()
+            {
+                return Err(
+                    "Usage: libredb batch <db.ldb> [--fact k=v] [--decision Title::Body] [--task key::title::status::prio] [--snapshot <text>]"
+                        .into(),
+                );
             }
             let t0 = Instant::now();
-            let db_path = Path::new(&args[1]);
-            let gdb_opt = hooks::open_global_ldb_checked(global_override.as_deref())?;
+            let db_path = Path::new(&cli.positionals[0]);
+            let gdb_opt = hooks::open_global_ldb_checked(cli.global_deref())?;
             let seal_guard =
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
             let db = Arc::new(LibreDb::open(db_path)?);
@@ -1380,77 +1198,85 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         "handoff" => {
-            let (global_override, args) = extract_cli_global_flag(&args, 5)?;
-            if args.len() < 5 {
-                return Err("Usage: libredb handoff <db.ldb> <handoff_id> <task_key> <role> [--notes <text>]".into());
-            }
-            let mut notes = "";
-            if args.len() >= 7 && args[5] == "--notes" {
-                notes = &args[6];
-            }
-            let db_path = Path::new(&args[1]);
-            let gdb_opt = hooks::open_global_ldb_checked(global_override.as_deref())?;
+            let cli = CliSpec::new(
+                "handoff",
+                "libredb handoff <db.ldb> <handoff_id> <task_key> <role> [--notes <text>] [--global <customizations.ldb>]",
+            )
+            .positionals(4, Some(4))
+            .allow_global()
+            .values(&["--notes"])
+            .parse(sub_args)?;
+            let notes = cli.value("--notes").unwrap_or("");
+            let db_path = Path::new(&cli.positionals[0]);
+            let gdb_opt = hooks::open_global_ldb_checked(cli.global_deref())?;
             let seal_guard =
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
             let db = Arc::new(LibreDb::open(db_path)?);
-            let (_, block) = create_subagent_handoff(&db, &args[2], &args[3], &args[4], notes)?;
+            let (_, block) = create_subagent_handoff(
+                &db,
+                &cli.positionals[1],
+                &cli.positionals[2],
+                &cli.positionals[3],
+                notes,
+            )?;
             seal_guard.reseal_after_write(gdb_opt.as_deref(), &db)?;
             print!("{block}");
         }
         "learn-assoc" => {
-            let (global_override, args) = extract_cli_global_flag(&args, 4)?;
-            if args.len() < 4 {
-                return Err("Usage: libredb learn-assoc <db.ldb> <cue_phrase> <id1,id2,...>".into());
-            }
-            let target_ids: Result<Vec<u64>, _> = args[3]
+            let cli = CliSpec::new(
+                "learn-assoc",
+                "libredb learn-assoc <db.ldb> <cue_phrase> <id1,id2,...> [--global <customizations.ldb>]",
+            )
+            .positionals(3, Some(3))
+            .raw_value_slots(&[1])
+            .allow_global()
+            .parse(sub_args)?;
+            let target_ids: Result<Vec<u64>, _> = cli.positionals[2]
                 .split(',')
                 .filter(|s| !s.trim().is_empty())
                 .map(|s| s.trim().parse::<u64>())
                 .collect();
             let target_ids = target_ids?;
-            let db_path = Path::new(&args[1]);
-            let gdb_opt = hooks::open_global_ldb_checked(global_override.as_deref())?;
+            let db_path = Path::new(&cli.positionals[0]);
+            let gdb_opt = hooks::open_global_ldb_checked(cli.global_deref())?;
             let seal_guard =
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
             let db = Arc::new(LibreDb::open(db_path)?);
             let mut cog = CognitiveEngine::open_db(Arc::clone(&db))?;
-            let edges = cog.reinforce_association(&args[2], &target_ids)?;
+            let edges = cog.reinforce_association(&cli.positionals[1], &target_ids)?;
             cog.save_index_snapshot()?;
             seal_guard.reseal_after_write(gdb_opt.as_deref(), &db)?;
             println!(
                 "Reinforced {} Hebbian concept synapses from '{}' -> {:?}",
-                edges, args[2], target_ids
+                edges, cli.positionals[1], target_ids
             );
         }
         "learn-reflex" => {
-            let (global_override, args) = extract_cli_global_flag(&args, 4)?;
-            if args.len() < 4 {
-                return Err("Usage: libredb learn-reflex <db.ldb> <id> <directive> [--stack s] [--action a] [--env e]".into());
-            }
-            let mut rule = ReflexRule {
-                id: args[2].clone(),
-                stack_any: Vec::new(),
-                action_any: Vec::new(),
-                env_or_error_any: Vec::new(),
-                directive: args[3].clone(),
-            };
-            let mut i = 4usize;
-            while i + 1 < args.len() {
-                let items: Vec<String> = args[i + 1]
+            let cli = CliSpec::new(
+                "learn-reflex",
+                "libredb learn-reflex <db.ldb> <id> <directive> [--stack s] [--action a] [--env e] [--global <customizations.ldb>]",
+            )
+            .positionals(3, Some(3))
+            .raw_value_slots(&[2])
+            .allow_global()
+            .values(&["--stack", "--action", "--env"])
+            .parse(sub_args)?;
+            let split_csv = |opt: Option<&str>| -> Vec<String> {
+                opt.unwrap_or("")
                     .split(',')
                     .map(|s| s.trim().to_owned())
                     .filter(|s| !s.is_empty())
-                    .collect();
-                match args[i].as_str() {
-                    "--stack" => rule.stack_any = items,
-                    "--action" => rule.action_any = items,
-                    "--env" => rule.env_or_error_any = items,
-                    other => return Err(format!("Unknown flag '{other}'").into()),
-                }
-                i += 2;
-            }
-            let db_path = Path::new(&args[1]);
-            let gdb_opt = hooks::open_global_ldb_checked(global_override.as_deref())?;
+                    .collect()
+            };
+            let rule = ReflexRule {
+                id: cli.positionals[1].clone(),
+                stack_any: split_csv(cli.value("--stack")),
+                action_any: split_csv(cli.value("--action")),
+                env_or_error_any: split_csv(cli.value("--env")),
+                directive: cli.positionals[2].clone(),
+            };
+            let db_path = Path::new(&cli.positionals[0]);
+            let gdb_opt = hooks::open_global_ldb_checked(cli.global_deref())?;
             let seal_guard =
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
             let db = Arc::new(LibreDb::open(db_path)?);
@@ -1459,24 +1285,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("Learned situational reflex '{}' as node #{nid}", rule.id);
         }
         "import-sqlite" => {
-            let (global_override, args) = extract_cli_global_flag(&args, 3)?;
-            if args.len() < 3 {
-                return Err("Usage: libredb import-sqlite <db.ldb> <source.db> [--scope central|project] [--global <customizations.ldb>]".into());
-            }
-            let mut scope = "central";
-            let mut i = 3usize;
-            while i < args.len() {
-                match args[i].as_str() {
-                    "--scope" if i + 1 < args.len() => {
-                        scope = &args[i + 1];
-                        i += 2;
-                    }
-                    other => return Err(format!("Unknown import-sqlite flag '{other}'").into()),
-                }
-            }
+            let cli = CliSpec::new(
+                "import-sqlite",
+                "libredb import-sqlite <db.ldb> <source.db> [--scope central|project] [--global <customizations.ldb>]",
+            )
+            .positionals(2, Some(2))
+            .allow_global()
+            .values(&["--scope"])
+            .parse(sub_args)?;
+            let scope = cli.value("--scope").unwrap_or("central");
             let t0 = Instant::now();
-            let db_path = Path::new(&args[1]);
-            let gdb_opt = hooks::open_global_ldb_checked(global_override.as_deref())?;
+            let db_path = Path::new(&cli.positionals[0]);
+            let gdb_opt = hooks::open_global_ldb_checked(cli.global_deref())?;
             let seal_guard = if scope == "central" {
                 security::PreMutationSealGuard::verify_before_write_allow_fresh_global_import(
                     gdb_opt.as_deref(),
@@ -1486,14 +1306,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?
             };
             let db = Arc::new(LibreDb::open(db_path)?);
-            let sum = import_sqlite_readonly(Path::new(&args[2]), &db, scope)?;
+            let sum = import_sqlite_readonly(Path::new(&cli.positionals[1]), &db, scope)?;
             // Pre-build and persist the inverted index snapshot BEFORE sealing so cold CLI `pulse` runs in <10 ms!
             let mut cog = CognitiveEngine::open_db(Arc::clone(&db))?;
             cog.save_index_snapshot()?;
             seal_guard.reseal_after_write(gdb_opt.as_deref(), &db)?;
             println!(
                 "[OK] Imported SQLite '{}' + saved persistent index snapshot in {:.2} ms: {} tables ({} rows) -> {} cognitive capsules + {} synapses",
-                args[2],
+                cli.positionals[1],
                 t0.elapsed().as_secs_f64() * 1000.0,
                 sum.tables_mirrored,
                 sum.total_sqlite_rows,
@@ -1502,41 +1322,37 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         "export-sqlite" => {
-            let (global_override, args) = extract_cli_global_flag(&args, 3)?;
-            if args.len() < 3 {
-                return Err("Usage: libredb export-sqlite <db.ldb> <reconstructed.db> [--scope central|project] [--global <customizations.ldb>]".into());
-            }
-            let mut scope = "central";
-            let mut i = 3usize;
-            while i < args.len() {
-                match args[i].as_str() {
-                    "--scope" if i + 1 < args.len() => {
-                        scope = &args[i + 1];
-                        i += 2;
-                    }
-                    other => return Err(format!("Unknown export-sqlite flag '{other}'").into()),
-                }
-            }
+            let cli = CliSpec::new(
+                "export-sqlite",
+                "libredb export-sqlite <db.ldb> <reconstructed.db> [--scope central|project] [--global <customizations.ldb>]",
+            )
+            .positionals(2, Some(2))
+            .allow_global()
+            .values(&["--scope"])
+            .parse(sub_args)?;
+            let scope = cli.value("--scope").unwrap_or("central");
             let t0 = Instant::now();
-            let db = open_cli_verified_project_db(global_override.as_deref(), Path::new(&args[1]))?;
-            let rows = export_sqlite_database(&db, scope, Path::new(&args[2]))?;
+            let db =
+                open_cli_verified_project_db(cli.global_deref(), Path::new(&cli.positionals[0]))?;
+            let rows = export_sqlite_database(&db, scope, Path::new(&cli.positionals[1]))?;
             println!(
                 "[OK] Reconstructed SQLite '{}' (scope={}, {} rows + FTS5 indexes) in {:.2} ms",
-                args[2],
+                cli.positionals[1],
                 scope,
                 rows,
                 t0.elapsed().as_secs_f64() * 1000.0
             );
         }
         "verify-roundtrip" => {
-            if args.len() < 2 {
-                return Err("Usage: libredb verify-roundtrip <source.db> [--scope central|project]".into());
-            }
-            let mut scope = "central";
-            if args.len() >= 4 && args[2] == "--scope" {
-                scope = &args[3];
-            }
-            let src_path = Path::new(&args[1]);
+            let cli = CliSpec::new(
+                "verify-roundtrip",
+                "libredb verify-roundtrip <source.db> [--scope central|project]",
+            )
+            .positionals(1, Some(1))
+            .values(&["--scope"])
+            .parse(sub_args)?;
+            let scope = cli.value("--scope").unwrap_or("central");
+            let src_path = Path::new(&cli.positionals[0]);
             let src_meta = std::fs::symlink_metadata(src_path)?;
             if src_meta.file_type().is_symlink() || !src_meta.file_type().is_file() {
                 return Err(format!(
@@ -1592,12 +1408,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("  Total round-trip time: {:.2} ms", elapsed_ms);
         }
         "init" => {
-            let (global_override, args) = extract_cli_global_flag(&args, 2)?;
-            if args.len() < 2 {
-                return Err("Usage: libredb init <db.ldb> [--global <customizations.ldb>]".into());
-            }
-            let db_path = Path::new(&args[1]);
-            let gdb_opt = hooks::open_global_ldb_checked(global_override.as_deref())?;
+            let cli = CliSpec::new(
+                "init",
+                "libredb init <db.ldb> [--global <customizations.ldb>]",
+            )
+            .positionals(1, Some(1))
+            .allow_global()
+            .parse(sub_args)?;
+            let db_path = Path::new(&cli.positionals[0]);
+            let gdb_opt = hooks::open_global_ldb_checked(cli.global_deref())?;
             let _seal_guard =
                 security::PreMutationSealGuard::verify_before_write_allow_fresh_global_import(
                     gdb_opt.as_deref(),
@@ -1607,37 +1426,32 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let st = db.stats()?;
             println!(
                 "Initialized LibreDB at '{}' ({} bytes, commit_seq={})",
-                args[1], st.file_bytes, st.commit_seq
+                cli.positionals[0], st.file_bytes, st.commit_seq
             );
         }
         "put" => {
-            let (global_override, args) = extract_cli_global_flag(&args, 4)?;
-            if args.len() < 4 {
-                return Err("Usage: libredb put <db.ldb> <kind> <payload> [--key <k>] [--importance <0..255>] [--pin]".into());
+            let cli = CliSpec::new(
+                "put",
+                "libredb put <db.ldb> <kind> <payload> [--key <k>] [--importance <0..255>] [--pin] [--global <customizations.ldb>]",
+            )
+            .positionals(3, Some(3))
+            .raw_value_slots(&[2])
+            .allow_global()
+            .switches(&["--pin"])
+            .values(&["--key", "--importance"])
+            .parse(sub_args)?;
+            let kind = NodeKind::parse(&cli.positionals[1])
+                .ok_or_else(|| format!("Unknown node kind '{}'", cli.positionals[1]))?;
+            let mut req = WriteRequest::new(kind, cli.positionals[2].as_bytes().to_vec());
+            let explicit_key = cli.value("--key").map(ToOwned::to_owned);
+            if let Some(ref k) = explicit_key {
+                req = req.with_key(k);
             }
-            let kind = NodeKind::parse(&args[2])
-                .ok_or_else(|| format!("Unknown node kind '{}'", args[2]))?;
-            let mut req = WriteRequest::new(kind, args[3].as_bytes().to_vec());
-            let mut explicit_key: Option<String> = None;
-
-            let mut i = 4usize;
-            while i < args.len() {
-                match args[i].as_str() {
-                    "--key" if i + 1 < args.len() => {
-                        explicit_key = Some(args[i + 1].clone());
-                        req = req.with_key(&args[i + 1]);
-                        i += 2;
-                    }
-                    "--importance" if i + 1 < args.len() => {
-                        req = req.with_importance(args[i + 1].parse()?);
-                        i += 2;
-                    }
-                    "--pin" => {
-                        req = req.with_pinned(true);
-                        i += 1;
-                    }
-                    other => return Err(format!("Unknown flag '{other}'").into()),
-                }
+            if let Some(imp) = cli.parse_value::<u8>("--importance")? {
+                req = req.with_importance(imp);
+            }
+            if cli.has_switch("--pin") {
+                req = req.with_pinned(true);
             }
             if kind == NodeKind::Config {
                 if let Some(ref k) = explicit_key {
@@ -1650,8 +1464,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            let db_path = Path::new(&args[1]);
-            let gdb_opt = hooks::open_global_ldb_checked(global_override.as_deref())?;
+            let db_path = Path::new(&cli.positionals[0]);
+            let gdb_opt = hooks::open_global_ldb_checked(cli.global_deref())?;
             let seal_guard =
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
             let db = LibreDb::open(db_path)?;
@@ -1668,41 +1482,51 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         "get" => {
-            let (global_override, args) = extract_cli_global_flag(&args, 3)?;
-            if args.len() < 3 {
-                return Err("Usage: libredb get <db.ldb> <node_id>".into());
-            }
-            let db = open_cli_verified_project_db(global_override.as_deref(), Path::new(&args[1]))?;
-            let id: u64 = args[2].parse()?;
+            let cli = CliSpec::new(
+                "get",
+                "libredb get <db.ldb> <node_id> [--global <customizations.ldb>]",
+            )
+            .positionals(2, Some(2))
+            .allow_global()
+            .parse(sub_args)?;
+            let db =
+                open_cli_verified_project_db(cli.global_deref(), Path::new(&cli.positionals[0]))?;
+            let id: u64 = cli.positionals[1].parse()?;
             let rec = db.get(id)?;
             print_record(&rec);
         }
         "get-key" => {
-            let (global_override, args) = extract_cli_global_flag(&args, 4)?;
-            if args.len() < 4 {
-                return Err("Usage: libredb get-key <db.ldb> <kind> <key>".into());
-            }
-            let kind = NodeKind::parse(&args[2])
-                .ok_or_else(|| format!("Unknown node kind '{}'", args[2]))?;
-            let db = open_cli_verified_project_db(global_override.as_deref(), Path::new(&args[1]))?;
-            let rec = db.get_by_key(kind, &args[3])?;
+            let cli = CliSpec::new(
+                "get-key",
+                "libredb get-key <db.ldb> <kind> <key> [--global <customizations.ldb>]",
+            )
+            .positionals(3, Some(3))
+            .raw_value_slots(&[2])
+            .allow_global()
+            .parse(sub_args)?;
+            let kind = NodeKind::parse(&cli.positionals[1])
+                .ok_or_else(|| format!("Unknown node kind '{}'", cli.positionals[1]))?;
+            let db =
+                open_cli_verified_project_db(cli.global_deref(), Path::new(&cli.positionals[0]))?;
+            let rec = db.get_by_key(kind, &cli.positionals[2])?;
             print_record(&rec);
         }
         "link" => {
-            let (global_override, args) = extract_cli_global_flag(&args, 5)?;
-            if args.len() < 5 {
-                return Err("Usage: libredb link <db.ldb> <src_id> <edge_kind> <dst_id> [--weight <0..255>]".into());
-            }
-            let src_id: u64 = args[2].parse()?;
-            let edge_kind = EdgeKind::parse(&args[3])
-                .ok_or_else(|| format!("Unknown edge kind '{}'", args[3]))?;
-            let dst_id: u64 = args[4].parse()?;
-            let mut weight: u8 = 200;
-            if args.len() >= 7 && args[5] == "--weight" {
-                weight = args[6].parse()?;
-            }
-            let db_path = Path::new(&args[1]);
-            let gdb_opt = hooks::open_global_ldb_checked(global_override.as_deref())?;
+            let cli = CliSpec::new(
+                "link",
+                "libredb link <db.ldb> <src_id> <edge_kind> <dst_id> [--weight <0..255>] [--global <customizations.ldb>]",
+            )
+            .positionals(4, Some(4))
+            .allow_global()
+            .values(&["--weight"])
+            .parse(sub_args)?;
+            let src_id: u64 = cli.positionals[1].parse()?;
+            let edge_kind = EdgeKind::parse(&cli.positionals[2])
+                .ok_or_else(|| format!("Unknown edge kind '{}'", cli.positionals[2]))?;
+            let dst_id: u64 = cli.positionals[3].parse()?;
+            let weight: u8 = cli.parse_value::<u8>("--weight")?.unwrap_or(200);
+            let db_path = Path::new(&cli.positionals[0]);
+            let gdb_opt = hooks::open_global_ldb_checked(cli.global_deref())?;
             let seal_guard =
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
             let db = LibreDb::open(db_path)?;
@@ -1717,43 +1541,59 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         "deprecate" => {
-            let (global_override, args) = extract_cli_global_flag(&args, 4)?;
-            if args.len() < 4 {
-                return Err("Usage: libredb deprecate <db.ldb> <kind> <key>".into());
-            }
-            let kind = NodeKind::parse(&args[2])
-                .ok_or_else(|| format!("Unknown node kind '{}'", args[2]))?;
-            if kind == NodeKind::Config && security::is_admin_only_security_config_key(&args[3]) {
+            let cli = CliSpec::new(
+                "deprecate",
+                "libredb deprecate <db.ldb> <kind> <key> [--global <customizations.ldb>]",
+            )
+            .positionals(3, Some(3))
+            .raw_value_slots(&[2])
+            .allow_global()
+            .parse(sub_args)?;
+            let kind = NodeKind::parse(&cli.positionals[1])
+                .ok_or_else(|| format!("Unknown node kind '{}'", cli.positionals[1]))?;
+            if kind == NodeKind::Config
+                && security::is_admin_only_security_config_key(&cli.positionals[2])
+            {
                 return Err(format!(
                     "Refusing to deprecate reserved cryptographic/policy Config key '{}' via 'libredb deprecate'; use 'libredb trust --revoke' or 'libredb config unset' instead.",
-                    args[3]
+                    cli.positionals[2]
                 )
                 .into());
             }
-            let db_path = Path::new(&args[1]);
-            let gdb_opt = hooks::open_global_ldb_checked(global_override.as_deref())?;
+            let db_path = Path::new(&cli.positionals[0]);
+            let gdb_opt = hooks::open_global_ldb_checked(cli.global_deref())?;
             let seal_guard =
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
             let db = LibreDb::open(db_path)?;
-            let removed = db.deprecate_key(kind, &args[3])?;
+            let removed = db.deprecate_key(kind, &cli.positionals[2])?;
             if removed {
                 seal_guard.reseal_after_write(gdb_opt.as_deref(), &db)?;
-                println!("Deprecated active key '{}' ({})", args[3], kind.as_str());
+                println!(
+                    "Deprecated active key '{}' ({})",
+                    cli.positionals[2],
+                    kind.as_str()
+                );
             } else {
-                println!("Key '{}' ({}) not found", args[3], kind.as_str());
+                println!(
+                    "Key '{}' ({}) not found",
+                    cli.positionals[2],
+                    kind.as_str()
+                );
             }
         }
         "trace" => {
-            let (global_override, args) = extract_cli_global_flag(&args, 3)?;
-            if args.len() < 3 {
-                return Err("Usage: libredb trace <db.ldb> <node_id> [--depth <n>]".into());
-            }
-            let root_id: u64 = args[2].parse()?;
-            let mut depth = 8usize;
-            if args.len() >= 5 && args[3] == "--depth" {
-                depth = args[4].parse()?;
-            }
-            let db = open_cli_verified_project_db(global_override.as_deref(), Path::new(&args[1]))?;
+            let cli = CliSpec::new(
+                "trace",
+                "libredb trace <db.ldb> <node_id> [--depth <n>] [--global <customizations.ldb>]",
+            )
+            .positionals(2, Some(2))
+            .allow_global()
+            .values(&["--depth"])
+            .parse(sub_args)?;
+            let root_id: u64 = cli.positionals[1].parse()?;
+            let depth: usize = cli.parse_value::<usize>("--depth")?.unwrap_or(8);
+            let db =
+                open_cli_verified_project_db(cli.global_deref(), Path::new(&cli.positionals[0]))?;
             let chain = db.trace_lineage(root_id, depth)?;
             println!(
                 "Causal & temporal lineage from node #{root_id} ({} steps):",
@@ -1775,28 +1615,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         "recall" => {
-            let (global_override, args) = extract_cli_global_flag(&args, 3)?;
-            if args.len() < 3 {
-                return Err("Usage: libredb recall <db.ldb> <seed_id> [--hops <n>] [--budget <tokens>]".into());
-            }
-            let seed_id: u64 = args[2].parse()?;
-            let mut hops = 2usize;
-            let mut budget = 800u32;
-            let mut i = 3usize;
-            while i + 1 < args.len() {
-                match args[i].as_str() {
-                    "--hops" => {
-                        hops = args[i + 1].parse()?;
-                        i += 2;
-                    }
-                    "--budget" => {
-                        budget = args[i + 1].parse()?;
-                        i += 2;
-                    }
-                    other => return Err(format!("Unknown flag '{other}'").into()),
-                }
-            }
-            let db = open_cli_verified_project_db(global_override.as_deref(), Path::new(&args[1]))?;
+            let cli = CliSpec::new(
+                "recall",
+                "libredb recall <db.ldb> <seed_id> [--hops <n>] [--budget <tokens>] [--global <customizations.ldb>]",
+            )
+            .positionals(2, Some(2))
+            .allow_global()
+            .values(&["--hops", "--budget"])
+            .parse(sub_args)?;
+            let seed_id: u64 = cli.positionals[1].parse()?;
+            let hops: usize = cli.parse_value::<usize>("--hops")?.unwrap_or(2);
+            let budget: u32 = cli.parse_value::<u32>("--budget")?.unwrap_or(800);
+            let db =
+                open_cli_verified_project_db(cli.global_deref(), Path::new(&cli.positionals[0]))?;
             let bundle = db.recall_within_budget(&[seed_id], hops, budget, false)?;
             println!(
                 "Recall bundle: {} nodes, {}/{} tokens, {} coalesced I/O read(s)",
@@ -1816,14 +1647,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         "compact" => {
-            let (global_override, args) = extract_cli_global_flag(&args, 2)?;
-            if args.len() < 2 {
-                return Err("Usage: libredb compact <db.ldb> [--prune] [--global <customizations.ldb>]".into());
-            }
-            let prune = args.iter().skip(2).any(|a| a == "--prune");
+            let cli = CliSpec::new(
+                "compact",
+                "libredb compact <db.ldb> [--prune] [--global <customizations.ldb>]",
+            )
+            .positionals(1, Some(1))
+            .allow_global()
+            .switches(&["--prune"])
+            .parse(sub_args)?;
+            let prune = cli.has_switch("--prune");
             let t0 = Instant::now();
-            let db_path = Path::new(&args[1]);
-            let gdb_opt = hooks::open_global_ldb_checked(global_override.as_deref())?;
+            let db_path = Path::new(&cli.positionals[0]);
+            let gdb_opt = hooks::open_global_ldb_checked(cli.global_deref())?;
             let seal_guard =
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
             let db = Arc::new(LibreDb::open(db_path)?);
@@ -1844,33 +1679,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         "stats" => {
-            if args.len() < 2 {
-                return Err("Usage: libredb stats <db.ldb> [--json]".into());
-            }
-            let mut db_arg: Option<&str> = None;
-            let mut json_out = false;
-            let mut i = 1usize;
-            while i < args.len() {
-                match args[i].as_str() {
-                    "--db" if i + 1 < args.len() => {
-                        db_arg = Some(&args[i + 1]);
-                        i += 2;
-                    }
-                    "--json" => {
-                        json_out = true;
-                        i += 1;
-                    }
-                    other if !other.starts_with('-') && db_arg.is_none() => {
-                        db_arg = Some(other);
-                        i += 1;
-                    }
-                    other => return Err(format!("Unknown flag '{other}'").into()),
-                }
-            }
-            let db_path = db_arg.ok_or("Usage: libredb stats <db.ldb> [--json]")?;
+            let cli = CliSpec::new("stats", "libredb stats <db.ldb> [--json]")
+                .positionals(0, Some(1))
+                .switches(&["--json"])
+                .values(&["--db"])
+                .parse(sub_args)?;
+            let db_path = cli
+                .value("--db")
+                .or_else(|| cli.positionals.first().map(String::as_str))
+                .ok_or("Usage: libredb stats <db.ldb> [--json]")?;
             let db = LibreDb::open(db_path)?;
             let st = db.stats()?;
-            if json_out {
+            if cli.has_switch("--json") {
                 println!("{}", serde_json::to_string_pretty(&st)?);
             } else {
                 println!("=== LibreDB Statistics ===");
@@ -1887,11 +1707,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         "verify" => {
-            if args.len() < 2 {
-                return Err("Usage: libredb verify <db.ldb>".into());
-            }
+            let cli = CliSpec::new("verify", "libredb verify <db.ldb>")
+                .positionals(1, Some(1))
+                .parse(sub_args)?;
             let t0 = Instant::now();
-            let db = LibreDb::open(&args[1])?;
+            let db = LibreDb::open(&cli.positionals[0])?;
             let st = db.verify_integrity()?;
             println!(
                 "[OK] Verified {} inodes and all extents in {:.2} ms ({} bytes, commit_seq={})",
@@ -1902,22 +1722,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         "bench" => {
-            let mut total_nodes = 10_000usize;
-            let mut threads = 16usize;
-            let mut i = 1usize;
-            while i + 1 < args.len() {
-                match args[i].as_str() {
-                    "--nodes" => {
-                        total_nodes = args[i + 1].parse()?;
-                        i += 2;
-                    }
-                    "--threads" => {
-                        threads = args[i + 1].parse()?;
-                        i += 2;
-                    }
-                    other => return Err(format!("Unknown flag '{other}'").into()),
-                }
-            }
+            let cli = CliSpec::new("bench", "libredb bench [--nodes <n>] [--threads <t>]")
+                .positionals(0, Some(0))
+                .values(&["--nodes", "--threads"])
+                .parse(sub_args)?;
+            let total_nodes = cli.parse_value::<usize>("--nodes")?.unwrap_or(10_000);
+            let threads = cli.parse_value::<usize>("--threads")?.unwrap_or(16);
             run_microbench(total_nodes, threads.max(1))?;
         }
         other => {
@@ -2754,5 +2564,37 @@ mod tests {
 
         drop(gdb);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cli_subcommands_reject_unknown_flags_missing_values_and_malformed_batch_specs() {
+        let s = |items: &[&str]| -> Vec<String> {
+            items.iter().map(|x| (*x).to_owned()).collect()
+        };
+
+        // Trailing missing option values and trailing unknown flags across previously silent subcommands:
+        for bad in [
+            s(&["pulse", "db.ldb", "query", "--budget"]),
+            s(&["pulse", "db.ldb", "query", "--typo"]),
+            s(&["skeleton", "db.ldb", "src/lib.rs", "--filter"]),
+            s(&["skeleton", "db.ldb", "src/lib.rs", "--bogus"]),
+            s(&["compact", "db.ldb", "--prun"]),
+            s(&["gitea-status", "--global"]),
+            s(&["gitea-status", "--bogus"]),
+            s(&["hook-pre-tool", "--global"]),
+            s(&["hook-pre-tool", "--bogus"]),
+            s(&["bench", "--nodes"]),
+            s(&["bench", "--bogus"]),
+            s(&["verify", "db.ldb", "extra.ldb"]),
+            s(&["batch", "db.ldb"]),
+            s(&["batch", "db.ldb", "--fact", "missing_equals"]),
+            s(&["batch", "db.ldb", "--decision", "missing_sep"]),
+            s(&["batch", "db.ldb", "--task", "only::two"]),
+        ] {
+            assert!(
+                run_with_args(&bad).is_err(),
+                "Expected CLI rejection for malformed args {bad:?}"
+            );
+        }
     }
 }
