@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.3] - 2026-11-11
+
+### Added
+
+- Added `is_admin_only_security_config_key` (`crates/libredb-core/src/lib.rs` and `crates/libredb-cli/src/security.rs`), CSPRNG `0700` ephemeral `MCP` brain directory helpers (`create_private_ephemeral_dir` and `ephemeral_workspace_ldb_filename` in `crates/libredb-cli/src/security.rs`, cleaned up via `impl Drop for McpServerState`), and 2 dedicated security regression tests (`mcp_sqlite_import_never_activates_security_switches_or_authorizes_untrusted_workspaces` and `mcp_without_global_db_rejects_unregistered_cwd_and_keeps_pinned_or_init_roots_consistent` in `crates/libredb-cli/src/mcp.rs`, plus extended `sqlite_import_strips_reserved_trust_and_sys_keys_while_preserving_lossless_mirror` in `crates/libredb-bridge/src/lib.rs`, bringing the automated suite to 76 tests + 10k crash simulations).
+
+### Changed
+
+- Updated `McpServerState::new_with_workspace_root` (`crates/libredb-cli/src/mcp.rs`) to open `--global` through `open_global_ldb_checked` (failing closed on corrupted/truncated `customizations.ldb` and keeping `global_db = None` without creating an empty `customizations.ldb` when absent), routed read/code `MCP` operations on clean memoryless workspaces through private `0700` ephemeral `.ldb` brains so read-only calls never materialize unsealed `<ws>/.agents/memory.ldb` files on disk, and restricted `mcp:*` and `gitea_allow_insecure_http` in `libredb config set/unset` (`crates/libredb-cli/src/main.rs`) strictly to global `customizations.ldb`.
+
+### Security
+
+- Closed `SQLite` import of privileged `MCP`, `Gitea`, and guardrail policy switches (`populate_cognitive_graph` in `crates/libredb-bridge/src/lib.rs` and `is_admin_only_security_config_key` in `crates/libredb-core/src/lib.rs`): imported `runtime_config` rows matching `mcp:*` (`mcp:allow_untrusted_workspaces`, `mcp:allow_central_sqlite_sync`, case-insensitive), `gitea_allow_insecure_http`, or `guardrail:allow_staged_files` are now stripped alongside `sys::*`, `trust:*`, `workspace:*`, and `workspace_id::*` before materializing active `NodeKind::Config` capsules (and blocked in low-level `libredb put`/`deprecate`), while preserving raw cells inside `sqlite_mirror::{scope}` for 100% lossless `SQLite` round-trip reconstruction.
+- Removed the unconfigured standalone `MCP` `cwd` fallback and eliminated Call-1 vs Call-2 workspace drift (`authorize_mcp_workspace_path` and `resolve_brain_with_seal_target` in `crates/libredb-cli/src/mcp.rs`): `libredb-mcp` now requires server-side workspace registration (`--workspace-root` / `LIBREDB_MCP_WORKSPACE_ROOT`, `MCP` `initialize` `workspaceFolders`/`rootUri`, or `customizations.ldb` trust) even when `customizations.ldb` does not exist, checks `is_workspace_memory_trusted(self.global_db.as_deref(), ...)` unconditionally across `--workspace-root` and `initialize` roots so pre-existing unverified `.agents/memory.*` files are rejected on Call 1, rejects `libredb_memorize` when `global_db` is `None`, and keeps clean authorized workspaces 100% deterministic across repeated calls without creating unsealed `.agents/memory.ldb` files.
+
 ## [0.10.2] - 2026-11-11
 
 ### Added

@@ -690,6 +690,57 @@ pub fn is_reserved_security_config_key(key: &str) -> bool {
     libredb_core::is_reserved_security_config_key(key)
 }
 
+/// Returns true if `key` addresses either a reserved internal trust/system namespace or a
+/// privileged host/MCP/guardrail policy switch (`mcp:*`, `gitea_allow_insecure_http`,
+/// `guardrail:allow_staged_files`) that must never be imported from SQLite or mutated via
+/// low-level `libredb put` / `libredb deprecate`.
+pub fn is_admin_only_security_config_key(key: &str) -> bool {
+    libredb_core::is_admin_only_security_config_key(key)
+}
+
+/// Creates an owner-only (`0700` on Unix) CSPRNG-named ephemeral directory inside `std::env::temp_dir()`
+/// using non-recursive `DirBuilder::create` (atomic fail-if-exists semantics against pre-created symlinks).
+pub(crate) fn create_private_ephemeral_dir(prefix: &str) -> Result<PathBuf, String> {
+    let base = std::env::temp_dir();
+    for _ in 0..8 {
+        let mut rnd = [0u8; 16];
+        fill_csprng(&mut rnd)?;
+        let candidate = base.join(format!(
+            "{prefix}_{}_{}",
+            std::process::id(),
+            hex_encode(&rnd)
+        ));
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(format!(
+                    "Failed to create private ephemeral directory '{}': {e}",
+                    candidate.display()
+                ));
+            }
+        }
+    }
+    Err("Failed to allocate unique CSPRNG ephemeral directory after 8 attempts".to_owned())
+}
+
+/// Computes a deterministic collision-free filename (`ws_<32-hex>.ldb`) for ephemeral MCP brains.
+pub(crate) fn ephemeral_workspace_ldb_filename(ws_root: &Path) -> String {
+    let norm = normalize_workspace_key(ws_root);
+    let mut h = Sha256::new();
+    h.update(b"LibreDB::EphemeralMcpBrain::v1\0");
+    h.update(norm.as_bytes());
+    let digest = h.finalize();
+    format!("ws_{}.ldb", hex_encode(&digest[..16]))
+}
+
 /// Computes a deterministic collision-free `Config` key (`workspace_id::<16-hex>`) from a
 /// normalized workspace path so distinct repositories sharing the same folder basename never
 /// overwrite or revoke one another's learned workspace records.

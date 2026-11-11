@@ -34,6 +34,20 @@ pub fn is_reserved_security_config_key(key: &str) -> bool {
         || low.starts_with("workspace_id::")
 }
 
+/// Returns true if `key` addresses either a reserved internal trust/system namespace
+/// (`is_reserved_security_config_key`) or a privileged host/MCP/guardrail security policy
+/// switch (`mcp:*`, `gitea_allow_insecure_http`, `guardrail:allow_staged_files`) that must
+/// never be imported from SQLite `runtime_config` or mutated via low-level `put`/`deprecate`.
+pub fn is_admin_only_security_config_key(key: &str) -> bool {
+    if is_reserved_security_config_key(key) {
+        return true;
+    }
+    let low = key.trim().to_ascii_lowercase();
+    low.starts_with("mcp:")
+        || low == "gitea_allow_insecure_http"
+        || low == "guardrail:allow_staged_files"
+}
+
 /// Returns true if `key` starts with the reserved internal system prefix `sys::` (case-insensitive).
 pub fn is_reserved_sys_key(key: &str) -> bool {
     key.trim().to_ascii_lowercase().starts_with("sys::")

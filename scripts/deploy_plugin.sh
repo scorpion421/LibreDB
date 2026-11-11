@@ -1,5 +1,5 @@
 #!/bin/sh
-# POSIX / Linux / macOS Antigravity plugin installer for LibreDB (v0.10.2)
+# POSIX / Linux / macOS Antigravity plugin installer for LibreDB (v0.10.3)
 # Enterprise-neutral by default (never installs personal rules or imports legacy SQLite unless requested).
 set -eu
 
@@ -134,7 +134,7 @@ cat > "$PLUGIN_DIR/plugin.json" <<'EOF'
 {
   "name": "libredb",
   "displayName": "LibreDB Cognitive Memory",
-  "version": "0.10.2",
+  "version": "0.10.3",
   "description": "Enterprise-ready Rust cognitive memory & MCP code graph: single-file LIBREDB1 storage, silent SQLite auto-porter, sub-2ms hooks, content-bound HMAC-SHA256 workspace trust seals, ChaCha20-Poly1305 OS credential vault, 20-language DI-aware causal code graph, and multi-remote Git/Gitea/GitHub automation.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
@@ -390,7 +390,7 @@ EOF
 
 # 7. Write user-facing README.md inside plugin bundle
 cat > "$PLUGIN_DIR/README.md" <<'EOF'
-# LibreDB cognitive memory plugin (v0.10.2)
+# LibreDB cognitive memory plugin (v0.10.3)
 
 Enterprise-ready standalone Rust cognitive memory & code-graph engine for `Antigravity`:
 - `libredb-mcp`: 3-tool multi-workspace cognitive memory & 20-language zero-hardcode heuristic DI code-graph server with interface/implementation resolution (`implementors`), zero-I/O RAM session delta, `[Zero-Repeat Skeleton]` deduplication, and corpus-`IDF` call-graph disambiguation.
@@ -431,6 +431,6 @@ PYEOF
     fi
 fi
 
-echo "[OK] Deployed LibreDB v0.10.2 standalone binary to: $BIN_DIR (profile=$PROFILE)"
+echo "[OK] Deployed LibreDB v0.10.3 standalone binary to: $BIN_DIR (profile=$PROFILE)"
 echo "[OK] Hydrated and modernized global store at: $GLOBAL_LDB"
 echo "[OK] Installed complete Antigravity plugin at: $PLUGIN_DIR"

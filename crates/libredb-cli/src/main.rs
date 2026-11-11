@@ -529,6 +529,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         )
                         .into());
                     }
+                    let key_low = key.to_ascii_lowercase();
+                    if proj_dir.is_some()
+                        && (key_low.starts_with("mcp:") || key_low == "gitea_allow_insecure_http")
+                    {
+                        return Err(format!(
+                            "Host-global security policy key '{key}' cannot be scoped to '--project'; omit '--project' to configure it in global customizations.ldb."
+                        )
+                        .into());
+                    }
                     let val = &positional[1];
                     let stored = if is_secret_key(key) {
                         security::protect_secret(val.trim())?
@@ -573,6 +582,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     if security::is_reserved_security_config_key(key) {
                         return Err(format!(
                             "Refusing to remove reserved security configuration key '{key}' via 'libredb config'; use 'libredb trust --revoke' instead."
+                        )
+                        .into());
+                    }
+                    let key_low = key.to_ascii_lowercase();
+                    if proj_dir.is_some()
+                        && (key_low.starts_with("mcp:") || key_low == "gitea_allow_insecure_http")
+                    {
+                        return Err(format!(
+                            "Host-global security policy key '{key}' cannot be scoped to '--project'; omit '--project' to remove it from global customizations.ldb."
                         )
                         .into());
                     }
@@ -1551,9 +1569,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             if kind == NodeKind::Config {
                 if let Some(ref k) = explicit_key {
-                    if security::is_reserved_security_config_key(k) {
+                    if security::is_admin_only_security_config_key(k) {
                         return Err(format!(
-                            "Refusing to write reserved cryptographic/trust Config key '{k}' via 'libredb put'; use 'libredb trust' instead."
+                            "Refusing to write reserved cryptographic/policy Config key '{k}' via 'libredb put'; use 'libredb trust' or 'libredb config' instead."
                         )
                         .into());
                     }
@@ -1629,9 +1647,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             let kind = NodeKind::parse(&args[2])
                 .ok_or_else(|| format!("Unknown node kind '{}'", args[2]))?;
-            if kind == NodeKind::Config && security::is_reserved_security_config_key(&args[3]) {
+            if kind == NodeKind::Config && security::is_admin_only_security_config_key(&args[3]) {
                 return Err(format!(
-                    "Refusing to deprecate reserved cryptographic/trust Config key '{}' via 'libredb deprecate'; use 'libredb trust --revoke' instead.",
+                    "Refusing to deprecate reserved cryptographic/policy Config key '{}' via 'libredb deprecate'; use 'libredb trust --revoke' or 'libredb config unset' instead.",
                     args[3]
                 )
                 .into());

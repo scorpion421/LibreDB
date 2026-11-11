@@ -10,7 +10,7 @@
 
 use libredb_core::crc::{crc32, hash_key};
 use libredb_core::{
-    is_reserved_security_config_key, is_reserved_sys_key, EdgeKind, LibreDb, NodeFlags, NodeKind,
+    is_admin_only_security_config_key, is_reserved_sys_key, EdgeKind, LibreDb, NodeFlags, NodeKind,
     WriteRequest,
 };
 use rusqlite::{types::ValueRef, Connection, OpenFlags};
@@ -859,11 +859,12 @@ fn populate_cognitive_graph(conn: &Connection, ldb: &LibreDb) -> Result<(usize, 
         })?;
         for row in rows {
             let (key, val, _upd) = row?;
-            // Never materialize security-critical internal trust or vault keys (`sys::*`,
-            // `trust:*`, `workspace:*`, `workspace_id::*`) from imported SQLite `runtime_config`
-            // rows into active `NodeKind::Config` capsules. Raw table cells remain preserved
-            // inside `sqlite_mirror::{scope}` for lossless SQLite round-trip reconstruction.
-            if is_reserved_security_config_key(&key) {
+            // Never materialize security-critical internal trust/vault keys (`sys::*`, `trust:*`,
+            // `workspace:*`, `workspace_id::*`) or privileged host/MCP/guardrail policy switches
+            // (`mcp:*`, `gitea_allow_insecure_http`, `guardrail:allow_staged_files`) from imported
+            // SQLite `runtime_config` rows into active `NodeKind::Config` capsules. Raw table cells
+            // remain preserved inside `sqlite_mirror::{scope}` for lossless SQLite reconstruction.
+            if is_admin_only_security_config_key(&key) {
                 continue;
             }
             let b_idx = prepared.len();
@@ -1687,6 +1688,10 @@ mod tests {
                     ('Trust:Revoked::/repo/victim', '', '2026-11-11'),
                     ('workspace:evil', '/repo/evil', '2026-11-11'),
                     ('workspace_id::0123456789abcdef', '/repo/evil', '2026-11-11'),
+                    ('mcp:allow_untrusted_workspaces', 'true', '2026-11-11'),
+                    ('MCP:Allow_Central_Sqlite_Sync', 'true', '2026-11-11'),
+                    ('gitea_allow_insecure_http', 'true', '2026-11-11'),
+                    ('guardrail:allow_staged_files', '.env', '2026-11-11'),
                     ('gitea_url', 'http://127.0.0.1:3000', '2026-11-11');
                 CREATE TABLE rules (id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT UNIQUE NOT NULL, name TEXT NOT NULL, category TEXT NOT NULL, scope TEXT NOT NULL, is_active INTEGER DEFAULT 1, summary TEXT, content TEXT NOT NULL);
                 INSERT INTO rules VALUES
@@ -1700,7 +1705,7 @@ mod tests {
         let ldb_path = tmp.path().join("customizations.ldb");
         let ldb = LibreDb::open(&ldb_path).unwrap();
 
-        // Pre-populate genuine host trust state in customizations.ldb:
+        // Pre-populate genuine host trust state and locked-down MCP policy switches in customizations.ldb:
         ldb.put(
             WriteRequest::new(NodeKind::Config, b"genuine_host_secret_hex".to_vec())
                 .with_key("sys::trust_anchor_secret"),
@@ -1711,11 +1716,21 @@ mod tests {
                 .with_key("trust:seal_rev::/repo/victim"),
         )
         .unwrap();
+        ldb.put(
+            WriteRequest::new(NodeKind::Config, b"false".to_vec())
+                .with_key("mcp:allow_untrusted_workspaces"),
+        )
+        .unwrap();
+        ldb.put(
+            WriteRequest::new(NodeKind::Config, b"false".to_vec())
+                .with_key("mcp:allow_central_sqlite_sync"),
+        )
+        .unwrap();
 
         let sum = import_sqlite_readonly(&malicious_sql, &ldb, "central").unwrap();
-        assert_eq!(sum.total_sqlite_rows, 10);
+        assert_eq!(sum.total_sqlite_rows, 14);
 
-        // 1. Genuine trust anchor secret and monotonic seal revision MUST remain 100% untouched:
+        // 1. Genuine trust anchor secret, monotonic seal revision, and host MCP switches MUST remain 100% untouched:
         assert_eq!(
             ldb.get_by_key(NodeKind::Config, "sys::trust_anchor_secret")
                 .unwrap()
@@ -1728,8 +1743,20 @@ mod tests {
                 .payload,
             b"5"
         );
+        assert_eq!(
+            ldb.get_by_key(NodeKind::Config, "mcp:allow_untrusted_workspaces")
+                .unwrap()
+                .payload,
+            b"false"
+        );
+        assert_eq!(
+            ldb.get_by_key(NodeKind::Config, "mcp:allow_central_sqlite_sync")
+                .unwrap()
+                .payload,
+            b"false"
+        );
 
-        // 2. Forged trust/workspace/sys keys from SQLite MUST NOT exist as active capsules:
+        // 2. Forged trust/workspace/sys/policy keys from SQLite MUST NOT exist as active capsules:
         for forbidden_cfg in [
             "SYS::trust_seals",
             "sys::trust_seals",
@@ -1737,6 +1764,9 @@ mod tests {
             "Trust:Revoked::/repo/victim",
             "workspace:evil",
             "workspace_id::0123456789abcdef",
+            "MCP:Allow_Central_Sqlite_Sync",
+            "gitea_allow_insecure_http",
+            "guardrail:allow_staged_files",
         ] {
             assert!(
                 ldb.get_by_key(NodeKind::Config, forbidden_cfg).is_err(),
@@ -1765,6 +1795,6 @@ mod tests {
         let recon_sql = tmp.path().join("reconstructed_customizations.db");
         export_sqlite_database(&ldb, "central", &recon_sql).unwrap();
         let rep = verify_sqlite_equivalence(&malicious_sql, &recon_sql).unwrap();
-        assert_eq!(rep.rows_verified, 10);
+        assert_eq!(rep.rows_verified, 14);
     }
 }

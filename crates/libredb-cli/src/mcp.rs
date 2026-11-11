@@ -44,6 +44,19 @@ pub struct McpServerState {
     /// Keyed by `canonical_brain_cache_key(db_path)` so relative paths, `..` segments, symlinks,
     /// and Windows casing variants always address and evict the exact same cached `OverlayBrain`.
     brains: HashMap<String, OverlayBrain>,
+    /// Lazy CSPRNG `0700` private directory holding ephemeral `.ldb` brains for clean workspaces
+    /// opened before `.agents/memory.ldb` exists or when `customizations.ldb` is absent, ensuring
+    /// read/code MCP tools never materialize unsealed `.agents/memory.ldb` files inside repos.
+    ephemeral_dir: Option<PathBuf>,
+}
+
+impl Drop for McpServerState {
+    fn drop(&mut self) {
+        self.brains.clear();
+        if let Some(dir) = self.ephemeral_dir.take() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
 }
 
 fn insert_brain_bounded(
@@ -300,10 +313,7 @@ impl McpServerState {
                 let def = default_global_ldb_path();
                 def.is_file().then_some(def)
             });
-        let global_db = match global_path {
-            Some(gp) => Some(open_global_ldb(Some(gp))?),
-            None => open_global_ldb_checked(None)?,
-        };
+        let global_db = open_global_ldb_checked(global_path)?;
 
         Ok(Self {
             default_project_path: fallback_proj,
@@ -312,7 +322,18 @@ impl McpServerState {
             pinned_workspace_root,
             client_workspace_roots: Vec::new(),
             brains: HashMap::new(),
+            ephemeral_dir: None,
         })
+    }
+
+    fn ephemeral_workspace_ldb_path(&mut self, ws_root: &Path) -> Result<PathBuf, String> {
+        if self.ephemeral_dir.is_none() {
+            self.ephemeral_dir = Some(crate::security::create_private_ephemeral_dir(
+                "libredb_mcp_eph",
+            )?);
+        }
+        let dir = self.ephemeral_dir.as_ref().unwrap();
+        Ok(dir.join(crate::security::ephemeral_workspace_ldb_filename(ws_root)))
     }
 
     pub(crate) fn register_initialize_roots(&mut self, params: &Value) {
@@ -363,6 +384,7 @@ impl McpServerState {
         } else if let Some(ref gp) = self.global_path {
             match open_global_ldb_checked(Some(gp)) {
                 Ok(Some(gdb)) => {
+                    self.brains.clear();
                     self.global_db = Some(gdb);
                 }
                 Ok(None) => {}
@@ -374,6 +396,7 @@ impl McpServerState {
         } else {
             match open_global_ldb_checked(None) {
                 Ok(Some(gdb)) => {
+                    self.brains.clear();
                     self.global_path = Some(default_global_ldb_path());
                     self.global_db = Some(gdb);
                 }
@@ -389,7 +412,8 @@ impl McpServerState {
 
     /// Validates `candidate_dir` against server-side workspace boundaries (`pinned_workspace_root`,
     /// MCP `initialize` `client_workspace_roots`, or `customizations.ldb` trusted workspaces) and
-    /// returns the canonical authorized workspace root on success.
+    /// returns the canonical authorized workspace root on success. Never falls back to accepting
+    /// self-declared `cwd` paths when `customizations.ldb` is absent.
     fn authorize_mcp_workspace_path(
         &mut self,
         candidate_dir: &Path,
@@ -425,14 +449,12 @@ impl McpServerState {
             if let Some(err) = crate::security::check_mcp_workspace_containment(&canon, pin_root) {
                 return Err(err);
             }
-            if let Some(ref gdb) = self.global_db {
-                if !crate::security::is_workspace_memory_trusted(Some(gdb), pin_root) {
-                    return Err(format!(
-                        "LibreDB MCP access denied: workspace memory in '{}' is untrusted, tampered, or rolled back; run 'libredb trust \"{}\"' in a terminal.",
-                        pin_root.display(),
-                        pin_root.display()
-                    ));
-                }
+            if !crate::security::is_workspace_memory_trusted(self.global_db.as_deref(), pin_root) {
+                return Err(format!(
+                    "LibreDB MCP access denied: workspace memory in '{}' is untrusted, tampered, or rolled back; run 'libredb trust \"{}\"' in a terminal.",
+                    pin_root.display(),
+                    pin_root.display()
+                ));
             }
             return Ok(pin_root.clone());
         }
@@ -444,14 +466,15 @@ impl McpServerState {
             .find(|cr| crate::security::check_mcp_workspace_containment(&canon, cr).is_none())
             .cloned()
         {
-            if let Some(ref gdb) = self.global_db {
-                if !crate::security::is_workspace_memory_trusted(Some(gdb), &matched_client_root) {
-                    return Err(format!(
-                        "LibreDB MCP access denied: workspace memory in '{}' is untrusted, tampered, or rolled back; run 'libredb trust \"{}\"' in a terminal.",
-                        matched_client_root.display(),
-                        matched_client_root.display()
-                    ));
-                }
+            if !crate::security::is_workspace_memory_trusted(
+                self.global_db.as_deref(),
+                &matched_client_root,
+            ) {
+                return Err(format!(
+                    "LibreDB MCP access denied: workspace memory in '{}' is untrusted, tampered, or rolled back; run 'libredb trust \"{}\"' in a terminal.",
+                    matched_client_root.display(),
+                    matched_client_root.display()
+                ));
             }
             return Ok(matched_client_root);
         }
@@ -487,17 +510,12 @@ impl McpServerState {
             return Ok(auth_root);
         }
 
-        // 4. Standalone mode without `customizations.ldb` and without `initialize` roots:
-        let inferred_root = find_owning_repo_or_agents_ancestor(&canon)
-            .or_else(|| find_workspace_root(&canon))
-            .unwrap_or(canon);
-        if crate::security::is_forbidden_mcp_workspace_root(&inferred_root) {
-            return Err(format!(
-                "LibreDB MCP access denied: '{}' is a forbidden workspace root",
-                candidate_dir.display()
-            ));
-        }
-        Ok(inferred_root)
+        Err(format!(
+            "LibreDB MCP access denied: workspace '{}' has no server-side authorization (global customizations.ldb is absent and neither '--workspace-root' nor MCP 'initialize' workspaceFolders was configured). Start 'libredb mcp --workspace-root \"{}\"', configure MCP 'initialize' roots, or run 'libredb init' and 'libredb trust \"{}\"'.",
+            candidate_dir.display(),
+            canon.display(),
+            canon.display()
+        ))
     }
 
     /// Resolves `(ws_root, containment_root)` for `libredb_code` and legacy code tools, failing
@@ -769,59 +787,102 @@ impl McpServerState {
                         Ok(auth_root) => {
                             let auth_ldb = auth_root.join(".agents").join("memory.ldb");
                             let auth_cache_key = canonical_brain_cache_key(&auth_ldb);
-                            let needs_mig_lock =
-                                !auth_ldb.is_file() && auth_ldb.with_extension("db").exists();
-                            if is_explicit_memorize || needs_mig_lock {
-                                if let Some(ref gdb) = self.global_db {
-                                    ws_write_lock = Some(
-                                        crate::security::WorkspaceTrustLockGuard::acquire(
-                                            gdb, &auth_root,
-                                        )?,
-                                    );
-                                }
-                            }
-                            let allow_readonly_sqlite_mig = !needs_mig_lock
-                                || is_explicit_memorize
-                                || self.global_db.as_deref().is_some_and(|gdb| {
-                                    let norm = crate::security::normalize_workspace_key(&auth_root);
-                                    gdb.get_by_key(
-                                        libredb_core::NodeKind::Config,
-                                        &format!("trust:allowed::{norm}"),
-                                    )
-                                    .is_ok()
-                                });
-                            if allow_readonly_sqlite_mig
-                                && crate::security::is_workspace_memory_trusted(
-                                    self.global_db.as_deref(),
-                                    &auth_root,
-                                )
-                            {
+                            if self.global_db.is_none() {
                                 if is_explicit_memorize {
-                                    ws_root_to_seal = Some(auth_root);
-                                }
-                                (auth_ldb, auth_cache_key)
-                            } else {
-                                self.brains.remove(&candidate_cache_key);
-                                self.brains.remove(&auth_cache_key);
-                                if is_explicit_memorize {
+                                    self.brains.remove(&candidate_cache_key);
+                                    self.brains.remove(&auth_cache_key);
                                     return Err(format!(
-                                        "Workspace memory at '{}' is quarantined because a pre-existing unsealed, tampered, rolled-back, or Git-tracked .agents database was detected. Run 'libredb trust \"{}\"' (or '--reinit-lost' / '--accept-rollback' if recovering) in a terminal if you trust this repository.",
-                                        auth_ldb.display(),
+                                        "LibreDB MCP access denied: persisting workspace memory in '{}' via libredb_memorize requires an initialized global customizations.ldb trust store; run 'libredb init' and 'libredb trust \"{}\"' in a terminal.",
+                                        auth_root.display(),
                                         auth_root.display()
                                     ));
                                 }
-                                ws_write_lock = None;
-                                let q_path =
-                                    default_libredb_home().join("quarantined_workspace.ldb");
-                                let q_key = canonical_brain_cache_key(&q_path);
-                                (q_path, q_key)
+                                if crate::security::is_workspace_memory_trusted(None, &auth_root) {
+                                    let eph_path = self.ephemeral_workspace_ldb_path(&auth_root)?;
+                                    let eph_key = canonical_brain_cache_key(&eph_path);
+                                    (eph_path, eph_key)
+                                } else {
+                                    self.brains.remove(&candidate_cache_key);
+                                    self.brains.remove(&auth_cache_key);
+                                    let q_path =
+                                        default_libredb_home().join("quarantined_workspace.ldb");
+                                    let q_key = canonical_brain_cache_key(&q_path);
+                                    (q_path, q_key)
+                                }
+                            } else {
+                                let has_disk_memory =
+                                    auth_ldb.is_file() || auth_ldb.with_extension("db").exists();
+                                let needs_mig_lock =
+                                    !auth_ldb.is_file() && auth_ldb.with_extension("db").exists();
+                                if is_explicit_memorize || needs_mig_lock {
+                                    if let Some(ref gdb) = self.global_db {
+                                        ws_write_lock = Some(
+                                            crate::security::WorkspaceTrustLockGuard::acquire(
+                                                gdb, &auth_root,
+                                            )?,
+                                        );
+                                    }
+                                }
+                                let allow_readonly_sqlite_mig = !needs_mig_lock
+                                    || is_explicit_memorize
+                                    || self.global_db.as_deref().is_some_and(|gdb| {
+                                        let norm =
+                                            crate::security::normalize_workspace_key(&auth_root);
+                                        gdb.get_by_key(
+                                            libredb_core::NodeKind::Config,
+                                            &format!("trust:allowed::{norm}"),
+                                        )
+                                        .is_ok()
+                                    });
+                                if allow_readonly_sqlite_mig
+                                    && crate::security::is_workspace_memory_trusted(
+                                        self.global_db.as_deref(),
+                                        &auth_root,
+                                    )
+                                {
+                                    if !is_explicit_memorize && !has_disk_memory {
+                                        let eph_path =
+                                            self.ephemeral_workspace_ldb_path(&auth_root)?;
+                                        let eph_key = canonical_brain_cache_key(&eph_path);
+                                        (eph_path, eph_key)
+                                    } else {
+                                        if is_explicit_memorize {
+                                            if let Some(ref dir) = self.ephemeral_dir {
+                                                let eph_path = dir.join(
+                                                    crate::security::ephemeral_workspace_ldb_filename(
+                                                        &auth_root,
+                                                    ),
+                                                );
+                                                let eph_key = canonical_brain_cache_key(&eph_path);
+                                                self.brains.remove(&eph_key);
+                                            }
+                                            ws_root_to_seal = Some(auth_root);
+                                        }
+                                        (auth_ldb, auth_cache_key)
+                                    }
+                                } else {
+                                    self.brains.remove(&candidate_cache_key);
+                                    self.brains.remove(&auth_cache_key);
+                                    if is_explicit_memorize {
+                                        return Err(format!(
+                                            "Workspace memory at '{}' is quarantined because a pre-existing unsealed, tampered, rolled-back, or Git-tracked .agents database was detected. Run 'libredb trust \"{}\"' (or '--reinit-lost' / '--accept-rollback' if recovering) in a terminal if you trust this repository.",
+                                            auth_ldb.display(),
+                                            auth_root.display()
+                                        ));
+                                    }
+                                    ws_write_lock = None;
+                                    let q_path =
+                                        default_libredb_home().join("quarantined_workspace.ldb");
+                                    let q_key = canonical_brain_cache_key(&q_path);
+                                    (q_path, q_key)
+                                }
                             }
                         }
                         Err(auth_err) => {
                             // Evict any cached OverlayBrain via canonical key and never create `.agents/memory.ldb`
                             // inside unauthorized or quarantined workspaces.
                             self.brains.remove(&candidate_cache_key);
-                            if is_explicit_memorize {
+                            if is_explicit_memorize || self.global_db.is_none() {
                                 return Err(auth_err);
                             }
                             let q_path = default_libredb_home().join("quarantined_workspace.ldb");
@@ -840,7 +901,7 @@ impl McpServerState {
                 let q_path = default_libredb_home().join("quarantined_workspace.ldb");
                 let q_key = canonical_brain_cache_key(&q_path);
                 (q_path, q_key)
-            } else if is_explicit_memorize && self.global_db.is_some() {
+            } else if is_explicit_memorize {
                 return Err(
                     "LibreDB MCP access denied: 'cwd' (authorized workspace directory) or 'cid' (conversation ID) is required for libredb_memorize when server is not pinned via '--workspace-root'."
                         .to_owned(),
@@ -1516,6 +1577,13 @@ fn dispatch_tool(
                 let brain = state.resolve_brain_mut(Some(&ws_root_str), cid_arg, false)?;
                 Arc::clone(brain.project_db())
             };
+            if state.is_quarantined_db(&proj_db) {
+                return Err(format!(
+                    "LibreDB MCP access denied: workspace '{}' is quarantined; run 'libredb trust' in a terminal first.",
+                    ws_root.display()
+                )
+                .into());
+            }
             let protected = state.custom_protected_paths(Some(&proj_db));
             if let Some(err) =
                 crate::security::check_mcp_read_path_policy(&resolved_fp, &protected)
@@ -1541,8 +1609,18 @@ fn dispatch_tool(
             let (ws_root, _) =
                 state.resolve_authorized_code_workspace(raw_cwd_arg, None, true)?;
             let ws_root_str = ws_root.to_string_lossy().into_owned();
-            let brain = state.resolve_brain_mut(Some(&ws_root_str), cid_arg, false)?;
-            let reports = query_symbol_impact(brain.project_db(), sym)?;
+            let proj_db = {
+                let brain = state.resolve_brain_mut(Some(&ws_root_str), cid_arg, false)?;
+                Arc::clone(brain.project_db())
+            };
+            if state.is_quarantined_db(&proj_db) {
+                return Err(format!(
+                    "LibreDB MCP access denied: workspace '{}' is quarantined; run 'libredb trust' in a terminal first.",
+                    ws_root.display()
+                )
+                .into());
+            }
+            let reports = query_symbol_impact(&proj_db, sym)?;
             Ok(serde_json::to_string_pretty(&reports)?)
         }
         "libredb_fim" => {
@@ -1563,6 +1641,13 @@ fn dispatch_tool(
                 let brain = state.resolve_brain_mut(Some(&ws_root_str), cid_arg, false)?;
                 Arc::clone(brain.project_db())
             };
+            if state.is_quarantined_db(&proj_db) {
+                return Err(format!(
+                    "LibreDB MCP access denied: workspace '{}' is quarantined; run 'libredb trust' in a terminal first.",
+                    ws_root.display()
+                )
+                .into());
+            }
             let protected = state.custom_protected_paths(Some(&proj_db));
             if let Some(err) =
                 crate::security::check_mcp_read_path_policy(&resolved_fp, &protected)
@@ -2392,6 +2477,361 @@ mod tests {
         }
 
         drop(pinned_state);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn mcp_sqlite_import_never_activates_security_switches_or_authorizes_untrusted_workspaces() {
+        use super::handle_rpc_method;
+        use libredb_bridge::import_sqlite_readonly;
+        use serde_json::json;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "libredb_mcp_sql_policy_switches_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let trusted_ws = tmp.join("trusted_ws");
+        let untrusted_ws = tmp.join("untrusted_ws");
+        fs::create_dir_all(trusted_ws.join(".agents")).unwrap();
+        fs::create_dir_all(trusted_ws.join("src")).unwrap();
+        fs::create_dir_all(untrusted_ws.join("src")).unwrap();
+        fs::write(trusted_ws.join("src").join("ok.rs"), "pub fn ok_fn() {}\n").unwrap();
+        fs::write(
+            untrusted_ws.join("src").join("secret.rs"),
+            "pub fn hidden_fn() {}\n",
+        )
+        .unwrap();
+
+        let global_path = tmp.join("customizations.ldb");
+        let poisoned_sql = tmp.join("poisoned_switches.db");
+        {
+            let gdb = LibreDb::open(&global_path).unwrap();
+            let pdb = LibreDb::open(trusted_ws.join(".agents").join("memory.ldb")).unwrap();
+            crate::security::seal_workspace_memory(&gdb, &pdb, &trusted_ws).unwrap();
+        }
+
+        // Craft a SQLite `runtime_config` attempting to enable `mcp:allow_untrusted_workspaces`,
+        // `mcp:allow_central_sqlite_sync`, `gitea_allow_insecure_http`, and `guardrail:allow_staged_files`:
+        {
+            let conn = rusqlite::Connection::open(&poisoned_sql).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE runtime_config (key TEXT PRIMARY KEY, value TEXT);
+                 INSERT INTO runtime_config (key, value) VALUES
+                   ('mcp:allow_untrusted_workspaces', 'true'),
+                   ('MCP:allow_central_sqlite_sync', 'true'),
+                   ('gitea_allow_insecure_http', 'true'),
+                   ('guardrail:allow_staged_files', '.env,secrets.json'),
+                   ('ui:accent', 'emerald');",
+            )
+            .unwrap();
+        }
+
+        {
+            let gdb = LibreDb::open(&global_path).unwrap();
+            import_sqlite_readonly(&poisoned_sql, &gdb, "central").unwrap();
+
+            for blocked_switch in [
+                "mcp:allow_untrusted_workspaces",
+                "mcp:allow_central_sqlite_sync",
+                "MCP:allow_central_sqlite_sync",
+                "gitea_allow_insecure_http",
+                "guardrail:allow_staged_files",
+            ] {
+                assert!(
+                    gdb.get_by_key(NodeKind::Config, blocked_switch).is_err(),
+                    "Privileged security switch '{blocked_switch}' MUST NOT materialize from SQLite import!"
+                );
+            }
+            assert!(
+                !crate::security::is_mcp_workspace_authorized_in_global(&gdb, &untrusted_ws),
+                "Untrusted workspace MUST NOT become MCP-authorized after importing SQLite runtime_config!"
+            );
+        }
+
+        let mut state =
+            McpServerState::new(Some(&tmp.join("default.ldb")), Some(&global_path)).unwrap();
+
+        // Untrusted workspace MUST still be rejected across `libredb_code` and `libredb_memorize`,
+        // and `sync_central_sqlite=true` MUST remain disabled:
+        for rejected_call in [
+            json!({
+                "name": "libredb_code",
+                "arguments": {
+                    "action": "skeleton",
+                    "cwd": untrusted_ws.to_string_lossy().to_string(),
+                    "target": "src/secret.rs"
+                }
+            }),
+            json!({
+                "name": "libredb_memorize",
+                "arguments": {
+                    "cwd": untrusted_ws.to_string_lossy().to_string(),
+                    "facts": { "pwn": "1" }
+                }
+            }),
+            json!({
+                "name": "libredb_memorize",
+                "arguments": {
+                    "cwd": trusted_ws.to_string_lossy().to_string(),
+                    "sync_central_sqlite": true
+                }
+            }),
+        ] {
+            assert!(
+                handle_rpc_method("tools/call", &rejected_call, &mut state).is_err(),
+                "SQLite-imported security switches MUST NOT weaken MCP enforcement: {rejected_call}"
+            );
+        }
+
+        drop(state);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn mcp_without_global_db_rejects_unregistered_cwd_and_keeps_pinned_or_init_roots_consistent() {
+        use super::handle_rpc_method;
+        use serde_json::json;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "libredb_mcp_standalone_authz_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let rogue_ws = tmp.join("rogue_ws");
+        let pinned_ws = tmp.join("pinned_ws");
+        let init_ws = tmp.join("init_ws");
+        let preseeded_ws = tmp.join("preseeded_ws");
+        for d in [&rogue_ws, &pinned_ws, &init_ws, &preseeded_ws] {
+            fs::create_dir_all(d.join("src")).unwrap();
+        }
+        fs::write(rogue_ws.join("src").join("rogue.rs"), "pub fn rogue() {}\n").unwrap();
+        fs::write(
+            pinned_ws.join("src").join("pinned.rs"),
+            "pub fn pinned_target() -> usize { 1 }\npub fn pinned_caller() -> usize { pinned_target() }\n",
+        )
+        .unwrap();
+        fs::write(
+            init_ws.join("src").join("init.rs"),
+            "pub fn init_fn() -> bool { true }\n",
+        )
+        .unwrap();
+        fs::write(
+            preseeded_ws.join("src").join("bad.rs"),
+            "pub fn unverified() {}\n",
+        )
+        .unwrap();
+        // Plant an unsealed `.agents/memory.ldb` inside `preseeded_ws` to simulate a cloned repository:
+        fs::create_dir_all(preseeded_ws.join(".agents")).unwrap();
+        {
+            let planted = LibreDb::open(preseeded_ws.join(".agents").join("memory.ldb")).unwrap();
+            planted
+                .put(WriteRequest::new(NodeKind::Fact, b"trap=1".to_vec()).with_key("trap"))
+                .unwrap();
+        }
+
+        let missing_global = tmp.join("nonexistent_customizations.ldb");
+
+        // 1. Unconfigured standalone server (no `customizations.ldb`, no `--workspace-root`, no `initialize` roots):
+        //    MUST keep `global_db == None`, MUST NOT create `customizations.ldb`, and MUST reject self-declared `cwd` on Call 1!
+        let mut unconfigured =
+            McpServerState::new(Some(&tmp.join("default.ldb")), Some(&missing_global)).unwrap();
+        assert!(unconfigured.global_db.is_none());
+        assert!(
+            !missing_global.exists(),
+            "McpServerState MUST NOT create an empty customizations.ldb when global DB does not exist!"
+        );
+        for unauth_call in [
+            json!({
+                "name": "libredb_code",
+                "arguments": {
+                    "action": "skeleton",
+                    "cwd": rogue_ws.to_string_lossy().to_string(),
+                    "target": "src/rogue.rs"
+                }
+            }),
+            json!({
+                "name": "libredb_memorize",
+                "arguments": {
+                    "cwd": rogue_ws.to_string_lossy().to_string(),
+                    "facts": { "a": "b" }
+                }
+            }),
+            json!({
+                "name": "libredb_pulse",
+                "arguments": {
+                    "query": "rules",
+                    "cwd": rogue_ws.to_string_lossy().to_string()
+                }
+            }),
+        ] {
+            assert!(
+                handle_rpc_method("tools/call", &unauth_call, &mut unconfigured).is_err(),
+                "Standalone MCP server without server-side workspace registration MUST reject self-declared cwd on Call 1: {unauth_call}"
+            );
+        }
+        assert!(!rogue_ws.join(".agents").join("memory.ldb").exists());
+
+        // 2. Host-provided MCP `initialize` `workspaceFolders` without `customizations.ldb`:
+        //    - Rejects `preseeded_ws` (which contains an unverified `.agents/memory.ldb`) even if listed in `initialize`!
+        //    - Allows `init_ws` consistently across Call 1, Call 2, and post-cache-eviction Call 3 without creating `.agents/memory.ldb`!
+        //    - Rejects `libredb_memorize` until `customizations.ldb` is initialized!
+        let init_uri = format!(
+            "file:///{}",
+            init_ws
+                .to_string_lossy()
+                .replace('\\', "/")
+                .trim_start_matches('/')
+        );
+        let preseeded_uri = format!(
+            "file:///{}",
+            preseeded_ws
+                .to_string_lossy()
+                .replace('\\', "/")
+                .trim_start_matches('/')
+        );
+        handle_rpc_method(
+            "initialize",
+            &json!({
+                "workspaceFolders": [
+                    { "uri": init_uri, "name": "init_ws" },
+                    { "uri": preseeded_uri, "name": "preseeded_ws" }
+                ]
+            }),
+            &mut unconfigured,
+        )
+        .unwrap();
+
+        assert!(
+            handle_rpc_method(
+                "tools/call",
+                &json!({
+                    "name": "libredb_code",
+                    "arguments": {
+                        "action": "skeleton",
+                        "cwd": preseeded_ws.to_string_lossy().to_string(),
+                        "target": "src/bad.rs"
+                    }
+                }),
+                &mut unconfigured,
+            )
+            .is_err(),
+            "Pre-existing unsealed .agents/memory.ldb MUST be rejected on Call 1 even when global_db is None!"
+        );
+
+        for round in 1..=3 {
+            if round == 3 {
+                unconfigured.brains.clear();
+            }
+            assert!(
+                handle_rpc_method(
+                    "tools/call",
+                    &json!({
+                        "name": "libredb_code",
+                        "arguments": {
+                            "action": "skeleton",
+                            "cwd": init_ws.to_string_lossy().to_string(),
+                            "target": "src/init.rs"
+                        }
+                    }),
+                    &mut unconfigured,
+                )
+                .is_ok(),
+                "MCP initialize workspace MUST succeed identically on round {round} without Call-1 vs Call-2 drift!"
+            );
+        }
+        assert!(
+            !init_ws.join(".agents").join("memory.ldb").exists(),
+            "Read/code MCP tools MUST NOT create unsealed .agents/memory.ldb inside clean workspaces!"
+        );
+        assert!(
+            handle_rpc_method(
+                "tools/call",
+                &json!({
+                    "name": "libredb_memorize",
+                    "arguments": {
+                        "cwd": init_ws.to_string_lossy().to_string(),
+                        "facts": { "persist": "denied_without_global_trust" }
+                    }
+                }),
+                &mut unconfigured,
+            )
+            .is_err(),
+            "libredb_memorize MUST fail closed when global customizations.ldb is absent!"
+        );
+        assert!(!init_ws.join(".agents").join("memory.ldb").exists());
+        let eph_dir_init = unconfigured.ephemeral_dir.clone();
+        drop(unconfigured);
+        if let Some(d) = eph_dir_init {
+            assert!(
+                !d.exists(),
+                "Ephemeral MCP brain directory MUST be removed on McpServerState drop!"
+            );
+        }
+
+        // 3. Server-pinned `--workspace-root` without `customizations.ldb`:
+        //    Succeeds consistently across `skeleton`, `impact` (indexing), `pulse`, and post-eviction `skeleton`
+        //    while keeping `pinned_ws/.agents/memory.ldb` completely absent on disk!
+        let mut pinned_no_global = McpServerState::new_with_workspace_root(
+            None,
+            Some(&missing_global),
+            Some(&pinned_ws),
+        )
+        .unwrap();
+        assert!(pinned_no_global.global_db.is_none());
+        for ok_call in [
+            json!({
+                "name": "libredb_code",
+                "arguments": {
+                    "action": "skeleton",
+                    "target": "src/pinned.rs"
+                }
+            }),
+            json!({
+                "name": "libredb_code",
+                "arguments": {
+                    "action": "impact",
+                    "target": "pinned_target"
+                }
+            }),
+            json!({
+                "name": "libredb_pulse",
+                "arguments": {
+                    "query": "pinned_target"
+                }
+            }),
+        ] {
+            assert!(
+                handle_rpc_method("tools/call", &ok_call, &mut pinned_no_global).is_ok(),
+                "Pinned workspace without customizations.ldb MUST succeed consistently: {ok_call}"
+            );
+        }
+        pinned_no_global.brains.clear();
+        assert!(
+            handle_rpc_method(
+                "tools/call",
+                &json!({
+                    "name": "libredb_code",
+                    "arguments": {
+                        "action": "skeleton",
+                        "target": "src/pinned.rs"
+                    }
+                }),
+                &mut pinned_no_global,
+            )
+            .is_ok(),
+            "Pinned workspace without customizations.ldb MUST still succeed after brain cache eviction!"
+        );
+        assert!(
+            !pinned_ws.join(".agents").join("memory.ldb").exists(),
+            "Pinned workspace without customizations.ldb MUST NOT leave unsealed .agents/memory.ldb on disk!"
+        );
+        drop(pinned_no_global);
+
         let _ = fs::remove_dir_all(&tmp);
     }
 }
