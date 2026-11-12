@@ -19,9 +19,46 @@ use std::path::{Path, PathBuf};
 pub const WORKSPACE_GRAPH_STATE_KEY: &str = "sys::workspace_graph_state";
 /// Ephemeral `WorkingSet` key prefix staging `PreToolUse` edits until disk bytes match `expected_post_hash`.
 pub const TENTATIVE_EDIT_PREFIX: &str = "tentative_edit::";
-const WORKSPACE_GRAPH_STATE_VERSION: u32 = 3;
+/// Internal ring-buffer key storing recent `0`-match queries (`<= 8` entries, `30 min` TTL)
+/// awaiting a verified file edit in the same workspace.
+pub const PENDING_MISS_CUES_KEY: &str = "sys::pending_miss_cues";
+/// Internal causal symbol-alias bridge key mapping `cue_token -> Vec<(symbol_key, weight)>`.
+pub const SYMBOL_CUE_BRIDGES_KEY: &str = "sys::symbol_cue_bridges";
+/// Maximum pending search-miss cues retained in `sys::pending_miss_cues`.
+pub const MAX_PENDING_MISS_CUES: usize = 8;
+/// Expiration window (`30 minutes` in nanoseconds) for binding a search miss cue to a verified edit.
+pub const MISS_CUE_TTL_NS: u128 = 30 * 60 * 1_000_000_000;
+/// Maximum number of source files allowed in a single Git commit for co-change coupling learning.
+pub const MAX_COCHANGE_COMMIT_FILES: usize = 12;
+
+const WORKSPACE_GRAPH_STATE_VERSION: u32 = 4;
 const RACY_SUBSEC_WINDOW_NS: u128 = 50_000_000;
 const RACY_COARSE_WINDOW_NS: u128 = 2_000_000_000;
+
+/// Pending `0`-match query recorded by `locate` / `impact` / `pulse`, awaiting a verified code edit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingMissCue {
+    pub raw_query: String,
+    pub tokens: Vec<String>,
+    pub recorded_at_ns: u128,
+}
+
+/// Persisted causal bridge mapping learned query cue tokens to workspace `symbol_key` strings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SymbolCueBridgeBook {
+    pub bridges: BTreeMap<String, Vec<(String, f64)>>,
+}
+
+/// Statistically verified Git co-change coupling partner for a source file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoChangePartner {
+    pub rel_path: String,
+    pub shared_commits: u32,
+    pub source_commits: u32,
+    pub confidence_pct: u8,
+    pub lift_x100: u32,
+    pub newman_score_x100: u32,
+}
 
 /// Unverified `PreToolUse` edit staged in `NodeKind::WorkingSet` without mutating live `Symbol`
 /// or `skeleton::*` contracts until disk bytes are verified against `expected_post_hash`.
@@ -33,6 +70,8 @@ pub struct TentativeFileEdit {
     pub raw_tokens: u64,
     pub created_ns: u128,
     pub post_skeleton: FileSkeleton,
+    #[serde(default)]
+    pub touched_symbol_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +90,10 @@ struct WorkspaceGraphState {
     scan_root_key: String,
     exclusions_sorted: Vec<String>,
     gov_fingerprint: u64,
+    #[serde(default)]
+    git_head_oid: String,
+    #[serde(default)]
+    co_change_map: BTreeMap<String, Vec<CoChangePartner>>,
     files_scanned: usize,
     binary_files_skipped: usize,
     symbols_indexed: usize,
@@ -128,6 +171,9 @@ pub struct SymbolImpactReport {
     pub callees: Vec<String>,
     /// Architectural `Decision` or `Task` capsules governing why this symbol exists.
     pub governing_decisions: Vec<String>,
+    /// Statistically verified Git co-change partner files (`Conf >= 55%`, `Lift >= 1.8`, top 3).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub co_changed_files: Vec<String>,
 }
 
 /// Surgical Fill-in-the-Middle (`FIM`) code slice enriched with blast-radius and causal context.
@@ -344,6 +390,7 @@ fn apply_skeleton_symbols_atomic(
         )?);
     }
 
+    let sym_count = new_key_set.len();
     let stale_ids: Vec<u64> = existing_file_syms
         .into_iter()
         .filter_map(|(nid, k)| (!new_key_set.contains(&k)).then_some(nid))
@@ -351,12 +398,287 @@ fn apply_skeleton_symbols_atomic(
 
     let mut deprecate_keys: Vec<(NodeKind, &str)> =
         Vec::with_capacity(1 + extra_deprecate_keys.len());
-    deprecate_keys.push((NodeKind::Generic, WORKSPACE_GRAPH_STATE_KEY));
+    if let Ok(st_rec) = db.get_by_key(NodeKind::Generic, WORKSPACE_GRAPH_STATE_KEY) {
+        if let Ok(mut st) = serde_json::from_slice::<WorkspaceGraphState>(&st_rec.payload) {
+            st.version = 0;
+            st.files.remove(rel_path);
+            if let Ok(st_bytes) = serde_json::to_vec(&st) {
+                let next_slot = prepared.len();
+                prepared.push(db.prepare(
+                    WriteRequest::new(NodeKind::Generic, st_bytes)
+                        .with_key(WORKSPACE_GRAPH_STATE_KEY)
+                        .with_importance(64),
+                    next_slot,
+                )?);
+            } else {
+                deprecate_keys.push((NodeKind::Generic, WORKSPACE_GRAPH_STATE_KEY));
+            }
+        } else {
+            deprecate_keys.push((NodeKind::Generic, WORKSPACE_GRAPH_STATE_KEY));
+        }
+    }
     deprecate_keys.extend_from_slice(extra_deprecate_keys);
 
-    let committed_ids = db.commit_batch_with_tombstones(&prepared, &stale_ids, &deprecate_keys)?;
+    let _ = db.commit_batch_with_tombstones(&prepared, &stale_ids, &deprecate_keys)?;
     let _ = db.maybe_auto_compact();
-    Ok(committed_ids.len().saturating_sub(1))
+    Ok(sym_count)
+}
+
+fn extract_cue_tokens(raw_query: &str) -> Vec<String> {
+    let trimmed = raw_query.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > 160
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+    {
+        return Vec::new();
+    }
+    let mut tokens: Vec<String> = libredb_index::segment_universal_tokens(trimmed)
+        .into_iter()
+        .filter(|t| t.chars().count() >= 3 && !t.chars().all(|c| c.is_ascii_digit()))
+        .collect();
+    let whole_ident = trimmed.trim_start_matches("::").to_lowercase();
+    if whole_ident.len() >= 3
+        && !whole_ident.contains(char::is_whitespace)
+        && !tokens.contains(&whole_ident)
+    {
+        tokens.insert(0, whole_ident);
+    }
+    tokens.truncate(8);
+    tokens
+}
+
+/// Records a `0`-match symbol or cognitive query in the bounded workspace ring buffer
+/// (`sys::pending_miss_cues`, `<= 8` entries, `30 min` TTL) so a subsequent verified code edit
+/// in the same workspace can automatically bridge the query tokens to the modified symbols.
+pub fn record_search_miss_cue(db: &LibreDb, raw_query: &str) -> Result<bool> {
+    let tokens = extract_cue_tokens(raw_query);
+    if tokens.is_empty() {
+        return Ok(false);
+    }
+    let now_ns = current_unix_ns();
+    let trimmed = raw_query.trim().to_owned();
+    let mut cues: Vec<PendingMissCue> = db
+        .get_by_key(NodeKind::Generic, PENDING_MISS_CUES_KEY)
+        .ok()
+        .and_then(|rec| serde_json::from_slice::<Vec<PendingMissCue>>(&rec.payload).ok())
+        .unwrap_or_default();
+
+    cues.retain(|c| {
+        now_ns.saturating_sub(c.recorded_at_ns) <= MISS_CUE_TTL_NS
+            && !c.raw_query.eq_ignore_ascii_case(&trimmed)
+    });
+    cues.push(PendingMissCue {
+        raw_query: trimmed,
+        tokens,
+        recorded_at_ns: now_ns,
+    });
+    if cues.len() > MAX_PENDING_MISS_CUES {
+        let drop_n = cues.len() - MAX_PENDING_MISS_CUES;
+        cues.drain(0..drop_n);
+    }
+    if let Ok(bytes) = serde_json::to_vec(&cues) {
+        db.put(
+            WriteRequest::new(NodeKind::Generic, bytes)
+                .with_key(PENDING_MISS_CUES_KEY)
+                .with_importance(32),
+        )?;
+    }
+    Ok(true)
+}
+
+fn compute_modified_symbol_keys(
+    db: &LibreDb,
+    old_disk_bytes: Option<&[u8]>,
+    rel_path: &str,
+    post_edit_bytes: &[u8],
+    post_skel: &FileSkeleton,
+) -> Vec<String> {
+    let post_keys = compute_file_symbol_keys(rel_path, post_skel);
+    if post_keys.is_empty() {
+        return Vec::new();
+    }
+    let mut touched: Vec<String> = Vec::new();
+
+    if let Some(old_bytes) = old_disk_bytes {
+        let old_text = String::from_utf8_lossy(old_bytes);
+        let new_text = String::from_utf8_lossy(post_edit_bytes);
+        let old_lines: Vec<&str> = old_text.lines().collect();
+        let new_lines: Vec<&str> = new_text.lines().collect();
+
+        let mut prefix_same = 0usize;
+        let min_len = old_lines.len().min(new_lines.len());
+        while prefix_same < min_len && old_lines[prefix_same] == new_lines[prefix_same] {
+            prefix_same += 1;
+        }
+        let mut suffix_same = 0usize;
+        while suffix_same < (min_len - prefix_same)
+            && old_lines[old_lines.len() - 1 - suffix_same]
+                == new_lines[new_lines.len() - 1 - suffix_same]
+        {
+            suffix_same += 1;
+        }
+        let diff_start_line = prefix_same + 1;
+        let diff_end_line = new_lines
+            .len()
+            .saturating_sub(suffix_same)
+            .max(diff_start_line);
+
+        for (sym_idx, sym_key) in &post_keys {
+            let sym = &post_skel.symbols[*sym_idx];
+            if sym.end_line >= diff_start_line && sym.start_line <= diff_end_line {
+                let stripped = strip_line_disambiguator(sym_key).to_owned();
+                if !touched.contains(&stripped) {
+                    touched.push(stripped);
+                }
+            }
+        }
+    }
+
+    let skel_key = format!("{SKELETON_KEY_PREFIX}{rel_path}");
+    if let Ok(rec) = db.get_by_key(NodeKind::WorkingSet, &skel_key) {
+        if let Ok(old_skel) = serde_json::from_slice::<FileSkeleton>(&rec.payload) {
+            let mut old_sigs: HashMap<String, (String, String, usize)> = HashMap::new();
+            for s in &old_skel.symbols {
+                old_sigs.insert(
+                    s.qualified_name(),
+                    (
+                        s.signature.clone(),
+                        s.doc_summary.clone(),
+                        s.end_line.saturating_sub(s.start_line),
+                    ),
+                );
+            }
+            for (sym_idx, sym_key) in &post_keys {
+                let sym = &post_skel.symbols[*sym_idx];
+                let qn = sym.qualified_name();
+                let span = sym.end_line.saturating_sub(sym.start_line);
+                let changed = match old_sigs.get(&qn) {
+                    Some((sig, doc, old_span)) => {
+                        sig != &sym.signature || doc != &sym.doc_summary || *old_span != span
+                    }
+                    None => true,
+                };
+                if changed {
+                    let stripped = strip_line_disambiguator(sym_key).to_owned();
+                    if !touched.contains(&stripped) {
+                        touched.push(stripped);
+                    }
+                }
+            }
+        }
+    }
+
+    if touched.is_empty() && post_keys.len() == 1 {
+        touched.push(strip_line_disambiguator(&post_keys[0].1).to_owned());
+    }
+    touched
+}
+
+fn bind_pending_miss_cues_to_symbols(
+    db: &LibreDb,
+    touched_symbol_keys: &[String],
+) -> Result<usize> {
+    if touched_symbol_keys.is_empty() || touched_symbol_keys.len() > 6 {
+        return Ok(0);
+    }
+    let Ok(cues_rec) = db.get_by_key(NodeKind::Generic, PENDING_MISS_CUES_KEY) else {
+        return Ok(0);
+    };
+    let _ = db.deprecate_key(NodeKind::Generic, PENDING_MISS_CUES_KEY);
+    let Ok(cues) = serde_json::from_slice::<Vec<PendingMissCue>>(&cues_rec.payload) else {
+        return Ok(0);
+    };
+    let now_ns = current_unix_ns();
+    let valid_cues: Vec<PendingMissCue> = cues
+        .into_iter()
+        .filter(|c| now_ns.saturating_sub(c.recorded_at_ns) <= MISS_CUE_TTL_NS)
+        .collect();
+    if valid_cues.is_empty() {
+        return Ok(0);
+    }
+
+    let mut book: SymbolCueBridgeBook = db
+        .get_by_key(NodeKind::Generic, SYMBOL_CUE_BRIDGES_KEY)
+        .ok()
+        .and_then(|r| serde_json::from_slice::<SymbolCueBridgeBook>(&r.payload).ok())
+        .unwrap_or_default();
+
+    let mut updated_links = 0usize;
+    for cue in &valid_cues {
+        for tok in &cue.tokens {
+            let list = book.bridges.entry(tok.clone()).or_default();
+            for sym_k in touched_symbol_keys {
+                let clean_k = strip_line_disambiguator(sym_k).to_owned();
+                if let Some(existing) = list.iter_mut().find(|(k, _)| k == &clean_k) {
+                    existing.1 = (1.0 - (1.0 - existing.1) * 0.40).clamp(0.10, 0.95);
+                } else {
+                    list.push((clean_k, 0.60));
+                }
+                updated_links += 1;
+            }
+            list.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+            list.truncate(8);
+        }
+    }
+
+    if updated_links > 0 {
+        if let Ok(bytes) = serde_json::to_vec(&book) {
+            db.put(
+                WriteRequest::new(NodeKind::Generic, bytes)
+                    .with_key(SYMBOL_CUE_BRIDGES_KEY)
+                    .with_importance(64),
+            )?;
+        }
+    }
+    Ok(updated_links)
+}
+
+pub(crate) fn match_symbol_cue_bridges(
+    db: &LibreDb,
+    raw_query: &str,
+    limit: usize,
+) -> Vec<(u64, f64)> {
+    let tokens = extract_cue_tokens(raw_query);
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+    let Ok(rec) = db.get_by_key(NodeKind::Generic, SYMBOL_CUE_BRIDGES_KEY) else {
+        return Vec::new();
+    };
+    let Ok(book) = serde_json::from_slice::<SymbolCueBridgeBook>(&rec.payload) else {
+        return Vec::new();
+    };
+    let mut key_scores: HashMap<String, f64> = HashMap::new();
+    for tok in &tokens {
+        if let Some(targets) = book.bridges.get(tok) {
+            for (sym_k, w) in targets {
+                *key_scores.entry(sym_k.clone()).or_insert(0.0) += *w;
+            }
+        }
+    }
+    if key_scores.is_empty() {
+        return Vec::new();
+    }
+    let mut hits: Vec<(u64, String, f64)> = Vec::new();
+    for (ino, key_opt, _) in db.list_inodes(Some(NodeKind::Symbol), false) {
+        let Some(full_k) = key_opt else { continue };
+        let stripped = strip_line_disambiguator(&full_k);
+        if let Some(&sc) = key_scores.get(stripped).or_else(|| key_scores.get(&full_k)) {
+            hits.push((ino.node_id, full_k, sc));
+        }
+    }
+    hits.sort_by(|a, b| {
+        b.2.partial_cmp(&a.2)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.cmp(&b.1))
+    });
+    hits.truncate(limit);
+    hits.into_iter().map(|(id, _, sc)| (id, sc)).collect()
 }
 
 /// Stages a predicted `PreToolUse` edit under `tentative_edit::<rel_path>` (`NodeKind::WorkingSet`)
@@ -388,7 +710,15 @@ pub fn stage_tentative_file_edit(
         return Ok((false, promoted_prior, saved_prior));
     }
 
+    let old_disk_bytes = crate::skeleton::read_bounded_source_file(target_file).ok();
     let post_skeleton = FileSkeleton::extract_from_bytes(rel_path.clone(), post_edit_bytes);
+    let touched_symbol_keys = compute_modified_symbol_keys(
+        db,
+        old_disk_bytes.as_deref(),
+        &rel_path,
+        post_edit_bytes,
+        &post_skeleton,
+    );
     let tentative = TentativeFileEdit {
         rel_path: rel_path.clone(),
         pre_edit_hash,
@@ -396,6 +726,7 @@ pub fn stage_tentative_file_edit(
         raw_tokens,
         created_ns: current_unix_ns(),
         post_skeleton,
+        touched_symbol_keys,
     };
     let payload = serde_json::to_vec(&tentative)
         .map_err(|_| LibreDbError::CorruptFormat("tentative edit serialize"))?;
@@ -440,7 +771,7 @@ pub fn reconcile_tentative_edits(db: &LibreDb, ws_root: &Path) -> Result<(usize,
         if !is_safe_workspace_rel_key(&tentative.rel_path) {
             let _ = db.deprecate_key(NodeKind::WorkingSet, &t_key);
             continue;
-        }
+        };
         let candidate_path = ws_root.join(&tentative.rel_path);
         let confirmed_rel = normalize_safe_workspace_rel_path(ws_root, &candidate_path);
         if confirmed_rel.as_deref() != Some(tentative.rel_path.as_str()) {
@@ -452,12 +783,24 @@ pub fn reconcile_tentative_edits(db: &LibreDb, ws_root: &Path) -> Result<(usize,
             Ok(disk_bytes) => {
                 let disk_hash = hash_key(SKELETON_HASH_SEED, &disk_bytes);
                 if disk_hash == tentative.expected_post_hash {
+                    let touched = if tentative.touched_symbol_keys.is_empty() {
+                        compute_modified_symbol_keys(
+                            db,
+                            None,
+                            &tentative.rel_path,
+                            &disk_bytes,
+                            &tentative.post_skeleton,
+                        )
+                    } else {
+                        tentative.touched_symbol_keys.clone()
+                    };
                     apply_skeleton_symbols_atomic(
                         db,
                         &tentative.rel_path,
                         &tentative.post_skeleton,
                         &[(NodeKind::WorkingSet, t_key.as_str())],
                     )?;
+                    let _ = bind_pending_miss_cues_to_symbols(db, &touched);
                     promoted_files += 1;
                     avoided_tokens = avoided_tokens.saturating_add(tentative.raw_tokens);
                 } else if Some(disk_hash) == tentative.pre_edit_hash {
@@ -469,12 +812,20 @@ pub fn reconcile_tentative_edits(db: &LibreDb, ws_root: &Path) -> Result<(usize,
                     if !disk_bytes[..probe_len].contains(&0u8) {
                         let actual_skel =
                             FileSkeleton::extract_from_bytes(tentative.rel_path.clone(), &disk_bytes);
+                        let touched = compute_modified_symbol_keys(
+                            db,
+                            None,
+                            &tentative.rel_path,
+                            &disk_bytes,
+                            &actual_skel,
+                        );
                         apply_skeleton_symbols_atomic(
                             db,
                             &tentative.rel_path,
                             &actual_skel,
                             &[(NodeKind::WorkingSet, t_key.as_str())],
                         )?;
+                        let _ = bind_pending_miss_cues_to_symbols(db, &touched);
                     } else {
                         let _ = db.deprecate_key(NodeKind::WorkingSet, &t_key);
                     }
@@ -525,12 +876,15 @@ pub fn sync_single_file_symbols(
     }
 
     let new_skel = FileSkeleton::extract_from_bytes(rel_path.clone(), post_edit_bytes);
-    apply_skeleton_symbols_atomic(
+    let touched = compute_modified_symbol_keys(db, None, &rel_path, post_edit_bytes, &new_skel);
+    let count = apply_skeleton_symbols_atomic(
         db,
         &rel_path,
         &new_skel,
         &[(NodeKind::WorkingSet, t_key.as_str())],
-    )
+    )?;
+    let _ = bind_pending_miss_cues_to_symbols(db, &touched);
+    Ok(count)
 }
 
 /// Incrementally indexes all non-binary source files under `root` into `db`, wiring both
@@ -558,7 +912,12 @@ pub fn index_workspace_with_exclusions(
     let mut exclusions_sorted: Vec<String> = scan_cfg.excluded_subroots.iter().cloned().collect();
     exclusions_sorted.sort();
     let gov_fp = compute_governance_fingerprint(db);
+    let current_git_head = resolve_git_head_oid_fast(root);
     let scan_started_ns = current_unix_ns();
+    let prev_state_opt: Option<WorkspaceGraphState> = db
+        .get_by_key(NodeKind::Generic, WORKSPACE_GRAPH_STATE_KEY)
+        .ok()
+        .and_then(|rec| serde_json::from_slice::<WorkspaceGraphState>(&rec.payload).ok());
 
     // `racy-git`-safe fast-path (Git `is_racy_timestamp` clean/smudge design):
     // Verify `symlink_metadata` `(len, mtime_ns)` on every candidate file. Any file whose `mtime_ns`
@@ -568,86 +927,86 @@ pub fn index_workspace_with_exclusions(
     // smudged `mtime_ns` values, `state.indexed_at_ns` is un-smudged once so all subsequent warm
     // `index` / `impact` / `fim` calls complete in `< 2 ms` with `0` file opens and `0` DB writes!
     if !force {
-        if let Ok(state_rec) = db.get_by_key(NodeKind::Generic, WORKSPACE_GRAPH_STATE_KEY) {
-            if let Ok(mut state) = serde_json::from_slice::<WorkspaceGraphState>(&state_rec.payload) {
-                if state.version == WORKSPACE_GRAPH_STATE_VERSION
-                    && state.skeleton_seed == SKELETON_HASH_SEED
-                    && state.scan_root_key == scan_root_key
-                    && state.exclusions_sorted == exclusions_sorted
-                    && state.gov_fingerprint == gov_fp
-                {
-                    let mut all_clean = true;
-                    let mut verified_count = 0usize;
-                    let mut any_smudged_checked = false;
-                    let mut can_unsmudge_all = true;
+        if let Some(ref prev_state) = prev_state_opt {
+            let mut state = prev_state.clone();
+            if state.version == WORKSPACE_GRAPH_STATE_VERSION
+                && state.skeleton_seed == SKELETON_HASH_SEED
+                && state.scan_root_key == scan_root_key
+                && state.exclusions_sorted == exclusions_sorted
+                && state.gov_fingerprint == gov_fp
+                && state.git_head_oid == current_git_head
+            {
+                let mut all_clean = true;
+                let mut verified_count = 0usize;
+                let mut any_smudged_checked = false;
+                let mut can_unsmudge_all = true;
 
-                    for (abs_path, rel_path) in &source_files {
-                        let Ok(sym_meta) = std::fs::symlink_metadata(abs_path) else {
+                for (abs_path, rel_path) in &source_files {
+                    let Ok(sym_meta) = std::fs::symlink_metadata(abs_path) else {
+                        all_clean = false;
+                        break;
+                    };
+                    if sym_meta.file_type().is_symlink()
+                        || !sym_meta.is_file()
+                        || sym_meta.len() > scan_cfg.max_file_bytes as u64
+                    {
+                        continue;
+                    }
+                    let Some(cached_stat) = state.files.get(rel_path) else {
+                        all_clean = false;
+                        break;
+                    };
+                    let mtime_ns = file_mtime_ns(&sym_meta);
+                    if cached_stat.len != sym_meta.len() || cached_stat.mtime_ns != mtime_ns {
+                        all_clean = false;
+                        break;
+                    };
+                    let racy_win = if mtime_ns == 0 || mtime_ns % 1_000_000_000 == 0 {
+                        RACY_COARSE_WINDOW_NS
+                    } else {
+                        RACY_SUBSEC_WINDOW_NS
+                    };
+                    let smudged = mtime_ns == 0
+                        || state.indexed_at_ns.saturating_sub(mtime_ns) <= racy_win;
+                    if smudged {
+                        any_smudged_checked = true;
+                        let Ok(raw_bytes) = std::fs::read(abs_path) else {
                             all_clean = false;
                             break;
                         };
-                        if sym_meta.file_type().is_symlink()
-                            || !sym_meta.is_file()
-                            || sym_meta.len() > scan_cfg.max_file_bytes as u64
+                        if hash_key(SKELETON_HASH_SEED, &raw_bytes) != cached_stat.content_hash {
+                            all_clean = false;
+                            break;
+                        }
+                        if mtime_ns == 0
+                            || scan_started_ns.saturating_sub(mtime_ns) <= racy_win
                         {
-                            continue;
+                            can_unsmudge_all = false;
                         }
-                        let Some(cached_stat) = state.files.get(rel_path) else {
-                            all_clean = false;
-                            break;
-                        };
-                        let mtime_ns = file_mtime_ns(&sym_meta);
-                        if cached_stat.len != sym_meta.len() || cached_stat.mtime_ns != mtime_ns {
-                            all_clean = false;
-                            break;
-                        }
-                        let racy_win = if mtime_ns == 0 || mtime_ns % 1_000_000_000 == 0 {
-                            RACY_COARSE_WINDOW_NS
-                        } else {
-                            RACY_SUBSEC_WINDOW_NS
-                        };
-                        let smudged = mtime_ns == 0
-                            || state.indexed_at_ns.saturating_sub(mtime_ns) <= racy_win;
-                        if smudged {
-                            any_smudged_checked = true;
-                            let Ok(raw_bytes) = std::fs::read(abs_path) else {
-                                all_clean = false;
-                                break;
-                            };
-                            if hash_key(SKELETON_HASH_SEED, &raw_bytes) != cached_stat.content_hash {
-                                all_clean = false;
-                                break;
-                            }
-                            if mtime_ns == 0
-                                || scan_started_ns.saturating_sub(mtime_ns) <= racy_win
-                            {
-                                can_unsmudge_all = false;
-                            }
-                        }
-                        verified_count += 1;
                     }
-                    if all_clean && verified_count == state.files.len() {
-                        if any_smudged_checked && can_unsmudge_all {
-                            state.indexed_at_ns = scan_started_ns;
-                            if let Ok(state_bytes) = serde_json::to_vec(&state) {
-                                let _ = db.put(
-                                    WriteRequest::new(NodeKind::Generic, state_bytes)
-                                        .with_key(WORKSPACE_GRAPH_STATE_KEY)
-                                        .with_importance(64),
-                                );
-                            }
+                    verified_count += 1;
+                }
+                if all_clean && verified_count == state.files.len() {
+                    if any_smudged_checked && can_unsmudge_all {
+                        state.indexed_at_ns = scan_started_ns;
+                        if let Ok(state_bytes) = serde_json::to_vec(&state) {
+                            let _ = db.put(
+                                WriteRequest::new(NodeKind::Generic, state_bytes)
+                                    .with_key(WORKSPACE_GRAPH_STATE_KEY)
+                                    .with_importance(64),
+                            );
                         }
-                        return Ok(WorkspaceIndexReport {
-                            files_scanned: state.files_scanned,
-                            files_unchanged_cached: state.files_scanned,
-                            files_reindexed: 0,
-                            binary_files_skipped: walk_binary_skipped + state.binary_files_skipped,
-                            symbols_indexed: state.symbols_indexed,
-                            call_synapses_wired: state.call_synapses_wired,
-                            governance_synapses_wired: state.governance_synapses_wired,
-                            fast_path_hit: true,
-                        });
                     }
+                    return Ok(WorkspaceIndexReport {
+                        files_scanned: state.files_scanned,
+                        files_unchanged_cached: state.files_scanned,
+                        files_reindexed: 0,
+                        binary_files_skipped: walk_binary_skipped + state.binary_files_skipped,
+                        symbols_indexed: state.symbols_indexed,
+                        call_synapses_wired: state.call_synapses_wired,
+                        governance_synapses_wired: state.governance_synapses_wired,
+                        fast_path_hit: true,
+                    });
                 }
             }
         }
@@ -1291,6 +1650,53 @@ pub fn index_workspace_with_exclusions(
         &gov_out_edges,
     )?;
 
+    prune_stale_symbol_cue_bridges(db, &live_rel_paths, &by_full_key);
+
+    if db.get_by_key(NodeKind::Config, "sys::trust_seals").is_err() {
+        let mut live_anchor_syms: HashSet<String> = HashSet::new();
+        for full_k in by_full_key.keys() {
+            let stripped = strip_line_disambiguator(full_k);
+            live_anchor_syms.insert(stripped.to_owned());
+            if let Some((_, sym_part)) = stripped.split_once("::") {
+                let clean_sym = sym_part.split('@').next().unwrap_or(sym_part);
+                live_anchor_syms.insert(clean_sym.to_owned());
+                if let Some((_, short_name)) = clean_sym.rsplit_once("::") {
+                    live_anchor_syms.insert(short_name.to_owned());
+                }
+            }
+        }
+        let _ = crate::reflex::ReflexEngine::reconcile_grounded_reflexes(
+            db,
+            &live_rel_paths,
+            &live_anchor_syms,
+        );
+    }
+
+    let co_change_map = if !current_git_head.is_empty() {
+        let can_reuse = !force
+            && prev_state_opt
+                .as_ref()
+                .is_some_and(|ps| ps.git_head_oid == current_git_head);
+        if can_reuse {
+            let mut reused = prev_state_opt
+                .as_ref()
+                .map(|ps| ps.co_change_map.clone())
+                .unwrap_or_default();
+            reused.retain(|k, partners| {
+                if !live_rel_paths.contains(k.as_str()) {
+                    return false;
+                }
+                partners.retain(|p| live_rel_paths.contains(p.rel_path.as_str()));
+                !partners.is_empty()
+            });
+            reused
+        } else {
+            compute_git_co_change_couplings(root, &live_rel_paths)
+        }
+    } else {
+        BTreeMap::new()
+    };
+
     let graph_state = WorkspaceGraphState {
         version: WORKSPACE_GRAPH_STATE_VERSION,
         skeleton_seed: SKELETON_HASH_SEED,
@@ -1298,6 +1704,8 @@ pub fn index_workspace_with_exclusions(
         scan_root_key,
         exclusions_sorted,
         gov_fingerprint: gov_fp,
+        git_head_oid: current_git_head,
+        co_change_map,
         files_scanned,
         binary_files_skipped: binary_probe_skipped,
         symbols_indexed,
@@ -1324,6 +1732,250 @@ pub fn index_workspace_with_exclusions(
         governance_synapses_wired: gov_edges,
         fast_path_hit: false,
     })
+}
+
+fn prune_stale_symbol_cue_bridges(
+    db: &LibreDb,
+    live_rel_paths: &HashSet<&str>,
+    by_full_key: &HashMap<String, u64>,
+) {
+    let Ok(rec) = db.get_by_key(NodeKind::Generic, SYMBOL_CUE_BRIDGES_KEY) else {
+        return;
+    };
+    let Ok(mut book) = serde_json::from_slice::<SymbolCueBridgeBook>(&rec.payload) else {
+        return;
+    };
+    let mut live_stripped: HashSet<String> = HashSet::with_capacity(by_full_key.len());
+    for full_k in by_full_key.keys() {
+        live_stripped.insert(strip_line_disambiguator(full_k).to_owned());
+    }
+    let mut modified = false;
+    book.bridges.retain(|_, list| {
+        let before = list.len();
+        list.retain(|(sym_k, _)| {
+            let stripped = strip_line_disambiguator(sym_k);
+            let file_ok = stripped
+                .split_once("::")
+                .is_some_and(|(fp, _)| live_rel_paths.contains(fp));
+            file_ok && (live_stripped.contains(stripped) || by_full_key.contains_key(sym_k))
+        });
+        if list.len() != before {
+            modified = true;
+        }
+        !list.is_empty()
+    });
+    if modified {
+        if let Ok(bytes) = serde_json::to_vec(&book) {
+            let _ = db.put(
+                WriteRequest::new(NodeKind::Generic, bytes)
+                    .with_key(SYMBOL_CUE_BRIDGES_KEY)
+                    .with_importance(64),
+            );
+        }
+    }
+}
+
+fn resolve_git_head_oid_fast(root: &Path) -> String {
+    let git_dir = root.join(".git");
+    if !git_dir.is_dir() {
+        return String::new();
+    }
+    let head_path = git_dir.join("HEAD");
+    let Ok(head_raw) = std::fs::read_to_string(&head_path) else {
+        return String::new();
+    };
+    let head_trim = head_raw.trim();
+    if let Some(ref_rel) = head_trim.strip_prefix("ref:") {
+        let ref_rel = ref_rel.trim();
+        if ref_rel.contains("..") || ref_rel.starts_with('/') || ref_rel.starts_with('\\') {
+            return String::new();
+        }
+        let ref_file = git_dir.join(ref_rel);
+        if let Ok(oid) = std::fs::read_to_string(&ref_file) {
+            let t = oid.trim();
+            if t.len() >= 40 && t.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return t.to_ascii_lowercase();
+            }
+        }
+        let packed = git_dir.join("packed-refs");
+        if let Ok(packed_raw) = std::fs::read_to_string(&packed) {
+            for line in packed_raw.lines() {
+                let l = line.trim();
+                if l.is_empty() || l.starts_with('#') || l.starts_with('^') {
+                    continue;
+                }
+                if let Some((oid, rname)) = l.split_once(' ') {
+                    if rname.trim() == ref_rel
+                        && oid.len() >= 40
+                        && oid.bytes().all(|b| b.is_ascii_hexdigit())
+                    {
+                        return oid.to_ascii_lowercase();
+                    }
+                }
+            }
+        }
+        String::new()
+    } else if head_trim.len() >= 40 && head_trim.bytes().all(|b| b.is_ascii_hexdigit()) {
+        head_trim.to_ascii_lowercase()
+    } else {
+        String::new()
+    }
+}
+
+fn is_doc_or_meta_cochange_excluded(rel_path: &str) -> bool {
+    let fname = rel_path.rsplit('/').next().unwrap_or(rel_path);
+    let low = fname.to_ascii_lowercase();
+    matches!(
+        low.as_str(),
+        "readme.md" | "changelog.md" | "license" | "license.md" | ".gitignore"
+    )
+}
+
+fn compute_git_co_change_couplings(
+    root: &Path,
+    live_rel_paths: &HashSet<&str>,
+) -> BTreeMap<String, Vec<CoChangePartner>> {
+    if !root.join(".git").is_dir() || live_rel_paths.len() < 2 {
+        return BTreeMap::new();
+    }
+    let output = std::process::Command::new("git")
+        .current_dir(root)
+        .args([
+            "-c",
+            "safe.directory=*",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.quotepath=false",
+            "log",
+            "-n",
+            "128",
+            "--name-only",
+            "--pretty=format:__COMMIT__%H",
+        ])
+        .output();
+    let Ok(out) = output else {
+        return BTreeMap::new();
+    };
+    if !out.status.success() {
+        return BTreeMap::new();
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut valid_commits: Vec<Vec<String>> = Vec::new();
+    let mut current_files: Vec<String> = Vec::new();
+    let mut raw_non_meta_count: usize = 0;
+
+    let mut flush_commit = |files: &mut Vec<String>, raw_cnt: &mut usize| {
+        if *raw_cnt == 0 && files.is_empty() {
+            return;
+        }
+        files.sort();
+        files.dedup();
+        if *raw_cnt >= 2
+            && *raw_cnt <= MAX_COCHANGE_COMMIT_FILES
+            && files.len() >= 2
+            && files.len() <= MAX_COCHANGE_COMMIT_FILES
+        {
+            valid_commits.push(std::mem::take(files));
+        } else {
+            files.clear();
+        }
+        *raw_cnt = 0;
+    };
+
+    for raw_line in stdout.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with("__COMMIT__") {
+            flush_commit(&mut current_files, &mut raw_non_meta_count);
+            continue;
+        }
+        let norm = line.replace('\\', "/");
+        if !is_doc_or_meta_cochange_excluded(&norm) {
+            raw_non_meta_count += 1;
+            if live_rel_paths.contains(norm.as_str()) {
+                current_files.push(norm);
+            }
+        }
+    }
+    flush_commit(&mut current_files, &mut raw_non_meta_count);
+
+    let m_valid = valid_commits.len();
+    if m_valid < 2 {
+        return BTreeMap::new();
+    }
+
+    let mut file_commits: HashMap<String, u32> = HashMap::new();
+    let mut pair_stats: HashMap<(String, String), (u32, f64)> = HashMap::new();
+
+    for c_files in &valid_commits {
+        let m = c_files.len();
+        let newman_w = 1.0 / ((m - 1) as f64);
+        for f in c_files {
+            *file_commits.entry(f.clone()).or_insert(0) += 1;
+        }
+        for i in 0..m {
+            for j in (i + 1)..m {
+                let a = &c_files[i];
+                let b = &c_files[j];
+                let entry_ab = pair_stats
+                    .entry((a.clone(), b.clone()))
+                    .or_insert((0, 0.0));
+                entry_ab.0 += 1;
+                entry_ab.1 += newman_w;
+                let entry_ba = pair_stats
+                    .entry((b.clone(), a.clone()))
+                    .or_insert((0, 0.0));
+                entry_ba.0 += 1;
+                entry_ba.1 += newman_w;
+            }
+        }
+    }
+
+    let mut result: BTreeMap<String, Vec<CoChangePartner>> = BTreeMap::new();
+    for ((src, dst), (shared, newman_sum)) in pair_stats {
+        let src_c = file_commits.get(&src).copied().unwrap_or(0);
+        let dst_c = file_commits.get(&dst).copied().unwrap_or(0);
+        if src_c == 0 || dst_c == 0 {
+            continue;
+        }
+        let min_shared = if m_valid <= 8 && shared == src_c { 2 } else { 3 };
+        if shared < min_shared {
+            continue;
+        }
+        let conf_ab = (shared as f64) / (src_c as f64);
+        let conf_ba = (shared as f64) / (dst_c as f64);
+        if conf_ab < 0.55 {
+            continue;
+        }
+        let lift = ((shared as f64) * (m_valid as f64)) / ((src_c as f64) * (dst_c as f64));
+        let high_mutual_coupling = conf_ab >= 0.75 && conf_ba >= 0.75 && shared >= 3;
+        if lift < 1.80 && !high_mutual_coupling {
+            continue;
+        }
+        let partner = CoChangePartner {
+            rel_path: dst,
+            shared_commits: shared,
+            source_commits: src_c,
+            confidence_pct: (conf_ab * 100.0).round().clamp(1.0, 100.0) as u8,
+            lift_x100: (lift * 100.0).round() as u32,
+            newman_score_x100: (newman_sum * 100.0).round() as u32,
+        };
+        result.entry(src).or_default().push(partner);
+    }
+
+    for partners in result.values_mut() {
+        partners.sort_by(|a, b| {
+            let sa = (a.confidence_pct as u64) * (a.newman_score_x100 as u64);
+            let sb = (b.confidence_pct as u64) * (b.newman_score_x100 as u64);
+            sb.cmp(&sa).then_with(|| a.rel_path.cmp(&b.rel_path))
+        });
+        partners.truncate(3);
+    }
+
+    result
 }
 
 fn compact_contract_ref(contract: &str) -> &str {
@@ -1528,6 +2180,12 @@ pub fn locate_symbols(db: &LibreDb, queries: &[String]) -> Result<Vec<SymbolLoca
                 || sym_part.eq_ignore_ascii_case(&normalized_q)
             {
                 tier2_ci.push((ino.node_id, full_k.clone()));
+            } else if (normalized_q.contains('/') || normalized_q.contains('.'))
+                && stripped_k
+                    .split_once("::")
+                    .is_some_and(|(fp, _)| fp.eq_ignore_ascii_case(&normalized_q))
+            {
+                tier1_exact.push((ino.node_id, full_k.clone()));
             } else if q_low.len() >= 3 && sym_part.to_lowercase().contains(&q_low) {
                 tier3_substr.push((ino.node_id, full_k.clone()));
             }
@@ -1541,6 +2199,22 @@ pub fn locate_symbols(db: &LibreDb, queries: &[String]) -> Result<Vec<SymbolLoca
             tier3_substr
         };
         matched_ids.sort_by(|a, b| a.1.cmp(&b.1));
+        if matched_ids.is_empty() {
+            let bridged = match_symbol_cue_bridges(db, raw_query, MAX_LOCATE_MATCHES_PER_QUERY);
+            if !bridged.is_empty() {
+                let key_by_id: HashMap<u64, String> = sym_inodes
+                    .iter()
+                    .filter_map(|(i, k, _)| Some((i.node_id, k.clone()?)))
+                    .collect();
+                for (bid, _) in bridged {
+                    if let Some(fk) = key_by_id.get(&bid) {
+                        matched_ids.push((bid, fk.clone()));
+                    }
+                }
+            } else {
+                let _ = record_search_miss_cue(db, raw_query);
+            }
+        }
         matched_ids.truncate(MAX_LOCATE_MATCHES_PER_QUERY);
 
         let req_ids: Vec<u64> = matched_ids.iter().map(|(id, _)| *id).collect();
@@ -1688,6 +2362,12 @@ pub fn format_impact_compact(symbol_query: &str, reports: &[SymbolImpactReport])
                 out.push_str(&format!("    -> {}\n", compact_contract_ref(c)));
             }
         }
+        if !rep.co_changed_files.is_empty() {
+            out.push_str(&format!("  Co-Changed files ({}):\n", rep.co_changed_files.len()));
+            for cf in rep.co_changed_files.iter().take(3) {
+                out.push_str(&format!("    <-> {cf}\n"));
+            }
+        }
     }
     out
 }
@@ -1749,7 +2429,7 @@ pub fn query_symbol_impact(db: &LibreDb, symbol_query: &str) -> Result<Vec<Symbo
         }
 
         let Some(ref full_k) = key_opt else { continue };
-        let Some((_, raw_sym_part)) = full_k.split_once("::") else { continue };
+        let Some((file_part, raw_sym_part)) = full_k.split_once("::") else { continue };
         let (sym_part, key_sig_opt) = match raw_sym_part.split_once('@') {
             Some((sp, tail)) if tail.starts_with('(') || tail.starts_with(':') => (sp, Some(tail)),
             Some((sp, _)) => (sp, None),
@@ -1791,6 +2471,10 @@ pub fn query_symbol_impact(db: &LibreDb, symbol_query: &str) -> Result<Vec<Symbo
             || sym_part.eq_ignore_ascii_case(&normalized_q)
         {
             tier2_ci.push((ino.node_id, full_k.clone()));
+        } else if (normalized_q.contains('/') || normalized_q.contains('.'))
+            && file_part.eq_ignore_ascii_case(&normalized_q)
+        {
+            tier1_exact.push((ino.node_id, full_k.clone()));
         } else if q_low.len() >= 3 && sym_part.to_lowercase().contains(&q_low) {
             // Never match against `file_part` so short queries (`"a"`, `"i4"`) never pull unrelated files!
             tier3_substr.push((ino.node_id, full_k.clone()));
@@ -1814,6 +2498,30 @@ pub fn query_symbol_impact(db: &LibreDb, symbol_query: &str) -> Result<Vec<Symbo
             + reverse_deps.get(id_b).map_or(0, Vec::len);
         cb.cmp(&ca).then_with(|| k_a.cmp(k_b))
     });
+
+    if matched_ids.is_empty() {
+        let bridged = match_symbol_cue_bridges(db, raw_q, 12);
+        if !bridged.is_empty() {
+            let key_by_id: HashMap<u64, String> = sym_inodes
+                .iter()
+                .filter_map(|(i, k, _)| Some((i.node_id, k.clone()?)))
+                .collect();
+            for (bid, _) in bridged {
+                if let Some(fk) = key_by_id.get(&bid) {
+                    matched_ids.push((bid, fk.clone()));
+                }
+            }
+        } else {
+            let _ = record_search_miss_cue(db, raw_q);
+        }
+    }
+
+    let co_change_map: BTreeMap<String, Vec<CoChangePartner>> = db
+        .get_by_key(NodeKind::Generic, WORKSPACE_GRAPH_STATE_KEY)
+        .ok()
+        .and_then(|rec| serde_json::from_slice::<WorkspaceGraphState>(&rec.payload).ok())
+        .map(|st| st.co_change_map)
+        .unwrap_or_default();
 
     const MAX_SERIALIZED_CALLERS: usize = 20;
     const MAX_SERIALIZED_CALLEES: usize = 12;
@@ -1887,6 +2595,24 @@ pub fn query_symbol_impact(db: &LibreDb, symbol_query: &str) -> Result<Vec<Symbo
             })
             .collect();
 
+        let mut co_changed_files = Vec::new();
+        if let Some((sym_file, _)) = sym_key.split_once("::") {
+            if let Some(partners) = co_change_map.get(sym_file) {
+                for p in partners.iter().take(3) {
+                    let p_prefix = format!("{} ::", p.rel_path);
+                    let already_linked = callers.iter().any(|c| c.starts_with(&p_prefix))
+                        || callees.iter().any(|c| c.starts_with(&p_prefix))
+                        || implementors.iter().any(|c| c.starts_with(&p_prefix));
+                    if !already_linked {
+                        co_changed_files.push(format!(
+                            "{} ({}%, {}/{} commits)",
+                            p.rel_path, p.confidence_pct, p.shared_commits, p.source_commits
+                        ));
+                    }
+                }
+            }
+        }
+
         reports.push(SymbolImpactReport {
             node_id: nid,
             symbol_key: sym_key,
@@ -1897,6 +2623,7 @@ pub fn query_symbol_impact(db: &LibreDb, symbol_query: &str) -> Result<Vec<Symbo
             total_callees,
             callees,
             governing_decisions,
+            co_changed_files,
         });
     }
 

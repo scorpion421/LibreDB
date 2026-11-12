@@ -33,10 +33,12 @@ pub use workspace::{
     extract_fim_slice, format_fim_batch_compact, format_impact_batch_compact,
     format_impact_compact, format_locate_compact, has_project_root_marker, index_workspace,
     index_workspace_with_exclusions, locate_symbols, query_symbol_impact,
-    query_symbols_impact_batch, reconcile_tentative_edits, stage_tentative_file_edit,
-    sync_single_file_symbols, FimSliceBundle, FimSliceRequest, SymbolImpactReport,
-    SymbolLocationMatch, TentativeFileEdit, WorkspaceIndexReport, MAX_BATCH_FIM_SLICES,
-    MAX_BATCH_SYMBOL_QUERIES, MAX_LOCATE_MATCHES_PER_QUERY, TENTATIVE_EDIT_PREFIX,
+    query_symbols_impact_batch, reconcile_tentative_edits, record_search_miss_cue,
+    stage_tentative_file_edit, sync_single_file_symbols, CoChangePartner, FimSliceBundle,
+    FimSliceRequest, PendingMissCue, SymbolCueBridgeBook, SymbolImpactReport, SymbolLocationMatch,
+    TentativeFileEdit, WorkspaceIndexReport, MAX_BATCH_FIM_SLICES, MAX_BATCH_SYMBOL_QUERIES,
+    MAX_LOCATE_MATCHES_PER_QUERY, PENDING_MISS_CUES_KEY, SYMBOL_CUE_BRIDGES_KEY,
+    TENTATIVE_EDIT_PREFIX,
 };
 
 use libredb_core::{EdgeKind, LibreDb, NodeFlags, NodeKind, Result};
@@ -226,7 +228,8 @@ impl CognitiveEngine {
         let mut lexical_hits = self.index.search(query, Some(&searchable_kinds), 24);
         if lexical_hits.is_empty() {
             // Fallback for pure code-symbol queries when no prose capsule matched:
-            // match active `NodeKind::Symbol` keys directly in RAM (`0` disk I/O, `0` index bloat).
+            // match active `NodeKind::Symbol` keys directly in RAM (`0` disk I/O, `0` index bloat),
+            // plus any learned `sys::symbol_cue_bridges` aliases from Search-Miss -> Verified-Edit!
             let q_tokens = libredb_index::segment_universal_tokens(query);
             for (sym_id, sym_score) in self.db.match_active_keys_by_kind(NodeKind::Symbol, &q_tokens, 8) {
                 lexical_hits.push(libredb_index::SearchHit {
@@ -236,6 +239,17 @@ impl CognitiveEngine {
                     score: sym_score,
                     matched_features: Vec::new(),
                 });
+            }
+            if lexical_hits.is_empty() {
+                for (sym_id, bridge_score) in workspace::match_symbol_cue_bridges(&self.db, query, 8) {
+                    lexical_hits.push(libredb_index::SearchHit {
+                        node_id: sym_id,
+                        kind: NodeKind::Symbol,
+                        key: None,
+                        score: bridge_score,
+                        matched_features: Vec::new(),
+                    });
+                }
             }
         }
         if lexical_hits.is_empty() {
@@ -269,11 +283,23 @@ impl CognitiveEngine {
                 Some((_, _, s)) => s.clone(),
                 None => continue,
             };
+            let d_out = syns
+                .iter()
+                .filter(|s| s.kind != EdgeKind::Supersedes)
+                .count() as f64;
+            let fan_denom = 1.0 + 0.35 * (1.0 + d_out).ln();
+
             for syn in syns {
                 if syn.kind == EdgeKind::Supersedes {
                     continue;
                 }
-                let next_e = energy * (syn.weight as f64 / 255.0) * 0.55;
+                let edge_alpha = match syn.kind {
+                    EdgeKind::Governs | EdgeKind::CausedBy | EdgeKind::Verifies => 0.65,
+                    EdgeKind::Calls | EdgeKind::DependsOn | EdgeKind::Inherits => 0.50,
+                    EdgeKind::RelatedTo | EdgeKind::HasSection | EdgeKind::UsesSkill => 0.45,
+                    _ => 0.35,
+                };
+                let next_e = energy * (syn.weight as f64 / 255.0) * (edge_alpha / fan_denom);
                 if next_e >= 0.25 {
                     if !meta_cache.contains_key(&syn.target_id) {
                         if let Some(m) = self.db.get_inode_meta(syn.target_id) {
@@ -304,13 +330,14 @@ impl CognitiveEngine {
                 {
                     return None;
                 }
+                let kind_mult = memory_kind_priority_multiplier(ino.kind, ino.flags);
                 Some(ScoredInodeCandidate {
                     node_id: nid,
                     kind: ino.kind,
                     key: key_opt.clone(),
                     generation: ino.generation,
                     token_count: ino.token_count.max(1),
-                    score,
+                    score: score * kind_mult,
                 })
             })
             .collect();
@@ -385,6 +412,9 @@ impl CognitiveEngine {
 
         // 2. Score candidates 100% in RAM (`0` payload disk reads!).
         let ranked = self.score_candidates_in_ram(&req.query);
+        if ranked.is_empty() && fired_reflexes.is_empty() {
+            let _ = workspace::record_search_miss_cue(&self.db, &req.query);
+        }
 
         // 3. Session Zero-Repeat Delta filtering + token-budget knapsack packing!
         let mut to_hydrate: Vec<ScoredInodeCandidate> = Vec::new();
@@ -539,5 +569,35 @@ impl CognitiveEngine {
         }
 
         Ok(out)
+    }
+}
+
+#[inline]
+fn memory_kind_priority_multiplier(kind: NodeKind, flags: NodeFlags) -> f64 {
+    let pinned = flags.contains(NodeFlags::PINNED);
+    match kind {
+        NodeKind::Rule
+        | NodeKind::Decision
+        | NodeKind::Fact
+        | NodeKind::SkillSection
+        | NodeKind::Task => {
+            if pinned {
+                1.08
+            } else {
+                1.00
+            }
+        }
+        NodeKind::Symbol | NodeKind::Skill | NodeKind::TaskVerification => 0.95,
+        NodeKind::Snapshot
+        | NodeKind::CompactionCheckpoint
+        | NodeKind::Handoff
+        | NodeKind::WorkingSet => {
+            if pinned {
+                1.00
+            } else {
+                0.78
+            }
+        }
+        _ => 0.90,
     }
 }

@@ -49,6 +49,7 @@ fn zero_repeat_session_delta_and_reflex_triggers_slash_multi_turn_tokens() {
             action_any: vec!["gitea".to_owned(), "release".to_owned()],
             env_or_error_any: vec![],
             directive: "Place compiled release binary into dist/ before calling gitea-release.".to_owned(),
+            ..Default::default()
         },
     )
     .unwrap();

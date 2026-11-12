@@ -1,11 +1,11 @@
 # LibreDB
 
-[![Version](https://img.shields.io/badge/version-1.2.0-blue.svg)](CHANGELOG.md)
-[![Tests](https://img.shields.io/badge/tests-passing%20(106%20tests%20%2B%2010%20audits%20%2B%2010k%20crash%20sims)-brightgreen.svg)](crates/libredb-cli/tests/)
+[![Version](https://img.shields.io/badge/version-1.3.0-blue.svg)](CHANGELOG.md)
+[![Tests](https://img.shields.io/badge/tests-passing%20(107%20tests%20%2B%2011%20audits%20%2B%2010k%20crash%20sims)-brightgreen.svg)](crates/libredb-cli/tests/)
 [![Tech Stack](https://img.shields.io/badge/rust-1.89%2B%20%7C%20PyO3%20abi3%20%7C%20MCP-orange.svg)](Cargo.toml)
 [![License](https://img.shields.io/badge/license-AGPLv3%20%2B%20Commons%20Clause-purple.svg)](LICENSE)
 
-`LibreDB` is an enterprise-ready, local-first, zero-configuration, single-file cognitive database, token-economy analytics & benchmark suite, lifecycle hook engine, dynamic multi-remote Git/Gitea automation suite, and multi-workspace `MCP` memory substrate (`*.ldb`) built in Rust for `Antigravity` and `MCP`-compatible `LLM` clients. It replaces `SQLite` + Python memory overhead with zero-I/O RAM-first `Zero-Repeat Delta` deduplication, cross-process-serialized revision-and-metadata-bound `HMAC-SHA256` workspace trust seals (`libredb trust`, `hmac-sha256:v4:r<rev>:` with crash-consistent CAS anti-rollback and anti-deletion ratchets), standards-compliant OS/AEAD secret protection (Windows `DPAPI` / RFC 8439 `ChaCha20-Poly1305`), `< 2 ms` compiled `PreInvocation` (subagent-aware priority-budgeted `BM25` `<= 450`-token hydration) and `PreToolUse` (tentative-verified ACID symbol-span shifting) hooks, `< 5 us` local topology-inferred 25+ language exact Dalvik/DI code-graph (`locate`, batched `fim`, batched `impact`, `skeleton`), native 3-tier `libredb savings` & `libredb bench` (`--suite kernel|full|audit`) verification, and strictly neutral default installation across Windows, Linux, and macOS.
+`LibreDB` is an enterprise-ready, local-first, zero-configuration, single-file cognitive database, token-economy analytics & benchmark suite, lifecycle hook engine, dynamic multi-remote Git/Gitea automation suite, and multi-workspace `MCP` memory substrate (`*.ldb`) built in Rust for `Antigravity` and `MCP`-compatible `LLM` clients. It replaces `SQLite` + Python memory overhead with zero-I/O RAM-first `Zero-Repeat Delta` deduplication, cross-process-serialized revision-and-metadata-bound `HMAC-SHA256` workspace trust seals (`libredb trust`, `hmac-sha256:v4:r<rev>:` with crash-consistent CAS anti-rollback and anti-deletion ratchets), standards-compliant OS/AEAD secret protection (Windows `DPAPI` / RFC 8439 `ChaCha20-Poly1305`), `< 2 ms` compiled `PreInvocation` (subagent-aware priority-budgeted `BM25` `<= 450`-token hydration) and `PreToolUse` (tentative-verified ACID symbol-span shifting + closed-loop `Search-Miss -> Verified-Edit` bridging) hooks, `< 5 us` local topology-inferred 25+ language exact Dalvik/DI code-graph (`locate`, batched `fim`, batched `impact` with Git co-change `Lift` mining, `skeleton`), falsifiable grounded reflexes, ACT-R hub fan damping, native 3-tier `libredb savings` & `libredb bench` (`--suite kernel|full|audit`) verification, and strictly neutral default installation across Windows, Linux, and macOS.
 
 ## Table of contents
 
@@ -17,14 +17,14 @@
 
 ## Executive summary and impact
 
-| Dimension | Legacy Python + `SQLite` (`SkillsDB`) | `LibreDB v1.2.0` (Pure `Rust` + `MCP` + `PyO3`) |
+| Dimension | Legacy Python + `SQLite` (`SkillsDB`) | `LibreDB v1.3.0` (Pure `Rust` + `MCP` + `PyO3`) |
 | :--- | :--- | :--- |
-| **Lifecycle hook latency** | `350-500 ms` Python startup + `SQLite` WAL per edit/turn | **`< 2 ms` in-engine (subagent-aware priority `BM25` `<= 450`-tok `PreInvocation` + tentative ACID `PreToolUse` shift)** |
+| **Lifecycle hook latency** | `350-500 ms` Python startup + `SQLite` WAL per edit/turn | **`< 2 ms` in-engine (subagent-aware priority `BM25` `<= 450`-tok `PreInvocation` + tentative ACID `PreToolUse` shift & miss-bridge)** |
 | **Turn 2+ recall & I/O** | `300-1500 ms` subprocess + repeated full text output | **`0` disk I/O reads (`< 3 ms` warm `MCP` / `locate` / `fim` / `impact`) via RAM-first `Zero-Repeat Delta` & stat+hash cache** |
 | **Cryptography & trust** | Plaintext DB tokens & unverified `.agents/memory.db` loads | **Windows `DPAPI` + RFC 8439 `ChaCha20-Poly1305` `AEAD` + monotonic `HMAC-SHA256` (`v4:r<rev>`)** |
 | **Symlink-safe path policy** | Lexical-only path checks vulnerable to symlink aliases | **Canonicalized symlink/junction, NTFS ADS (`:stream`) & `..` containment across `MCP`, `CLI` & hooks** |
-| **Topology & DI code graph** | Full `read_file` scans + blind to Dalvik/R8 & interfaces | **`< 5 us` structural topology + exact Dalvik/R8 descriptors + batched `locate`, `fim` (`slices`), `impact` (`symbols`) & `skeleton`** across 25+ languages |
-| **Built-in economy & audit** | External ad-hoc Python scripts required to measure savings | **Native 3-tier `libredb savings` (`report`) & `libredb bench --suite kernel\|full\|audit` (`C1..C6` + `A1..A10`, `--json`)** |
+| **Topology & DI code graph** | Full `read_file` scans + blind to Dalvik/R8 & interfaces | **`< 5 us` structural topology + exact Dalvik/R8 + Git co-change `Lift` + closed-loop miss->edit bridges + batched `locate`/`fim`/`impact`** |
+| **Built-in economy & audit** | External ad-hoc Python scripts required to measure savings | **Native 3-tier `libredb savings` (`report`) & `libredb bench --suite kernel\|full\|audit` (`C1..C6` + `A1..A11`, `--json`)** |
 
 ## Installation and quickstart
 
@@ -58,10 +58,10 @@ pwsh -ExecutionPolicy Bypass -File .\scripts\deploy_plugin.ps1 -Profile Personal
 | Command / MCP tool | Description |
 | :--- | :--- |
 | `libredb_pulse` (`MCP`) / `libredb pulse [<db.ldb>] <query>` | Zero-boilerplate dual-layer associative recall with hands-free `/compact` sync & zero-I/O `Zero-Repeat Delta` |
-| `libredb_code` (`MCP`) / `locate`, `skeleton`, `impact`, `fim`, `index-workspace` | Topology + Dalvik/R8 + `DI` code graph supporting `< 0.5 ms` `locate`, batched `impact` (`symbols`) & `fim` (`slices`), `[Lstart-Lend]` slices, `implementors`, `Decisions`, and `savings` |
+| `libredb_code` (`MCP`) / `locate`, `skeleton`, `impact`, `fim`, `index-workspace` | Topology + Dalvik/R8 + `DI` + Git co-change `Lift` code graph supporting `< 0.5 ms` `locate`, closed-loop `Search-Miss -> Verified-Edit` bridging, batched `impact` (`symbols`) & `fim` (`slices`), `[Lstart-Lend]` slices, and `savings` |
 | `libredb slice-skill <query>` / `get-skill [--section \| --query]` | Direct `BM25` + `HybridIndex` progressive-disclosure skill-section search across `customizations.ldb` |
-| `libredb savings` (`report`) / `libredb bench` | Built-in 3-tier token-consumption & savings analytics (`--today`, `--days`, `--cid`, `--project`, `--json`) and `C1..C6` / `A1..A10` benchmark & security verification suite (`--suite kernel\|full\|audit`, `--workspace`) |
-| `libredb_memorize` (`MCP`) / `batch`, `learn-assoc`, `learn-reflex` | Atomic multi-capsule commits, tasks, language-agnostic Hebbian learning, and pitfall reflexes |
+| `libredb savings` (`report`) / `libredb bench` | Built-in 3-tier token-consumption & savings analytics (`--today`, `--days`, `--cid`, `--project`, `--json`) and `C1..C6` / `A1..A11` benchmark & security verification suite (`--suite kernel\|full\|audit`, `--workspace`) |
+| `libredb_memorize` (`MCP`) / `batch`, `learn-assoc`, `learn-reflex [--anchor]` | Atomic multi-capsule commits, tasks, language-agnostic Hebbian learning, and grounded falsifiable reflexes |
 | `libredb mcp-serve` / `hook-pre-invocation` / `hook-pre-tool` / `guardrail check` | Multi-workspace or `--workspace-root`-pinned `MCP` server, sub-2ms lifecycle hooks, symlink-resolved path protection & guardrail scanner |
 | `libredb trust` / `libredb config` | Monotonic `HMAC-SHA256` (`v4:r<rev>`) workspace trust seals (`--accept-rollback`, `--reinit-lost`, `--migrate-v3`, `--migrate-v2`) & dynamic settings |
 | `libredb git-init` / `git-sync` / `git-release` (aliases: `gitea-*`) | Provider-aware multi-remote Git, Keep a Changelog release, and binary asset automation |
@@ -73,7 +73,7 @@ pwsh -ExecutionPolicy Bypass -File .\scripts\deploy_plugin.ps1 -Profile Personal
 LibreDB/
 |-- Cargo.toml                                     # Rust workspace (5 default CLI/MCP crates + optional PyO3 crate)
 |-- Makefile                                       # Zero-dependency POSIX/Linux/macOS source build & installer
-|-- VERSION                                        # Semantic Version (1.2.0)
+|-- VERSION                                        # Semantic Version (1.3.0)
 |-- CHANGELOG.md                                   # Keep a Changelog 1.1.0 release history
 |-- LICENSE                                        # Commons Clause v1.0 + full verbatim GNU AGPL v3.0 text
 |-- README.md                                      # 9-block standardized documentation
@@ -83,18 +83,18 @@ LibreDB/
 |-- crates/
     |-- libredb-core/                              # Frozen single-file LIBREDB1 storage kernel (Inodes, Extents, MVCC)
     |-- libredb-index/                             # Language-agnostic IDF n-grams, alphanumeric v5 tokens & Hebbian learner
-    |-- libredb-cognitive/                         # OverlayBrain, Session Delta, Guardrails, Reflexes, Topology/Dalvik/DI WorkspaceGraph & FIM
+    |-- libredb-cognitive/                         # OverlayBrain, Session Delta, Guardrails, Grounded Reflexes, Causal WorkspaceGraph & FIM
     |-- libredb-bridge/                            # Zero-amnesia 19-table SQLite migrator & parity verifier
     |-- libredb-cli/                               # Modular CLI, MCP Server, Telemetry/Benchmarks, DPAPI/ChaCha20-Poly1305 Vault & Gitea Suite
     |   |-- src/cli_args.rs                        # Deterministic zero-dependency CLI flag & positional parser (CliSpec)
-    |   |-- src/bench.rs                           # Native kernel, C1..C6 economy & A1..A10 feature/security audit engine
+    |   |-- src/bench.rs                           # Native kernel, C1..C6 economy & A1..A11 feature/security audit engine
     |   |-- src/telemetry.rs                       # Cross-process-atomic telemetry.ldb ledger + streaming 8 MiB transcript analyzer
     |   |-- src/mcp/                               # Modular MCP server (mod, protocol, authz, tools, tests)
     |   |-- src/security/                          # Modular security suite (mod, ephemeral, vault, seals, path_policy, tests)
     |   |-- src/hooks.rs                           # Sub-2ms subagent-aware priority BM25 PreInvocation & tentative PreToolUse hooks
     |   |-- src/gitea.rs                           # Provider-aware multi-remote Git, Gitea & GitHub release automation
     |   |-- tests/military_grade_mcp_security.rs   # Multi-process OS SIGKILL, root-refresh & boundary isolation E2E suite
-    |   |-- tests/v111_feature_and_security_audit.rs # E2E MCP savings authz, batched locate/impact/fim, 4-process telemetry & A1..A10 audit suite
+    |   |-- tests/v111_feature_and_security_audit.rs # E2E MCP savings authz, batched locate/impact/fim, closed-loop causal learning & A1..A11 audit suite
     |-- libredb-py/                                # Optional PyO3 abi3 Python extension (`libredb.pyd` / `.so`)
 ```
 

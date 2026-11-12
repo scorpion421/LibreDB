@@ -1928,6 +1928,186 @@ pub fn run_feature_and_security_audit(
         },
     );
 
+    // A11: `v1.3.0` closed-loop `Search-Miss -> Verified-Edit` bridging, Git co-change Lift, grounded reflex falsification & ACT-R fan damping
+    run_check(
+        "A11",
+        "Closed-loop miss-bridge, git co-change, grounded reflex & fan damping",
+        &mut || {
+            let ws_v130 = sbx_root.join("ws_v130_causal");
+            fs::create_dir_all(ws_v130.join("src")).map_err(|e| e.to_string())?;
+            fs::create_dir_all(ws_v130.join(".agents")).map_err(|e| e.to_string())?;
+            let proto_rs = ws_v130.join("src/protocol.rs");
+            let tools_rs = ws_v130.join("src/tools.rs");
+            let obs_rs = ws_v130.join("src/obsolete.rs");
+            fs::write(
+                &proto_rs,
+                "pub fn check_handshake_gate(token: u64) -> bool {\n    token > 0\n}\n\npub fn keep_untouched() -> u32 {\n    42\n}\n",
+            )
+            .map_err(|e| e.to_string())?;
+            fs::write(
+                &tools_rs,
+                "pub fn dispatch_handshake(token: u64) -> bool {\n    token == 7\n}\n",
+            )
+            .map_err(|e| e.to_string())?;
+            fs::write(&obs_rs, "pub fn legacy_adapter() {}\n").map_err(|e| e.to_string())?;
+
+            // Optional git repository setup for co-change Lift verification (gracefully skipped only if git binary is absent)
+            let git_available = std::process::Command::new("git")
+                .arg("--version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if git_available {
+                let run_git = |args: &[&str]| -> Result<(), String> {
+                    let st = std::process::Command::new("git")
+                        .current_dir(&ws_v130)
+                        .args(["-c", "safe.directory=*"])
+                        .args(args)
+                        .env("GIT_AUTHOR_NAME", "Audit")
+                        .env("GIT_AUTHOR_EMAIL", "audit@local.dev")
+                        .env("GIT_COMMITTER_NAME", "Audit")
+                        .env("GIT_COMMITTER_EMAIL", "audit@local.dev")
+                        .output()
+                        .map_err(|e| e.to_string())?;
+                    if !st.status.success() {
+                        return Err(String::from_utf8_lossy(&st.stderr).to_string());
+                    }
+                    Ok(())
+                };
+                run_git(&["init", "-q"])?;
+                // 4 focused commits co-changing `src/protocol.rs` and `src/tools.rs` + `README.md` (which must be filtered out)
+                for c in 1..=4 {
+                    fs::write(
+                        &proto_rs,
+                        format!(
+                            "pub fn check_handshake_gate(token: u64) -> bool {{\n    token >= {c}\n}}\n\npub fn keep_untouched() -> u32 {{\n    42\n}}\n"
+                        ),
+                    )
+                    .map_err(|e| e.to_string())?;
+                    fs::write(
+                        &tools_rs,
+                        format!(
+                            "pub fn dispatch_handshake(token: u64) -> bool {{\n    token == {c}\n}}\n"
+                        ),
+                    )
+                    .map_err(|e| e.to_string())?;
+                    fs::write(ws_v130.join("README.md"), format!("# Rev {c}\n"))
+                        .map_err(|e| e.to_string())?;
+                    run_git(&["add", "src/protocol.rs", "src/tools.rs", "README.md"])?;
+                    run_git(&["commit", "-q", "-m", &format!("focused commit {c}")])?;
+                }
+                // 1 noisy mass commit touching 14 files (>12 threshold: must be ignored)
+                for m in 1..=14 {
+                    let nf = ws_v130.join(format!("src/noise_{m}.rs"));
+                    fs::write(&nf, format!("pub fn noise_{m}() {{}}\n")).map_err(|e| e.to_string())?;
+                }
+                run_git(&["add", "."])?;
+                run_git(&["commit", "-q", "-m", "mass format commit"])?;
+            }
+
+            let gdb = LibreDb::open(&global_ldb).map_err(|e| e.to_string())?;
+            let pdb = Arc::new(
+                LibreDb::open(ws_v130.join(".agents/memory.ldb")).map_err(|e| e.to_string())?,
+            );
+            libredb_cognitive::index_workspace(&pdb, &ws_v130, true).map_err(|e| e.to_string())?;
+
+            // 1. Grounded reflex lifecycle: active while `src/obsolete.rs` exists, auto-deprecated when removed
+            let grounded_rule = libredb_cognitive::ReflexRule {
+                id: "grounded-obsolete-adapter".to_owned(),
+                stack_any: Vec::new(),
+                action_any: vec!["refactor".to_owned()],
+                env_or_error_any: Vec::new(),
+                directive: "Keep legacy_adapter aligned in src/obsolete.rs.".to_owned(),
+                code_anchors: vec!["src/obsolete.rs".to_owned()],
+                anchor_contract_hash: None,
+            };
+            libredb_cognitive::ReflexEngine::learn_reflex(&pdb, &grounded_rule)
+                .map_err(|e| e.to_string())?;
+            let rx_before = libredb_cognitive::ReflexEngine::load(&pdb).map_err(|e| e.to_string())?;
+            if rx_before
+                .evaluate(Some(&ws_v130), "refactor adapter", None)
+                .is_empty()
+            {
+                return Err("Grounded reflex did not fire while anchor file existed".to_owned());
+            }
+            fs::remove_file(&obs_rs).map_err(|e| e.to_string())?;
+            libredb_cognitive::index_workspace(&pdb, &ws_v130, true).map_err(|e| e.to_string())?;
+            let rx_after = libredb_cognitive::ReflexEngine::load(&pdb).map_err(|e| e.to_string())?;
+            if !rx_after
+                .evaluate(Some(&ws_v130), "refactor adapter", None)
+                .is_empty()
+            {
+                return Err("Grounded reflex still fired after anchored file was removed!".to_owned());
+            }
+
+            // Seal workspace AFTER cognitive rule reconciliation, then verify search-miss -> verified-edit bridge preserves v4 seal
+            crate::security::seal_workspace_memory(&gdb, &pdb, &ws_v130)?;
+
+            // 2. Search-Miss -> Verified-Edit bridging (`quorum_lease_ticket` initially misses -> edit `check_handshake_gate` -> resolves!)
+            let miss_q = vec!["quorum_lease_ticket".to_owned()];
+            let initial_loc =
+                libredb_cognitive::locate_symbols(&pdb, &miss_q).map_err(|e| e.to_string())?;
+            if !initial_loc.is_empty() {
+                return Err(format!("Expected initial search miss, got: {initial_loc:?}"));
+            }
+            let pre_bytes = fs::read(&proto_rs).map_err(|e| e.to_string())?;
+            let pre_hash = libredb_cognitive::FileSkeleton::extract_from_bytes("src/protocol.rs", &pre_bytes).content_hash;
+            let edited_proto = "pub fn check_handshake_gate(token: u64) -> bool {\n    let valid = token >= 4;\n    valid\n}\n\npub fn keep_untouched() -> u32 {\n    42\n}\n";
+            libredb_cognitive::stage_tentative_file_edit(
+                &pdb,
+                &ws_v130,
+                &proto_rs,
+                Some(pre_hash),
+                edited_proto.as_bytes(),
+                1_700_000_100,
+            )
+            .map_err(|e| e.to_string())?;
+            fs::write(&proto_rs, edited_proto).map_err(|e| e.to_string())?;
+            let (promoted, _) = libredb_cognitive::reconcile_tentative_edits(&pdb, &ws_v130)
+                .map_err(|e| e.to_string())?;
+            if promoted != 1 {
+                return Err(format!("Expected 1 tentative edit promoted, got {promoted}"));
+            }
+            let bridged_loc =
+                libredb_cognitive::locate_symbols(&pdb, &miss_q).map_err(|e| e.to_string())?;
+            if bridged_loc.len() != 1
+                || bridged_loc[0].symbol_name != "check_handshake_gate"
+            {
+                return Err(format!(
+                    "Expected Search-Miss -> Verified-Edit bridge to resolve check_handshake_gate (not keep_untouched), got: {bridged_loc:?}"
+                ));
+            }
+
+            // 3. Git co-change coupling verification on `check_handshake_gate`
+            let imp = libredb_cognitive::query_symbol_impact(&pdb, "check_handshake_gate")
+                .map_err(|e| e.to_string())?;
+            if imp.is_empty() {
+                return Err("check_handshake_gate impact empty".to_owned());
+            }
+            if git_available {
+                let partners = &imp[0].co_changed_files;
+                if !partners.iter().any(|p| p.contains("src/tools.rs"))
+                    || partners.iter().any(|p| p.contains("README.md"))
+                    || partners.iter().any(|p| p.contains("noise_"))
+                {
+                    return Err(format!(
+                        "Git co-change filtering failed: expected src/tools.rs and no README/noise, got: {partners:?}"
+                    ));
+                }
+            }
+
+            // 4. Verify `hmac-sha256:v4` seal remained 100% intact across miss-cue staging and bridge promotion
+            if !crate::security::is_workspace_memory_trusted(Some(&gdb), &ws_v130) {
+                return Err("v4 workspace seal broken by Search-Miss -> Verified-Edit bridge".to_owned());
+            }
+
+            Ok(format!(
+                "miss->edit bridge resolved check_handshake_gate, co_change={}, reflex deprecated, v4_seal=true",
+                imp[0].co_changed_files.len()
+            ))
+        },
+    );
+
     let passed = checks.iter().filter(|c| c.passed).count();
     let failed = checks.len().saturating_sub(passed);
     let report = AuditSuiteReport {

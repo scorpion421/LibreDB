@@ -52,8 +52,8 @@ fn built_in_audit_suite_cli_passes_all_9_checks() {
     );
 
     let rep: Value = serde_json::from_slice(&out.stdout).expect("valid audit JSON");
-    assert_eq!(rep.get("total_checks").and_then(Value::as_u64), Some(10));
-    assert_eq!(rep.get("passed_checks").and_then(Value::as_u64), Some(10));
+    assert_eq!(rep.get("total_checks").and_then(Value::as_u64), Some(11));
+    assert_eq!(rep.get("passed_checks").and_then(Value::as_u64), Some(11));
     assert_eq!(rep.get("failed_checks").and_then(Value::as_u64), Some(0));
 
     let checks = rep
@@ -61,7 +61,7 @@ fn built_in_audit_suite_cli_passes_all_9_checks() {
         .and_then(Value::as_array)
         .expect("checks array");
     for (idx, expected_id) in [
-        "A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "A9", "A10",
+        "A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "A9", "A10", "A11",
     ]
     .iter()
     .enumerate()
@@ -536,4 +536,257 @@ fn v120_mcp_batched_locate_impact_fim_and_zero_boilerplate_cli_work() {
     );
     let cli_loc_out = String::from_utf8_lossy(&cli_loc.stdout);
     assert!(cli_loc_out.contains("first_fn") && cli_loc_out.contains("second_fn"));
+}
+
+#[test]
+fn v130_closed_loop_search_bridge_git_cochange_and_falsifiable_reflexes_work() {
+    let sbx = fresh_sandbox("v130_closed_loop");
+    let bin = env!("CARGO_BIN_EXE_libredb");
+
+    let fake_home = sbx.0.join("home");
+    fs::create_dir_all(fake_home.join(".gemini/libredb")).unwrap();
+    let global_ldb = fake_home.join(".gemini/libredb/customizations.ldb");
+    let tel_ldb = sbx.0.join("v130_telemetry.ldb");
+
+    let ws = sbx.0.join("ws_causal");
+    fs::create_dir_all(ws.join("src")).unwrap();
+    fs::write(
+        ws.join("Cargo.toml"),
+        "[package]\nname = \"ws_causal\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let auth_rs = ws.join("src/auth.rs");
+    let session_rs = ws.join("src/session.rs");
+    let legacy_rs = ws.join("src/legacy_v1.rs");
+
+    fs::write(
+        &auth_rs,
+        "pub fn verify_hmac_seal(nonce: u64) -> bool {\n    nonce > 10\n}\n\npub fn unrelated_helper() -> u32 {\n    99\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        &session_rs,
+        "pub fn open_sealed_session(nonce: u64) -> bool {\n    nonce == 42\n}\n",
+    )
+    .unwrap();
+    fs::write(&legacy_rs, "pub fn old_v1_shim() {}\n").unwrap();
+
+    // Initialize git history with 3 focused co-change commits between `src/auth.rs` and `src/session.rs`:
+    let run_git = |args: &[&str]| {
+        let out = Command::new("git")
+            .current_dir(&ws)
+            .args(["-c", "safe.directory=*"])
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@local.dev")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@local.dev")
+            .output()
+            .expect("git command");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    run_git(&["init", "-q"]);
+    for rev in 1..=3 {
+        fs::write(
+            &auth_rs,
+            format!(
+                "pub fn verify_hmac_seal(nonce: u64) -> bool {{\n    nonce > {rev}\n}}\n\npub fn unrelated_helper() -> u32 {{\n    99\n}}\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &session_rs,
+            format!("pub fn open_sealed_session(nonce: u64) -> bool {{\n    nonce == {rev}\n}}\n"),
+        )
+        .unwrap();
+        run_git(&["add", "src/auth.rs", "src/session.rs"]);
+        run_git(&["commit", "-q", "-m", &format!("cochange {rev}")]);
+    }
+
+    // Trust workspace and learn a grounded reflex anchored to `src/legacy_v1.rs`:
+    assert!(Command::new(bin)
+        .args([
+            "trust",
+            &ws.to_string_lossy(),
+            "--global",
+            &global_ldb.to_string_lossy()
+        ])
+        .env("USERPROFILE", &fake_home)
+        .env("HOME", &fake_home)
+        .status()
+        .unwrap()
+        .success());
+
+    let db_path = ws.join(".agents/memory.ldb");
+    assert!(Command::new(bin)
+        .args([
+            "learn-reflex",
+            &db_path.to_string_lossy(),
+            "legacy-v1-guard",
+            "Always update old_v1_shim in src/legacy_v1.rs when refactoring.",
+            "--stack",
+            "rust",
+            "--action",
+            "shim",
+            "--anchor",
+            "src/legacy_v1.rs",
+            "--global",
+            &global_ldb.to_string_lossy(),
+        ])
+        .env("USERPROFILE", &fake_home)
+        .env("HOME", &fake_home)
+        .status()
+        .unwrap()
+        .success());
+
+    // 1. Verify grounded reflex fires while `src/legacy_v1.rs` exists:
+    let p_active = Command::new(bin)
+        .args([
+            "pulse",
+            "rust shim",
+            "--cwd",
+            &ws.to_string_lossy(),
+            "--global",
+            &global_ldb.to_string_lossy(),
+        ])
+        .env("LIBREDB_TELEMETRY_PATH", &tel_ldb)
+        .env("USERPROFILE", &fake_home)
+        .env("HOME", &fake_home)
+        .output()
+        .unwrap();
+    let p_active_txt = String::from_utf8_lossy(&p_active.stdout);
+    assert!(
+        p_active_txt.contains("legacy-v1-guard"),
+        "Expected grounded reflex while anchor exists, got: {p_active_txt}"
+    );
+
+    // 2. Trigger a search miss on `zero_knowledge_ticket` via `locate`:
+    let miss_out = Command::new(bin)
+        .args([
+            "locate",
+            "zero_knowledge_ticket",
+            "--cwd",
+            &ws.to_string_lossy(),
+            "--global",
+            &global_ldb.to_string_lossy(),
+        ])
+        .env("LIBREDB_TELEMETRY_PATH", &tel_ldb)
+        .env("USERPROFILE", &fake_home)
+        .env("HOME", &fake_home)
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&miss_out.stdout).contains("0 symbols matched"),
+        "Expected initial search miss, got: {}",
+        String::from_utf8_lossy(&miss_out.stdout)
+    );
+
+    // 3. Simulate `PreToolUse` (`edit_file` on `src/auth.rs` modifying `verify_hmac_seal`) + disk write:
+    let new_auth = "pub fn verify_hmac_seal(nonce: u64) -> bool {\n    let checked = nonce > 5;\n    checked\n}\n\npub fn unrelated_helper() -> u32 {\n    99\n}\n";
+    let mut hook_child = Command::new(bin)
+        .args([
+            "hook-pre-tool",
+            "--global",
+            &global_ldb.to_string_lossy(),
+        ])
+        .env("LIBREDB_TELEMETRY_PATH", &tel_ldb)
+        .env("USERPROFILE", &fake_home)
+        .env("HOME", &fake_home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let hook_payload = json!({
+        "toolName": "write_file",
+        "toolArgs": {
+            "Path": auth_rs.to_string_lossy().to_string(),
+            "Content": new_auth
+        }
+    });
+    writeln!(hook_child.stdin.take().unwrap(), "{hook_payload}").unwrap();
+    let _ = hook_child.wait_with_output().unwrap();
+    fs::write(&auth_rs, new_auth).unwrap();
+
+    // 4. Now repeat `locate zero_knowledge_ticket` -> `reconcile_tentative_edits` promotes edit & binds cue to `verify_hmac_seal`!
+    let hit_out = Command::new(bin)
+        .args([
+            "locate",
+            "zero_knowledge_ticket",
+            "--cwd",
+            &ws.to_string_lossy(),
+            "--global",
+            &global_ldb.to_string_lossy(),
+        ])
+        .env("LIBREDB_TELEMETRY_PATH", &tel_ldb)
+        .env("USERPROFILE", &fake_home)
+        .env("HOME", &fake_home)
+        .output()
+        .unwrap();
+    let hit_txt = String::from_utf8_lossy(&hit_out.stdout);
+    assert!(
+        hit_txt.contains("verify_hmac_seal") && !hit_txt.contains("unrelated_helper"),
+        "Expected Search-Miss -> Verified-Edit bridge to resolve verify_hmac_seal, got: {hit_txt}"
+    );
+
+    // 5. Verify `impact verify_hmac_seal` surfaces `src/session.rs` in `Co-changed files (git Lift)`:
+    let imp_out = Command::new(bin)
+        .args([
+            "impact",
+            "verify_hmac_seal",
+            "--cwd",
+            &ws.to_string_lossy(),
+            "--global",
+            &global_ldb.to_string_lossy(),
+        ])
+        .env("LIBREDB_TELEMETRY_PATH", &tel_ldb)
+        .env("USERPROFILE", &fake_home)
+        .env("HOME", &fake_home)
+        .output()
+        .unwrap();
+    let imp_txt = String::from_utf8_lossy(&imp_out.stdout);
+    assert!(
+        imp_txt.contains("Co-changed files (git Lift)") && imp_txt.contains("src/session.rs"),
+        "Expected git co-change partner src/session.rs in impact output, got: {imp_txt}"
+    );
+
+    // 6. Delete `src/legacy_v1.rs`, re-index, and verify grounded reflex `legacy-v1-guard` is suppressed!
+    fs::remove_file(&legacy_rs).unwrap();
+    assert!(Command::new(bin)
+        .args([
+            "index-workspace",
+            &db_path.to_string_lossy(),
+            &ws.to_string_lossy(),
+            "--global",
+            &global_ldb.to_string_lossy(),
+        ])
+        .env("USERPROFILE", &fake_home)
+        .env("HOME", &fake_home)
+        .status()
+        .unwrap()
+        .success());
+
+    let p_after = Command::new(bin)
+        .args([
+            "pulse",
+            "rust shim",
+            "--cwd",
+            &ws.to_string_lossy(),
+            "--global",
+            &global_ldb.to_string_lossy(),
+        ])
+        .env("LIBREDB_TELEMETRY_PATH", &tel_ldb)
+        .env("USERPROFILE", &fake_home)
+        .env("HOME", &fake_home)
+        .output()
+        .unwrap();
+    let p_after_txt = String::from_utf8_lossy(&p_after.stdout);
+    assert!(
+        !p_after_txt.contains("legacy-v1-guard"),
+        "Expected falsified grounded reflex to be suppressed after src/legacy_v1.rs removal, got: {p_after_txt}"
+    );
 }

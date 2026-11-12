@@ -134,7 +134,7 @@ cat > "$PLUGIN_DIR/plugin.json" <<'EOF'
 {
   "name": "libredb",
   "displayName": "LibreDB Cognitive Memory",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Enterprise-ready Rust cognitive memory, token-economy analytics & MCP code graph: single-file LIBREDB1 storage, silent SQLite auto-porter, sub-2ms hooks, content-bound HMAC-SHA256 workspace trust seals, ChaCha20-Poly1305 OS credential vault, zero-hardcode topology & Dalvik/DI causal code graph, built-in benchmarks & token-savings reports, and multi-remote Git/Gitea/GitHub automation.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
@@ -396,11 +396,11 @@ EOF
 
 # 7. Write user-facing README.md inside plugin bundle
 cat > "$PLUGIN_DIR/README.md" <<'EOF'
-# LibreDB cognitive memory plugin (v1.2.0)
+# LibreDB cognitive memory plugin (v1.3.0)
 
 Enterprise-ready standalone Rust cognitive memory, token-economy analytics & code-graph engine for `Antigravity`:
-- `libredb-mcp`: 3-tool multi-workspace cognitive memory & 25+ language zero-hardcode topology + exact Dalvik/DI code-graph server with `< 0.5 ms` `locate`, batched `impact` (`symbols`) & `fim` (`slices`), tentative-verified `PreToolUse` ACID symbol shifting, subagent-aware priority-budgeted `BM25` `PreInvocation` hydration, zero-I/O RAM session delta, and `[Zero-Repeat Skeleton]` deduplication.
-- Built-in analytics, benchmarks & verification suite: `libredb savings` (`report`) combines cross-process-atomic `~/.gemini/libredb/telemetry.ldb` counters with bounded streaming `Antigravity` transcript parsing (`<= 8 MiB/line`, 3-tier observed vs counterfactual vs provider usage), and `libredb bench` (`--suite kernel|full|audit`, `--workspace`) runs `C1..C6` token-economy benchmarks and `A1..A10` security/feature audits natively without external scripts.
+- `libredb-mcp`: 3-tool multi-workspace cognitive memory & 25+ language zero-hardcode topology + exact Dalvik/DI + Git co-change `Lift` code-graph server with `< 0.5 ms` `locate`, closed-loop `Search-Miss -> Verified-Edit` bridging, batched `impact` (`symbols`) & `fim` (`slices`), tentative-verified `PreToolUse` ACID symbol shifting, grounded falsifiable reflexes, subagent-aware priority-budgeted `BM25` `PreInvocation` hydration, zero-I/O RAM session delta, and `[Zero-Repeat Skeleton]` deduplication.
+- Built-in analytics, benchmarks & verification suite: `libredb savings` (`report`) combines cross-process-atomic `~/.gemini/libredb/telemetry.ldb` counters with bounded streaming `Antigravity` transcript parsing (`<= 8 MiB/line`, 3-tier observed vs counterfactual vs provider usage), and `libredb bench` (`--suite kernel|full|audit`, `--workspace`) runs `C1..C6` token-economy benchmarks and `A1..A11` security/feature audits natively without external scripts.
 - Standards-compliant security: monotonic content-and-metadata-bound RFC 2104 `HMAC-SHA256` (`v4:r<rev>`) workspace trust seals (`libredb trust`), RFC 8439 `ChaCha20-Poly1305` AEAD OS credential vault (`0600` `.vault.key` with safe `vault:v1` -> `vault:v2` migration and symlink guards), symlink-canonicalized control-plane & credential path protection, and universal `libredb config` customization.
 - Strictly neutral by default: `deploy_plugin.sh` installs `libredb-mcp` and security guardrails with `0` personal rules, `0` implicit legacy DB imports, and preserved corporate `git config` identity.
 EOF
@@ -437,6 +437,6 @@ PYEOF
     fi
 fi
 
-echo "[OK] Deployed LibreDB v1.2.0 standalone binary to: $BIN_DIR (profile=$PROFILE)"
+echo "[OK] Deployed LibreDB v1.3.0 standalone binary to: $BIN_DIR (profile=$PROFILE)"
 echo "[OK] Hydrated and modernized global store at: $GLOBAL_LDB"
 echo "[OK] Installed complete Antigravity plugin at: $PLUGIN_DIR"

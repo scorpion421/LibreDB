@@ -1161,6 +1161,14 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     ws_dir_opt.as_deref(),
                 )?
             };
+            if db
+                .get_by_key(NodeKind::Generic, "sys::workspace_graph_state")
+                .is_err()
+            {
+                if let Some(ref ws_root) = ws_dir_opt {
+                    let _ = libredb_cognitive::index_workspace(&db, ws_root, false);
+                }
+            }
             let matches = locate_symbols(&db, &queries)?;
             let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
             if cli.has_switch("--json") {
@@ -1198,6 +1206,14 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     ws_dir_opt.as_deref(),
                 )?
             };
+            if db
+                .get_by_key(NodeKind::Generic, "sys::workspace_graph_state")
+                .is_err()
+            {
+                if let Some(ref ws_root) = ws_dir_opt {
+                    let _ = libredb_cognitive::index_workspace(&db, ws_root, false);
+                }
+            }
             if queries.len() == 1 {
                 let reports = query_symbol_impact(&db, &queries[0])?;
                 if cli.has_switch("--json") {
@@ -1222,6 +1238,12 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         }
                         for d in &r.callees {
                             println!("    [Calls/Depends]  -> {d}");
+                        }
+                        if !r.co_changed_files.is_empty() {
+                            println!(
+                                "    [Co-changed files (git Lift)]: {}",
+                                r.co_changed_files.join(" | ")
+                            );
                         }
                     }
                 }
@@ -1397,12 +1419,12 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "learn-reflex" => {
             let cli = CliSpec::new(
                 "learn-reflex",
-                "libredb learn-reflex <db.ldb> <id> <directive> [--stack s] [--action a] [--env e] [--global <customizations.ldb>]",
+                "libredb learn-reflex <db.ldb> <id> <directive> [--stack s] [--action a] [--env e] [--anchor a] [--global <customizations.ldb>]",
             )
             .positionals(3, Some(3))
             .raw_value_slots(&[2])
             .allow_global()
-            .values(&["--stack", "--action", "--env"])
+            .values(&["--stack", "--action", "--env", "--anchor"])
             .parse(sub_args)?;
             let split_csv = |opt: Option<&str>| -> Vec<String> {
                 opt.unwrap_or("")
@@ -1417,6 +1439,8 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 action_any: split_csv(cli.value("--action")),
                 env_or_error_any: split_csv(cli.value("--env")),
                 directive: cli.positionals[2].clone(),
+                code_anchors: split_csv(cli.value("--anchor")),
+                anchor_contract_hash: None,
             };
             let db_path = Path::new(&cli.positionals[0]);
             let gdb_opt = hooks::open_global_ldb_checked(cli.global_deref())?;
@@ -2271,6 +2295,7 @@ fn modernize_global_db(
             action_any: vec!["hook".to_owned(), "plugin".to_owned(), "deploy".to_owned()],
             env_or_error_any: Vec::new(),
             directive: "On Windows, hooks.json commands run via cmd.exe /C: keep space-free %USERPROFILE%\\.gemini\\libredb\\bin\\libredb.exe unquoted, and wrap executable paths containing spaces in one pair of escaped double quotes (\\\"C:\\\\Path With Spaces\\\\libredb.exe\\\" <subcmd>).".to_owned(),
+            ..Default::default()
         },
         ReflexRule {
             id: "gitea-collision-and-github-guard".to_owned(),
@@ -2278,6 +2303,7 @@ fn modernize_global_db(
             action_any: vec!["gitea-init".to_owned(), "gitea-sync".to_owned(), "gitea-release".to_owned(), "git-sync".to_owned(), "git-release".to_owned(), "push".to_owned()],
             env_or_error_any: vec!["GITEA REPOSITORY COLLISION".to_owned(), "UNVERSIONED WORKSPACE".to_owned(), "SEMVER IMMUTABILITY VIOLATION".to_owned()],
             directive: "Never hijack existing non-Gitea origin remotes or leak Gitea Basic Auth headers to external servers. Pause and ask user on [GITEA REPOSITORY COLLISION] or before --allow-unversioned.".to_owned(),
+            ..Default::default()
         },
         ReflexRule {
             id: "git-non-acl-safe-dir".to_owned(),
@@ -2285,6 +2311,7 @@ fn modernize_global_db(
             action_any: vec!["git".to_owned(), "gitea-init".to_owned()],
             env_or_error_any: vec!["dubious ownership".to_owned()],
             directive: "On non-ACL drives, run 'git config --global --add safe.directory <repo>' right after git init.".to_owned(),
+            ..Default::default()
         },
     ];
 
@@ -2296,6 +2323,7 @@ fn modernize_global_db(
             action_any: vec!["commit".to_owned(), "gitea".to_owned(), "release".to_owned(), "sync".to_owned()],
             env_or_error_any: Vec::new(),
             directive: "Ensure /target/ and /dist/ are in .gitignore and run 'libredb guardrail check --path <dir> --staged --strict' before committing.".to_owned(),
+            ..Default::default()
         },
         ReflexRule {
             id: "candid-architectural-pushback".to_owned(),
@@ -2303,6 +2331,7 @@ fn modernize_global_db(
             action_any: vec!["plan".to_owned(), "design".to_owned(), "build".to_owned(), "implement".to_owned(), "architecture".to_owned()],
             env_or_error_any: Vec::new(),
             directive: "Always give candid, unvarnished engineering feedback: if a proposed idea shoots past the target or introduces unnecessary complexity, say so directly and propose the cleaner alternative.".to_owned(),
+            ..Default::default()
         },
         ReflexRule {
             id: "semver-changelog-discipline".to_owned(),
@@ -2310,6 +2339,7 @@ fn modernize_global_db(
             action_any: vec!["release".to_owned(), "tag".to_owned(), "version".to_owned(), "gitea-release".to_owned()],
             env_or_error_any: Vec::new(),
             directive: "Never overwrite an existing release tag in place; increment SemVer X.Y.Z, document under Keep a Changelog 1.1.0 in CHANGELOG.md, and attach deliverables from dist/ or releases/.".to_owned(),
+            ..Default::default()
         },
         ReflexRule {
             id: "anti-salami-code-slicing".to_owned(),
@@ -2317,6 +2347,7 @@ fn modernize_global_db(
             action_any: vec!["read".to_owned(), "inspect".to_owned(), "skeleton".to_owned(), "fim".to_owned(), "impact".to_owned(), "refactor".to_owned()],
             env_or_error_any: Vec::new(),
             directive: "Read files <=800 lines in one read_file call; for files >800 lines use libredb_code (action=skeleton, fim, or impact) before editing.".to_owned(),
+            ..Default::default()
         },
         ReflexRule {
             id: "windows-soc-admin-audit".to_owned(),
@@ -2324,6 +2355,7 @@ fn modernize_global_db(
             action_any: vec!["elevate".to_owned(), "admin".to_owned(), "service".to_owned(), "schtasks".to_owned(), "firewall".to_owned()],
             env_or_error_any: vec!["Access is denied".to_owned(), "RunAs".to_owned()],
             directive: "Follow SOC transparent IT admin standard: log all 4 phases ([1/4 PRE-CHECK]..[4/4 POST-CHECK]) under C:\\IT_ADMIN_LOGS\\<USER>\\<TASK>\\<TARGET>\\<Date>\\<hh_mm_ss>\\ and never use C:\\Windows\\Temp or cmd.exe /c wrappers.".to_owned(),
+            ..Default::default()
         },
         ReflexRule {
             id: "formatting-and-language-boundary".to_owned(),
@@ -2331,6 +2363,7 @@ fn modernize_global_db(
             action_any: vec!["write".to_owned(), "edit".to_owned(), "commit".to_owned(), "readme".to_owned()],
             env_or_error_any: Vec::new(),
             directive: "Enforce strict output invariants: zero em-dashes/en-dashes, zero emojis, sentence case headings, informal German ('Du') in chat without Deppenbindestriche, and 100% ASCII English in code/comments/commits.".to_owned(),
+            ..Default::default()
         },
         ReflexRule {
             id: "rust-gitea-dist".to_owned(),
@@ -2338,6 +2371,7 @@ fn modernize_global_db(
             action_any: vec!["gitea-release".to_owned(), "gitea-sync".to_owned()],
             env_or_error_any: Vec::new(),
             directive: "Copy compiled release deliverables into dist/ before running 'libredb gitea-release' so assets attach automatically.".to_owned(),
+            ..Default::default()
         },
     ];
 

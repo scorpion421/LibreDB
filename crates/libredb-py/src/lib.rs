@@ -305,6 +305,7 @@ impl PyBrain {
             action_any: action.unwrap_or_default(),
             env_or_error_any: env.unwrap_or_default(),
             directive: directive.to_owned(),
+            ..Default::default()
         };
         ReflexEngine::learn_reflex(&self.project_db, &rule).map_err(to_py_err)
     }

@@ -437,7 +437,8 @@ pub fn handle_rpc_method(
                                     "directive": { "type": "string" },
                                     "stack": { "type": "array", "items": { "type": "string" } },
                                     "action": { "type": "array", "items": { "type": "string" } },
-                                    "env": { "type": "array", "items": { "type": "string" } }
+                                    "env": { "type": "array", "items": { "type": "string" } },
+                                    "anchors": { "type": "array", "items": { "type": "string" } }
                                 }
                             },
                             "sync_central_sqlite": { "type": "boolean" }
