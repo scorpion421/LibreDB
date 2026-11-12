@@ -2027,7 +2027,8 @@ impl LibreDb {
     }
 
     /// Automatically runs a non-pruning Gravity Compaction if the uncompacted delta tail
-    /// exceeds `1 MiB` (or `512 KiB` with `>= 32` superseded/tombstoned Inodes).
+    /// exceeds `1 MiB` (or `512 KiB` with `>= 32` superseded/tombstoned Inodes, or `>= 64`
+    /// uncompacted superseded/tombstoned Inodes representing `>= 50%` of total Inode slots).
     pub fn maybe_auto_compact(&self) -> Result<bool> {
         let should_compact = {
             let snap = self.state.read();
@@ -2035,17 +2036,19 @@ impl LibreDb {
                 .superblock
                 .data_tail_offset
                 .saturating_sub(snap.superblock.delta_start_offset);
+            let uncompacted_stale = snap
+                .inodes
+                .values()
+                .filter(|ino| {
+                    !ino.flags.is_live_active() && !ino.flags.contains(NodeFlags::COLD_ARCHIVE)
+                })
+                .count();
             if delta_bytes >= 1_048_576 {
                 true
-            } else if delta_bytes >= 524_288 {
-                let stale = snap
-                    .inodes
-                    .values()
-                    .filter(|ino| !ino.flags.is_live_active())
-                    .count();
-                stale >= 32
+            } else if delta_bytes >= 524_288 && uncompacted_stale >= 32 {
+                true
             } else {
-                false
+                uncompacted_stale >= 64 && uncompacted_stale.saturating_mul(2) >= snap.inodes.len()
             }
         };
         if should_compact {

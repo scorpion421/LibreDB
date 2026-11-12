@@ -1143,6 +1143,9 @@ fn parse_single_transcript(
         }
 
         if !content.is_empty() {
+            let mut seen_fim_in_step = false;
+            let mut seen_fim_files_in_step: HashSet<String> = HashSet::new();
+            let mut seen_impact_in_step = false;
             for line in content.lines() {
                 if let Some(rest) = line.strip_prefix("=== SKELETON: ") {
                     if let Some((raw_t, skel_t)) = parse_skeleton_header_tokens(rest) {
@@ -1166,6 +1169,7 @@ fn parse_single_transcript(
                     bucket.skeleton_baseline_tokens += est_raw;
                     bucket.skeleton_emitted_tokens += 55;
                 } else if let Some(rest) = line.strip_prefix("=== FIM SLICE: ") {
+                    let file_lbl = rest.split(" :: ").next().unwrap_or(rest).trim().to_owned();
                     let total_lines = rest
                         .split(" of L")
                         .nth(1)
@@ -1176,17 +1180,28 @@ fn parse_single_transcript(
                     let raw_est = (total_lines.saturating_mul(9)).max(em_tok);
                     matched_any_step = true;
                     let bucket = local_by_day.entry(ymd.to_owned()).or_default();
-                    bucket.fim_calls += 1;
-                    bucket.fim_baseline_tokens += raw_est;
-                    bucket.fim_emitted_tokens += em_tok;
-                } else if let Some(rest) = line.strip_prefix("=== IMPACT: ") {
+                    if !seen_fim_in_step {
+                        seen_fim_in_step = true;
+                        bucket.fim_calls += 1;
+                        bucket.fim_emitted_tokens += em_tok;
+                    }
+                    if seen_fim_files_in_step.insert(file_lbl) {
+                        bucket.fim_baseline_tokens += raw_est;
+                    }
+                } else if let Some(rest) = line
+                    .strip_prefix("=== IMPACT: ")
+                    .or_else(|| line.strip_prefix("=== LOCATE: "))
+                {
                     let _ = rest;
                     let em_tok = (count_tokens_exact(content.as_bytes()) as u64).max(30);
                     matched_any_step = true;
                     let bucket = local_by_day.entry(ymd.to_owned()).or_default();
-                    bucket.impact_calls += 1;
-                    bucket.impact_baseline_tokens += (em_tok.saturating_mul(5)).max(2_400);
-                    bucket.impact_emitted_tokens += em_tok;
+                    if !seen_impact_in_step {
+                        seen_impact_in_step = true;
+                        bucket.impact_calls += 1;
+                        bucket.impact_baseline_tokens += (em_tok.saturating_mul(5)).max(2_400);
+                        bucket.impact_emitted_tokens += em_tok;
+                    }
                 } else if let Some(rest) = line.strip_prefix("=== LIBREDB PULSE (") {
                     if let Some((em_t, total_t)) = parse_pulse_header_tokens(rest) {
                         matched_any_step = true;
@@ -1199,8 +1214,11 @@ fn parse_single_transcript(
             }
         }
 
-        // CLI `get-skill --section` progressive disclosure calls in `tool_calls`
-        if trimmed.contains("get-skill") && trimmed.contains("--section") {
+        // CLI `get-skill --section` / `get-skill --query` / `slice-skill` progressive disclosure calls in `tool_calls`
+        if (trimmed.contains("get-skill")
+            && (trimmed.contains("--section") || trimmed.contains("--query")))
+            || trimmed.contains("slice-skill")
+        {
             matched_any_step = true;
             let bucket = local_by_day.entry(ymd.to_owned()).or_default();
             bucket.skill_slice_calls += 1;

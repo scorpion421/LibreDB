@@ -97,7 +97,7 @@ $PluginJson = @'
 {
   "name": "libredb",
   "displayName": "LibreDB Cognitive Memory",
-  "version": "1.1.3",
+  "version": "1.2.0",
   "description": "Enterprise-ready Rust cognitive memory, token-economy analytics & MCP code graph: single-file LIBREDB1 storage, silent SQLite auto-porter, sub-2ms hooks, content-bound HMAC-SHA256 workspace trust seals, DPAPI / ChaCha20-Poly1305 credential vault, zero-hardcode topology & Dalvik/DI causal code graph, built-in benchmarks & token-savings reports, and multi-remote Git/Gitea/GitHub automation.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
@@ -273,12 +273,12 @@ All system rules, coding standards, administrative credentials, and skills live 
    - Elevate directly, via DPAPI (`~/.gemini/config/credentials/*.credential.xml`), or `Start-Process -Verb RunAs`. Never stage in `C:\Windows\Temp`, use `cmd.exe /c` wrappers, create remote services (`sc.exe \\`), or hardcode identities. After approval, log `[1/4 PRE-CHECK]`, `[2/4..3/4 ACTION]`, `[4/4 POST-CHECK]`, `[CLEANUP]` to `AuditLog_<Target>_<Date>_<hh_mm_ss>.log`.
 
 5. **Turn-economy, diagnostics, and built-in benchmarks**:
-   - **Anti-salami-slicing**: Read files `<= 800 lines` in one `read_file` call; for `> 800 lines` use `libredb_code` (`skeleton`, `fim`, `impact`) and batch parallel reads.
+   - **Anti-salami-slicing**: Read files `<= 800 lines` in one `read_file` call; for `> 800 lines` use `libredb_code` (`skeleton`, `locate`, `fim`, `impact` with batched `files`/`symbols`/`slices`) and batch parallel reads.
    - **Subagent firewall**: Run 1-3 file edits and WMI/CIM commands in main context; delegate `>= 4` searches or `> 5` files to `research` (`Model="flash"`).
    - **Batching & verification**: Fix entire bug classes before rebuilding, chain `build && test && verify`, commit memory via `libredb_memorize`, check `libredb guardrail check --path "<dir>" --staged --strict`, inspect savings/benchmarks natively via `libredb savings` and `libredb bench` (zero ad-hoc scripts), and use `WaitMsBeforeAsync=10000` without polling. Note any internal tool workarounds briefly at the end.
 
 6. **Autonomous project memory & Git/Gitea sync (pure Pull)**:
-   - Persist/recall via `libredb_memorize`, `libredb_pulse` (`query`, `cwd`, `cid`, `budget`), and `libredb get-skill <name> [--section "<Section>"]` on `.agents/memory.ldb` (auto-migrating legacy `.agents/memory.db` 1:1).
+   - Persist/recall via `libredb_memorize`, `libredb_pulse` (`query`, `cwd`, `cid`, `budget`), and `libredb get-skill <name> [--section "<Section>"]` / `libredb slice-skill "<query>"` on `.agents/memory.ldb` (auto-migrating legacy `.agents/memory.db` 1:1).
    - Use `libredb git-init`, `git-sync`, `git-release`, and `gitea-status`. Never hijack non-Gitea `origin` remotes or leak Gitea auth headers; ask before `--allow-unversioned` ("Soll ich das wirklich ohne Versionierung hochladen?") and pause on `[GITEA REPOSITORY COLLISION]`. Link URLs as `[Label](url)`.
 
 7. **Model & concurrency catalog**:
@@ -322,17 +322,24 @@ description: >-
 1. **`libredb_pulse`** (`query`, `cwd`, `cid`, `budget`, `error`):
    - Retrieves relevant rules, micro-skills, decisions, facts, tasks, snapshots, and symbols across global + workspace layers within `budget` tokens.
    - Always pass `cid` (Conversation ID) and `cwd` so RAM-first `Zero-Repeat Delta` suppresses already-delivered items (`0` disk I/O reads on Turn 2+) and automatically re-hydrates after `/compact`.
-2. **`libredb_code`** (`action`: `"index"` | `"skeleton"` | `"impact"` | `"fim"` | `"savings"`, `target`, `files`, `cwd`, `cid`, `force`, `symbol`, `line`, `pad`, `format`, `days`):
+2. **`libredb_code`** (`action`: `"index"` | `"skeleton"` | `"locate"` | `"impact"` | `"fim"` | `"savings"`, `target`, `files`, `symbols`, `slices`, `cwd`, `cid`, `force`, `symbol`, `line`, `pad`, `format`, `days`):
    - `"index"`: Incrementally scans non-binary source files in `target` (`< 3 ms` warm stat+hash fast path), wiring `Calls` (including Dalvik/Smali descriptors & `1..2`-char R8 methods) and `Decision -> Governs -> Symbol` synapses.
    - `"skeleton"`: Returns a `92-99%` compressed `[Lstart-Lend]` contract map of a single `target` file or multi-file batch (`files: [...]`) across 25+ languages and `< 5 us` topology-inferred extensionless files with session-aware `[Zero-Repeat Skeleton]` deduplication (`cid`).
-   - `"impact"`: Returns compact (`-70%` token) bidirectional callers, DI/interface implementors, callees, and governing architectural decisions (`format="json"` for raw JSON).
-   - `"fim"`: Returns a surgical `[Lstart-Lend]` edit slice with blast-radius callers, implementors, and governing decisions attached.
+   - `"locate"`: Returns `< 0.5 ms` 1-line `[Lstart-Lend]` symbol locations for a single `target` or batched `symbols: [...]` (`<= 64`) without full caller/callee edge traversal.
+   - `"impact"`: Returns compact (`-70%` token) bidirectional callers, DI/interface implementors, callees, and governing architectural decisions for a single `target` or batched `symbols: [...]` (`<= 64`, `format="json"` for raw JSON).
+   - `"fim"`: Returns surgical `[Lstart-Lend]` edit slices with blast-radius callers, implementors, and governing decisions attached for a single `target` or batched `slices: [{"target": "...", "symbol": "...", "line": 42, "pad": 12}]` / `symbols: [...]` (`<= 32` slices, deduplicating file baseline tokens).
    - `"savings"`: Returns an authorized workspace 3-tier token-consumption and savings report (`days=0` for today, `days <= 3660`).
 3. **`libredb_memorize`** (`cwd`, `cid`, `facts`, `decisions`, `tasks`, `snapshot`, `learn_assoc`, `learn_reflex`, `sync_central_sqlite`):
    - Atomically commits workspace/chat facts, architectural decisions (auto-linked to symbols), tasks, milestone snapshots, language-agnostic Hebbian concept bridges, or situational pitfall reflexes.
 
 ## CLI commands (`libredb`)
 
+- **Zero-boilerplate cognitive & code-graph queries:**
+  - `libredb pulse [<db.ldb>] "<query>" [--cwd "<dir>"] [--cid <id>] [--budget <tok>]`
+  - `libredb locate [<db.ldb>] <symbol...> [--cwd "<dir>"] [--json]`
+  - `libredb impact [<db.ldb>] <symbol...> [--cwd "<dir>"] [--json]`
+  - `libredb slice-skill "<query>" [--skill <skill_name>] [--top <k>] [--json]`
+  - `libredb get-skill [<skill_name>] [--section "<Section Title>" | --query "<query>" [--top <k>]] [--json]`
 - **Token savings & reproducible benchmarks:**
   - `libredb savings | report [--today] [--days <n>] [--cid <id>] [--project "<dir>"] [--json]`
   - `libredb bench [--suite kernel|full|audit] [--workspace "<dir>"] [--filter <p1,p2>] [--ext <e1,e2>] [--max-files <n>] [--nodes <n>] [--threads <t>] [--json]`
@@ -342,7 +349,6 @@ description: >-
   - `libredb config <get|set|unset|list> [<key>] [<value>] [--project "<dir>"]`
 - **Compaction & GC:** `libredb compact <db.ldb> [--prune]`
 - **Rules, skills & reflexes:**
-  - `libredb get-skill <skill_name> [--section "<Section Title>"]`
   - `libredb sync-skill <SKILL.md> [--name <skill_name>]`
   - `libredb list-rules`, `libredb list-skills`, `libredb list-reflexes`
   - `libredb modernize-global`
@@ -405,11 +411,11 @@ $LogoSvg = @'
 
 # 7. Write user-facing README.md inside plugin bundle
 $PluginReadme = @'
-# LibreDB cognitive memory plugin (v1.1.3)
+# LibreDB cognitive memory plugin (v1.2.0)
 
 Enterprise-ready standalone Rust cognitive memory, token-economy analytics & code-graph engine for `Antigravity`:
-- `libredb-mcp`: 3-tool multi-workspace cognitive memory & 25+ language zero-hardcode topology + exact Dalvik/DI code-graph server with compact blast-radius `impact`, tentative-verified `PreToolUse` ACID symbol shifting, priority-budgeted `BM25` `PreInvocation` hydration, zero-I/O RAM session delta, and `[Zero-Repeat Skeleton]` deduplication.
-- Built-in analytics, benchmarks & verification suite: `libredb savings` (`report`) combines cross-process-atomic `~/.gemini/libredb/telemetry.ldb` counters with bounded streaming `Antigravity` transcript parsing (`<= 8 MiB/line`, 3-tier observed vs counterfactual vs provider usage), and `libredb bench` (`--suite kernel|full|audit`, `--workspace`) runs `C1..C6` token-economy benchmarks and `A1..A9` security/feature audits natively without external scripts.
+- `libredb-mcp`: 3-tool multi-workspace cognitive memory & 25+ language zero-hardcode topology + exact Dalvik/DI code-graph server with `< 0.5 ms` `locate`, batched `impact` (`symbols`) & `fim` (`slices`), tentative-verified `PreToolUse` ACID symbol shifting, subagent-aware priority-budgeted `BM25` `PreInvocation` hydration, zero-I/O RAM session delta, and `[Zero-Repeat Skeleton]` deduplication.
+- Built-in analytics, benchmarks & verification suite: `libredb savings` (`report`) combines cross-process-atomic `~/.gemini/libredb/telemetry.ldb` counters with bounded streaming `Antigravity` transcript parsing (`<= 8 MiB/line`, 3-tier observed vs counterfactual vs provider usage), and `libredb bench` (`--suite kernel|full|audit`, `--workspace`) runs `C1..C6` token-economy benchmarks and `A1..A10` security/feature audits natively without external scripts.
 - Standards-compliant security: monotonic content-and-metadata-bound RFC 2104 `HMAC-SHA256` (`v4:r<rev>`) workspace trust seals (`libredb trust`), Windows `DPAPI` (`CryptProtectData`) and POSIX RFC 8439 `ChaCha20-Poly1305` AEAD OS credential vault, symlink-canonicalized control-plane & credential path protection, and universal `libredb config` customization.
 - Strictly neutral by default: `deploy_plugin.ps1` (`-Profile Neutral`, default) installs `libredb-mcp` and security guardrails with `0` personal rules, `0` implicit legacy DB imports, and preserved corporate `git config` identity.
 '@
@@ -434,6 +440,6 @@ if (Test-Path $AgyConfigPath) {
     }
 }
 
-Write-Output "[OK] Deployed LibreDB v1.1.3 standalone binaries to: $BinDir (Profile=$Profile)"
+Write-Output "[OK] Deployed LibreDB v1.2.0 standalone binaries to: $BinDir (Profile=$Profile)"
 Write-Output "[OK] Hydrated and modernized global store at: $GlobalLdb"
 Write-Output "[OK] Installed complete Antigravity plugin at: $PluginDir"

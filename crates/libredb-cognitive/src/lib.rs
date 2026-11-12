@@ -30,10 +30,13 @@ pub use transcript::{
     sync_transcript_epoch, AtomicBatchReport, AtomicBatchSpec, TaskCapsule, TranscriptEpochState,
 };
 pub use workspace::{
-    extract_fim_slice, format_impact_compact, has_project_root_marker, index_workspace,
-    index_workspace_with_exclusions, query_symbol_impact, reconcile_tentative_edits,
-    stage_tentative_file_edit, sync_single_file_symbols, FimSliceBundle, SymbolImpactReport,
-    TentativeFileEdit, WorkspaceIndexReport, TENTATIVE_EDIT_PREFIX,
+    extract_fim_slice, format_fim_batch_compact, format_impact_batch_compact,
+    format_impact_compact, format_locate_compact, has_project_root_marker, index_workspace,
+    index_workspace_with_exclusions, locate_symbols, query_symbol_impact,
+    query_symbols_impact_batch, reconcile_tentative_edits, stage_tentative_file_edit,
+    sync_single_file_symbols, FimSliceBundle, FimSliceRequest, SymbolImpactReport,
+    SymbolLocationMatch, TentativeFileEdit, WorkspaceIndexReport, MAX_BATCH_FIM_SLICES,
+    MAX_BATCH_SYMBOL_QUERIES, MAX_LOCATE_MATCHES_PER_QUERY, TENTATIVE_EDIT_PREFIX,
 };
 
 use libredb_core::{EdgeKind, LibreDb, NodeFlags, NodeKind, Result};
@@ -143,6 +146,19 @@ pub struct ScoredInodeCandidate {
     pub generation: u32,
     pub token_count: u32,
     pub score: f64,
+}
+
+/// Ranked `NodeKind::SkillSection` capsule returned by `CognitiveEngine::slice_skill_sections`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillSectionSliceMatch {
+    pub node_id: u64,
+    pub key: String,
+    pub skill_name: String,
+    pub section_title: String,
+    pub score: f64,
+    pub token_count: u32,
+    pub full_skill_tokens: u32,
+    pub content: String,
 }
 
 /// High-level cognitive facade over `LibreDb`, `HybridIndex`, and `ReflexEngine`.
@@ -437,5 +453,91 @@ impl CognitiveEngine {
             tokens_saved_by_delta: saved_by_delta,
             coalesced_io_reads: io_reads,
         })
+    }
+
+    /// Ranks active `NodeKind::SkillSection` capsules via `HybridIndex` (`BM25` + Unicode 3-grams)
+    /// and optional `skill_filter`, returning the top `top_k` micro-sections with parent skill token baselines.
+    pub fn slice_skill_sections(
+        &self,
+        query: &str,
+        skill_filter: Option<&str>,
+        top_k: usize,
+    ) -> Result<Vec<SkillSectionSliceMatch>> {
+        let cap = top_k.clamp(1, 16);
+        let prefix_low = skill_filter.map(|s| format!("{}::", s.trim().to_ascii_lowercase()));
+        let mut hits = self
+            .index
+            .search(query, Some(&[NodeKind::SkillSection]), (cap * 6).max(24));
+
+        if let Some(ref pfx) = prefix_low {
+            hits.retain(|h| {
+                h.key
+                    .as_deref()
+                    .is_some_and(|k| k.to_ascii_lowercase().starts_with(pfx))
+            });
+        }
+
+        if hits.is_empty() {
+            let q_low = query.trim().to_ascii_lowercase();
+            if !q_low.is_empty() {
+                for (ino, k_opt, _) in self.db.list_inodes(Some(NodeKind::SkillSection), false) {
+                    if let Some(k) = k_opt {
+                        let kl = k.to_ascii_lowercase();
+                        if let Some(ref pfx) = prefix_low {
+                            if !kl.starts_with(pfx) {
+                                continue;
+                            }
+                        }
+                        if kl.contains(&q_low) {
+                            hits.push(libredb_index::SearchHit {
+                                node_id: ino.node_id,
+                                kind: NodeKind::SkillSection,
+                                key: Some(k),
+                                score: 1.0,
+                                matched_features: Vec::new(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        hits.truncate(cap);
+        if hits.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let ids: Vec<u64> = hits.iter().map(|h| h.node_id).collect();
+        let (recs, _) = self.db.get_many_coalesced(&ids)?;
+        let mut full_tok_cache: HashMap<String, u32> = HashMap::new();
+        let mut out = Vec::with_capacity(recs.len());
+
+        for (hit, rec) in hits.into_iter().zip(recs.into_iter()) {
+            let key = hit.key.unwrap_or_else(|| format!("node_{}", rec.node_id));
+            let (skill_name, section_title) = key
+                .split_once("::")
+                .map(|(s, t)| (s.to_owned(), t.to_owned()))
+                .unwrap_or_else(|| (key.clone(), String::new()));
+            let full_skill_tokens = *full_tok_cache
+                .entry(skill_name.clone())
+                .or_insert_with(|| {
+                    self.db
+                        .get_by_key(NodeKind::Generic, &format!("skill_full::{skill_name}"))
+                        .map(|r| r.token_count.max(((r.payload.len() + 3) / 4) as u32))
+                        .unwrap_or(rec.token_count)
+                });
+            out.push(SkillSectionSliceMatch {
+                node_id: rec.node_id,
+                key,
+                skill_name,
+                section_title,
+                score: hit.score,
+                token_count: rec.token_count.max(1),
+                full_skill_tokens,
+                content: String::from_utf8_lossy(&rec.payload).into_owned(),
+            });
+        }
+
+        Ok(out)
     }
 }

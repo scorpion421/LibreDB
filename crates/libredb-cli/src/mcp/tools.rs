@@ -14,9 +14,12 @@ use libredb_cognitive::skeleton::{
     read_bounded_source_file, SKELETON_HASH_SEED, SKELETON_KEY_PREFIX,
 };
 use libredb_cognitive::{
-    create_subagent_handoff, execute_atomic_batch, extract_fim_slice, format_impact_compact,
-    query_symbol_impact, reconcile_tentative_edits, sync_transcript_epoch, AtomicBatchSpec,
-    CognitiveEngine, FileSkeleton, PulseRequest, ReflexEngine, ReflexRule, SessionState,
+    create_subagent_handoff, execute_atomic_batch, extract_fim_slice, format_fim_batch_compact,
+    format_impact_batch_compact, format_impact_compact, format_locate_compact, locate_symbols,
+    query_symbol_impact, query_symbols_impact_batch, reconcile_tentative_edits,
+    sync_transcript_epoch, AtomicBatchSpec, CognitiveEngine, FileSkeleton, FimSliceRequest,
+    PulseRequest, ReflexEngine, ReflexRule, SessionState, MAX_BATCH_FIM_SLICES,
+    MAX_BATCH_SYMBOL_QUERIES,
 };
 use libredb_core::crc::hash_key;
 use libredb_core::{LibreDb, LibreDbError, NodeKind, PreparedWrite, WriteRequest};
@@ -374,16 +377,68 @@ pub(super) fn dispatch_tool(
                         .collect()
                 })
                 .unwrap_or_default();
-            let first_file_hint = target_opt.or_else(|| files_arr.first().map(String::as_str));
+            let symbols_arr: Vec<String> = args
+                .get("symbols")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(ToOwned::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let pad = args.get("pad").and_then(Value::as_u64).unwrap_or(12) as usize;
+            let slices_arr: Vec<FimSliceRequest> = match args.get("slices") {
+                None | Some(Value::Null) => Vec::new(),
+                Some(Value::Array(arr)) => {
+                    let mut parsed = Vec::with_capacity(arr.len());
+                    for item in arr {
+                        let t = item
+                            .get("target")
+                            .or_else(|| item.get("file"))
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .ok_or("Each item in 'slices' must specify a non-empty 'target' file path")?;
+                        let s = item
+                            .get("symbol")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|v| !v.is_empty())
+                            .map(ToOwned::to_owned);
+                        let l = item.get("line").and_then(Value::as_u64).map(|n| n as usize);
+                        let p = item
+                            .get("pad")
+                            .and_then(Value::as_u64)
+                            .map_or(pad, |n| n as usize);
+                        parsed.push(FimSliceRequest {
+                            target: t.to_owned(),
+                            symbol: s,
+                            line: l,
+                            pad: p,
+                        });
+                    }
+                    parsed
+                }
+                Some(_) => return Err("Invalid 'slices' parameter: expected array of slice objects".into()),
+            };
+            let first_file_hint = target_opt
+                .or_else(|| files_arr.first().map(String::as_str))
+                .or_else(|| slices_arr.first().map(|s| s.target.as_str()));
             let sym = args.get("symbol").and_then(Value::as_str);
             let line = args.get("line").and_then(Value::as_u64).map(|n| n as usize);
-            let pad = args.get("pad").and_then(Value::as_u64).unwrap_or(12) as usize;
             let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
+            let want_json = args
+                .get("format")
+                .and_then(Value::as_str)
+                .is_some_and(|f| f.eq_ignore_ascii_case("json"));
 
             let (ws_root, containment_root) = state.resolve_authorized_code_workspace(
                 raw_cwd_arg,
                 first_file_hint,
-                action == "impact",
+                matches!(action, "impact" | "locate"),
             )?;
             let ws_root_str = ws_root.to_string_lossy().into_owned();
             let proj_db = {
@@ -421,6 +476,42 @@ pub(super) fn dispatch_tool(
                 }
                 Ok(())
             };
+            let collect_symbol_queries = || -> Result<Vec<String>, String> {
+                let mut queries: Vec<String> = Vec::new();
+                let mut push_unique = |raw: &str| {
+                    let t = raw.trim();
+                    if !t.is_empty() && !queries.iter().any(|q| q == t) {
+                        queries.push(t.to_owned());
+                    }
+                };
+                if let Some(t) = target_opt {
+                    if symbols_arr.is_empty() && t.contains(',') && !t.contains('(') {
+                        for part in t.split(',') {
+                            push_unique(part);
+                        }
+                    } else {
+                        push_unique(t);
+                    }
+                }
+                if let Some(s) = sym {
+                    push_unique(s);
+                }
+                for s in &symbols_arr {
+                    push_unique(s);
+                }
+                if queries.is_empty() {
+                    return Err(format!(
+                        "Missing 'target' or 'symbols' for action='{action}'"
+                    ));
+                }
+                if queries.len() > MAX_BATCH_SYMBOL_QUERIES {
+                    return Err(format!(
+                        "Requested symbol batch ({}) exceeds maximum allowed ({MAX_BATCH_SYMBOL_QUERIES})",
+                        queries.len()
+                    ));
+                }
+                Ok(queries)
+            };
 
             match action {
                 "skeleton" => {
@@ -453,8 +544,8 @@ pub(super) fn dispatch_tool(
                         cid_arg,
                     )
                 }
-                "impact" => {
-                    let target = target_opt.ok_or("Missing target")?;
+                "locate" => {
+                    let queries = collect_symbol_queries()?;
                     check_target_access(&ws_root)?;
                     state.run_locked_workspace_index(
                         &proj_db,
@@ -463,23 +554,72 @@ pub(super) fn dispatch_tool(
                         Some(&ws_root_str),
                         cid_arg,
                     )?;
-                    let reports = query_symbol_impact(&proj_db, target)?;
-                    let want_json = args
-                        .get("format")
-                        .and_then(Value::as_str)
-                        .is_some_and(|f| f.eq_ignore_ascii_case("json"));
+                    let matches = locate_symbols(&proj_db, &queries)?;
                     let rendered = if want_json {
-                        serde_json::to_string_pretty(&reports)?
+                        serde_json::to_string_pretty(&matches)?
                     } else {
-                        format_impact_compact(target, &reports)
+                        format_locate_compact(&queries, &matches)
                     };
                     let emitted_tok = ((rendered.len() + 3) / 4) as u64;
-                    let total_refs: usize = reports
-                        .iter()
-                        .map(|r| r.total_callers.max(r.callers.len()))
-                        .sum();
-                    let baseline_grep_tok =
-                        ((total_refs.max(1) * 180).max(rendered.len() / 4)) as u64;
+                    let baseline_tok = ((matches.len().max(queries.len()) * 140)
+                        .max(rendered.len() / 4)) as u64;
+                    record_workspace_event(
+                        &ws_root,
+                        TelemetryEvent::Impact {
+                            baseline_tokens: baseline_tok.max(emitted_tok),
+                            emitted_tokens: emitted_tok,
+                        },
+                    );
+                    Ok(rendered)
+                }
+                "impact" => {
+                    let queries = collect_symbol_queries()?;
+                    check_target_access(&ws_root)?;
+                    state.run_locked_workspace_index(
+                        &proj_db,
+                        &ws_root,
+                        &ws_root,
+                        Some(&ws_root_str),
+                        cid_arg,
+                    )?;
+                    let (rendered, total_refs) = if queries.len() == 1 {
+                        let reports = query_symbol_impact(&proj_db, &queries[0])?;
+                        let refs: usize = reports
+                            .iter()
+                            .map(|r| r.total_callers.max(r.callers.len()))
+                            .sum();
+                        let txt = if want_json {
+                            serde_json::to_string_pretty(&reports)?
+                        } else {
+                            format_impact_compact(&queries[0], &reports)
+                        };
+                        (txt, refs)
+                    } else {
+                        let batches = query_symbols_impact_batch(&proj_db, &queries)?;
+                        let refs: usize = batches
+                            .iter()
+                            .flat_map(|(_, reps)| reps.iter())
+                            .map(|r| r.total_callers.max(r.callers.len()))
+                            .sum();
+                        let txt = if want_json {
+                            let json_batches: Vec<Value> = batches
+                                .iter()
+                                .map(|(q, reps)| {
+                                    serde_json::json!({
+                                        "query": q,
+                                        "reports": reps,
+                                    })
+                                })
+                                .collect();
+                            serde_json::to_string_pretty(&json_batches)?
+                        } else {
+                            format_impact_batch_compact(&batches)
+                        };
+                        (txt, refs)
+                    };
+                    let emitted_tok = ((rendered.len() + 3) / 4) as u64;
+                    let baseline_grep_tok = ((total_refs.max(queries.len()) * 180)
+                        .max(rendered.len() / 4)) as u64;
                     record_workspace_event(
                         &ws_root,
                         TelemetryEvent::Impact {
@@ -490,11 +630,48 @@ pub(super) fn dispatch_tool(
                     Ok(rendered)
                 }
                 "fim" => {
-                    let target = target_opt.ok_or("Missing target")?;
-                    let resolved_target = resolve_rel(target);
-                    check_target_access(&resolved_target)?;
+                    let mut requests: Vec<FimSliceRequest> = Vec::new();
+                    if !slices_arr.is_empty() {
+                        requests.extend(slices_arr);
+                    } else if !symbols_arr.is_empty() {
+                        let target = target_opt
+                            .or_else(|| files_arr.first().map(String::as_str))
+                            .ok_or("Missing 'target' file path for batched 'symbols' in action='fim'")?;
+                        for s in &symbols_arr {
+                            requests.push(FimSliceRequest {
+                                target: target.to_owned(),
+                                symbol: Some(s.clone()),
+                                line: None,
+                                pad,
+                            });
+                        }
+                    } else {
+                        let target = target_opt.ok_or("Missing target")?;
+                        requests.push(FimSliceRequest {
+                            target: target.to_owned(),
+                            symbol: sym.map(ToOwned::to_owned),
+                            line,
+                            pad,
+                        });
+                    }
+                    if requests.len() > MAX_BATCH_FIM_SLICES {
+                        return Err(format!(
+                            "Requested FIM slice batch ({}) exceeds maximum allowed ({MAX_BATCH_FIM_SLICES})",
+                            requests.len()
+                        )
+                        .into());
+                    }
+
                     check_target_access(&ws_root)?;
-                    state.verify_target_belongs_to_workspace(&resolved_target, &ws_root)?;
+                    let mut resolved_requests: Vec<(PathBuf, FimSliceRequest)> =
+                        Vec::with_capacity(requests.len());
+                    for req in requests {
+                        let rp = resolve_rel(&req.target);
+                        check_target_access(&rp)?;
+                        state.verify_target_belongs_to_workspace(&rp, &ws_root)?;
+                        resolved_requests.push((rp, req));
+                    }
+
                     state.run_locked_workspace_index(
                         &proj_db,
                         &ws_root,
@@ -502,17 +679,43 @@ pub(super) fn dispatch_tool(
                         Some(&ws_root_str),
                         cid_arg,
                     )?;
-                    let bundle = extract_fim_slice(&proj_db, &resolved_target, sym, line, pad)?;
-                    let rendered = bundle.format_compact();
+
+                    let mut bundles = Vec::with_capacity(resolved_requests.len());
+                    let mut unique_files: std::collections::HashSet<PathBuf> =
+                        std::collections::HashSet::new();
+                    let mut raw_file_tok_sum = 0u64;
+
+                    for (rp, req) in &resolved_requests {
+                        let bundle = extract_fim_slice(
+                            &proj_db,
+                            rp,
+                            req.symbol.as_deref(),
+                            req.line,
+                            req.pad,
+                        )?;
+                        if unique_files.insert(rp.clone()) {
+                            let file_tok = std::fs::metadata(rp)
+                                .map(|m| (m.len().saturating_add(3)) / 4)
+                                .unwrap_or(0);
+                            raw_file_tok_sum = raw_file_tok_sum.saturating_add(file_tok);
+                        }
+                        bundles.push(bundle);
+                    }
+
+                    let rendered = if want_json {
+                        if bundles.len() == 1 {
+                            serde_json::to_string_pretty(&bundles[0])?
+                        } else {
+                            serde_json::to_string_pretty(&bundles)?
+                        }
+                    } else {
+                        format_fim_batch_compact(&bundles)
+                    };
                     let emitted_tok = ((rendered.len() + 3) / 4) as u64;
-                    let raw_file_tok = std::fs::metadata(&resolved_target)
-                        .map(|m| (m.len().saturating_add(3)) / 4)
-                        .unwrap_or(emitted_tok)
-                        .max(emitted_tok);
                     record_workspace_event(
                         &ws_root,
                         TelemetryEvent::Fim {
-                            baseline_tokens: raw_file_tok,
+                            baseline_tokens: raw_file_tok_sum.max(emitted_tok),
                             emitted_tokens: emitted_tok,
                         },
                     );
@@ -672,6 +875,7 @@ pub(super) fn dispatch_tool(
                 }
             }
 
+            let _ = proj_db.maybe_auto_compact();
             let seal_res =
                 state.seal_project_db_if_authorized(ws_root_to_seal.as_deref(), &proj_db);
             drop(ws_write_lock);
@@ -827,6 +1031,7 @@ pub(super) fn dispatch_tool(
                 (lock_opt, ws_opt, Arc::clone(brain.project_db()))
             };
             let (_, block) = create_subagent_handoff(&proj_db, hid, tkey, role, notes)?;
+            let _ = proj_db.maybe_auto_compact();
             let seal_res =
                 state.seal_project_db_if_authorized(ws_root_to_seal.as_deref(), &proj_db);
             drop(ws_write_lock);

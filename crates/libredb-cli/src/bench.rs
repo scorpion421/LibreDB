@@ -1807,6 +1807,127 @@ pub fn run_feature_and_security_audit(
         },
     );
 
+    // A10: `v1.2.0` batched `locate`/`impact`/`fim`, `slice-skill` BM25, subagent prompt-hint & auto-compaction seal parity
+    run_check(
+        "A10",
+        "Batched locate/impact/fim, skill BM25, subagent hint & auto-compact",
+        &mut || {
+            let ws_v120 = sbx_root.join("ws_v120_batch");
+            fs::create_dir_all(ws_v120.join("src")).map_err(|e| e.to_string())?;
+            fs::create_dir_all(ws_v120.join(".agents")).map_err(|e| e.to_string())?;
+            let src_file = ws_v120.join("src/engine.rs");
+            fs::write(
+                &src_file,
+                "pub fn alpha_step(x: u32) -> u32 {\n    beta_step(x) + 1\n}\n\npub fn beta_step(v: u32) -> u32 {\n    v * 2\n}\n\npub fn gamma_step() -> u32 {\n    alpha_step(10)\n}\n",
+            )
+            .map_err(|e| e.to_string())?;
+
+            let pdb = Arc::new(
+                LibreDb::open(ws_v120.join(".agents/memory.ldb")).map_err(|e| e.to_string())?,
+            );
+            libredb_cognitive::index_workspace(&pdb, &ws_v120, false).map_err(|e| e.to_string())?;
+
+            // 1. Fast `locate_symbols` & batched `query_symbols_impact_batch`
+            let queries = vec!["alpha_step".to_owned(), "beta_step".to_owned()];
+            let located =
+                libredb_cognitive::locate_symbols(&pdb, &queries).map_err(|e| e.to_string())?;
+            if located.len() != 2
+                || located[0].start_line != 1
+                || located[1].start_line != 5
+            {
+                return Err(format!("locate_symbols mismatch: {located:?}"));
+            }
+            let batch_imp = libredb_cognitive::query_symbols_impact_batch(&pdb, &queries)
+                .map_err(|e| e.to_string())?;
+            if batch_imp.len() != 2
+                || batch_imp[0].1.first().map_or(0, |r| r.total_callers) != 1
+                || batch_imp[1].1.first().map_or(0, |r| r.total_callers) != 1
+            {
+                return Err(format!("query_symbols_impact_batch mismatch: {batch_imp:?}"));
+            }
+
+            // 2. Skill-section BM25 slicing (`CognitiveEngine::slice_skill_sections`)
+            let gdb = Arc::new(LibreDb::open(&global_ldb).map_err(|e| e.to_string())?);
+            gdb.put(
+                WriteRequest::new(
+                    NodeKind::Generic,
+                    vec![b'X'; 4096],
+                )
+                .with_key("skill_full::audit_bm25_skill")
+                .with_importance(120),
+            )
+            .map_err(|e| e.to_string())?;
+            gdb.put(
+                WriteRequest::new(
+                    NodeKind::SkillSection,
+                    b"[audit_bm25_skill > Dalvik bytecode descriptors]\nUse full Lpkg/Cls;->method(I)Z signatures for R8 call resolution.".to_vec(),
+                )
+                .with_key("audit_bm25_skill::Dalvik bytecode descriptors")
+                .with_importance(195),
+            )
+            .map_err(|e| e.to_string())?;
+            gdb.put(
+                WriteRequest::new(
+                    NodeKind::SkillSection,
+                    b"[audit_bm25_skill > Gitea release workflow]\nUse libredb git-release vX.Y.Z --project <dir>.".to_vec(),
+                )
+                .with_key("audit_bm25_skill::Gitea release workflow")
+                .with_importance(195),
+            )
+            .map_err(|e| e.to_string())?;
+            let mut glob_cog =
+                libredb_cognitive::CognitiveEngine::open_db(Arc::clone(&gdb)).map_err(|e| e.to_string())?;
+            glob_cog.refresh_indices().map_err(|e| e.to_string())?;
+            let skill_slices = glob_cog
+                .slice_skill_sections("Dalvik R8 bytecode signature", Some("audit_bm25_skill"), 1)
+                .map_err(|e| e.to_string())?;
+            if skill_slices.len() != 1
+                || !skill_slices[0].section_title.contains("Dalvik")
+                || skill_slices[0].full_skill_tokens < 500
+            {
+                return Err(format!("slice_skill_sections mismatch: {skill_slices:?}"));
+            }
+
+            // 3. Subagent-aware `extract_prompt_hint` (nested `toolArgs.Prompt` + `<SYSTEM_MESSAGE>` stripping)
+            let subagent_payload = json!({
+                "toolArgs": {
+                    "Prompt": "<SYSTEM_MESSAGE>Boilerplate system header</SYSTEM_MESSAGE>\nVerify Dalvik R8 overload disambiguation"
+                }
+            });
+            let hint = crate::hooks::extract_prompt_hint(&subagent_payload, None)
+                .ok_or_else(|| "extract_prompt_hint returned None for subagent payload".to_owned())?;
+            if hint.contains("SYSTEM_MESSAGE") || !hint.contains("Dalvik R8 overload") {
+                return Err(format!("subagent prompt hint sanitization failed: {hint}"));
+            }
+
+            // 4. Auto-compaction trigger after repeated batch mutations + `hmac-sha256:v4` seal preservation
+            for i in 0..70 {
+                let mut spec = libredb_cognitive::AtomicBatchSpec::default();
+                spec.facts.push((
+                    "rolling_counter".to_owned(),
+                    format!("iteration_{i}"),
+                ));
+                libredb_cognitive::execute_atomic_batch(&pdb, &spec).map_err(|e| e.to_string())?;
+            }
+            crate::security::seal_workspace_memory(&gdb, &pdb, &ws_v120)?;
+            let stats_after = pdb.stats().map_err(|e| e.to_string())?;
+            if stats_after.superseded_nodes >= 64 {
+                return Err(format!(
+                    "maybe_auto_compact did not compact superseded slots: superseded={}",
+                    stats_after.superseded_nodes
+                ));
+            }
+            if !crate::security::is_workspace_memory_trusted(Some(&gdb), &ws_v120) {
+                return Err("v4 seal invalid after auto-compaction".to_owned());
+            }
+
+            Ok(format!(
+                "2 located, 2 batched impacts, BM25 skill slice #1 matched, subagent hint clean, compacted (superseded={}) + v4 sealed",
+                stats_after.superseded_nodes
+            ))
+        },
+    );
+
     let passed = checks.iter().filter(|c| c.passed).count();
     let failed = checks.len().saturating_sub(passed);
     let report = AuditSuiteReport {

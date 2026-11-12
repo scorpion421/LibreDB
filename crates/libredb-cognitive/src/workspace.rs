@@ -73,6 +73,40 @@ pub struct WorkspaceIndexReport {
     pub fast_path_hit: bool,
 }
 
+/// Ultra-compact 1-line symbol location match returned by `locate_symbols` (`< 0.5 ms`, zero edge walk).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SymbolLocationMatch {
+    pub query: String,
+    pub node_id: u64,
+    pub symbol_key: String,
+    pub file_path: String,
+    pub symbol_name: String,
+    pub qualified_name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub descriptor: String,
+    pub kind: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub signature: String,
+    pub contract: String,
+}
+
+/// Specification for a single slice inside a batched `fim` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FimSliceRequest {
+    pub target: String,
+    #[serde(default)]
+    pub symbol: Option<String>,
+    #[serde(default)]
+    pub line: Option<usize>,
+    #[serde(default = "default_fim_pad")]
+    pub pad: usize,
+}
+
+fn default_fim_pad() -> usize {
+    12
+}
+
 /// Blast-radius impact and causal governance report for a located symbol.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SymbolImpactReport {
@@ -321,6 +355,7 @@ fn apply_skeleton_symbols_atomic(
     deprecate_keys.extend_from_slice(extra_deprecate_keys);
 
     let committed_ids = db.commit_batch_with_tombstones(&prepared, &stale_ids, &deprecate_keys)?;
+    let _ = db.maybe_auto_compact();
     Ok(committed_ids.len().saturating_sub(1))
 }
 
@@ -452,6 +487,7 @@ pub fn reconcile_tentative_edits(db: &LibreDb, ws_root: &Path) -> Result<(usize,
         }
     }
 
+    let _ = db.maybe_auto_compact();
     Ok((promoted_files, avoided_tokens))
 }
 
@@ -1276,6 +1312,7 @@ pub fn index_workspace_with_exclusions(
                 .with_importance(64),
         );
     }
+    let _ = db.maybe_auto_compact();
 
     Ok(WorkspaceIndexReport {
         files_scanned,
@@ -1295,6 +1332,313 @@ fn compact_contract_ref(contract: &str) -> &str {
     } else {
         contract.trim()
     }
+}
+
+/// Maximum number of symbols allowed in a single batched `locate` or `impact` call.
+pub const MAX_BATCH_SYMBOL_QUERIES: usize = 64;
+/// Maximum number of slice specs allowed in a single batched `fim` call.
+pub const MAX_BATCH_FIM_SLICES: usize = 32;
+/// Maximum matches emitted per query in `locate_symbols`.
+pub const MAX_LOCATE_MATCHES_PER_QUERY: usize = 16;
+
+fn normalize_symbol_query_parts(symbol_query: &str) -> Option<(String, Option<String>, bool)> {
+    let raw_q = symbol_query.trim().trim_start_matches("::");
+    if raw_q.is_empty() {
+        return None;
+    }
+    let mut sig_filter: Option<String> = None;
+    let normalized_q: String = if let Some((before, after_semi)) = raw_q.split_once(";->") {
+        let cls = before.trim_start_matches('L').trim_end_matches(';');
+        let m = if let Some(sig_idx) = after_semi.find(['(', ':']) {
+            sig_filter = Some(after_semi[sig_idx..].to_owned());
+            &after_semi[..sig_idx]
+        } else {
+            after_semi
+        };
+        format!("{cls}::{m}")
+    } else if raw_q.starts_with('L') && raw_q.ends_with(';') && raw_q.len() > 2 {
+        raw_q[1..raw_q.len() - 1].to_owned()
+    } else if raw_q.contains("::") && raw_q.contains('(') {
+        let idx = raw_q.find('(').unwrap_or(raw_q.len());
+        sig_filter = Some(raw_q[idx..].to_owned());
+        raw_q[..idx].to_owned()
+    } else if raw_q.contains("->") {
+        raw_q.replace("->", "::")
+    } else if raw_q.contains('.')
+        && !raw_q.ends_with(".rs")
+        && !raw_q.ends_with(".smali")
+        && !raw_q.contains('/')
+    {
+        raw_q.replace('.', "::")
+    } else {
+        raw_q.to_owned()
+    };
+    let is_qualified = normalized_q.contains("::");
+    Some((normalized_q, sig_filter, is_qualified))
+}
+
+fn parse_symbol_location_from_contract(
+    query: &str,
+    node_id: u64,
+    sym_key: &str,
+    contract: &str,
+) -> SymbolLocationMatch {
+    let stripped_key = strip_line_disambiguator(sym_key);
+    let (file_part, raw_sym_part) = stripped_key.split_once("::").unwrap_or(("", stripped_key));
+    let (qname, key_sig_opt) = match raw_sym_part.split_once('@') {
+        Some((sp, tail)) if tail.starts_with('(') || tail.starts_with(':') => (sp, Some(tail)),
+        Some((sp, _)) => (sp, None),
+        None => (raw_sym_part, None),
+    };
+    let short_name = qname
+        .rsplit_once("::")
+        .map_or_else(|| qname.rsplit('/').next().unwrap_or(qname), |(_, m)| m);
+    let descriptor = if let Some(sig) = key_sig_opt {
+        if let Some((cls, member)) = qname.rsplit_once("::") {
+            format!("L{cls};->{member}{sig}")
+        } else {
+            String::new()
+        }
+    } else if file_part.ends_with(".smali") && !qname.contains("::") {
+        format!("L{qname};")
+    } else {
+        String::new()
+    };
+
+    let mut start_line = 1usize;
+    let mut end_line = 1usize;
+    let mut kind = String::from("symbol");
+    let mut signature = String::new();
+
+    if let Some(l_idx) = contract.find(" [L") {
+        let after_l = &contract[l_idx + 3..];
+        if let Some(close_br) = after_l.find(']') {
+            let span_str = &after_l[..close_br];
+            if let Some((s_str, e_str)) = span_str.split_once("-L") {
+                start_line = s_str.parse::<usize>().unwrap_or(1);
+                end_line = e_str.parse::<usize>().unwrap_or(start_line);
+            }
+            let after_br = after_l[close_br + 1..].trim_start();
+            if let Some(after_open_paren) = after_br.strip_prefix('(') {
+                if let Some(close_paren) = after_open_paren.find(')') {
+                    kind = after_open_paren[..close_paren].trim().to_owned();
+                    let rest = after_open_paren[close_paren + 1..].trim();
+                    signature = rest.split(" // ").next().unwrap_or(rest).trim().to_owned();
+                }
+            }
+        }
+    }
+
+    SymbolLocationMatch {
+        query: query.to_owned(),
+        node_id,
+        symbol_key: sym_key.to_owned(),
+        file_path: file_part.to_owned(),
+        symbol_name: short_name.to_owned(),
+        qualified_name: qname.to_owned(),
+        descriptor,
+        kind,
+        start_line,
+        end_line,
+        signature,
+        contract: contract.trim().to_owned(),
+    }
+}
+
+/// Fast (`< 0.5 ms`) single-pass symbol coordinate lookup (`[Lstart-Lend]`) for `1..=64` symbol queries
+/// without traversing caller/callee/governance graph edges.
+pub fn locate_symbols(db: &LibreDb, queries: &[String]) -> Result<Vec<SymbolLocationMatch>> {
+    if let Some(ws_root) = infer_agents_ws_root(db) {
+        let _ = reconcile_tentative_edits(db, &ws_root);
+    }
+    let mut clean_queries: Vec<String> = Vec::new();
+    for q in queries {
+        let t = q.trim();
+        if !t.is_empty() && !clean_queries.iter().any(|existing| existing == t) {
+            clean_queries.push(t.to_owned());
+            if clean_queries.len() >= MAX_BATCH_SYMBOL_QUERIES {
+                break;
+            }
+        }
+    }
+    if clean_queries.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let sym_inodes = db.list_inodes(Some(NodeKind::Symbol), false);
+    let mut out = Vec::new();
+
+    for raw_query in &clean_queries {
+        let Some((normalized_q, sig_filter, is_qualified_query)) =
+            normalize_symbol_query_parts(raw_query)
+        else {
+            continue;
+        };
+        let q_low = normalized_q.to_lowercase();
+        let mut tier1_exact: Vec<(u64, String)> = Vec::new();
+        let mut tier2_ci: Vec<(u64, String)> = Vec::new();
+        let mut tier3_substr: Vec<(u64, String)> = Vec::new();
+
+        for (ino, key_opt, _) in &sym_inodes {
+            let Some(ref full_k) = key_opt else { continue };
+            let stripped_k = strip_line_disambiguator(full_k);
+            let Some((_, raw_sym_part)) = stripped_k.split_once("::") else {
+                continue;
+            };
+            let (sym_part, key_sig_opt) = match raw_sym_part.split_once('@') {
+                Some((sp, tail)) if tail.starts_with('(') || tail.starts_with(':') => {
+                    (sp, Some(tail))
+                }
+                Some((sp, _)) => (sp, None),
+                None => (raw_sym_part, None),
+            };
+            if let Some(ref req_sig) = sig_filter {
+                if key_sig_opt != Some(req_sig.as_str()) {
+                    continue;
+                }
+            }
+            let short_name = sym_part
+                .rsplit_once("::")
+                .map_or_else(|| sym_part.rsplit('/').next().unwrap_or(sym_part), |(_, m)| m);
+
+            if is_qualified_query {
+                let ns_suffix = format!("::{normalized_q}");
+                let pkg_suffix = format!("/{normalized_q}");
+                if sym_part == normalized_q
+                    || sym_part.ends_with(&ns_suffix)
+                    || sym_part.ends_with(&pkg_suffix)
+                {
+                    tier1_exact.push((ino.node_id, full_k.clone()));
+                } else {
+                    let sym_low = sym_part.to_lowercase();
+                    let ns_suffix_low = format!("::{q_low}");
+                    let pkg_suffix_low = format!("/{q_low}");
+                    if sym_low == q_low
+                        || sym_low.ends_with(&ns_suffix_low)
+                        || sym_low.ends_with(&pkg_suffix_low)
+                    {
+                        tier2_ci.push((ino.node_id, full_k.clone()));
+                    } else if q_low.len() >= 4 && sym_low.contains(&q_low) {
+                        tier3_substr.push((ino.node_id, full_k.clone()));
+                    }
+                }
+            } else if short_name == normalized_q || sym_part == normalized_q {
+                tier1_exact.push((ino.node_id, full_k.clone()));
+            } else if short_name.eq_ignore_ascii_case(&normalized_q)
+                || sym_part.eq_ignore_ascii_case(&normalized_q)
+            {
+                tier2_ci.push((ino.node_id, full_k.clone()));
+            } else if q_low.len() >= 3 && sym_part.to_lowercase().contains(&q_low) {
+                tier3_substr.push((ino.node_id, full_k.clone()));
+            }
+        }
+
+        let mut matched_ids = if !tier1_exact.is_empty() {
+            tier1_exact
+        } else if !tier2_ci.is_empty() {
+            tier2_ci
+        } else {
+            tier3_substr
+        };
+        matched_ids.sort_by(|a, b| a.1.cmp(&b.1));
+        matched_ids.truncate(MAX_LOCATE_MATCHES_PER_QUERY);
+
+        let req_ids: Vec<u64> = matched_ids.iter().map(|(id, _)| *id).collect();
+        let (recs, _) = db.get_many_coalesced(&req_ids)?;
+        for ((nid, sym_key), rec) in matched_ids.into_iter().zip(recs.into_iter()) {
+            let contract = String::from_utf8_lossy(&rec.payload);
+            out.push(parse_symbol_location_from_contract(
+                raw_query,
+                nid,
+                &sym_key,
+                &contract,
+            ));
+        }
+    }
+
+    Ok(out)
+}
+
+/// Renders ultra-compact 1-line `[Lstart-Lend]` symbol locations.
+pub fn format_locate_compact(queries: &[String], matches: &[SymbolLocationMatch]) -> String {
+    let q_label = if queries.len() == 1 {
+        queries[0].clone()
+    } else {
+        format!("{} queries", queries.len())
+    };
+    if matches.is_empty() {
+        return format!("=== LOCATE: {q_label} (0 symbols matched) ===\n");
+    }
+    let mut out = format!(
+        "=== LOCATE: {} ({} symbol{} matched) ===\n",
+        q_label,
+        matches.len(),
+        if matches.len() == 1 { "" } else { "s" }
+    );
+    for m in matches {
+        if queries.len() > 1 {
+            out.push_str(&format!("* [{}] {}\n", m.query, m.contract));
+        } else {
+            out.push_str(&format!("* {}\n", m.contract));
+        }
+    }
+    out
+}
+
+/// Evaluates `query_symbol_impact` across `1..=64` symbols in a single batch call.
+pub fn query_symbols_impact_batch(
+    db: &LibreDb,
+    symbols: &[String],
+) -> Result<Vec<(String, Vec<SymbolImpactReport>)>> {
+    if let Some(ws_root) = infer_agents_ws_root(db) {
+        let _ = reconcile_tentative_edits(db, &ws_root);
+    }
+    let mut clean: Vec<String> = Vec::new();
+    for s in symbols {
+        let t = s.trim();
+        if !t.is_empty() && !clean.iter().any(|existing| existing == t) {
+            clean.push(t.to_owned());
+            if clean.len() >= MAX_BATCH_SYMBOL_QUERIES {
+                break;
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(clean.len());
+    for q in clean {
+        let reps = query_symbol_impact(db, &q)?;
+        out.push((q, reps));
+    }
+    Ok(out)
+}
+
+/// Renders batched `impact` reports into a single compact markdown block.
+pub fn format_impact_batch_compact(batches: &[(String, Vec<SymbolImpactReport>)]) -> String {
+    if batches.len() == 1 {
+        return format_impact_compact(&batches[0].0, &batches[0].1);
+    }
+    let total_matches: usize = batches.iter().map(|(_, r)| r.len()).sum();
+    let mut out = format!(
+        "=== BATCH IMPACT: {} queries ({} total symbol{} matched) ===\n",
+        batches.len(),
+        total_matches,
+        if total_matches == 1 { "" } else { "s" }
+    );
+    for (q, reps) in batches {
+        out.push_str(&format_impact_compact(q, reps));
+    }
+    out
+}
+
+/// Renders multiple `FimSliceBundle` slices into a single compact response block.
+pub fn format_fim_batch_compact(bundles: &[FimSliceBundle]) -> String {
+    if bundles.len() == 1 {
+        return bundles[0].format_compact();
+    }
+    let mut out = format!("=== BATCH FIM SLICES ({} slices) ===\n", bundles.len());
+    for b in bundles {
+        out.push_str(&b.format_compact());
+    }
+    out
 }
 
 /// Renders a token-minimal structural blast-radius summary (`80-90%` smaller than pretty JSON).

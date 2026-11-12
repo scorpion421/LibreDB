@@ -365,20 +365,35 @@ pub fn handle_rpc_method(
                 },
                 {
                     "name": "libredb_code",
-                    "description": "Zero-bloat source code graph: 'skeleton' (-95% file map, supports single 'target' or batch 'files'), 'impact' (compact caller/callee blast radius + governing decisions), 'fim' (surgical edit slice + callers + decisions), 'index' (scan workspace), or 'savings' (authorized workspace token-economy report).",
+                    "description": "Zero-bloat source code graph: 'skeleton' (-95% file map, supports single 'target' or batch 'files'), 'locate' (<0.5ms 1-line [Lstart-Lend] symbol lookup, supports single 'target' or batch 'symbols'), 'impact' (compact caller/callee blast radius + governing decisions, supports single 'target' or batch 'symbols'), 'fim' (surgical edit slice + callers + decisions, supports single 'target' or batch 'slices'/'symbols'), 'index' (scan workspace), or 'savings' (authorized workspace token-economy report).",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "action": { "type": "string", "enum": ["skeleton", "impact", "fim", "index", "savings"] },
+                            "action": { "type": "string", "enum": ["skeleton", "locate", "impact", "fim", "index", "savings"] },
                             "target": { "type": "string", "description": "File path, workspace directory, or symbol query" },
                             "files": { "type": "array", "items": { "type": "string" }, "description": "Optional batch of file paths for action='skeleton' (single fsync)" },
+                            "symbols": { "type": "array", "items": { "type": "string" }, "description": "Optional batch of symbol names/descriptors for action='locate', action='impact', or multi-symbol action='fim' on 'target' (max 64)" },
+                            "slices": {
+                                "type": "array",
+                                "description": "Optional batch of slice requests for action='fim' across one or multiple files (max 32)",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "target": { "type": "string" },
+                                        "symbol": { "type": "string" },
+                                        "line": { "type": "integer" },
+                                        "pad": { "type": "integer" }
+                                    },
+                                    "required": ["target"]
+                                }
+                            },
                             "cwd": { "type": "string" },
                             "cid": { "type": "string", "description": "Optional conversation ID for Zero-Repeat Skeleton deduplication or savings filtering" },
                             "force": { "type": "boolean", "description": "Force full skeleton emission even if unchanged in session" },
                             "symbol": { "type": "string", "description": "Symbol filter or FIM target" },
                             "line": { "type": "integer" },
                             "pad": { "type": "integer", "default": 12 },
-                            "format": { "type": "string", "enum": ["compact", "json"], "description": "Output format for action='impact' or 'savings' (default: 'compact')" },
+                            "format": { "type": "string", "enum": ["compact", "json"], "description": "Output format for action='locate', 'impact', 'fim', or 'savings' (default: 'compact')" },
                             "days": { "type": "integer", "description": "Optional lookback window in days for action='savings' (0 = today, max 3660)" }
                         },
                         "required": ["action"]

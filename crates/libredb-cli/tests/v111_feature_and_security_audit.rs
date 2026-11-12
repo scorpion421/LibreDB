@@ -52,17 +52,19 @@ fn built_in_audit_suite_cli_passes_all_9_checks() {
     );
 
     let rep: Value = serde_json::from_slice(&out.stdout).expect("valid audit JSON");
-    assert_eq!(rep.get("total_checks").and_then(Value::as_u64), Some(9));
-    assert_eq!(rep.get("passed_checks").and_then(Value::as_u64), Some(9));
+    assert_eq!(rep.get("total_checks").and_then(Value::as_u64), Some(10));
+    assert_eq!(rep.get("passed_checks").and_then(Value::as_u64), Some(10));
     assert_eq!(rep.get("failed_checks").and_then(Value::as_u64), Some(0));
 
     let checks = rep
         .get("checks")
         .and_then(Value::as_array)
         .expect("checks array");
-    for (idx, expected_id) in ["A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "A9"]
-        .iter()
-        .enumerate()
+    for (idx, expected_id) in [
+        "A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "A9", "A10",
+    ]
+    .iter()
+    .enumerate()
     {
         assert_eq!(
             checks[idx].get("check_id").and_then(Value::as_str),
@@ -329,4 +331,209 @@ fn four_concurrent_os_processes_increment_telemetry_ldb_without_lost_updates() {
         .output()
         .expect("savings huge days");
     assert!(!bad_days.status.success());
+}
+
+#[test]
+fn v120_mcp_batched_locate_impact_fim_and_zero_boilerplate_cli_work() {
+    let sbx = fresh_sandbox("v120_batch_and_cli");
+    let bin = env!("CARGO_BIN_EXE_libredb");
+
+    let fake_home = sbx.0.join("home");
+    fs::create_dir_all(fake_home.join(".gemini/libredb")).unwrap();
+    let global_ldb = fake_home.join(".gemini/libredb/customizations.ldb");
+    let tel_ldb = sbx.0.join("v120_telemetry.ldb");
+
+    let ws = sbx.0.join("workspace_main");
+    let outside_ws = sbx.0.join("workspace_outside");
+    fs::create_dir_all(ws.join("src")).unwrap();
+    fs::create_dir_all(outside_ws.join("src")).unwrap();
+    fs::write(
+        ws.join("src/lib.rs"),
+        "pub fn first_fn(a: i32) -> i32 {\n    second_fn(a) + 1\n}\n\npub fn second_fn(b: i32) -> i32 {\n    b * 3\n}\n",
+    )
+    .unwrap();
+    fs::write(outside_ws.join("src/secret.rs"), "pub fn secret_fn() {}\n").unwrap();
+
+    // Trust `ws` and seed a fact + skill in `global_ldb`:
+    assert!(Command::new(bin)
+        .args([
+            "trust",
+            &ws.to_string_lossy(),
+            "--global",
+            &global_ldb.to_string_lossy()
+        ])
+        .env("USERPROFILE", &fake_home)
+        .env("HOME", &fake_home)
+        .status()
+        .unwrap()
+        .success());
+
+    assert!(Command::new(bin)
+        .args([
+            "batch",
+            &ws.join(".agents/memory.ldb").to_string_lossy(),
+            "--fact",
+            "v120_arch=batched_mcp_and_zero_boilerplate_cli",
+            "--global",
+            &global_ldb.to_string_lossy(),
+        ])
+        .env("USERPROFILE", &fake_home)
+        .env("HOME", &fake_home)
+        .status()
+        .unwrap()
+        .success());
+
+    // 1. Zero-boilerplate `libredb pulse "<query>" --cwd <ws>` (omitting `<db.ldb>`):
+    let pulse_out = Command::new(bin)
+        .args([
+            "pulse",
+            "batched_mcp_and_zero_boilerplate_cli",
+            "--cwd",
+            &ws.to_string_lossy(),
+            "--global",
+            &global_ldb.to_string_lossy(),
+        ])
+        .env("LIBREDB_TELEMETRY_PATH", &tel_ldb)
+        .env("USERPROFILE", &fake_home)
+        .env("HOME", &fake_home)
+        .output()
+        .expect("zero-boilerplate pulse");
+    assert!(
+        pulse_out.status.success(),
+        "zero-boilerplate pulse failed: {}",
+        String::from_utf8_lossy(&pulse_out.stderr)
+    );
+    let pulse_stdout = String::from_utf8_lossy(&pulse_out.stdout);
+    assert!(
+        pulse_stdout.contains("v120_arch = batched_mcp_and_zero_boilerplate_cli"),
+        "Expected fact in pulse output, got: {pulse_stdout}"
+    );
+
+    // 2. MCP stdio server: batched `locate`, batched `impact`, batched `fim`, and containment check on `slices`
+    let mut child = Command::new(bin)
+        .args([
+            "mcp-serve",
+            "--workspace-root",
+            &ws.to_string_lossy(),
+            "--global",
+            &global_ldb.to_string_lossy(),
+        ])
+        .env("LIBREDB_TELEMETRY_PATH", &tel_ldb)
+        .env("USERPROFILE", &fake_home)
+        .env("HOME", &fake_home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mcp-serve");
+
+    let mut stdin = child.stdin.take().expect("mcp stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("mcp stdout"));
+
+    let mut rpc = |id: u64, args: Value| -> Value {
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "name": "libredb_code",
+                "arguments": args
+            }
+        });
+        writeln!(stdin, "{req}").expect("write rpc");
+        stdin.flush().expect("flush rpc");
+        let mut line = String::new();
+        stdout.read_line(&mut line).expect("read rpc");
+        serde_json::from_str(&line).expect("valid rpc json")
+    };
+
+    // 2a. Batched `locate`
+    let loc_resp = rpc(
+        1,
+        json!({
+            "action": "locate",
+            "symbols": ["first_fn", "second_fn"],
+            "format": "json"
+        }),
+    );
+    let loc_txt = loc_resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("locate json text");
+    let loc_arr: Vec<Value> = serde_json::from_str(loc_txt).expect("parse locate json");
+    assert_eq!(loc_arr.len(), 2);
+
+    // 2b. Batched `impact`
+    let imp_resp = rpc(
+        2,
+        json!({
+            "action": "impact",
+            "symbols": ["first_fn", "second_fn"]
+        }),
+    );
+    let imp_txt = imp_resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("impact text");
+    assert!(imp_txt.contains("=== BATCH IMPACT: 2 queries"));
+    assert!(imp_txt.contains("first_fn"));
+    assert!(imp_txt.contains("second_fn"));
+
+    // 2c. Batched `fim` via `slices`
+    let fim_resp = rpc(
+        3,
+        json!({
+            "action": "fim",
+            "slices": [
+                { "target": "src/lib.rs", "symbol": "first_fn", "pad": 2 },
+                { "target": "src/lib.rs", "symbol": "second_fn", "pad": 2 }
+            ]
+        }),
+    );
+    let fim_txt = fim_resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("fim text");
+    assert!(fim_txt.contains("=== BATCH FIM SLICES (2 slices) ==="));
+
+    // 2d. Security containment: a batched `fim` request containing an out-of-workspace slice MUST fail closed!
+    let bad_fim = rpc(
+        4,
+        json!({
+            "action": "fim",
+            "slices": [
+                { "target": "src/lib.rs", "symbol": "first_fn" },
+                { "target": outside_ws.join("src/secret.rs").to_string_lossy(), "symbol": "secret_fn" }
+            ]
+        }),
+    );
+    assert!(
+        bad_fim.get("error").is_some(),
+        "Expected MCP containment denial when any slice escapes workspace, got: {bad_fim}"
+    );
+
+    drop(stdin);
+    let _ = child.kill();
+    let _ = child.wait();
+
+    // 3. Zero-boilerplate CLI `libredb locate first_fn second_fn --cwd <ws>`
+    let cli_loc = Command::new(bin)
+        .args([
+            "locate",
+            "first_fn",
+            "second_fn",
+            "--cwd",
+            &ws.to_string_lossy(),
+            "--global",
+            &global_ldb.to_string_lossy(),
+        ])
+        .env("LIBREDB_TELEMETRY_PATH", &tel_ldb)
+        .env("USERPROFILE", &fake_home)
+        .env("HOME", &fake_home)
+        .output()
+        .expect("cli locate");
+    assert!(
+        cli_loc.status.success(),
+        "cli locate failed: {}",
+        String::from_utf8_lossy(&cli_loc.stderr)
+    );
+    let cli_loc_out = String::from_utf8_lossy(&cli_loc.stdout);
+    assert!(cli_loc_out.contains("first_fn") && cli_loc_out.contains("second_fn"));
 }

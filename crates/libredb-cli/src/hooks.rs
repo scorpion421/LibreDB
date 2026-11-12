@@ -706,23 +706,89 @@ fn truncate_utf8_clean(s: &str, max_chars: usize) -> (&str, bool) {
     }
 }
 
-fn extract_prompt_hint(payload: &Value, transcript_opt: Option<&Path>) -> Option<String> {
-    for key in [
+fn strip_tag_block(mut text: String, open_tag: &str, close_tag: &str) -> String {
+    while let Some(start) = text.find(open_tag) {
+        if let Some(rel_end) = text[start + open_tag.len()..].find(close_tag) {
+            let end = start + open_tag.len() + rel_end + close_tag.len();
+            text.replace_range(start..end, " ");
+        } else {
+            text.truncate(start);
+            break;
+        }
+    }
+    text
+}
+
+fn sanitize_prompt_hint_text(raw: &str) -> Option<String> {
+    if let Some(u_start) = raw.find("<USER_REQUEST>") {
+        let after = &raw[u_start + "<USER_REQUEST>".len()..];
+        let inner = match after.find("</USER_REQUEST>") {
+            Some(u_end) => &after[..u_end],
+            None => after,
+        };
+        let t = inner.trim();
+        if !t.is_empty() {
+            let (head, _) = truncate_utf8_clean(t, 512);
+            return Some(head.to_owned());
+        }
+    }
+    let mut cleaned = raw.to_owned();
+    for (o, c) in [
+        ("<SYSTEM_MESSAGE>", "</SYSTEM_MESSAGE>"),
+        ("<EPHEMERAL_MESSAGE>", "</EPHEMERAL_MESSAGE>"),
+        ("< EPHEMERAL_MESSAGE >", "</ EPHEMERAL_MESSAGE >"),
+        ("<ADDITIONAL_METADATA>", "</ADDITIONAL_METADATA>"),
+        ("<CONTEXT_SUMMARY>", "</CONTEXT_SUMMARY>"),
+    ] {
+        cleaned = strip_tag_block(cleaned, o, c);
+    }
+    let trimmed = cleaned
+        .replace("<USER_REQUEST>", " ")
+        .replace("</USER_REQUEST>", " ");
+    let trimmed = trimmed.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        let (head, _) = truncate_utf8_clean(trimmed, 512);
+        Some(head.to_owned())
+    }
+}
+
+pub fn extract_prompt_hint(payload: &Value, transcript_opt: Option<&Path>) -> Option<String> {
+    const HINT_KEYS: &[&str] = &[
         "prompt",
+        "Prompt",
         "userPrompt",
         "userMessage",
         "query",
         "message",
+        "Message",
         "input",
-    ] {
-        if let Some(raw) = payload.get(key).and_then(Value::as_str) {
-            let trimmed = raw.trim();
-            if !trimmed.is_empty() {
-                let (head, _) = truncate_utf8_clean(trimmed, 512);
-                return Some(head.to_owned());
+        "task",
+        "instruction",
+        "objective",
+        "brief",
+        "description",
+    ];
+    for key in HINT_KEYS {
+        if let Some(raw) = payload.get(*key).and_then(Value::as_str) {
+            if let Some(clean) = sanitize_prompt_hint_text(raw) {
+                return Some(clean);
             }
         }
     }
+    for container_key in ["toolArgs", "arguments", "request", "params", "subagent"] {
+        if let Some(sub_obj) = payload.get(container_key) {
+            for key in HINT_KEYS {
+                if let Some(raw) = sub_obj.get(*key).and_then(Value::as_str) {
+                    if let Some(clean) = sanitize_prompt_hint_text(raw) {
+                        return Some(clean);
+                    }
+                }
+            }
+        }
+    }
+
     let tp = transcript_opt?;
     use std::io::{Seek, SeekFrom};
     let mut f = std::fs::File::open(tp).ok()?;
@@ -735,19 +801,62 @@ fn extract_prompt_hint(payload: &Value, transcript_opt: Option<&Path>) -> Option
     let mut buf = vec![0u8; read_len as usize];
     f.read_exact(&mut buf).ok()?;
     let tail = String::from_utf8_lossy(&buf);
-    for line in tail.lines().rev().take(16) {
-        let trimmed = line.trim();
-        if !trimmed.starts_with('{') || !trimmed.contains("USER_INPUT") {
+    let recent_lines: Vec<&str> = tail
+        .lines()
+        .rev()
+        .take(16)
+        .map(str::trim)
+        .filter(|l| l.starts_with('{'))
+        .collect();
+
+    // Pass 1: Standard `USER_INPUT` step with non-empty sanitized user/task text
+    for line in &recent_lines {
+        if !line.contains("USER_INPUT") {
             continue;
         }
-        if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+        if let Ok(v) = serde_json::from_str::<Value>(line) {
             if v.get("type").and_then(Value::as_str) == Some("USER_INPUT") {
                 if let Some(c) = v.get("content").and_then(Value::as_str) {
-                    let clean = c.trim();
-                    if !clean.is_empty() {
-                        let (head, _) = truncate_utf8_clean(clean, 512);
-                        return Some(head.to_owned());
+                    if let Some(clean) = sanitize_prompt_hint_text(c) {
+                        return Some(clean);
                     }
+                }
+            }
+        }
+    }
+
+    // Pass 2: Subagent / swarm dispatch fallback (inspect `tool_calls` arguments or initial subagent prompt)
+    for line in &recent_lines {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if let Some(tcalls) = v.get("tool_calls").and_then(Value::as_array) {
+            for tc in tcalls {
+                for arg_container in [
+                    tc.get("arguments"),
+                    tc.get("args"),
+                    tc.get("input"),
+                    Some(tc),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    for key in ["Prompt", "prompt", "brief", "task", "Message", "query"] {
+                        if let Some(raw) = arg_container.get(key).and_then(Value::as_str) {
+                            if let Some(clean) = sanitize_prompt_hint_text(raw) {
+                                return Some(clean);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let step_idx = v.get("step_index").and_then(Value::as_u64).unwrap_or(99);
+        let src = v.get("source").and_then(Value::as_str).unwrap_or("");
+        if step_idx <= 2 || matches!(src, "USER_EXPLICIT" | "SYSTEM" | "AGENT") {
+            if let Some(c) = v.get("content").and_then(Value::as_str) {
+                if let Some(clean) = sanitize_prompt_hint_text(c) {
+                    return Some(clean);
                 }
             }
         }

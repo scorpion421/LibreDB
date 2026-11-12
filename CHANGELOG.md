@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-11-12
+
+### Added
+
+- Added ultra-compact `< 0.5 ms` symbol coordinate lookup (`SymbolLocationMatch`, `locate_symbols`, and `format_locate_compact` in `crates/libredb-cognitive/src/workspace.rs`, exposed via `MCP` `libredb_code(action="locate", target="..." | symbols=[...])` in `crates/libredb-cli/src/mcp/tools.rs` and `CLI` `libredb locate [<db.ldb>] <symbol...> [--cwd <dir>] [--json]` in `crates/libredb-cli/src/main.rs`): resolves `1..=64` symbol queries (exact Dalvik/R8 descriptors, qualified `pkg/Cls::m` paths, `Cls::m`, or short names) to 1-line `[Lstart-Lend]` contracts in a single `NodeKind::Symbol` scan without walking caller/callee/governance graph edges.
+- Added multi-target batching for `impact` (`symbols: Vec<String>`, up to 64 symbols via `query_symbols_impact_batch` and `format_impact_batch_compact`) and `fim` (`slices: Vec<FimSliceRequest>` or `target` + `symbols`, up to 32 slices via `format_fim_batch_compact`) in `libredb_code` (`crates/libredb-cli/src/mcp/protocol.rs` and `crates/libredb-cli/src/mcp/tools.rs`): executes one workspace lock/index check and one aggregated telemetry write per batch while enforcing per-slice `check_target_access` and `verify_target_belongs_to_workspace` containment and deduplicating per-file `baseline_tokens` across slices from the same file.
+- Added direct `BM25` + `HybridIndex` progressive-disclosure skill-section search (`SkillSectionSliceMatch` and `CognitiveEngine::slice_skill_sections` in `crates/libredb-cognitive/src/lib.rs`, exposed via `libredb slice-skill <query> [--skill <name>] [--top <k>] [--json]` and `libredb get-skill [<name>] --query <query> [--top <k>]` in `crates/libredb-cli/src/main.rs`) and zero-boilerplate `CLI` project DB resolution (`resolve_default_cli_project_db` and `split_cli_db_and_symbol_queries` in `crates/libredb-cli/src/main.rs`) so `libredb pulse "<query>"`, `libredb locate <sym...>`, and `libredb impact <sym...>` automatically discover `<cwd>/.agents/memory.ldb` without requiring an explicit `.ldb` path positional.
+- Added built-in audit check `A10` (`Batched locate/impact/fim, skill BM25, subagent hint & auto-compact` in `crates/libredb-cli/src/bench.rs`) and end-to-end integration test `v120_mcp_batched_locate_impact_fim_and_zero_boilerplate_cli_work` (`crates/libredb-cli/tests/v111_feature_and_security_audit.rs`, bringing the automated suite to 106 tests + 10 `A1..A10` audit checks + 10k crash simulations across Linux, macOS, and Windows).
+
+### Changed
+
+- Upgraded `PreInvocation` `BM25` prompt-hint extraction (`extract_prompt_hint` and `sanitize_prompt_hint_text` in `crates/libredb-cli/src/hooks.rs`) to support delegated subagents and swarm workers: inspects top-level and nested (`toolArgs`, `arguments`, `request`, `params`, `subagent`) task fields (`prompt`, `Prompt`, `task`, `instruction`, `objective`, `brief`, `description`, `Message`, `query`), strips `<SYSTEM_MESSAGE>`, `<EPHEMERAL_MESSAGE>`, `<ADDITIONAL_METADATA>`, and `<CONTEXT_SUMMARY>` blocks before `BM25` tokenization, and falls back to subagent dispatch tool calls or initial task steps in `transcript.jsonl` when no `USER_INPUT` step is present in the tail window.
+- Upgraded `LibreDb::maybe_auto_compact` (`crates/libredb-core/src/engine.rs`) to trigger non-pruning Gravity Compaction whenever uncompacted non-`COLD_ARCHIVE` superseded/tombstoned Inodes reach `>= 64` and `>= 50%` of total Inode slots (in addition to existing byte-tail thresholds), and wired automatic compaction triggers into `apply_skeleton_symbols_atomic`, `reconcile_tentative_edits`, and `index_workspace_with_exclusions` (`crates/libredb-cognitive/src/workspace.rs`) as well as `libredb_memorize` (`crates/libredb-cli/src/mcp/tools.rs`) strictly before `seal_project_db_if_authorized` so `hmac-sha256:v4` workspace trust seals remain 100% synchronized.
+
 ## [1.1.3] - 2026-11-11
 
 ### Fixed

@@ -15,9 +15,10 @@ use libredb_bridge::{
 };
 use libredb_cognitive::{
     audit_workspace_guardrails_with_prefixes, create_subagent_handoff, execute_atomic_batch,
-    extract_fim_slice, index_workspace_with_exclusions, query_symbol_impact, sync_transcript_epoch,
-    AtomicBatchSpec, CognitiveEngine, FileSkeleton, OverlayBrain, PulseRequest, ReflexEngine,
-    ReflexRule,
+    extract_fim_slice, format_impact_batch_compact, format_locate_compact,
+    index_workspace_with_exclusions, locate_symbols, query_symbol_impact,
+    query_symbols_impact_batch, sync_transcript_epoch, AtomicBatchSpec, CognitiveEngine,
+    FileSkeleton, OverlayBrain, PulseRequest, ReflexEngine, ReflexRule,
 };
 use libredb_core::{EdgeKind, LibreDb, NodeKind, WriteRequest};
 use std::env;
@@ -32,16 +33,18 @@ fn print_usage() {
         "LibreDB v{} - Tailored cognitive memory, workspace graph & MCP engine for Antigravity
 
 Antigravity Cognitive & Code-Graph Commands:
-  libredb pulse <db.ldb> <query> [--global <g.ldb>] [--cid <id>] [--transcript <t.jsonl>] [--epoch <n>] [--budget <tok>] [--cwd <dir>] [--err <msg>]
+  libredb pulse [<db.ldb>] <query> [--global <g.ldb>] [--cid <id>] [--transcript <t.jsonl>] [--epoch <n>] [--budget <tok>] [--cwd <dir>] [--err <msg>]
   libredb index-workspace <db.ldb> <workspace_dir> [--force]
   libredb skeleton <db.ldb> <source_file> [--filter <substr>]
-  libredb impact <db.ldb> <symbol_query>
+  libredb locate [<db.ldb>] <symbol_query...> [--cwd <dir>] [--json]
+  libredb impact [<db.ldb>] <symbol_query...> [--cwd <dir>] [--json]
   libredb fim <db.ldb> <source_file> [--symbol <name> | --line <n>] [--pad <lines>]
   libredb batch <db.ldb> [--fact k=v]... [--decision Title::Body]... [--task key::title::status::prio]... [--snapshot <summary>]
   libredb handoff <db.ldb> <handoff_id> <task_key> <role> [--notes <text>]
   libredb learn-assoc <db.ldb> <cue_phrase> <target_id_1,target_id_2>
   libredb learn-reflex <db.ldb> <id> <directive> [--stack <s1,s2>] [--action <a1,a2>] [--env <e1,e2>]
-  libredb get-skill <skill_name> [--section <title>] [--global <customizations.ldb>]
+  libredb get-skill [<skill_name>] [--section <title> | --query <q> [--top <k>]] [--json] [--global <customizations.ldb>]
+  libredb slice-skill <query> [--skill <skill_name>] [--top <k>] [--json] [--global <customizations.ldb>]
   libredb sync-skill <SKILL.md> [--name <skill_name>] [--global <customizations.ldb>]
   libredb list-rules [--global <customizations.ldb>]
   libredb list-skills [--global <customizations.ldb>]
@@ -605,14 +608,32 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "get-skill" => {
             let cli = CliSpec::new(
                 "get-skill",
-                "libredb get-skill <skill_name> [--section <title>] [--global <customizations.ldb>]",
+                "libredb get-skill [<skill_name>] [--section <title> | --query <q> [--top <k>]] [--json] [--global <customizations.ldb>]",
             )
-            .positionals(1, Some(1))
+            .positionals(0, Some(1))
             .allow_global()
-            .values(&["--section"])
+            .switches(&["--json"])
+            .values(&["--section", "--query", "--top"])
             .parse(sub_args)?;
-            let skill_name = &cli.positionals[0];
             let gdb = hooks::open_global_ldb(cli.global_deref())?;
+            if let Some(q) = cli.value("--query") {
+                let top_k = cli.parse_value::<usize>("--top")?.unwrap_or(3);
+                let skill_filter = cli.positionals.first().map(String::as_str);
+                execute_skill_slice_query(
+                    gdb,
+                    q,
+                    skill_filter,
+                    top_k,
+                    cli.has_switch("--json"),
+                )?;
+                return Ok(());
+            }
+            let Some(skill_name) = cli.positionals.first() else {
+                return Err(
+                    "Usage: libredb get-skill <skill_name> [--section <title>] OR libredb get-skill [<skill_name>] --query <q> [--top <k>]"
+                        .into(),
+                );
+            };
             if let Some(sec_title) = cli.value("--section") {
                 let full_baseline_tok = gdb
                     .get_by_key(NodeKind::Generic, &format!("skill_full::{skill_name}"))
@@ -661,6 +682,27 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 let rec = gdb.get_by_key(NodeKind::Skill, skill_name)?;
                 println!("{}", String::from_utf8_lossy(&rec.payload));
             }
+        }
+        "slice-skill" => {
+            let cli = CliSpec::new(
+                "slice-skill",
+                "libredb slice-skill <query> [--skill <skill_name>] [--top <k>] [--json] [--global <customizations.ldb>]",
+            )
+            .positionals(1, Some(1))
+            .raw_value_slots(&[0])
+            .allow_global()
+            .switches(&["--json"])
+            .values(&["--skill", "--top"])
+            .parse(sub_args)?;
+            let gdb = hooks::open_global_ldb(cli.global_deref())?;
+            let top_k = cli.parse_value::<usize>("--top")?.unwrap_or(3);
+            execute_skill_slice_query(
+                gdb,
+                &cli.positionals[0],
+                cli.value("--skill"),
+                top_k,
+                cli.has_switch("--json"),
+            )?;
         }
         "list-rules" => {
             let cli = CliSpec::new(
@@ -962,10 +1004,10 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "pulse" => {
             let cli = CliSpec::new(
                 "pulse",
-                "libredb pulse <db.ldb> <query> [--global <g.ldb>] [--cid <id>] [--transcript <t.jsonl>] [--epoch <n>] [--budget <tok>] [--cwd <dir>] [--err <msg>]",
+                "libredb pulse [<db.ldb>] <query> [--global <g.ldb>] [--cid <id>] [--transcript <t.jsonl>] [--epoch <n>] [--budget <tok>] [--cwd <dir>] [--err <msg>]",
             )
-            .positionals(2, Some(2))
-            .raw_value_slots(&[1])
+            .positionals(1, Some(2))
+            .raw_value_slots(&[0, 1])
             .allow_global()
             .values(&[
                 "--cid",
@@ -976,7 +1018,12 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 "--err",
             ])
             .parse(sub_args)?;
-            let mut req = PulseRequest::new(&cli.positionals[1], 800);
+            let (explicit_db_opt, query_str) = if cli.positionals.len() == 2 {
+                (Some(PathBuf::from(&cli.positionals[0])), &cli.positionals[1])
+            } else {
+                (None, &cli.positionals[0])
+            };
+            let mut req = PulseRequest::new(query_str, 800);
             req.conversation_id = cli.value("--cid").map(ToOwned::to_owned);
             let transcript_path = cli.path_value("--transcript");
             if let Some(ep) = cli.parse_value::<u32>("--epoch")? {
@@ -985,19 +1032,27 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             if let Some(b) = cli.parse_value::<u32>("--budget")? {
                 req.token_budget = b;
             }
-            req.workspace_dir = cli.path_value("--cwd");
+            let ws_dir_opt = cli.path_value("--cwd").or_else(|| env::current_dir().ok());
+            req.workspace_dir = ws_dir_opt.clone();
             req.error_context = cli.value("--err").map(ToOwned::to_owned);
 
             let t0 = Instant::now();
-            let proj_db =
-                open_cli_verified_project_db(cli.global_deref(), Path::new(&cli.positionals[0]))?;
-            if let (Some(ref cid), Some(ref tp)) = (&req.conversation_id, &transcript_path) {
-                req.epoch = sync_transcript_epoch(&proj_db, cid, tp)?;
-            }
             let glob_db = match cli.global_deref() {
                 Some(gp) => Some(hooks::open_global_ldb(Some(gp))?),
                 None => hooks::open_global_ldb_checked(None)?,
             };
+            let proj_db = if let Some(ref db_p) = explicit_db_opt {
+                open_cli_verified_project_db(cli.global_deref(), db_p)?
+            } else {
+                resolve_default_cli_project_db(
+                    cli.global_deref(),
+                    glob_db.as_ref(),
+                    ws_dir_opt.as_deref(),
+                )?
+            };
+            if let (Some(ref cid), Some(ref tp)) = (&req.conversation_id, &transcript_path) {
+                req.epoch = sync_transcript_epoch(&proj_db, cid, tp)?;
+            }
             let brain = OverlayBrain::open(glob_db, proj_db)?;
             let resp = brain.pulse(&req)?;
             let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -1078,38 +1133,108 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 elapsed_ms
             );
         }
+        "locate" => {
+            let cli = CliSpec::new(
+                "locate",
+                "libredb locate [<db.ldb>] <symbol_query...> [--cwd <dir>] [--db <db.ldb>] [--json] [--global <customizations.ldb>]",
+            )
+            .positionals(1, None)
+            .raw_value_slots(&[0, 1])
+            .allow_global()
+            .switches(&["--json"])
+            .values(&["--cwd", "--db"])
+            .parse(sub_args)?;
+            let t0 = Instant::now();
+            let ws_dir_opt = cli.path_value("--cwd").or_else(|| env::current_dir().ok());
+            let (explicit_db_opt, queries) =
+                split_cli_db_and_symbol_queries(&cli.positionals, cli.path_value("--db"));
+            let glob_db = match cli.global_deref() {
+                Some(gp) => Some(hooks::open_global_ldb(Some(gp))?),
+                None => hooks::open_global_ldb_checked(None)?,
+            };
+            let db = if let Some(ref db_p) = explicit_db_opt {
+                open_cli_verified_project_db(cli.global_deref(), db_p)?
+            } else {
+                resolve_default_cli_project_db(
+                    cli.global_deref(),
+                    glob_db.as_ref(),
+                    ws_dir_opt.as_deref(),
+                )?
+            };
+            let matches = locate_symbols(&db, &queries)?;
+            let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            if cli.has_switch("--json") {
+                println!("{}", serde_json::to_string_pretty(&matches)?);
+            } else {
+                print!("{}", format_locate_compact(&queries, &matches));
+                println!("[Located in {elapsed_ms:.2} ms]");
+            }
+        }
         "impact" => {
             let cli = CliSpec::new(
                 "impact",
-                "libredb impact <db.ldb> <symbol_query> [--global <customizations.ldb>]",
+                "libredb impact [<db.ldb>] <symbol_query...> [--cwd <dir>] [--db <db.ldb>] [--json] [--global <customizations.ldb>]",
             )
-            .positionals(2, Some(2))
-            .raw_value_slots(&[1])
+            .positionals(1, None)
+            .raw_value_slots(&[0, 1])
             .allow_global()
+            .switches(&["--json"])
+            .values(&["--cwd", "--db"])
             .parse(sub_args)?;
             let t0 = Instant::now();
-            let db =
-                open_cli_verified_project_db(cli.global_deref(), Path::new(&cli.positionals[0]))?;
-            let reports = query_symbol_impact(&db, &cli.positionals[1])?;
-            println!(
-                "=== BLAST-RADIUS & CAUSAL IMPACT: '{}' ({} matches in {:.2} ms) ===",
-                cli.positionals[1],
-                reports.len(),
-                t0.elapsed().as_secs_f64() * 1000.0
-            );
-            for r in reports {
-                println!("\n* [#{}] {}", r.node_id, r.contract);
-                for g in &r.governing_decisions {
-                    println!("    [Governed by]:    {g}");
+            let ws_dir_opt = cli.path_value("--cwd").or_else(|| env::current_dir().ok());
+            let (explicit_db_opt, queries) =
+                split_cli_db_and_symbol_queries(&cli.positionals, cli.path_value("--db"));
+            let glob_db = match cli.global_deref() {
+                Some(gp) => Some(hooks::open_global_ldb(Some(gp))?),
+                None => hooks::open_global_ldb_checked(None)?,
+            };
+            let db = if let Some(ref db_p) = explicit_db_opt {
+                open_cli_verified_project_db(cli.global_deref(), db_p)?
+            } else {
+                resolve_default_cli_project_db(
+                    cli.global_deref(),
+                    glob_db.as_ref(),
+                    ws_dir_opt.as_deref(),
+                )?
+            };
+            if queries.len() == 1 {
+                let reports = query_symbol_impact(&db, &queries[0])?;
+                if cli.has_switch("--json") {
+                    println!("{}", serde_json::to_string_pretty(&reports)?);
+                } else {
+                    println!(
+                        "=== BLAST-RADIUS & CAUSAL IMPACT: '{}' ({} matches in {:.2} ms) ===",
+                        queries[0],
+                        reports.len(),
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
+                    for r in reports {
+                        println!("\n* [#{}] {}", r.node_id, r.contract);
+                        for g in &r.governing_decisions {
+                            println!("    [Governed by]:    {g}");
+                        }
+                        for imp in &r.implementors {
+                            println!("    [Implemented by] <= {imp}");
+                        }
+                        for c in &r.callers {
+                            println!("    [Called by]      <- {c}");
+                        }
+                        for d in &r.callees {
+                            println!("    [Calls/Depends]  -> {d}");
+                        }
+                    }
                 }
-                for imp in &r.implementors {
-                    println!("    [Implemented by] <= {imp}");
-                }
-                for c in &r.callers {
-                    println!("    [Called by]      <- {c}");
-                }
-                for d in &r.callees {
-                    println!("    [Calls/Depends]  -> {d}");
+            } else {
+                let batches = query_symbols_impact_batch(&db, &queries)?;
+                if cli.has_switch("--json") {
+                    let json_batches: Vec<serde_json::Value> = batches
+                        .iter()
+                        .map(|(q, reps)| serde_json::json!({ "query": q, "reports": reps }))
+                        .collect();
+                    println!("{}", serde_json::to_string_pretty(&json_batches)?);
+                } else {
+                    print!("{}", format_impact_batch_compact(&batches));
                 }
             }
         }
@@ -2392,6 +2517,127 @@ fn open_cli_verified_project_db(
         }
     }
     Ok(Arc::new(LibreDb::open(&resolved_db)?))
+}
+
+fn split_cli_db_and_symbol_queries(
+    positionals: &[String],
+    explicit_db_flag: Option<PathBuf>,
+) -> (Option<PathBuf>, Vec<String>) {
+    let mut queries = Vec::new();
+    let mut push_query = |raw: &str| {
+        if raw.contains(',') && !raw.contains('(') {
+            for part in raw.split(',') {
+                let t = part.trim();
+                if !t.is_empty() && !queries.iter().any(|q| q == t) {
+                    queries.push(t.to_owned());
+                }
+            }
+        } else {
+            let t = raw.trim();
+            if !t.is_empty() && !queries.iter().any(|q| q == t) {
+                queries.push(t.to_owned());
+            }
+        }
+    };
+
+    if explicit_db_flag.is_some() {
+        for p in positionals {
+            push_query(p);
+        }
+        return (explicit_db_flag, queries);
+    }
+
+    if positionals.len() >= 2 {
+        let first = &positionals[0];
+        let low = first.to_ascii_lowercase();
+        if low.ends_with(".ldb") || low.ends_with(".db") || Path::new(first).is_file() {
+            for p in &positionals[1..] {
+                push_query(p);
+            }
+            return (Some(PathBuf::from(first)), queries);
+        }
+    }
+
+    for p in positionals {
+        push_query(p);
+    }
+    (None, queries)
+}
+
+fn resolve_default_cli_project_db(
+    global_path_opt: Option<&Path>,
+    glob_db_opt: Option<&Arc<LibreDb>>,
+    ws_dir_opt: Option<&Path>,
+) -> Result<Arc<LibreDb>, Box<dyn std::error::Error>> {
+    if let Some(ws) = ws_dir_opt {
+        let mut curr: Option<&Path> = Some(ws);
+        while let Some(dir) = curr {
+            let ldb_cand = dir.join(".agents").join("memory.ldb");
+            let sql_cand = dir.join(".agents").join("memory.db");
+            if ldb_cand.is_file() || sql_cand.is_file() {
+                return open_cli_verified_project_db(global_path_opt, &ldb_cand);
+            }
+            curr = dir.parent();
+        }
+    }
+    if let Some(gdb) = glob_db_opt {
+        return Ok(Arc::clone(gdb));
+    }
+    let fallback_ws = ws_dir_opt
+        .map(Path::to_path_buf)
+        .or_else(|| env::current_dir().ok())
+        .ok_or("Unable to resolve current working directory or project .agents/memory.ldb")?;
+    open_cli_verified_project_db(
+        global_path_opt,
+        &fallback_ws.join(".agents").join("memory.ldb"),
+    )
+}
+
+fn execute_skill_slice_query(
+    gdb: Arc<LibreDb>,
+    query: &str,
+    skill_filter: Option<&str>,
+    top_k: usize,
+    as_json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cog = CognitiveEngine::open_db(gdb)?;
+    let matches = cog.slice_skill_sections(query, skill_filter, top_k)?;
+    if matches.is_empty() {
+        return Err(format!("No skill sections matched query '{query}'").into());
+    }
+    let mut seen_skills: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut baseline_tok = 0u64;
+    let mut emitted_tok = 0u64;
+    for m in &matches {
+        emitted_tok = emitted_tok.saturating_add(m.token_count as u64);
+        if seen_skills.insert(m.skill_name.clone()) {
+            baseline_tok = baseline_tok.saturating_add(m.full_skill_tokens as u64);
+        }
+    }
+    telemetry::record_event(telemetry::TelemetryEvent::SkillSlice {
+        baseline_tokens: baseline_tok.max(emitted_tok),
+        emitted_tokens: emitted_tok,
+    });
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&matches)?);
+    } else {
+        for (idx, m) in matches.iter().enumerate() {
+            if idx > 0 {
+                println!("\n---");
+            }
+            println!(
+                "=== SKILL SECTION [{}/{}]: {} (score={:.2}, ~{} of {} tok) ===\n{}",
+                idx + 1,
+                matches.len(),
+                m.key,
+                m.score,
+                m.token_count,
+                m.full_skill_tokens,
+                m.content.trim()
+            );
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
