@@ -19,35 +19,22 @@ use std::path::{Path, PathBuf};
 pub const WORKSPACE_GRAPH_STATE_KEY: &str = "sys::workspace_graph_state";
 /// Ephemeral `WorkingSet` key prefix staging `PreToolUse` edits until disk bytes match `expected_post_hash`.
 pub const TENTATIVE_EDIT_PREFIX: &str = "tentative_edit::";
-/// Internal ring-buffer key storing recent `0`-match queries (`<= 8` entries, `30 min` TTL)
-/// awaiting a verified file edit in the same workspace.
-pub const PENDING_MISS_CUES_KEY: &str = "sys::pending_miss_cues";
-/// Internal causal symbol-alias bridge key mapping `cue_token -> Vec<(symbol_key, weight)>`.
-pub const SYMBOL_CUE_BRIDGES_KEY: &str = "sys::symbol_cue_bridges";
-/// Maximum pending search-miss cues retained in `sys::pending_miss_cues`.
-pub const MAX_PENDING_MISS_CUES: usize = 8;
-/// Expiration window (`30 minutes` in nanoseconds) for binding a search miss cue to a verified edit.
-pub const MISS_CUE_TTL_NS: u128 = 30 * 60 * 1_000_000_000;
+pub use crate::learning::{
+    record_search_miss_cue, record_search_miss_cue_with_source, MissCueSource, PendingMissCue,
+    SymbolCueBridgeBook, MAX_PENDING_MISS_CUES, MISS_CUE_TTL_NS, PENDING_MISS_CUES_KEY,
+    SYMBOL_CUE_BRIDGES_KEY,
+};
+use crate::learning::{
+    compose_tiers_with_bridges, diff_symbol_bodies, learn_from_verified_edit,
+    note_bulk_scan_skipped, BridgeScorer, EditEvidence, EditOrigin, MAX_INDEX_SCAN_LEARN_FILES,
+};
 /// Maximum number of source files allowed in a single Git commit for co-change coupling learning.
 pub const MAX_COCHANGE_COMMIT_FILES: usize = 12;
 
-const WORKSPACE_GRAPH_STATE_VERSION: u32 = 4;
+/// Bumped to `5` in v1.4.0 so the first scan after upgrade re-extracts skeletons lacking body hashes.
+const WORKSPACE_GRAPH_STATE_VERSION: u32 = 5;
 const RACY_SUBSEC_WINDOW_NS: u128 = 50_000_000;
 const RACY_COARSE_WINDOW_NS: u128 = 2_000_000_000;
-
-/// Pending `0`-match query recorded by `locate` / `impact` / `pulse`, awaiting a verified code edit.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PendingMissCue {
-    pub raw_query: String,
-    pub tokens: Vec<String>,
-    pub recorded_at_ns: u128,
-}
-
-/// Persisted causal bridge mapping learned query cue tokens to workspace `symbol_key` strings.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SymbolCueBridgeBook {
-    pub bridges: BTreeMap<String, Vec<(String, f64)>>,
-}
 
 /// Statistically verified Git co-change coupling partner for a source file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -236,7 +223,7 @@ fn file_mtime_ns(meta: &std::fs::Metadata) -> u128 {
         .map_or(0, |d| d.as_nanos())
 }
 
-fn current_unix_ns() -> u128 {
+pub(crate) fn current_unix_ns() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos())
@@ -302,7 +289,7 @@ fn infer_agents_ws_root(db: &LibreDb) -> Option<PathBuf> {
     }
 }
 
-fn strip_line_disambiguator(sym_key: &str) -> &str {
+pub(crate) fn strip_line_disambiguator(sym_key: &str) -> &str {
     if let Some((head, tail)) = sym_key.rsplit_once("@L") {
         if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) {
             return head;
@@ -424,261 +411,12 @@ fn apply_skeleton_symbols_atomic(
     Ok(sym_count)
 }
 
-fn extract_cue_tokens(raw_query: &str) -> Vec<String> {
-    let trimmed = raw_query.trim();
-    if trimmed.is_empty()
-        || trimmed.len() > 160
-        || trimmed.contains('/')
-        || trimmed.contains('\\')
-    {
-        return Vec::new();
-    }
-    let mut tokens: Vec<String> = libredb_index::segment_universal_tokens(trimmed)
-        .into_iter()
-        .filter(|t| t.chars().count() >= 3 && !t.chars().all(|c| c.is_ascii_digit()))
-        .collect();
-    let whole_ident = trimmed.trim_start_matches("::").to_lowercase();
-    if whole_ident.len() >= 3
-        && !whole_ident.contains(char::is_whitespace)
-        && !tokens.contains(&whole_ident)
-    {
-        tokens.insert(0, whole_ident);
-    }
-    tokens.truncate(8);
-    tokens
-}
-
-/// Records a `0`-match symbol or cognitive query in the bounded workspace ring buffer
-/// (`sys::pending_miss_cues`, `<= 8` entries, `30 min` TTL) so a subsequent verified code edit
-/// in the same workspace can automatically bridge the query tokens to the modified symbols.
-pub fn record_search_miss_cue(db: &LibreDb, raw_query: &str) -> Result<bool> {
-    let tokens = extract_cue_tokens(raw_query);
-    if tokens.is_empty() {
-        return Ok(false);
-    }
-    let now_ns = current_unix_ns();
-    let trimmed = raw_query.trim().to_owned();
-    let mut cues: Vec<PendingMissCue> = db
-        .get_by_key(NodeKind::Generic, PENDING_MISS_CUES_KEY)
-        .ok()
-        .and_then(|rec| serde_json::from_slice::<Vec<PendingMissCue>>(&rec.payload).ok())
-        .unwrap_or_default();
-
-    cues.retain(|c| {
-        now_ns.saturating_sub(c.recorded_at_ns) <= MISS_CUE_TTL_NS
-            && !c.raw_query.eq_ignore_ascii_case(&trimmed)
-    });
-    cues.push(PendingMissCue {
-        raw_query: trimmed,
-        tokens,
-        recorded_at_ns: now_ns,
-    });
-    if cues.len() > MAX_PENDING_MISS_CUES {
-        let drop_n = cues.len() - MAX_PENDING_MISS_CUES;
-        cues.drain(0..drop_n);
-    }
-    if let Ok(bytes) = serde_json::to_vec(&cues) {
-        db.put(
-            WriteRequest::new(NodeKind::Generic, bytes)
-                .with_key(PENDING_MISS_CUES_KEY)
-                .with_importance(32),
-        )?;
-    }
-    Ok(true)
-}
-
-fn compute_modified_symbol_keys(
-    db: &LibreDb,
-    old_disk_bytes: Option<&[u8]>,
-    rel_path: &str,
-    post_edit_bytes: &[u8],
-    post_skel: &FileSkeleton,
-) -> Vec<String> {
-    let post_keys = compute_file_symbol_keys(rel_path, post_skel);
-    if post_keys.is_empty() {
-        return Vec::new();
-    }
-    let mut touched: Vec<String> = Vec::new();
-
-    if let Some(old_bytes) = old_disk_bytes {
-        let old_text = String::from_utf8_lossy(old_bytes);
-        let new_text = String::from_utf8_lossy(post_edit_bytes);
-        let old_lines: Vec<&str> = old_text.lines().collect();
-        let new_lines: Vec<&str> = new_text.lines().collect();
-
-        let mut prefix_same = 0usize;
-        let min_len = old_lines.len().min(new_lines.len());
-        while prefix_same < min_len && old_lines[prefix_same] == new_lines[prefix_same] {
-            prefix_same += 1;
-        }
-        let mut suffix_same = 0usize;
-        while suffix_same < (min_len - prefix_same)
-            && old_lines[old_lines.len() - 1 - suffix_same]
-                == new_lines[new_lines.len() - 1 - suffix_same]
-        {
-            suffix_same += 1;
-        }
-        let diff_start_line = prefix_same + 1;
-        let diff_end_line = new_lines
-            .len()
-            .saturating_sub(suffix_same)
-            .max(diff_start_line);
-
-        for (sym_idx, sym_key) in &post_keys {
-            let sym = &post_skel.symbols[*sym_idx];
-            if sym.end_line >= diff_start_line && sym.start_line <= diff_end_line {
-                let stripped = strip_line_disambiguator(sym_key).to_owned();
-                if !touched.contains(&stripped) {
-                    touched.push(stripped);
-                }
-            }
-        }
-    }
-
-    let skel_key = format!("{SKELETON_KEY_PREFIX}{rel_path}");
-    if let Ok(rec) = db.get_by_key(NodeKind::WorkingSet, &skel_key) {
-        if let Ok(old_skel) = serde_json::from_slice::<FileSkeleton>(&rec.payload) {
-            let mut old_sigs: HashMap<String, (String, String, usize)> = HashMap::new();
-            for s in &old_skel.symbols {
-                old_sigs.insert(
-                    s.qualified_name(),
-                    (
-                        s.signature.clone(),
-                        s.doc_summary.clone(),
-                        s.end_line.saturating_sub(s.start_line),
-                    ),
-                );
-            }
-            for (sym_idx, sym_key) in &post_keys {
-                let sym = &post_skel.symbols[*sym_idx];
-                let qn = sym.qualified_name();
-                let span = sym.end_line.saturating_sub(sym.start_line);
-                let changed = match old_sigs.get(&qn) {
-                    Some((sig, doc, old_span)) => {
-                        sig != &sym.signature || doc != &sym.doc_summary || *old_span != span
-                    }
-                    None => true,
-                };
-                if changed {
-                    let stripped = strip_line_disambiguator(sym_key).to_owned();
-                    if !touched.contains(&stripped) {
-                        touched.push(stripped);
-                    }
-                }
-            }
-        }
-    }
-
-    if touched.is_empty() && post_keys.len() == 1 {
-        touched.push(strip_line_disambiguator(&post_keys[0].1).to_owned());
-    }
-    touched
-}
-
-fn bind_pending_miss_cues_to_symbols(
-    db: &LibreDb,
-    touched_symbol_keys: &[String],
-) -> Result<usize> {
-    if touched_symbol_keys.is_empty() || touched_symbol_keys.len() > 6 {
-        return Ok(0);
-    }
-    let Ok(cues_rec) = db.get_by_key(NodeKind::Generic, PENDING_MISS_CUES_KEY) else {
-        return Ok(0);
-    };
-    let _ = db.deprecate_key(NodeKind::Generic, PENDING_MISS_CUES_KEY);
-    let Ok(cues) = serde_json::from_slice::<Vec<PendingMissCue>>(&cues_rec.payload) else {
-        return Ok(0);
-    };
-    let now_ns = current_unix_ns();
-    let valid_cues: Vec<PendingMissCue> = cues
-        .into_iter()
-        .filter(|c| now_ns.saturating_sub(c.recorded_at_ns) <= MISS_CUE_TTL_NS)
-        .collect();
-    if valid_cues.is_empty() {
-        return Ok(0);
-    }
-
-    let mut book: SymbolCueBridgeBook = db
-        .get_by_key(NodeKind::Generic, SYMBOL_CUE_BRIDGES_KEY)
-        .ok()
-        .and_then(|r| serde_json::from_slice::<SymbolCueBridgeBook>(&r.payload).ok())
-        .unwrap_or_default();
-
-    let mut updated_links = 0usize;
-    for cue in &valid_cues {
-        for tok in &cue.tokens {
-            let list = book.bridges.entry(tok.clone()).or_default();
-            for sym_k in touched_symbol_keys {
-                let clean_k = strip_line_disambiguator(sym_k).to_owned();
-                if let Some(existing) = list.iter_mut().find(|(k, _)| k == &clean_k) {
-                    existing.1 = (1.0 - (1.0 - existing.1) * 0.40).clamp(0.10, 0.95);
-                } else {
-                    list.push((clean_k, 0.60));
-                }
-                updated_links += 1;
-            }
-            list.sort_by(|a, b| {
-                b.1.partial_cmp(&a.1)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.0.cmp(&b.0))
-            });
-            list.truncate(8);
-        }
-    }
-
-    if updated_links > 0 {
-        if let Ok(bytes) = serde_json::to_vec(&book) {
-            db.put(
-                WriteRequest::new(NodeKind::Generic, bytes)
-                    .with_key(SYMBOL_CUE_BRIDGES_KEY)
-                    .with_importance(64),
-            )?;
-        }
-    }
-    Ok(updated_links)
-}
-
-pub(crate) fn match_symbol_cue_bridges(
-    db: &LibreDb,
-    raw_query: &str,
-    limit: usize,
-) -> Vec<(u64, f64)> {
-    let tokens = extract_cue_tokens(raw_query);
-    if tokens.is_empty() {
-        return Vec::new();
-    }
-    let Ok(rec) = db.get_by_key(NodeKind::Generic, SYMBOL_CUE_BRIDGES_KEY) else {
-        return Vec::new();
-    };
-    let Ok(book) = serde_json::from_slice::<SymbolCueBridgeBook>(&rec.payload) else {
-        return Vec::new();
-    };
-    let mut key_scores: HashMap<String, f64> = HashMap::new();
-    for tok in &tokens {
-        if let Some(targets) = book.bridges.get(tok) {
-            for (sym_k, w) in targets {
-                *key_scores.entry(sym_k.clone()).or_insert(0.0) += *w;
-            }
-        }
-    }
-    if key_scores.is_empty() {
-        return Vec::new();
-    }
-    let mut hits: Vec<(u64, String, f64)> = Vec::new();
-    for (ino, key_opt, _) in db.list_inodes(Some(NodeKind::Symbol), false) {
-        let Some(full_k) = key_opt else { continue };
-        let stripped = strip_line_disambiguator(&full_k);
-        if let Some(&sc) = key_scores.get(stripped).or_else(|| key_scores.get(&full_k)) {
-            hits.push((ino.node_id, full_k, sc));
-        }
-    }
-    hits.sort_by(|a, b| {
-        b.2.partial_cmp(&a.2)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.1.cmp(&b.1))
-    });
-    hits.truncate(limit);
-    hits.into_iter().map(|(id, _, sc)| (id, sc)).collect()
+/// Loads the last verified `skeleton::<rel_path>` snapshot (the pre-edit baseline for symbol diffs).
+fn load_cached_skeleton(db: &LibreDb, rel_path: &str) -> Option<FileSkeleton> {
+    let rec = db
+        .get_by_key(NodeKind::WorkingSet, &format!("{SKELETON_KEY_PREFIX}{rel_path}"))
+        .ok()?;
+    serde_json::from_slice::<FileSkeleton>(&rec.payload).ok()
 }
 
 /// Stages a predicted `PreToolUse` edit under `tentative_edit::<rel_path>` (`NodeKind::WorkingSet`)
@@ -712,13 +450,11 @@ pub fn stage_tentative_file_edit(
 
     let old_disk_bytes = crate::skeleton::read_bounded_source_file(target_file).ok();
     let post_skeleton = FileSkeleton::extract_from_bytes(rel_path.clone(), post_edit_bytes);
-    let touched_symbol_keys = compute_modified_symbol_keys(
-        db,
-        old_disk_bytes.as_deref(),
-        &rel_path,
-        post_edit_bytes,
-        &post_skeleton,
-    );
+    // Exact pre-edit baseline: the bytes currently on disk (`None` = file is being created).
+    let old_skeleton = old_disk_bytes
+        .as_deref()
+        .map(|b| FileSkeleton::extract_from_bytes(rel_path.clone(), b));
+    let touched_symbol_keys = diff_symbol_bodies(&rel_path, old_skeleton.as_ref(), &post_skeleton);
     let tentative = TentativeFileEdit {
         rel_path: rel_path.clone(),
         pre_edit_hash,
@@ -783,24 +519,24 @@ pub fn reconcile_tentative_edits(db: &LibreDb, ws_root: &Path) -> Result<(usize,
             Ok(disk_bytes) => {
                 let disk_hash = hash_key(SKELETON_HASH_SEED, &disk_bytes);
                 if disk_hash == tentative.expected_post_hash {
-                    let touched = if tentative.touched_symbol_keys.is_empty() {
-                        compute_modified_symbol_keys(
-                            db,
-                            None,
-                            &tentative.rel_path,
-                            &disk_bytes,
-                            &tentative.post_skeleton,
-                        )
-                    } else {
-                        tentative.touched_symbol_keys.clone()
-                    };
+                    // `touched_symbol_keys` was computed at staging time against the exact pre-edit
+                    // disk bytes; staging time (`created_ns`) is the causal edit timestamp.
+                    let touched = tentative.touched_symbol_keys.clone();
                     apply_skeleton_symbols_atomic(
                         db,
                         &tentative.rel_path,
                         &tentative.post_skeleton,
                         &[(NodeKind::WorkingSet, t_key.as_str())],
                     )?;
-                    let _ = bind_pending_miss_cues_to_symbols(db, &touched);
+                    let _ = learn_from_verified_edit(
+                        db,
+                        &EditEvidence {
+                            rel_path: tentative.rel_path.clone(),
+                            edit_ns: tentative.created_ns,
+                            touched,
+                            origin: EditOrigin::Hook,
+                        },
+                    );
                     promoted_files += 1;
                     avoided_tokens = avoided_tokens.saturating_add(tentative.raw_tokens);
                 } else if Some(disk_hash) == tentative.pre_edit_hash {
@@ -812,20 +548,29 @@ pub fn reconcile_tentative_edits(db: &LibreDb, ws_root: &Path) -> Result<(usize,
                     if !disk_bytes[..probe_len].contains(&0u8) {
                         let actual_skel =
                             FileSkeleton::extract_from_bytes(tentative.rel_path.clone(), &disk_bytes);
-                        let touched = compute_modified_symbol_keys(
-                            db,
-                            None,
-                            &tentative.rel_path,
-                            &disk_bytes,
-                            &actual_skel,
-                        );
+                        let baseline = load_cached_skeleton(db, &tentative.rel_path);
+                        let touched = baseline
+                            .as_ref()
+                            .map(|old| diff_symbol_bodies(&tentative.rel_path, Some(old), &actual_skel))
+                            .unwrap_or_default();
+                        let edit_ns = std::fs::symlink_metadata(&candidate_path)
+                            .map(|m| file_mtime_ns(&m))
+                            .unwrap_or_else(|_| current_unix_ns());
                         apply_skeleton_symbols_atomic(
                             db,
                             &tentative.rel_path,
                             &actual_skel,
                             &[(NodeKind::WorkingSet, t_key.as_str())],
                         )?;
-                        let _ = bind_pending_miss_cues_to_symbols(db, &touched);
+                        let _ = learn_from_verified_edit(
+                            db,
+                            &EditEvidence {
+                                rel_path: tentative.rel_path.clone(),
+                                edit_ns,
+                                touched,
+                                origin: EditOrigin::DiskSync,
+                            },
+                        );
                     } else {
                         let _ = db.deprecate_key(NodeKind::WorkingSet, &t_key);
                     }
@@ -866,24 +611,37 @@ pub fn sync_single_file_symbols(
     let skel_key = format!("{SKELETON_KEY_PREFIX}{rel_path}");
     let t_key = format!("{TENTATIVE_EDIT_PREFIX}{rel_path}");
     let new_hash = hash_key(SKELETON_HASH_SEED, post_edit_bytes);
+    let mut baseline: Option<FileSkeleton> = None;
     if let Ok(rec) = db.get_by_key(NodeKind::WorkingSet, &skel_key) {
         if let Ok(cached) = serde_json::from_slice::<FileSkeleton>(&rec.payload) {
             if cached.content_hash == new_hash {
                 let _ = db.deprecate_key(NodeKind::WorkingSet, &t_key);
                 return Ok(0);
             }
+            baseline = Some(cached);
         }
     }
 
     let new_skel = FileSkeleton::extract_from_bytes(rel_path.clone(), post_edit_bytes);
-    let touched = compute_modified_symbol_keys(db, None, &rel_path, post_edit_bytes, &new_skel);
+    let touched = baseline
+        .as_ref()
+        .map(|old| diff_symbol_bodies(&rel_path, Some(old), &new_skel))
+        .unwrap_or_default();
     let count = apply_skeleton_symbols_atomic(
         db,
         &rel_path,
         &new_skel,
         &[(NodeKind::WorkingSet, t_key.as_str())],
     )?;
-    let _ = bind_pending_miss_cues_to_symbols(db, &touched);
+    let _ = learn_from_verified_edit(
+        db,
+        &EditEvidence {
+            rel_path,
+            edit_ns: current_unix_ns(),
+            touched,
+            origin: EditOrigin::DiskSync,
+        },
+    );
     Ok(count)
 }
 
@@ -1024,6 +782,9 @@ pub fn index_workspace_with_exclusions(
 
     let mut changed_files: Vec<ParsedFile> = Vec::new();
     let mut all_skeletons: Vec<(String, FileSkeleton, Option<String>)> = Vec::new();
+    // `(rel_path, last verified skeleton, file mtime_ns)` for files whose content changed on disk
+    // outside the `PreToolUse` hook (terminal tools, scripts, editors without hooks).
+    let mut learn_candidates: Vec<(String, FileSkeleton, u128)> = Vec::new();
 
     for (abs_path, rel_path) in source_files {
         let Ok(sym_meta) = std::fs::symlink_metadata(&abs_path) else {
@@ -1070,15 +831,22 @@ pub fn index_workspace_with_exclusions(
             },
         );
         let skel_key = format!("{SKELETON_KEY_PREFIX}{rel_path}");
+        let mut prior_skel: Option<FileSkeleton> = None;
 
         if !force {
             if let Ok(rec) = db.get_by_key(NodeKind::WorkingSet, &skel_key) {
                 if let Ok(cached) = serde_json::from_slice::<FileSkeleton>(&rec.payload) {
-                    if cached.content_hash == current_hash {
+                    // Skeletons persisted before v1.4.0 lack per-symbol body hashes: re-extract them
+                    // once (no learning event, because the file content itself is unchanged).
+                    let has_body_hashes = cached.symbols.iter().all(|s| s.body_hash != 0);
+                    if cached.content_hash == current_hash && has_body_hashes {
                         unchanged += 1;
                         let text = String::from_utf8_lossy(&raw_bytes).into_owned();
                         all_skeletons.push((rel_path, cached, Some(text)));
                         continue;
+                    }
+                    if cached.content_hash != current_hash {
+                        prior_skel = Some(cached);
                     }
                 }
             }
@@ -1087,6 +855,9 @@ pub fn index_workspace_with_exclusions(
         let raw_text = String::from_utf8_lossy(&raw_bytes).into_owned();
         let skel = FileSkeleton::extract_from_bytes(rel_path.clone(), &raw_bytes);
         reindexed += 1;
+        if let Some(old_skel) = prior_skel {
+            learn_candidates.push((rel_path.clone(), old_skel, mtime_ns));
+        }
         all_skeletons.push((rel_path.clone(), skel.clone(), Some(raw_text)));
         changed_files.push(ParsedFile {
             rel_path,
@@ -1174,6 +945,29 @@ pub fn index_workspace_with_exclusions(
 
     if !prepared.is_empty() {
         db.commit_batch(&prepared)?;
+    }
+
+    // Learn from targeted external edits only: never on the first index of a workspace and never
+    // when a scan sees a bulk change (checkout, pull, formatter run across many files).
+    if prev_state_opt.is_some() && !learn_candidates.is_empty() {
+        if learn_candidates.len() <= MAX_INDEX_SCAN_LEARN_FILES {
+            for (rel, old_skel, mtime) in &learn_candidates {
+                if let Some(pf) = changed_files.iter().find(|pf| &pf.rel_path == rel) {
+                    let touched = diff_symbol_bodies(rel, Some(old_skel), &pf.skeleton);
+                    let _ = learn_from_verified_edit(
+                        db,
+                        &EditEvidence {
+                            rel_path: rel.clone(),
+                            edit_ns: *mtime,
+                            touched,
+                            origin: EditOrigin::IndexScan,
+                        },
+                    );
+                }
+            }
+        } else {
+            note_bulk_scan_skipped(db);
+        }
     }
 
     // Build structural lookup tables of all active `NodeKind::Symbol` nodes (zero hardcoded stopwords):
@@ -1652,6 +1446,10 @@ pub fn index_workspace_with_exclusions(
 
     prune_stale_symbol_cue_bridges(db, &live_rel_paths, &by_full_key);
 
+    // Physically deprecate falsified grounded reflexes ONLY on unsealed workspaces. Sealed workspaces
+    // carry `sys::trust_seals` inside this very `.agents/memory.ldb`, and `NodeKind::Rule` is part of
+    // the `hmac-sha256:v4` digest, so read/index paths must never mutate it there; `ReflexEngine::load`
+    // already suppresses falsified reflexes at runtime without any write.
     if db.get_by_key(NodeKind::Config, "sys::trust_seals").is_err() {
         let mut live_anchor_syms: HashSet<String> = HashSet::new();
         for full_k in by_full_key.keys() {
@@ -2119,6 +1917,11 @@ pub fn locate_symbols(db: &LibreDb, queries: &[String]) -> Result<Vec<SymbolLoca
 
     let sym_inodes = db.list_inodes(Some(NodeKind::Symbol), false);
     let mut out = Vec::new();
+    let bridge_scorer = BridgeScorer::from_symbol_inodes(db, &sym_inodes);
+    let full_key_by_id: HashMap<u64, String> = sym_inodes
+        .iter()
+        .filter_map(|(i, k, _)| Some((i.node_id, k.clone()?)))
+        .collect();
 
     for raw_query in &clean_queries {
         let Some((normalized_q, sig_filter, is_qualified_query)) =
@@ -2191,30 +1994,19 @@ pub fn locate_symbols(db: &LibreDb, queries: &[String]) -> Result<Vec<SymbolLoca
             }
         }
 
-        let mut matched_ids = if !tier1_exact.is_empty() {
-            tier1_exact
-        } else if !tier2_ci.is_empty() {
-            tier2_ci
-        } else {
-            tier3_substr
-        };
-        matched_ids.sort_by(|a, b| a.1.cmp(&b.1));
-        if matched_ids.is_empty() {
-            let bridged = match_symbol_cue_bridges(db, raw_query, MAX_LOCATE_MATCHES_PER_QUERY);
-            if !bridged.is_empty() {
-                let key_by_id: HashMap<u64, String> = sym_inodes
-                    .iter()
-                    .filter_map(|(i, k, _)| Some((i.node_id, k.clone()?)))
-                    .collect();
-                for (bid, _) in bridged {
-                    if let Some(fk) = key_by_id.get(&bid) {
-                        matched_ids.push((bid, fk.clone()));
-                    }
-                }
-            } else {
-                let _ = record_search_miss_cue(db, raw_query);
-            }
-        }
+        tier1_exact.sort_by(|a, b| a.1.cmp(&b.1));
+        tier2_ci.sort_by(|a, b| a.1.cmp(&b.1));
+        tier3_substr.sort_by(|a, b| a.1.cmp(&b.1));
+        let mut matched_ids = compose_tiers_with_bridges(
+            db,
+            raw_query,
+            tier1_exact,
+            tier2_ci,
+            tier3_substr,
+            bridge_scorer.as_ref(),
+            &full_key_by_id,
+            MissCueSource::Locate,
+        );
         matched_ids.truncate(MAX_LOCATE_MATCHES_PER_QUERY);
 
         let req_ids: Vec<u64> = matched_ids.iter().map(|(id, _)| *id).collect();
@@ -2481,40 +2273,33 @@ pub fn query_symbol_impact(db: &LibreDb, symbol_query: &str) -> Result<Vec<Symbo
         }
     }
 
-    let mut matched_ids = if !tier1_exact.is_empty() {
-        tier1_exact
-    } else if !tier2_ci.is_empty() {
-        tier2_ci
-    } else {
-        tier3_substr
-    };
-
     // Rank ambiguous matches (e.g. R8 short method `"a"` across 80 classes) by incoming caller fan-in
     // descending so the highest-impact call-graph hubs always surface first!
-    matched_ids.sort_by(|(id_a, k_a), (id_b, k_b)| {
+    let fan_in_order = |(id_a, k_a): &(u64, String), (id_b, k_b): &(u64, String)| {
         let ca = reverse_calls.get(id_a).map_or(0, Vec::len)
             + reverse_deps.get(id_a).map_or(0, Vec::len);
         let cb = reverse_calls.get(id_b).map_or(0, Vec::len)
             + reverse_deps.get(id_b).map_or(0, Vec::len);
         cb.cmp(&ca).then_with(|| k_a.cmp(k_b))
-    });
-
-    if matched_ids.is_empty() {
-        let bridged = match_symbol_cue_bridges(db, raw_q, 12);
-        if !bridged.is_empty() {
-            let key_by_id: HashMap<u64, String> = sym_inodes
-                .iter()
-                .filter_map(|(i, k, _)| Some((i.node_id, k.clone()?)))
-                .collect();
-            for (bid, _) in bridged {
-                if let Some(fk) = key_by_id.get(&bid) {
-                    matched_ids.push((bid, fk.clone()));
-                }
-            }
-        } else {
-            let _ = record_search_miss_cue(db, raw_q);
-        }
-    }
+    };
+    tier1_exact.sort_by(fan_in_order);
+    tier2_ci.sort_by(fan_in_order);
+    tier3_substr.sort_by(fan_in_order);
+    let bridge_scorer = BridgeScorer::from_symbol_inodes(db, &sym_inodes);
+    let full_key_by_id: HashMap<u64, String> = sym_inodes
+        .iter()
+        .filter_map(|(i, k, _)| Some((i.node_id, k.clone()?)))
+        .collect();
+    let matched_ids = compose_tiers_with_bridges(
+        db,
+        raw_q,
+        tier1_exact,
+        tier2_ci,
+        tier3_substr,
+        bridge_scorer.as_ref(),
+        &full_key_by_id,
+        MissCueSource::Impact,
+    );
 
     let co_change_map: BTreeMap<String, Vec<CoChangePartner>> = db
         .get_by_key(NodeKind::Generic, WORKSPACE_GRAPH_STATE_KEY)
@@ -3037,7 +2822,7 @@ fn collect_supertype_chain(
     out
 }
 
-fn compute_file_symbol_keys(rel_path: &str, skel: &FileSkeleton) -> Vec<(usize, String)> {
+pub(crate) fn compute_file_symbol_keys(rel_path: &str, skel: &FileSkeleton) -> Vec<(usize, String)> {
     let mut out = Vec::with_capacity(skel.symbols.len());
     let mut seen_keys: HashSet<String> = HashSet::with_capacity(skel.symbols.len());
     for (idx, sym) in skel.symbols.iter().enumerate() {

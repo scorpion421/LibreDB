@@ -2019,7 +2019,7 @@ pub fn run_feature_and_security_audit(
                 env_or_error_any: Vec::new(),
                 directive: "Keep legacy_adapter aligned in src/obsolete.rs.".to_owned(),
                 code_anchors: vec!["src/obsolete.rs".to_owned()],
-                anchor_contract_hash: None,
+                ..Default::default()
             };
             libredb_cognitive::ReflexEngine::learn_reflex(&pdb, &grounded_rule)
                 .map_err(|e| e.to_string())?;
@@ -2105,6 +2105,99 @@ pub fn run_feature_and_security_audit(
                 "miss->edit bridge resolved check_handshake_gate, co_change={}, reflex deprecated, v4_seal=true",
                 imp[0].co_changed_files.len()
             ))
+        },
+    );
+
+    // A12: `v1.4.0` learning under production conditions: `OverlayBrain` with a global layer,
+    // a workspace sealed BEFORE learning, causal binding, and calibrated bridge retrieval.
+    run_check(
+        "A12",
+        "Overlay miss capture, causal binding & sealed bridge retrieval",
+        &mut || {
+            let ws = sbx_root.join("ws_v140_learning");
+            fs::create_dir_all(ws.join("src")).map_err(|e| e.to_string())?;
+            fs::create_dir_all(ws.join(".agents")).map_err(|e| e.to_string())?;
+            let engine_rs = ws.join("src/engine.rs");
+            let helper_rs = ws.join("src/helper.rs");
+            let engine_src = |step3: &str| -> String {
+                (0..6)
+                    .map(|i| {
+                        let add = if i == 3 { step3.to_owned() } else { i.to_string() };
+                        format!("pub fn engine_step_{i}(x: u64) -> u64 {{\n    let y = x + {add};\n    y * 2\n}}\n\n")
+                    })
+                    .collect()
+            };
+            fs::write(&engine_rs, engine_src("3")).map_err(|e| e.to_string())?;
+            fs::write(&helper_rs, "pub fn helper_value() -> u32 {\n    1\n}\n").map_err(|e| e.to_string())?;
+
+            let gdb = LibreDb::open(&global_ldb).map_err(|e| e.to_string())?;
+            let pdb = Arc::new(LibreDb::open(ws.join(".agents/memory.ldb")).map_err(|e| e.to_string())?);
+            for i in 0..12 {
+                pdb.put(
+                    WriteRequest::new(
+                        NodeKind::Fact,
+                        format!("noise_{i} = quotas and windows of zephyr gateways rotate per release {i}").into_bytes(),
+                    )
+                    .with_key(format!("noise_{i}")),
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            libredb_cognitive::index_workspace(&pdb, &ws, false).map_err(|e| e.to_string())?;
+            crate::security::seal_workspace_memory(&gdb, &pdb, &ws)?;
+            let (digest_before, _) =
+                crate::security::compute_cognitive_content_digest(&pdb)?;
+            let overlay = || -> Result<libredb_cognitive::OverlayBrain, String> {
+                libredb_cognitive::OverlayBrain::open(
+                    Some(Arc::new(LibreDb::open(&global_ldb).map_err(|e| e.to_string())?)),
+                    Arc::clone(&pdb),
+                )
+                .map_err(|e| e.to_string())
+            };
+            let stage = |path: &Path, rel_label: &str, new_src: &str| -> Result<(), String> {
+                let pre = fs::read(path).map_err(|e| e.to_string())?;
+                let pre_hash = libredb_cognitive::FileSkeleton::extract_from_bytes(rel_label, &pre).content_hash;
+                libredb_cognitive::stage_tentative_file_edit(&pdb, &ws, path, Some(pre_hash), new_src.as_bytes(), 64)
+                    .map_err(|e| e.to_string())?;
+                fs::write(path, new_src).map_err(|e| e.to_string())
+            };
+
+            // 1. Prior edit (staged BEFORE the miss) must never consume the later miss.
+            stage(&helper_rs, "src/helper.rs", "pub fn helper_value() -> u32 {\n    2\n}\n")?;
+            let query = "zephyr_quota_window";
+            let _ = overlay()?
+                .pulse(&libredb_cognitive::PulseRequest::new(query, 600))
+                .map_err(|e| e.to_string())?;
+            let pending_ok = pdb
+                .get_by_key(NodeKind::Generic, libredb_cognitive::PENDING_MISS_CUES_KEY)
+                .map(|r| String::from_utf8_lossy(&r.payload).contains(query))
+                .unwrap_or(false);
+            if !pending_ok {
+                return Err("OverlayBrain pulse did not record the project-layer miss".to_owned());
+            }
+            // 2. Causally later edit of engine_step_3 binds the cue.
+            stage(&engine_rs, "src/engine.rs", &engine_src("333"))?;
+            libredb_cognitive::reconcile_tentative_edits(&pdb, &ws).map_err(|e| e.to_string())?;
+            let book = pdb
+                .get_by_key(NodeKind::Generic, libredb_cognitive::SYMBOL_CUE_BRIDGES_KEY)
+                .map(|r| String::from_utf8_lossy(&r.payload).into_owned())
+                .unwrap_or_default();
+            if !book.contains("src/engine.rs::engine_step_3") || book.contains("helper_value") {
+                return Err(format!("Causal binding failed (expected engine_step_3 only): {book}"));
+            }
+            // 3. Overlay pulse retrieves the bridged symbol despite noise facts.
+            let resp = overlay()?
+                .pulse(&libredb_cognitive::PulseRequest::new(query, 2000))
+                .map_err(|e| e.to_string())?;
+            if !resp.capsules.iter().any(|c| c.content.contains("engine_step_3")) {
+                return Err(format!("Bridged symbol not delivered by overlay pulse: {}", resp.format_compact()));
+            }
+            // 4. Seal and cognitive digest untouched by all learning writes.
+            let (digest_after, _) =
+                crate::security::compute_cognitive_content_digest(&pdb)?;
+            if digest_before != digest_after || !crate::security::is_workspace_memory_trusted(Some(&gdb), &ws) {
+                return Err("Learning writes changed the sealed cognitive digest".to_owned());
+            }
+            Ok("overlay miss captured, prior edit ignored, engine_step_3 bound & retrieved, v4_seal=true".to_owned())
         },
     );
 

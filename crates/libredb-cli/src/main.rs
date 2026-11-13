@@ -42,7 +42,8 @@ Antigravity Cognitive & Code-Graph Commands:
   libredb batch <db.ldb> [--fact k=v]... [--decision Title::Body]... [--task key::title::status::prio]... [--snapshot <summary>]
   libredb handoff <db.ldb> <handoff_id> <task_key> <role> [--notes <text>]
   libredb learn-assoc <db.ldb> <cue_phrase> <target_id_1,target_id_2>
-  libredb learn-reflex <db.ldb> <id> <directive> [--stack <s1,s2>] [--action <a1,a2>] [--env <e1,e2>]
+  libredb learn-reflex <db.ldb> <id> <directive> [--stack <s1,s2>] [--action <a1,a2>] [--env <e1,e2>] [--anchor <a1,a2>]
+  libredb learning [<db.ldb>] [--cwd <dir>] [--top <n>] [--json]
   libredb get-skill [<skill_name>] [--section <title> | --query <q> [--top <k>]] [--json] [--global <customizations.ldb>]
   libredb slice-skill <query> [--skill <skill_name>] [--top <k>] [--json] [--global <customizations.ldb>]
   libredb sync-skill <SKILL.md> [--name <skill_name>] [--global <customizations.ldb>]
@@ -1440,7 +1441,7 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 env_or_error_any: split_csv(cli.value("--env")),
                 directive: cli.positionals[2].clone(),
                 code_anchors: split_csv(cli.value("--anchor")),
-                anchor_contract_hash: None,
+                ..Default::default()
             };
             let db_path = Path::new(&cli.positionals[0]);
             let gdb_opt = hooks::open_global_ldb_checked(cli.global_deref())?;
@@ -1450,6 +1451,41 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let nid = ReflexEngine::learn_reflex(&db, &rule)?;
             seal_guard.reseal_after_write(gdb_opt.as_deref(), &db)?;
             println!("Learned situational reflex '{}' as node #{nid}", rule.id);
+        }
+        "learning" => {
+            let cli = CliSpec::new(
+                "learning",
+                "libredb learning [<db.ldb>] [--cwd <dir>] [--db <db.ldb>] [--top <n>] [--json] [--global <customizations.ldb>]",
+            )
+            .positionals(0, Some(1))
+            .allow_global()
+            .switches(&["--json"])
+            .values(&["--cwd", "--db", "--top"])
+            .parse(sub_args)?;
+            let top_n = cli.parse_value::<usize>("--top")?.unwrap_or(10).clamp(1, 100);
+            let ws_dir_opt = cli.path_value("--cwd").or_else(|| env::current_dir().ok());
+            let explicit_db_opt = cli
+                .path_value("--db")
+                .or_else(|| cli.positionals.first().map(PathBuf::from));
+            let glob_db = match cli.global_deref() {
+                Some(gp) => Some(hooks::open_global_ldb(Some(gp))?),
+                None => hooks::open_global_ldb_checked(None)?,
+            };
+            let db = if let Some(ref db_p) = explicit_db_opt {
+                open_cli_verified_project_db(cli.global_deref(), db_p)?
+            } else {
+                resolve_default_cli_project_db(
+                    cli.global_deref(),
+                    glob_db.as_ref(),
+                    ws_dir_opt.as_deref(),
+                )?
+            };
+            let rep = libredb_cognitive::learning_state_report(&db, top_n);
+            if cli.has_switch("--json") {
+                println!("{}", serde_json::to_string_pretty(&rep)?);
+            } else {
+                println!("{}", libredb_cognitive::format_learning_report(&rep));
+            }
         }
         "import-sqlite" => {
             let cli = CliSpec::new(

@@ -634,9 +634,19 @@ pub fn cmd_gitea_sync(
         .current_dir(&clean_root)
         .output()?;
     if staged_out.status.success() {
+        let mut skipped_deliverables = 0usize;
         for raw_line in String::from_utf8_lossy(&staged_out.stdout).lines() {
             let rel = raw_line.trim();
             if rel.is_empty() {
+                continue;
+            }
+            // Release binaries are uploaded as release assets; never duplicate them in the Git tree.
+            if is_release_deliverable_path(rel) {
+                let _ = Command::new("git")
+                    .args(["-c", "core.fsmonitor=false", "rm", "--cached", "--quiet", "--", rel])
+                    .current_dir(&clean_root)
+                    .output();
+                skipped_deliverables += 1;
                 continue;
             }
             if let Some(reason) = is_sensitive_staged_file(rel, &allowed_staged) {
@@ -656,6 +666,11 @@ pub fn cmd_gitea_sync(
                 )
                 .into());
             }
+        }
+        if skipped_deliverables > 0 {
+            println!(
+                "  [OK] Kept {skipped_deliverables} release deliverable(s) out of the Git tree (published as release assets instead)"
+            );
         }
     }
 
@@ -1128,11 +1143,23 @@ fn attach_release_assets(
     uploaded
 }
 
+/// File extensions treated as binary release deliverables (uploaded as release assets).
+const RELEASE_DELIVERABLE_EXTS: [&str; 15] = [
+    ".exe", ".msi", ".msix", ".zip", ".7z", ".tar.gz", ".whl", ".jar", ".apk", ".aab", ".vsix",
+    ".xpi", ".deb", ".rpm", ".dmg",
+];
+
+/// Returns `true` for binary release deliverables under `dist/` or `releases/` that must never be
+/// committed to the Git tree because they are published as release assets. Source files inside
+/// those directories (e.g. web build output tracked on purpose) are left untouched.
+fn is_release_deliverable_path(rel: &str) -> bool {
+    let low = rel.trim().trim_matches('"').replace('\\', "/").to_ascii_lowercase();
+    (low.starts_with("dist/") || low.starts_with("releases/"))
+        && RELEASE_DELIVERABLE_EXTS.iter().any(|ext| low.ends_with(ext))
+}
+
 fn discover_deliverable_files(project_root: &Path, tag: &str) -> Vec<PathBuf> {
-    let exts = [
-        ".exe", ".msi", ".msix", ".zip", ".7z", ".tar.gz", ".whl", ".jar", ".apk", ".aab", ".vsix",
-        ".xpi", ".deb", ".rpm", ".dmg",
-    ];
+    let exts = RELEASE_DELIVERABLE_EXTS;
     let mut found = Vec::new();
     for sub in ["dist", "releases"] {
         let dir = project_root.join(sub);
@@ -2133,6 +2160,20 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
+    /// S19 (v1.4.0): release binaries under `dist/` and `releases/` never enter the Git tree,
+    /// while source files in those directories and deliverable-like names elsewhere are kept.
+    #[test]
+    fn release_deliverables_are_kept_out_of_git_tree_only_under_dist_and_releases() {
+        use super::is_release_deliverable_path;
+        assert!(is_release_deliverable_path("releases/libredb-v1.4.0-x86_64-pc-windows-msvc.zip"));
+        assert!(is_release_deliverable_path("dist\\installer.msi"));
+        assert!(is_release_deliverable_path("dist/pkg/libredb-1.4.0.tar.gz"));
+        assert!(is_release_deliverable_path("\"releases/app.apk\""));
+        assert!(!is_release_deliverable_path("dist/index.html"));
+        assert!(!is_release_deliverable_path("releases/README.md"));
+        assert!(!is_release_deliverable_path("tests/fixtures/sample.zip"));
+        assert!(!is_release_deliverable_path("src/dist/notes.zipper"));
+    }
     #[test]
     fn strip_verbatim_prefix_preserves_unc_and_drive_paths() {
         assert_eq!(

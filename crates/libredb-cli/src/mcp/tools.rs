@@ -870,7 +870,7 @@ pub(super) fn dispatch_tool(
                         env_or_error_any: parse_arr("env"),
                         directive: dir.to_owned(),
                         code_anchors: parse_arr("anchors"),
-                        anchor_contract_hash: None,
+                        ..Default::default()
                     };
                     let nid = ReflexEngine::learn_reflex(&proj_db, &rule)?;
                     outputs.push(format!("Learned reflex '{id}' (#{nid})"));

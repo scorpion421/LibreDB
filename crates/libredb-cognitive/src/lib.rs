@@ -8,6 +8,7 @@
 //! 5. `FileSkeleton` (`95-99%` hash-cached code contract compression).
 
 pub mod guardrail;
+pub mod learning;
 pub mod overlay;
 pub mod reflex;
 pub mod session;
@@ -21,8 +22,12 @@ pub use guardrail::{
     check_text_guardrails_with_options, is_sensitive_staged_file, is_test_or_scratch_path,
     GuardrailAuditReport, GuardrailViolation,
 };
+pub use learning::{
+    format_learning_report, learning_state_report, record_search_miss_cue_with_source,
+    LearningCounters, LearningStateReport, MissCueSource,
+};
 pub use overlay::OverlayBrain;
-pub use reflex::{detect_workspace_markers, FiredReflex, ReflexEngine, ReflexRule};
+pub use reflex::{detect_workspace_markers, FiredReflex, ReflexEngine, ReflexRule, ReflexStatus};
 pub use session::SessionState;
 pub use skeleton::{FileSkeleton, SectionSpan, SymbolContract};
 pub use transcript::{
@@ -44,9 +49,9 @@ pub use workspace::{
 use libredb_core::{EdgeKind, LibreDb, NodeFlags, NodeKind, Result};
 use libredb_index::HybridIndex;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// Input query to `CognitiveEngine::pulse`.
 #[derive(Debug, Clone)]
@@ -148,6 +153,9 @@ pub struct ScoredInodeCandidate {
     pub generation: u32,
     pub token_count: u32,
     pub score: f64,
+    /// `true` if the candidate was surfaced by a calibrated learned bridge (`BridgeScorer`), which
+    /// carries its own absolute acceptance threshold and is exempt from relative peak floors.
+    pub via_bridge: bool,
 }
 
 /// Ranked `NodeKind::SkillSection` capsule returned by `CognitiveEngine::slice_skill_sections`.
@@ -168,6 +176,7 @@ pub struct CognitiveEngine {
     db: Arc<LibreDb>,
     index: HybridIndex,
     reflexes: ReflexEngine,
+    bridge_scorer: OnceLock<Option<learning::BridgeScorer>>,
 }
 
 impl CognitiveEngine {
@@ -178,6 +187,7 @@ impl CognitiveEngine {
             db,
             index,
             reflexes,
+            bridge_scorer: OnceLock::new(),
         })
     }
 
@@ -185,10 +195,16 @@ impl CognitiveEngine {
         &self.db
     }
 
+    /// Learned situational reflexes of this layer (used by `OverlayBrain` for cross-layer anchors).
+    pub fn reflex_engine(&self) -> &ReflexEngine {
+        &self.reflexes
+    }
+
     /// Re-synchronizes the in-memory `HybridIndex` and `ReflexEngine` incrementally after writes.
     pub fn refresh_indices(&mut self) -> Result<()> {
         self.index.reconcile_in_ram(&self.db)?;
         self.reflexes = ReflexEngine::load(&self.db)?;
+        self.bridge_scorer = OnceLock::new();
         Ok(())
     }
 
@@ -228,8 +244,7 @@ impl CognitiveEngine {
         let mut lexical_hits = self.index.search(query, Some(&searchable_kinds), 24);
         if lexical_hits.is_empty() {
             // Fallback for pure code-symbol queries when no prose capsule matched:
-            // match active `NodeKind::Symbol` keys directly in RAM (`0` disk I/O, `0` index bloat),
-            // plus any learned `sys::symbol_cue_bridges` aliases from Search-Miss -> Verified-Edit!
+            // match active `NodeKind::Symbol` keys directly in RAM (`0` disk I/O, `0` index bloat).
             let q_tokens = libredb_index::segment_universal_tokens(query);
             for (sym_id, sym_score) in self.db.match_active_keys_by_kind(NodeKind::Symbol, &q_tokens, 8) {
                 lexical_hits.push(libredb_index::SearchHit {
@@ -240,8 +255,19 @@ impl CognitiveEngine {
                     matched_features: Vec::new(),
                 });
             }
-            if lexical_hits.is_empty() {
-                for (sym_id, bridge_score) in workspace::match_symbol_cue_bridges(&self.db, query, 8) {
+        }
+        // Learned `Search-Miss -> Verified-Edit` bridges form an independent, always-on channel on a
+        // calibrated absolute scale, so weak 3-gram noise hits can never mask them.
+        let mut bridged_ids: HashSet<u64> = HashSet::new();
+        if let Some(scorer) = self
+            .bridge_scorer
+            .get_or_init(|| learning::BridgeScorer::load(&self.db))
+        {
+            for (sym_id, bridge_score) in scorer.score_query(query).into_iter().take(8) {
+                bridged_ids.insert(sym_id);
+                if let Some(hit) = lexical_hits.iter_mut().find(|h| h.node_id == sym_id) {
+                    hit.score = hit.score.max(bridge_score);
+                } else {
                     lexical_hits.push(libredb_index::SearchHit {
                         node_id: sym_id,
                         kind: NodeKind::Symbol,
@@ -338,6 +364,7 @@ impl CognitiveEngine {
                     generation: ino.generation,
                     token_count: ino.token_count.max(1),
                     score: score * kind_mult,
+                    via_bridge: bridged_ids.contains(&nid),
                 })
             })
             .collect();
@@ -351,7 +378,7 @@ impl CognitiveEngine {
 
         let peak_score = out.first().map_or(0.0, |x| x.score);
         let relevance_floor = (peak_score * 0.35).max(0.80);
-        out.retain(|c| c.score >= relevance_floor);
+        out.retain(|c| c.score >= relevance_floor || c.via_bridge);
         out
     }
 
@@ -413,7 +440,11 @@ impl CognitiveEngine {
         // 2. Score candidates 100% in RAM (`0` payload disk reads!).
         let ranked = self.score_candidates_in_ram(&req.query);
         if ranked.is_empty() && fired_reflexes.is_empty() {
-            let _ = workspace::record_search_miss_cue(&self.db, &req.query);
+            let _ = learning::record_search_miss_cue_with_source(
+                &self.db,
+                &req.query,
+                learning::MissCueSource::Pulse,
+            );
         }
 
         // 3. Session Zero-Repeat Delta filtering + token-budget knapsack packing!

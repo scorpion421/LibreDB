@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-11-13
+
+### Added
+
+- Added a dedicated causal learning engine module (`crates/libredb-cognitive/src/learning.rs`, re-exported from `crates/libredb-cognitive/src/lib.rs`) implementing `MissCueSource` (`locate`, `impact`, `pulse`), extended `PendingMissCue` (`source`, `first_bound_edit_ns`, `bound_files`, `bound_symbols`), `LearningCounters` (`sys::learning_counters`), `EditOrigin` (`Hook`, `DiskSync`, `IndexScan`), `EditEvidence`, `record_search_miss_cue_with_source`, `diff_symbol_bodies`, `SymbolVocabulary`, `BridgeScorer`, `compose_tiers_with_bridges`, `learn_from_verified_edit`, `learning_state_report`, and `format_learning_report`.
+- Added whitespace-insensitive per-symbol body hashing (`SymbolContract::body_hash` with `SYMBOL_BODY_HASH_SEED = 0xB1` and `compute_symbol_body_hash` in `crates/libredb-cognitive/src/skeleton.rs`), replacing brittle byte-span/name diffing so in-place fixes bind accurately while untouched functions whose line numbers shifted downstream never false-bind.
+- Added per-anchor signature tracking and drift detection (`ReflexRule::anchor_contracts`, `ReflexStatus`, `ReflexEngine::describe_all`, and `ReflexEngine::evaluate_with_anchor_context` in `crates/libredb-cognitive/src/reflex.rs`, surfaced in `OverlayBrain::pulse`) plus `Learned Reflexes:` hydration (up to 2 matching workspace reflexes) in `build_project_memory_hydration` (`crates/libredb-cli/src/hooks.rs`).
+- Added the read-only `libredb learning [<db.ldb>] [--cwd <dir>] [--db <db.ldb>] [--top <n>] [--json]` CLI diagnostic command (`crates/libredb-cli/src/main.rs`) reporting pending cues, top cue bridges, reflex active/drift/falsified status, and cumulative learning counters.
+- Added `/releases/` to `.gitignore` and automatic `RELEASE_DELIVERABLE_EXTS` binary unstaging under `dist/` and `releases/` in `git-sync` (`crates/libredb-cli/src/gitea.rs`) so release executables are attached to GitHub/Gitea releases without polluting the Git commit tree.
+- Added Audit Check `A12` (`Overlay miss capture, causal binding & sealed bridge retrieval` in `crates/libredb-cli/src/bench.rs`), 15 realistic integration scenarios (`crates/libredb-cognitive/tests/v140_learning_real_world.rs`), 2 subprocess E2E scenarios (`crates/libredb-cli/tests/v140_learning_e2e.rs`), and 8 unit/regression tests across `learning.rs`, `hooks.rs`, `security/tests.rs`, and `gitea.rs` (bringing the automated suite to 132 tests + 12 `A1..A12` audit checks + 10k crash simulations across Linux, macOS, and Windows).
+
+### Changed
+
+- Replaced percentile/BM25 bridge scaling with an always-on calibrated `BridgeScorer` channel (`coverage * confidence * 2.0 >= 0.80`) inside `CognitiveEngine::score_candidates_in_ram` (`via_bridge: true` in `crates/libredb-cognitive/src/lib.rs`) and `compose_tiers_with_bridges` in `locate_symbols` and `query_symbol_impact` (`crates/libredb-cognitive/src/workspace.rs`), ensuring exact keyword/symbol matches never suppress high-confidence learned bridges in slots `2..K` while weak single-token hits on short identifiers are still captured as partial misses.
+- Generalized `learn_from_verified_edit` across `reconcile_tentative_edits`, `sync_single_file_symbols`, and bounded `index_workspace_with_exclusions` scans (`<= 3` changed files; bumped `WORKSPACE_GRAPH_STATE_VERSION = 5` in `crates/libredb-cognitive/src/workspace.rs`) with causal time ordering (`edit_ns >= recorded_at_ns`), a `120 s` multi-file episode window (`<= 3` files, `<= 8` symbols), specificity gating, and explicit non-learning for bulk index scans and legacy skeleton hash upgrades.
+- Updated `OverlayBrain::pulse` (`crates/libredb-cognitive/src/overlay.rs`) to record `MissCueSource::Pulse` cues whenever the workspace layer produces `0` symbol/capsule hits and forward live anchor signature context into global reflex evaluation.
+
+### Fixed
+
+- Fixed concurrent lost updates on `sys::pending_miss_cues`, `sys::symbol_cue_bridges`, and `sys::learning_counters` by executing all miss-cue and bridge updates atomically inside `LibreDb::transact_key`.
+- Fixed premature `ReflexRule` invalidation on single-file signature drift by verifying anchor contract hashes against live workspace symbols instead of suppressing modified symbols outright, while keeping `hmac-sha256:v4` sealed workspace cognitive digests strictly invariant across read, index, and learning operations.
+
 ## [1.3.0] - 2026-11-12
 
 ### Added

@@ -52,8 +52,8 @@ fn built_in_audit_suite_cli_passes_all_9_checks() {
     );
 
     let rep: Value = serde_json::from_slice(&out.stdout).expect("valid audit JSON");
-    assert_eq!(rep.get("total_checks").and_then(Value::as_u64), Some(11));
-    assert_eq!(rep.get("passed_checks").and_then(Value::as_u64), Some(11));
+    assert_eq!(rep.get("total_checks").and_then(Value::as_u64), Some(12));
+    assert_eq!(rep.get("passed_checks").and_then(Value::as_u64), Some(12));
     assert_eq!(rep.get("failed_checks").and_then(Value::as_u64), Some(0));
 
     let checks = rep
@@ -61,7 +61,7 @@ fn built_in_audit_suite_cli_passes_all_9_checks() {
         .and_then(Value::as_array)
         .expect("checks array");
     for (idx, expected_id) in [
-        "A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "A9", "A10", "A11",
+        "A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "A9", "A10", "A11", "A12",
     ]
     .iter()
     .enumerate()

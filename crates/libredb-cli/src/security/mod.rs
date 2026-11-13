@@ -36,7 +36,8 @@ pub(crate) use seals::{
     is_mcp_workspace_authorized_in_global, workspace_trust_lock_path_for_root,
 };
 pub use seals::{
-    check_global_trust_sync, detect_workspace_seal_rollback, has_prior_workspace_seal_marker,
+    check_global_trust_sync, compute_cognitive_content_digest, detect_workspace_seal_rollback,
+    has_prior_workspace_seal_marker,
     has_valid_legacy_v3_content_seal, is_unsealed_replacement_of_sealed_workspace,
     is_workspace_memory_trusted, list_trusted_workspaces, migrate_workspace_seal_v2_to_v3,
     migrate_workspace_seal_v3_to_v4, revoke_workspace_trust, seal_workspace_memory,

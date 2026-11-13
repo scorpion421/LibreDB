@@ -698,6 +698,8 @@ pub(crate) fn evaluate_pre_invocation_payload(
 }
 
 const MAX_PRE_INVOCATION_BYTES: usize = 1_800;
+/// Maximum learned reflex directives injected by `PreInvocation` per turn.
+const MAX_PRE_INVOCATION_REFLEXES: usize = 2;
 
 fn truncate_utf8_clean(s: &str, max_chars: usize) -> (&str, bool) {
     match s.char_indices().nth(max_chars) {
@@ -877,9 +879,37 @@ fn build_project_memory_hydration(
     prompt_hint: Option<&str>,
 ) -> (String, usize) {
     let mut naive_baseline_bytes = 64usize;
-    let git_line_opt = ws_root.and_then(collect_git_telemetry_line);
+    let mut git_line_opt = ws_root.and_then(collect_git_telemetry_line);
     if let Some(ref g) = git_line_opt {
         naive_baseline_bytes += g.len() + 1;
+    }
+
+    // Tier 1 (with Git): learned situational reflexes matching the current prompt. Reflexes are
+    // `NodeKind::Rule` capsules covered by the `hmac-sha256:v4` workspace seal, so injecting them
+    // keeps the sealed-capsules-only invariant. Falsified reflexes are suppressed by `ReflexEngine`.
+    if let Some(hint) = prompt_hint.map(str::trim).filter(|h| !h.is_empty()) {
+        if let Ok(rx) = libredb_cognitive::ReflexEngine::load(proj_db) {
+            let fired = rx.evaluate(ws_root, hint, None);
+            if !fired.is_empty() {
+                let mut block = vec!["Learned Reflexes:".to_owned()];
+                for rf in fired.iter().take(MAX_PRE_INVOCATION_REFLEXES) {
+                    let flat = rf.directive.lines().collect::<Vec<_>>().join(" ");
+                    let (short, cut) = truncate_utf8_clean(flat.trim(), 160);
+                    let ellipsis = if cut { "..." } else { "" };
+                    if short.starts_with("[REFLEX") {
+                        block.push(format!("  * {short}{ellipsis}"));
+                    } else {
+                        block.push(format!("  * [{}] {short}{ellipsis}", rf.id));
+                    }
+                }
+                let reflex_block = block.join("\n");
+                naive_baseline_bytes += reflex_block.len() + 1;
+                git_line_opt = Some(match git_line_opt {
+                    Some(g) => format!("{g}\n\n{reflex_block}"),
+                    None => reflex_block,
+                });
+            }
+        }
     }
 
     let inodes = proj_db.list_inodes(None, false);
@@ -2585,6 +2615,81 @@ mod tests {
         assert!(
             sys_msg.contains("early_dalvik_supertype_decision"),
             "BM25-assisted PreInvocation failed to protect Decision #1 ('early_dalvik_supertype_decision') from eviction under task/fact saturation:\n{sys_msg}"
+        );
+
+        let _ = fs::remove_dir_all(&base_dir);
+    }
+
+    /// S16 (v1.4.0): `PreInvocation` proactively injects learned reflexes matching the prompt
+    /// (sealed `NodeKind::Rule` capsules) within the 1,800-byte budget, and nothing otherwise.
+    #[test]
+    fn pre_invocation_injects_only_matching_learned_reflexes() {
+        let base_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join(format!(
+                "libredb_preinv_reflex_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos())
+            ));
+        let ws_repo = base_dir.join("repo");
+        fs::create_dir_all(ws_repo.join(".agents")).unwrap();
+        let global_path = base_dir.join("customizations.ldb");
+        let proj_ldb = ws_repo.join(".agents").join("memory.ldb");
+        {
+            let gdb = libredb_core::LibreDb::open(&global_path).unwrap();
+            let pdb = std::sync::Arc::new(libredb_core::LibreDb::open(&proj_ldb).unwrap());
+            pdb.put(
+                libredb_core::WriteRequest::new(
+                    libredb_core::NodeKind::Fact,
+                    b"db_engine = PostgreSQL 16 with logical replication".to_vec(),
+                )
+                .with_key("db_engine"),
+            )
+            .unwrap();
+            libredb_cognitive::ReflexEngine::learn_reflex(
+                &pdb,
+                &libredb_cognitive::ReflexRule {
+                    id: "migration-lock-guard".to_owned(),
+                    action_any: vec!["migration".to_owned()],
+                    directive: "Run schema migrations only while holding the advisory lock.".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            crate::security::seal_workspace_memory(&gdb, &pdb, &ws_repo).unwrap();
+        }
+
+        let hit_payload = json!({
+            "conversationId": "conv-reflex-hit",
+            "workspacePaths": [ws_repo.to_string_lossy().to_string()],
+            "prompt": "Please write the migration for the users table"
+        });
+        let out = super::evaluate_pre_invocation_payload(&hit_payload, Some(&global_path)).unwrap();
+        let sys_msg = out["injectSteps"][0]["systemMessage"]["systemMessage"]
+            .as_str()
+            .expect("Expected hydrated systemMessage");
+        assert!(sys_msg.len() <= super::MAX_PRE_INVOCATION_BYTES);
+        assert!(
+            sys_msg.contains("Learned Reflexes:") && sys_msg.contains("migration-lock-guard"),
+            "Matching reflex must be injected proactively:\n{sys_msg}"
+        );
+
+        let miss_payload = json!({
+            "conversationId": "conv-reflex-miss",
+            "workspacePaths": [ws_repo.to_string_lossy().to_string()],
+            "prompt": "Update the README badges"
+        });
+        let out2 = super::evaluate_pre_invocation_payload(&miss_payload, Some(&global_path)).unwrap();
+        let sys_msg2 = out2["injectSteps"][0]["systemMessage"]["systemMessage"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            !sys_msg2.contains("migration-lock-guard"),
+            "Non-matching prompt must not inject the reflex:\n{sys_msg2}"
         );
 
         let _ = fs::remove_dir_all(&base_dir);

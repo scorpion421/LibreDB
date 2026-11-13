@@ -1957,3 +1957,99 @@ use libredb_core::EdgeKind;
         drop(gdb);
         let _ = fs::remove_dir_all(&tmp);
     }
+
+    /// S4 (v1.4.0): No read, index, or learning path may change the `hmac-sha256:v4` cognitive
+    /// digest of a sealed workspace. Learning state lives exclusively in unsealed `sys::*` capsules,
+    /// and falsified grounded reflexes are suppressed at runtime instead of being mutated.
+    #[test]
+    fn v140_read_index_and_learning_paths_never_change_sealed_cognitive_digest() {
+        let tmp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join(format!(
+                "libredb_v140_digest_invariance_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos())
+            ));
+        let _ = fs::remove_dir_all(&tmp);
+        let ws = tmp.join("repo");
+        fs::create_dir_all(ws.join("src")).unwrap();
+        fs::create_dir_all(ws.join(".agents")).unwrap();
+        fs::write(ws.join("Cargo.toml"), "[package]\nname = \"digest_ws\"\nversion = \"0.1.0\"\n").unwrap();
+        let engine_v1 = "pub fn alpha_step(x: u64) -> u64 {\n    x + 1\n}\n\npub fn beta_step(x: u64) -> u64 {\n    x + 2\n}\n";
+        fs::write(ws.join("src/engine.rs"), engine_v1).unwrap();
+        fs::write(ws.join("src/legacy.rs"), "pub fn legacy_shim() {}\n").unwrap();
+
+        let gdb = LibreDb::open(tmp.join("customizations.ldb")).unwrap();
+        let pdb = std::sync::Arc::new(LibreDb::open(ws.join(".agents/memory.ldb")).unwrap());
+        pdb.put(
+            WriteRequest::new(NodeKind::Fact, b"digest_probe = sealed fact".to_vec())
+                .with_key("digest_probe"),
+        )
+        .unwrap();
+        libredb_cognitive::index_workspace(&pdb, &ws, false).unwrap();
+        libredb_cognitive::ReflexEngine::learn_reflex(
+            &pdb,
+            &libredb_cognitive::ReflexRule {
+                id: "legacy-guard".to_owned(),
+                action_any: vec!["shim".to_owned()],
+                directive: "Keep legacy_shim in sync.".to_owned(),
+                code_anchors: vec!["src/legacy.rs".to_owned(), "beta_step".to_owned()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        seal_workspace_memory(&gdb, &pdb, &ws).unwrap();
+        let (digest_before, _) = compute_cognitive_content_digest(&pdb).unwrap();
+
+        // Read and learning paths: misses, hook staging, reconcile, external edits, falsification.
+        let _ = libredb_cognitive::locate_symbols(&pdb, &["digest_unknown_concept".to_owned()]).unwrap();
+        let _ = libredb_cognitive::query_symbol_impact(&pdb, "alpha_step").unwrap();
+        let target = ws.join("src/engine.rs");
+        let engine_v2 = engine_v1.replace("x + 1", "x + 100");
+        libredb_cognitive::stage_tentative_file_edit(
+            &pdb,
+            &ws,
+            &target,
+            Some(libredb_core::crc::hash_key(
+                libredb_cognitive::skeleton::SKELETON_HASH_SEED,
+                engine_v1.as_bytes(),
+            )),
+            engine_v2.as_bytes(),
+            32,
+        )
+        .unwrap();
+        fs::write(&target, &engine_v2).unwrap();
+        libredb_cognitive::reconcile_tentative_edits(&pdb, &ws).unwrap();
+        fs::write(&target, engine_v2.replace("x + 2", "x * 2")).unwrap();
+        fs::remove_file(ws.join("src/legacy.rs")).unwrap();
+        libredb_cognitive::index_workspace(&pdb, &ws, false).unwrap();
+        {
+            let brain = libredb_cognitive::OverlayBrain::open(
+                Some(std::sync::Arc::new(LibreDb::open(tmp.join("customizations.ldb")).unwrap())),
+                std::sync::Arc::clone(&pdb),
+            )
+            .unwrap();
+            let _ = brain
+                .pulse(&libredb_cognitive::PulseRequest::new("digest_unknown_prose_concept", 600))
+                .unwrap();
+        }
+
+        assert!(
+            pdb.get_by_key(NodeKind::Generic, libredb_cognitive::SYMBOL_CUE_BRIDGES_KEY).is_ok(),
+            "precondition: learning paths actually wrote bridge state"
+        );
+        let (digest_after, _) = compute_cognitive_content_digest(&pdb).unwrap();
+        assert_eq!(
+            digest_before, digest_after,
+            "Read, index, and learning paths must never change the sealed cognitive digest"
+        );
+        assert!(is_workspace_memory_trusted(Some(&gdb), &ws));
+
+        drop(pdb);
+        drop(gdb);
+        let _ = fs::remove_dir_all(&tmp);
+    }

@@ -98,10 +98,12 @@ impl OverlayBrain {
             &req.query,
             req.error_context.as_deref(),
         );
-        let glob_rf = global_eng.evaluate_reflexes(
+        let project_reflex_fired = !proj_rf.is_empty();
+        let glob_rf = global_eng.reflex_engine().evaluate_with_anchor_context(
             req.workspace_dir.as_deref(),
             &req.query,
             req.error_context.as_deref(),
+            Some(self.project.reflex_engine()),
         );
 
         for (is_global, rf) in proj_rf
@@ -136,6 +138,22 @@ impl OverlayBrain {
         let proj_cands = self.project.score_candidates_in_ram(&req.query);
         let glob_cands = global_eng.score_candidates_in_ram(&req.query);
 
+        // Only the project layer decides whether a query was a workspace miss: generic global
+        // rule/skill matches must never mask an unresolved project-specific concept.
+        if proj_cands.is_empty() && !project_reflex_fired {
+            let recorded = crate::learning::record_search_miss_cue_with_source(
+                self.project.db(),
+                &req.query,
+                crate::learning::MissCueSource::Pulse,
+            )
+            .unwrap_or(false);
+            if recorded {
+                if let Ok(st) = self.project.db().stats() {
+                    self.last_project_seq.store(st.commit_seq, Ordering::Relaxed);
+                }
+            }
+        }
+
         let mut merged: Vec<(bool, ScoredInodeCandidate)> =
             Vec::with_capacity(proj_cands.len() + glob_cands.len());
         for mut c in proj_cands {
@@ -162,7 +180,7 @@ impl OverlayBrain {
         let mut order_plan: Vec<(bool, usize)> = Vec::new();
 
         for (is_global, cand) in merged {
-            if cand.score < floor {
+            if cand.score < floor && !cand.via_bridge {
                 continue;
             }
             let ns_id = if is_global {

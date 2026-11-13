@@ -9,6 +9,7 @@ __pycache__/
 *.so
 *.egg-info/
 dist/
+/releases/
 build/
 .venv/
 .pytest_cache/

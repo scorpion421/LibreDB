@@ -82,6 +82,34 @@ pub struct SymbolContract {
     pub doc_summary: String,
     pub start_line: usize,
     pub end_line: usize,
+    /// Whitespace-insensitive 64-bit hash of the symbol body `[start_line..=end_line]`.
+    /// `0` means unknown (skeletons persisted before v1.4.0).
+    #[serde(default)]
+    pub body_hash: u64,
+}
+
+/// Seed for `SymbolContract::body_hash` (distinct from `SKELETON_HASH_SEED`).
+pub const SYMBOL_BODY_HASH_SEED: u8 = 0xB1;
+
+/// Computes the whitespace-insensitive body hash of lines `start_line..=end_line` (1-based).
+/// Formatting-only edits (indentation, spacing, blank lines) keep the hash stable, while any
+/// token-level change alters it. Never returns `0` (reserved for "unknown").
+pub fn compute_symbol_body_hash(lines: &[&str], start_line: usize, end_line: usize) -> u64 {
+    let start = start_line.max(1);
+    let end = end_line.min(lines.len());
+    let mut buf: Vec<u8> = Vec::new();
+    if start <= end {
+        for line in &lines[start - 1..end] {
+            for ch in line.chars().filter(|c| !c.is_whitespace()) {
+                let mut tmp = [0u8; 4];
+                buf.extend_from_slice(ch.encode_utf8(&mut tmp).as_bytes());
+            }
+        }
+    }
+    match hash_key(SYMBOL_BODY_HASH_SEED, &buf) {
+        0 => 1,
+        h => h,
+    }
 }
 
 impl SymbolContract {
@@ -146,6 +174,10 @@ impl FileSkeleton {
             }
             _ => extract_brace_symbols(&lines, total_lines, &lang),
         };
+        let mut symbols = symbols;
+        for sym in &mut symbols {
+            sym.body_hash = compute_symbol_body_hash(&lines, sym.start_line, sym.end_line);
+        }
 
         let mut skel = Self {
             file_label: label,
@@ -632,6 +664,7 @@ fn extract_python_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContr
             doc_summary: truncate_chars(doc_summary, 85),
             start_line,
             end_line: resolved_end,
+            body_hash: 0,
         });
     }
     out
@@ -681,6 +714,7 @@ fn extract_smali_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContra
                         doc_summary: String::new(),
                         start_line: idx + 1,
                         end_line: total_lines.max(idx + 1),
+                        body_hash: 0,
                     });
                 }
             }
@@ -716,6 +750,7 @@ fn extract_smali_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContra
                             doc_summary: String::new(),
                             start_line: idx + 1,
                             end_line: idx + 1,
+                            body_hash: 0,
                         });
                     }
                 }
@@ -744,6 +779,7 @@ fn extract_smali_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContra
                             doc_summary: String::new(),
                             start_line: idx + 1,
                             end_line,
+                            body_hash: 0,
                         });
                     }
                 }
@@ -895,6 +931,7 @@ fn extract_asm_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContract
             doc_summary: String::new(),
             start_line: start,
             end_line,
+            body_hash: 0,
         });
     }
     out
@@ -947,6 +984,7 @@ fn extract_markdown_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolCon
             doc_summary: String::new(),
             start_line: start,
             end_line,
+            body_hash: 0,
         });
     }
     out
@@ -1031,6 +1069,7 @@ fn extract_makefile_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolCon
             doc_summary: truncate_chars(doc, 85),
             start_line: start,
             end_line: end_line.min(total_lines.max(start)),
+            body_hash: 0,
         });
     }
     out
@@ -1148,6 +1187,7 @@ fn extract_end_block_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolCo
             doc_summary: String::new(),
             start_line: idx + 1,
             end_line: end_line.min(total_lines.max(idx + 1)),
+            body_hash: 0,
         });
     }
 
@@ -1229,6 +1269,7 @@ fn extract_sql_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContract
             doc_summary: String::new(),
             start_line: idx + 1,
             end_line: end_line.min(total_lines.max(1)),
+            body_hash: 0,
         });
     }
     out
@@ -1268,6 +1309,7 @@ fn extract_powershell_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolC
                         doc_summary: String::new(),
                         start_line: idx + 1,
                         end_line,
+                        body_hash: 0,
                     });
                 }
                 break;
@@ -1319,6 +1361,7 @@ fn extract_shell_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContra
                 doc_summary: String::new(),
                 start_line: idx + 1,
                 end_line,
+                body_hash: 0,
             });
         }
     }
@@ -1529,6 +1572,7 @@ fn extract_brace_symbols(lines: &[&str], total_lines: usize, lang: &str) -> Vec<
                         doc_summary: truncate_chars(&pending_doc, 85),
                         start_line,
                         end_line,
+                        body_hash: 0,
                     });
                     pending_doc.clear();
                     continue;
