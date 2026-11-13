@@ -590,6 +590,107 @@ fn s18_legacy_skeletons_migrate_once_without_learning() {
     assert_eq!(rep2.files_reindexed, 0, "Migration must happen exactly once");
 }
 
+// --- S19 (v1.5.0): Procedural error-recovery learning, 2-stage banality filter, and superseding ---
+#[test]
+fn s19_v150_error_recovery_banality_and_situational_superseding() {
+    use libredb_cognitive::{
+        diff_symbol_body_tokens, is_banal_syntax_error, learn_explicit_error_resolution,
+        learning_state_report, record_error_cue, FileSkeleton, PulseRequest, ReflexEngine,
+    };
+
+    assert!(is_banal_syntax_error("error: expected ';', found '}'"));
+    assert!(is_banal_syntax_error("SyntaxError: unexpected token ')'"));
+    assert!(!is_banal_syntax_error(
+        "error[E0425]: cannot find value 'workspace_scope_root' in this scope"
+    ));
+
+    let fx = fixture("s19");
+    let old_src = b"pub fn alpha_guard(x: i32) -> i32 {\n    x + 1\n}\n";
+    let punct_src = b"pub fn alpha_guard(x: i32) -> i32 {\n    (x + 1);\n}\n";
+    let old_sk = FileSkeleton::extract_from_bytes("src/g.rs", old_src);
+    let punct_sk = FileSkeleton::extract_from_bytes("src/g.rs", punct_src);
+    let touched = vec!["src/g.rs::alpha_guard".to_owned()];
+    assert!(
+        diff_symbol_body_tokens(
+            "src/g.rs",
+            Some(old_src),
+            Some(&old_sk),
+            punct_src,
+            &punct_sk,
+            &touched
+        )
+        .is_empty(),
+        "Punctuation-only diff must yield zero newly introduced body tokens"
+    );
+
+    assert!(!record_error_cue(&fx.proj, "error: expected ';', found '}'", None).unwrap());
+    assert!(record_error_cue(
+        &fx.proj,
+        "error[E0425]: cannot find value 'session_guard_token' in this scope",
+        Some("check")
+    )
+    .unwrap());
+    let learned = learn_explicit_error_resolution(
+        &fx.proj,
+        "error[E0425]: cannot find value 'session_guard_token' in this scope",
+        "Bind session_guard_token from validate_session_scope before checking gates.",
+        Some("check"),
+        &["src/engine.rs::compute_engine_step_2".to_owned()],
+        &[],
+    )
+    .unwrap();
+    assert!(learned.is_some());
+
+    let m1 = ReflexRule {
+        id: "m1-general".to_owned(),
+        stack_any: vec!["cargo.toml".to_owned()],
+        action_any: vec!["migrate".to_owned()],
+        directive: "Use general migration runner.".to_owned(),
+        code_anchors: vec!["compute_engine_step_2".to_owned()],
+        ..Default::default()
+    };
+    let m2 = ReflexRule {
+        id: "m2-zero-downtime".to_owned(),
+        stack_any: vec!["cargo.toml".to_owned()],
+        action_any: vec!["migrate".to_owned()],
+        context_tags: vec!["bluegreen".to_owned(), "sharded".to_owned()],
+        supersedes: vec!["m1-general".to_owned()],
+        directive: "Use sharded blue-green expansion migration protocol.".to_owned(),
+        code_anchors: vec!["compute_engine_step_2".to_owned()],
+        ..Default::default()
+    };
+    ReflexEngine::learn_reflex(&fx.proj, &m1).unwrap();
+    ReflexEngine::learn_reflex(&fx.proj, &m2).unwrap();
+
+    let rx = ReflexEngine::load(&fx.proj).unwrap();
+    let gen_hit = rx.evaluate(Some(&fx.root), "migrate database", None);
+    assert_eq!(gen_hit.len(), 1);
+    assert_eq!(gen_hit[0].id, "m1-general");
+
+    let spec_hit = rx.evaluate(Some(&fx.root), "migrate bluegreen sharded database", None);
+    assert_eq!(spec_hit.len(), 1);
+    assert_eq!(spec_hit[0].id, "m2-zero-downtime");
+    assert_eq!(spec_hit[0].superseded_ids, vec!["m1-general".to_owned()]);
+
+    for _ in 0..4 {
+        ReflexEngine::record_reflex_outcome(&fx.proj, "m2-zero-downtime", false).unwrap();
+    }
+    let rx_fallback = ReflexEngine::load(&fx.proj).unwrap();
+    let fb_hit = rx_fallback.evaluate(Some(&fx.root), "migrate bluegreen sharded database", None);
+    assert_eq!(fb_hit[0].id, "m1-general");
+
+    let mut req = PulseRequest::new("compute_engine_step_2", 1500);
+    req.error_context = Some("E0425 session_guard_token".to_owned());
+    let cog = CognitiveEngine::open_db(Arc::clone(&fx.proj)).unwrap();
+    let resp = cog.pulse(&req).unwrap();
+    assert!(resp.fired_reflexes.iter().any(|r| r.id.starts_with("pitfall::")));
+
+    let rep = learning_state_report(&fx.proj, 10);
+    assert!(rep.counters.trivial_errors_filtered >= 1);
+    assert!(rep.counters.pitfalls_learned >= 1);
+    assert!(rep.counters.method_supersedes_applied >= 1);
+}
+
 #[allow(dead_code)]
 fn assert_path_exists(p: &Path) {
     assert!(p.exists(), "missing {}", p.display());

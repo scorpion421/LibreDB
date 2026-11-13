@@ -3484,6 +3484,301 @@ fn verify_l10_live_workspace(
     Ok((source_label, detail))
 }
 
+fn verify_l11_error_recovery_and_banality_filter(
+    sbx_root: &Path,
+    global_ldb: &Path,
+    acc: &mut LearningMetricsAccumulator,
+) -> Result<String, String> {
+    let fx = LearningFixture::new(sbx_root, global_ldb, "l11_err_recovery")?;
+    let scope_init = "pub fn enforce_strict_scope_bound(input: &str) -> bool {\n    !input.is_empty()\n}\n\npub fn resolve_guard(input: &str) -> bool {\n    let checked = input.len() > 1;\n    checked\n}\n";
+    fx.write_src("src/scope.rs", scope_init)?;
+    fx.index(false)?;
+    fx.seal()?;
+
+    // 1. Stage 1 Banality Filter: pure delimiter/syntax slips are rejected immediately.
+    let s1_semi = libredb_cognitive::record_error_cue(
+        &fx.pdb,
+        "error: expected ';', found '}'",
+        Some("cargo check"),
+    )
+    .map_err(|e| e.to_string())?;
+    let s1_paren = libredb_cognitive::record_error_cue(
+        &fx.pdb,
+        "SyntaxError: unexpected token ')'",
+        Some("build"),
+    )
+    .map_err(|e| e.to_string())?;
+    if s1_semi || s1_paren {
+        acc.placebo_false_bindings += 1;
+        return Err("L11 Stage 1 banality filter failed to reject syntax slip".to_owned());
+    }
+
+    // 2. Stage 2 AST Body-Token Delta Banality Filter: non-trivial error + punctuation-only edit
+    // changes SymbolContract::body_hash while added_body_tokens stays empty -> 0 pitfalls learned.
+    let s2_recorded = libredb_cognitive::record_error_cue(
+        &fx.pdb,
+        "error[E0308]: mismatched return expression in resolve_guard",
+        Some("cargo check"),
+    )
+    .map_err(|e| e.to_string())?;
+    if !s2_recorded {
+        return Err("L11 expected E0308 non-trivial error cue to pass Stage 1".to_owned());
+    }
+    let punct_only = scope_init
+        .replace("input.len() > 1;", "(input.len() > 1);")
+        .replace("    checked\n", "    checked;\n");
+    fx.stage_and_write("src/scope.rs", &punct_only)?;
+
+    let rep_after_banal = libredb_cognitive::learning_state_report(&fx.pdb, 10);
+    if !rep_after_banal.learned_pitfalls.is_empty()
+        || rep_after_banal.counters.pitfalls_learned != 0
+        || rep_after_banal.counters.trivial_errors_filtered < 3
+    {
+        acc.placebo_false_bindings += rep_after_banal.learned_pitfalls.len().max(1);
+        return Err(format!(
+            "L11 Stage 2 banality leak: pitfalls={}, filtered={}",
+            rep_after_banal.learned_pitfalls.len(),
+            rep_after_banal.counters.trivial_errors_filtered
+        ));
+    }
+
+    // 3. Structural Failure -> Verified Fix -> Proactive Recall + Placebo Check + Seal Check.
+    let err_msg = "error[E0425]: cannot find value 'workspace_scope_root' in this scope";
+    let mut err_req = libredb_cognitive::PulseRequest::new("cargo check resolve_guard", 2000);
+    err_req.workspace_dir = Some(fx.root.clone());
+    err_req.error_context = Some(err_msg.to_owned());
+    let _ = fx
+        .open_overlay()?
+        .pulse(&err_req)
+        .map_err(|e| e.to_string())?;
+
+    let rep_pending = libredb_cognitive::learning_state_report(&fx.pdb, 10);
+    if rep_pending.pending_errors.len() != 1 {
+        return Err(format!(
+            "L11 expected 1 pending error cue, got {}",
+            rep_pending.pending_errors.len()
+        ));
+    }
+
+    let structural_fix = punct_only.replace(
+        "    checked;\n",
+        "    let workspace_scope_root = enforce_strict_scope_bound(input);\n    workspace_scope_root && checked\n",
+    );
+    fx.stage_and_write("src/scope.rs", &structural_fix)?;
+
+    let rep_learned = libredb_cognitive::learning_state_report(&fx.pdb, 10);
+    if rep_learned.counters.pitfalls_learned != 1 || rep_learned.learned_pitfalls.len() != 1 {
+        return Err(format!(
+            "L11 expected pitfalls_learned=1, got count={} entries={}",
+            rep_learned.counters.pitfalls_learned,
+            rep_learned.learned_pitfalls.len()
+        ));
+    }
+    let pitfall = &rep_learned.learned_pitfalls[0];
+    if pitfall.confidence < libredb_cognitive::ACTIVE_PITFALL_MIN_CONFIDENCE
+        || !pitfall
+            .resolution_tokens
+            .iter()
+            .any(|t| t == "workspace_scope_root")
+        || !pitfall
+            .resolution_tokens
+            .iter()
+            .any(|t| t == "enforce_strict_scope_bound")
+    {
+        return Err(format!("L11 incomplete learned pitfall: {pitfall:?}"));
+    }
+
+    let mut recall_req = libredb_cognitive::PulseRequest::new("resolve_guard", 2000);
+    recall_req.workspace_dir = Some(fx.root.clone());
+    recall_req.error_context = Some("error[E0425] workspace_scope_root".to_owned());
+    let recall_resp = fx
+        .open_overlay()?
+        .pulse(&recall_req)
+        .map_err(|e| e.to_string())?;
+    let hit = recall_resp.fired_reflexes.iter().find(|rf| {
+        rf.id.starts_with("pitfall::")
+            && rf.directive.contains("workspace_scope_root")
+            && rf.directive.contains("enforce_strict_scope_bound")
+    });
+    if hit.is_none() {
+        return Err(format!(
+            "L11 OverlayBrain::pulse did not surface learned pitfall reflex: {:?}",
+            recall_resp.fired_reflexes
+        ));
+    }
+
+    let mut placebo_req =
+        libredb_cognitive::PulseRequest::new("unrelated documentation formatting check", 2000);
+    placebo_req.workspace_dir = Some(fx.root.clone());
+    let placebo_resp = fx
+        .open_overlay()?
+        .pulse(&placebo_req)
+        .map_err(|e| e.to_string())?;
+    if placebo_resp
+        .fired_reflexes
+        .iter()
+        .any(|rf| rf.id.starts_with("pitfall::"))
+    {
+        acc.placebo_false_bindings += 1;
+        return Err(format!(
+            "L11 learned pitfall leaked onto unrelated placebo query: {:?}",
+            placebo_resp.fired_reflexes
+        ));
+    }
+
+    if !fx.is_trusted()? {
+        return Err("L11 hmac-sha256:v4 seal invalidated after error-recovery learning".to_owned());
+    }
+
+    Ok(format!(
+        "Stage1+2 filtered={}, learned 1 structural pitfall (conf={:.2}) & recalled cleanly, seal=valid",
+        rep_learned.counters.trivial_errors_filtered, pitfall.confidence
+    ))
+}
+
+fn verify_l12_situational_superseding_and_belief_revision(
+    sbx_root: &Path,
+    global_ldb: &Path,
+) -> Result<String, String> {
+    let fx = LearningFixture::new(sbx_root, global_ldb, "l12_supersede")?;
+    let diff_src = "pub fn compute_diff(old_s: &str, new_s: &str) -> usize {\n    old_s.len().abs_diff(new_s.len())\n}\n";
+    fx.write_src("src/diff.rs", diff_src)?;
+    fx.index(false)?;
+
+    let m1 = libredb_cognitive::ReflexRule {
+        id: "legacy-line-diff".to_owned(),
+        stack_any: vec!["cargo.toml".to_owned()],
+        action_any: vec!["diff".to_owned()],
+        directive: "Use legacy line-by-line diff fallback.".to_owned(),
+        code_anchors: vec!["src/diff.rs::compute_diff".to_owned()],
+        ..Default::default()
+    };
+    let m2 = libredb_cognitive::ReflexRule {
+        id: "ast-body-hash-diff".to_owned(),
+        stack_any: vec!["cargo.toml".to_owned()],
+        action_any: vec!["diff".to_owned()],
+        context_tags: vec!["inplace".to_owned(), "reformat".to_owned()],
+        supersedes: vec!["legacy-line-diff".to_owned()],
+        directive: "Use AST body-hash diff when reformatting code inplace.".to_owned(),
+        code_anchors: vec!["src/diff.rs::compute_diff".to_owned()],
+        ..Default::default()
+    };
+    libredb_cognitive::ReflexEngine::learn_reflex(&fx.pdb, &m1).map_err(|e| e.to_string())?;
+    libredb_cognitive::ReflexEngine::learn_reflex(&fx.pdb, &m2).map_err(|e| e.to_string())?;
+    fx.seal()?;
+
+    // 1. General situation -> only general reflex M1 fires.
+    let mut gen_req = libredb_cognitive::PulseRequest::new("standard diff check", 2000);
+    gen_req.workspace_dir = Some(fx.root.clone());
+    let gen_resp = fx
+        .open_overlay()?
+        .pulse(&gen_req)
+        .map_err(|e| e.to_string())?;
+    let gen_ids: Vec<&str> = gen_resp
+        .fired_reflexes
+        .iter()
+        .map(|r| r.id.as_str())
+        .collect();
+    if gen_ids != ["legacy-line-diff"] {
+        return Err(format!("L12 general query expected only legacy-line-diff, got {gen_ids:?}"));
+    }
+
+    // 2. Specialized situation -> M2 overrides M1 in both OverlayBrain::pulse & PreInvocation.
+    let mut spec_req = libredb_cognitive::PulseRequest::new("inplace reformat diff", 2000);
+    spec_req.workspace_dir = Some(fx.root.clone());
+    let spec_resp = fx
+        .open_overlay()?
+        .pulse(&spec_req)
+        .map_err(|e| e.to_string())?;
+    if spec_resp.fired_reflexes.len() != 1
+        || spec_resp.fired_reflexes[0].id != "ast-body-hash-diff"
+        || spec_resp.fired_reflexes[0].superseded_ids != vec!["legacy-line-diff".to_owned()]
+    {
+        return Err(format!(
+            "L12 specialized query did not supersede M1 cleanly: {:?}",
+            spec_resp.fired_reflexes
+        ));
+    }
+
+    let hook_before = crate::hooks::evaluate_pre_invocation_payload(
+        &json!({
+            "conversationId": "l12-spec-hook",
+            "workspacePaths": [fx.root.to_string_lossy().to_string()],
+            "prompt": "please diff inplace reformat in cargo.toml"
+        }),
+        Some(global_ldb),
+    )
+    .map_err(|e| e.to_string())?;
+    let msg_before = hook_before["injectSteps"][0]["systemMessage"]["systemMessage"]
+        .as_str()
+        .unwrap_or("");
+    if !msg_before.contains("ast-body-hash-diff") || msg_before.contains("legacy-line-diff") {
+        return Err(format!(
+            "L12 PreInvocation did not honor specialized superseding:\n{msg_before}"
+        ));
+    }
+
+    // 3. Empirical falsification of M2 (4 failures) -> Utility(M2) drops below 0.80 * Utility(M1)
+    //    and M1 automatically reclaims #1 priority without manual intervention.
+    let mut u_m2 = 0.75;
+    for _ in 0..4 {
+        u_m2 = libredb_cognitive::ReflexEngine::record_reflex_outcome(
+            &fx.pdb,
+            "ast-body-hash-diff",
+            false,
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    if u_m2 >= 0.80 * 0.75 {
+        return Err(format!(
+            "L12 expected M2 utility < 0.60 after 4 failures, got {u_m2:.3}"
+        ));
+    }
+
+    let rev_resp = fx
+        .open_overlay()?
+        .pulse(&spec_req)
+        .map_err(|e| e.to_string())?;
+    let rev_ids: Vec<&str> = rev_resp
+        .fired_reflexes
+        .iter()
+        .map(|r| r.id.as_str())
+        .collect();
+    if rev_ids.first().copied() != Some("legacy-line-diff") {
+        return Err(format!(
+            "L12 failed empirical belief revision fallback to M1: {rev_ids:?}"
+        ));
+    }
+
+    let hook_after = crate::hooks::evaluate_pre_invocation_payload(
+        &json!({
+            "conversationId": "l12-rev-hook",
+            "workspacePaths": [fx.root.to_string_lossy().to_string()],
+            "prompt": "please diff inplace reformat in cargo.toml"
+        }),
+        Some(global_ldb),
+    )
+    .map_err(|e| e.to_string())?;
+    let msg_after = hook_after["injectSteps"][0]["systemMessage"]["systemMessage"]
+        .as_str()
+        .unwrap_or("");
+    let idx_m1 = msg_after.find("legacy-line-diff");
+    let idx_m2 = msg_after.find("ast-body-hash-diff");
+    if idx_m1.is_none() || idx_m2.is_some_and(|i2| idx_m1.unwrap() > i2) {
+        return Err(format!(
+            "L12 PreInvocation did not restore M1 ahead of degraded M2:\n{msg_after}"
+        ));
+    }
+
+    if !fx.is_trusted()? {
+        return Err("L12 hmac-sha256:v4 seal broken after reflex outcome updates".to_owned());
+    }
+
+    Ok(format!(
+        "general->M1, specialized->M2 (superseded M1), 4x fail U(M2)={u_m2:.2} -> M1 reclaimed #1, seal=valid"
+    ))
+}
+
 pub fn run_learning_verification_suite(
     workspace_source: Option<&Path>,
     as_json: bool,
@@ -3509,7 +3804,7 @@ pub fn run_learning_verification_suite(
         seed_bench_skill(&gdb)?;
     }
 
-    let mut stages = Vec::with_capacity(10);
+    let mut stages = Vec::with_capacity(12);
     let mut acc = LearningMetricsAccumulator::default();
     let mut resolved_source = workspace_source
         .map(|p| p.display().to_string())
@@ -3579,6 +3874,18 @@ pub fn run_learning_verification_suite(
             resolved_source = src;
             Ok(detail)
         },
+    );
+    run_learning_stage(
+        &mut stages,
+        "L11",
+        "Procedural error-recovery & 2-stage banality filter",
+        || verify_l11_error_recovery_and_banality_filter(&sbx_root, &global_ldb, &mut acc),
+    );
+    run_learning_stage(
+        &mut stages,
+        "L12",
+        "Situational method superseding & empirical revision",
+        || verify_l12_situational_superseding_and_belief_revision(&sbx_root, &global_ldb),
     );
 
     let passed = stages.iter().filter(|s| s.passed).count();

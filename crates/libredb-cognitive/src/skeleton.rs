@@ -112,6 +112,118 @@ pub fn compute_symbol_body_hash(lines: &[&str], start_line: usize, end_line: usi
     }
 }
 
+/// Extracts the set of meaningful lowercase tokens (`>= 2` chars, not purely numeric)
+/// from lines `start_line..=end_line` (1-based) of `source`.
+pub fn extract_symbol_body_tokens(
+    lines: &[&str],
+    start_line: usize,
+    end_line: usize,
+) -> std::collections::BTreeSet<String> {
+    let start = start_line.max(1);
+    let end = end_line.min(lines.len());
+    let mut out = std::collections::BTreeSet::new();
+    if start <= end {
+        for line in &lines[start - 1..end] {
+            for raw in line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+                if raw.len() >= 4
+                    && raw.contains('_')
+                    && raw.chars().any(|c| c.is_ascii_alphabetic())
+                {
+                    out.insert(raw.to_ascii_lowercase());
+                }
+            }
+            for tok in libredb_index::segment_universal_tokens(line) {
+                if tok.chars().count() >= 2 && !tok.chars().all(|c| c.is_ascii_digit()) {
+                    out.insert(tok);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Computes up to 8 newly introduced meaningful body tokens across `touched_keys` (`rel_path::sym_name`)
+/// between `old_bytes`/`old_skel` and `new_bytes`/`new_skel`.
+/// If an edit only changed punctuation (`;`, `,`, `)`), comments, or whitespace, returns an empty `Vec`.
+pub fn diff_symbol_body_tokens(
+    rel_path: &str,
+    old_bytes: Option<&[u8]>,
+    old_skel: Option<&FileSkeleton>,
+    new_bytes: &[u8],
+    new_skel: &FileSkeleton,
+    touched_keys: &[String],
+) -> Vec<String> {
+    if touched_keys.is_empty() {
+        return Vec::new();
+    }
+    let old_text = old_bytes
+        .and_then(|b| std::str::from_utf8(b).ok())
+        .unwrap_or("");
+    let old_lines: Vec<&str> = old_text.lines().collect();
+    let new_text = match std::str::from_utf8(new_bytes) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let new_lines: Vec<&str> = new_text.lines().collect();
+
+    let mut old_sym_tokens: std::collections::HashMap<String, std::collections::BTreeSet<String>> =
+        std::collections::HashMap::new();
+    if let Some(os) = old_skel {
+        for sym in &os.symbols {
+            let key = format!("{rel_path}::{}", sym.qualified_name());
+            old_sym_tokens
+                .entry(key.clone())
+                .or_default()
+                .extend(extract_symbol_body_tokens(&old_lines, sym.start_line, sym.end_line));
+            if sym.container.is_some() {
+                let short_key = format!("{rel_path}::{}", sym.name);
+                old_sym_tokens
+                    .entry(short_key)
+                    .or_default()
+                    .extend(extract_symbol_body_tokens(&old_lines, sym.start_line, sym.end_line));
+            }
+        }
+    }
+
+    let touched_set: std::collections::HashSet<&str> =
+        touched_keys.iter().map(String::as_str).collect();
+    let mut added = std::collections::BTreeSet::new();
+    for sym in &new_skel.symbols {
+        let q_key = format!("{rel_path}::{}", sym.qualified_name());
+        let short_key = format!("{rel_path}::{}", sym.name);
+        let matched_key = if touched_set.contains(q_key.as_str()) {
+            Some(q_key)
+        } else if touched_set.contains(short_key.as_str()) {
+            Some(short_key)
+        } else {
+            None
+        };
+        let Some(ref key) = matched_key else {
+            continue;
+        };
+        let new_toks = extract_symbol_body_tokens(&new_lines, sym.start_line, sym.end_line);
+        if let Some(prev_toks) = old_sym_tokens.get(key) {
+            if old_bytes.is_some() {
+                for t in new_toks.difference(prev_toks) {
+                    added.insert(t.clone());
+                }
+            }
+        } else {
+            for t in new_toks {
+                added.insert(t);
+            }
+        }
+    }
+    let mut out: Vec<String> = added.into_iter().collect();
+    out.sort_by(|a, b| {
+        b.contains('_')
+            .cmp(&a.contains('_'))
+            .then_with(|| a.cmp(b))
+    });
+    out.truncate(8);
+    out
+}
+
 impl SymbolContract {
     /// Returns `Container::name` when enclosed in an `impl`, `class`, `struct`, `trait`, or `interface`,
     /// or `name` for top-level declarations.

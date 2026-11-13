@@ -848,12 +848,67 @@ pub(super) fn dispatch_tool(
             }
 
             if let Some(lr) = args.get("learn_reflex").and_then(Value::as_object) {
-                if let (Some(id), Some(dir)) = (
+                let parse_arr = |k: &str| -> Vec<String> {
+                    lr.get(k)
+                        .and_then(Value::as_array)
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(Value::as_str)
+                                .map(ToOwned::to_owned)
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                if let (Some(id), Some(outcome)) = (
+                    lr.get("id").and_then(Value::as_str),
+                    lr.get("outcome").and_then(Value::as_str),
+                ) {
+                    let success = match outcome.trim().to_ascii_lowercase().as_str() {
+                        "pass" | "success" | "ok" | "true" => true,
+                        "fail" | "failure" | "err" | "false" => false,
+                        other => {
+                            return Err(format!(
+                                "Unsupported learn_reflex.outcome '{other}' (expected pass/fail)"
+                            )
+                            .into())
+                        }
+                    };
+                    let new_util = ReflexEngine::record_reflex_outcome(&proj_db, id, success)?;
+                    outputs.push(format!(
+                        "Recorded {} outcome for reflex '{id}' (utility={new_util:.2})",
+                        if success { "pass" } else { "fail" }
+                    ));
+                } else if let (Some(id), Some(dir)) = (
                     lr.get("id").and_then(Value::as_str),
                     lr.get("directive").and_then(Value::as_str),
                 ) {
-                    let parse_arr = |k: &str| -> Vec<String> {
-                        lr.get(k)
+                    let rule = ReflexRule {
+                        id: id.to_owned(),
+                        stack_any: parse_arr("stack"),
+                        action_any: parse_arr("action"),
+                        env_or_error_any: parse_arr("env"),
+                        context_tags: parse_arr("context_tags"),
+                        supersedes: parse_arr("supersedes"),
+                        base_utility: lr
+                            .get("base_utility")
+                            .and_then(Value::as_f64)
+                            .map(|u| u.clamp(0.10, 0.99)),
+                        directive: dir.to_owned(),
+                        code_anchors: parse_arr("anchors"),
+                        ..Default::default()
+                    };
+                    let nid = ReflexEngine::learn_reflex(&proj_db, &rule)?;
+                    outputs.push(format!("Learned reflex '{id}' (#{nid})"));
+                }
+            }
+
+            if let Some(le) = args.get("learn_error").and_then(Value::as_object) {
+                if let (Some(err_txt), Some(fix_dir)) = (
+                    le.get("error_text").and_then(Value::as_str),
+                    le.get("fix_directive").and_then(Value::as_str),
+                ) {
+                    let parse_le_arr = |k: &str| -> Vec<String> {
+                        le.get(k)
                             .and_then(Value::as_array)
                             .map(|a| {
                                 a.iter()
@@ -863,17 +918,27 @@ pub(super) fn dispatch_tool(
                             })
                             .unwrap_or_default()
                     };
-                    let rule = ReflexRule {
-                        id: id.to_owned(),
-                        stack_any: parse_arr("stack"),
-                        action_any: parse_arr("action"),
-                        env_or_error_any: parse_arr("env"),
-                        directive: dir.to_owned(),
-                        code_anchors: parse_arr("anchors"),
-                        ..Default::default()
-                    };
-                    let nid = ReflexEngine::learn_reflex(&proj_db, &rule)?;
-                    outputs.push(format!("Learned reflex '{id}' (#{nid})"));
+                    let action_hint = le.get("action_hint").and_then(Value::as_str);
+                    let syms = parse_le_arr("symbols");
+                    let sup = parse_le_arr("supersedes");
+                    match libredb_cognitive::learn_explicit_error_resolution(
+                        &proj_db,
+                        err_txt,
+                        fix_dir,
+                        action_hint,
+                        &syms,
+                        &sup,
+                    )? {
+                        Some(entry) => {
+                            outputs.push(format!(
+                                "Learned error recovery pitfall '{}' (conf={:.2})",
+                                entry.id, entry.confidence
+                            ));
+                        }
+                        None => {
+                            outputs.push("Filtered banal syntax slip at Stage 1 gate".to_owned());
+                        }
+                    }
                 }
             }
 

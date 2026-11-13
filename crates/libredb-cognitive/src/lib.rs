@@ -23,13 +23,20 @@ pub use guardrail::{
     GuardrailAuditReport, GuardrailViolation,
 };
 pub use learning::{
-    format_learning_report, learning_state_report, record_search_miss_cue_with_source,
-    LearningCounters, LearningStateReport, MissCueSource,
+    format_learning_report, is_banal_syntax_error, learn_explicit_error_resolution,
+    learning_state_report, record_error_cue, record_search_miss_cue_with_source,
+    ErrorPitfallBook, LearnedPitfallEntry, LearningCounters, LearningStateReport, MissCueSource,
+    PendingErrorCue, ACTIVE_PITFALL_MIN_CONFIDENCE, ERROR_PITFALL_BOOK_KEY, PENDING_ERROR_CUES_KEY,
 };
 pub use overlay::OverlayBrain;
-pub use reflex::{detect_workspace_markers, FiredReflex, ReflexEngine, ReflexRule, ReflexStatus};
+pub use reflex::{
+    compute_smoothed_utility, detect_workspace_markers, FiredReflex, ReflexEngine, ReflexRule,
+    ReflexStatus, ReflexUtilityBook, ReflexUtilityStats, REFLEX_UTILITY_BOOK_KEY,
+};
 pub use session::SessionState;
-pub use skeleton::{FileSkeleton, SectionSpan, SymbolContract};
+pub use skeleton::{
+    diff_symbol_body_tokens, extract_symbol_body_tokens, FileSkeleton, SectionSpan, SymbolContract,
+};
 pub use transcript::{
     create_subagent_handoff, execute_atomic_batch, is_compaction_checkpoint_line,
     sync_transcript_epoch, AtomicBatchReport, AtomicBatchSpec, TaskCapsule, TranscriptEpochState,
@@ -410,7 +417,16 @@ impl CognitiveEngine {
         };
         let mut session_dirty = false;
 
-        // 1. Evaluate situational Reflexes first (highest-ROI mistake prevention!).
+        // 1. Evaluate situational Reflexes first (highest-ROI mistake prevention!) and capture any
+        // non-banal observed error context into the procedural error-recovery cue buffer.
+        if let Some(err_str) = req
+            .error_context
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let _ = learning::record_error_cue(&self.db, err_str, None);
+        }
         let raw_reflexes = self.reflexes.evaluate(
             req.workspace_dir.as_deref(),
             &req.query,

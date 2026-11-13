@@ -42,8 +42,9 @@ Antigravity Cognitive & Code-Graph Commands:
   libredb batch <db.ldb> [--fact k=v]... [--decision Title::Body]... [--task key::title::status::prio]... [--snapshot <summary>]
   libredb handoff <db.ldb> <handoff_id> <task_key> <role> [--notes <text>]
   libredb learn-assoc <db.ldb> <cue_phrase> <target_id_1,target_id_2>
-  libredb learn-reflex <db.ldb> <id> <directive> [--stack <s1,s2>] [--action <a1,a2>] [--env <e1,e2>] [--anchor <a1,a2>]
-  libredb learning [<db.ldb>] [--cwd <dir>] [--top <n>] [--json]
+  libredb learn-reflex <db.ldb> <id> [<directive>] [--stack <s1,s2>] [--action <a1,a2>] [--env <e1,e2>] [--anchor <a1,a2>] [--context <c1,c2>] [--supersedes <id1,id2>] [--utility <0.1..0.99>] [--outcome <pass|fail>]
+  libredb learn-error <db.ldb> <error_text> <fix_directive> [--action <csv>] [--symbols <csv>] [--supersedes <id1,id2>]
+  libredb learning [<db.ldb>] [--verify] [--cwd <dir>] [--top <n>] [--json]
   libredb get-skill [<skill_name>] [--section <title> | --query <q> [--top <k>]] [--json] [--global <customizations.ldb>]
   libredb slice-skill <query> [--skill <skill_name>] [--top <k>] [--json] [--global <customizations.ldb>]
   libredb sync-skill <SKILL.md> [--name <skill_name>] [--global <customizations.ldb>]
@@ -1420,12 +1421,21 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "learn-reflex" => {
             let cli = CliSpec::new(
                 "learn-reflex",
-                "libredb learn-reflex <db.ldb> <id> <directive> [--stack s] [--action a] [--env e] [--anchor a] [--global <customizations.ldb>]",
+                "libredb learn-reflex <db.ldb> <id> [<directive>] [--stack s] [--action a] [--env e] [--anchor a] [--context c] [--supersedes ids] [--utility f] [--outcome pass|fail] [--global <customizations.ldb>]",
             )
-            .positionals(3, Some(3))
+            .positionals(2, Some(3))
             .raw_value_slots(&[2])
             .allow_global()
-            .values(&["--stack", "--action", "--env", "--anchor"])
+            .values(&[
+                "--stack",
+                "--action",
+                "--env",
+                "--anchor",
+                "--context",
+                "--supersedes",
+                "--utility",
+                "--outcome",
+            ])
             .parse(sub_args)?;
             let split_csv = |opt: Option<&str>| -> Vec<String> {
                 opt.unwrap_or("")
@@ -1434,23 +1444,93 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     .filter(|s| !s.is_empty())
                     .collect()
             };
-            let rule = ReflexRule {
-                id: cli.positionals[1].clone(),
-                stack_any: split_csv(cli.value("--stack")),
-                action_any: split_csv(cli.value("--action")),
-                env_or_error_any: split_csv(cli.value("--env")),
-                directive: cli.positionals[2].clone(),
-                code_anchors: split_csv(cli.value("--anchor")),
-                ..Default::default()
-            };
             let db_path = Path::new(&cli.positionals[0]);
             let gdb_opt = hooks::open_global_ldb_checked(cli.global_deref())?;
-            let seal_guard =
-                security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
-            let db = Arc::new(LibreDb::open(db_path)?);
-            let nid = ReflexEngine::learn_reflex(&db, &rule)?;
-            seal_guard.reseal_after_write(gdb_opt.as_deref(), &db)?;
-            println!("Learned situational reflex '{}' as node #{nid}", rule.id);
+            if let Some(outcome_raw) = cli.value("--outcome") {
+                let success = match outcome_raw.trim().to_ascii_lowercase().as_str() {
+                    "pass" | "success" | "ok" | "true" => true,
+                    "fail" | "failure" | "err" | "false" => false,
+                    other => {
+                        return Err(format!(
+                            "Invalid --outcome '{other}' (expected 'pass' or 'fail')"
+                        )
+                        .into())
+                    }
+                };
+                let db = open_cli_verified_project_db(cli.global_deref(), db_path)?;
+                let new_util = ReflexEngine::record_reflex_outcome(&db, &cli.positionals[1], success)?;
+                println!(
+                    "Recorded {} outcome for reflex '{}' (utility={new_util:.2})",
+                    if success { "pass" } else { "fail" },
+                    cli.positionals[1]
+                );
+            } else {
+                let directive = cli
+                    .positionals
+                    .get(2)
+                    .ok_or("Missing <directive> (required unless --outcome is specified)")?;
+                let base_utility = cli
+                    .parse_value::<f64>("--utility")?
+                    .map(|u| u.clamp(0.10, 0.99));
+                let rule = ReflexRule {
+                    id: cli.positionals[1].clone(),
+                    stack_any: split_csv(cli.value("--stack")),
+                    action_any: split_csv(cli.value("--action")),
+                    env_or_error_any: split_csv(cli.value("--env")),
+                    context_tags: split_csv(cli.value("--context")),
+                    supersedes: split_csv(cli.value("--supersedes")),
+                    base_utility,
+                    directive: directive.clone(),
+                    code_anchors: split_csv(cli.value("--anchor")),
+                    ..Default::default()
+                };
+                let seal_guard =
+                    security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
+                let db = Arc::new(LibreDb::open(db_path)?);
+                let nid = ReflexEngine::learn_reflex(&db, &rule)?;
+                seal_guard.reseal_after_write(gdb_opt.as_deref(), &db)?;
+                println!("Learned situational reflex '{}' as node #{nid}", rule.id);
+            }
+        }
+        "learn-error" => {
+            let cli = CliSpec::new(
+                "learn-error",
+                "libredb learn-error <db.ldb> <error_text> <fix_directive> [--action <csv>] [--symbols <csv>] [--supersedes <csv>] [--global <customizations.ldb>]",
+            )
+            .positionals(3, Some(3))
+            .raw_value_slots(&[1, 2])
+            .allow_global()
+            .values(&["--action", "--symbols", "--supersedes"])
+            .parse(sub_args)?;
+            let split_csv = |opt: Option<&str>| -> Vec<String> {
+                opt.unwrap_or("")
+                    .split(',')
+                    .map(|s| s.trim().to_owned())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            };
+            let db_path = Path::new(&cli.positionals[0]);
+            let db = open_cli_verified_project_db(cli.global_deref(), db_path)?;
+            let symbols = split_csv(cli.value("--symbols"));
+            let supersedes = split_csv(cli.value("--supersedes"));
+            match libredb_cognitive::learn_explicit_error_resolution(
+                &db,
+                &cli.positionals[1],
+                &cli.positionals[2],
+                cli.value("--action"),
+                &symbols,
+                &supersedes,
+            )? {
+                Some(entry) => {
+                    println!(
+                        "Learned error-recovery pitfall '{}' (confidence={:.2}, tokens={:?})",
+                        entry.id, entry.confidence, entry.resolution_tokens
+                    );
+                }
+                None => {
+                    println!("Filtered banal syntax slip at Stage 1 gate (0 pitfalls written)");
+                }
+            }
         }
         "learning" => {
             let cli = CliSpec::new(

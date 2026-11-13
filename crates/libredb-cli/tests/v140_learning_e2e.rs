@@ -317,7 +317,7 @@ fn learning_verify_and_bench_suite_prove_causal_learning_without_placebo_leaks()
     let rep: serde_json::Value = serde_json::from_slice(&verify_out.stdout)
         .expect("parse learning --verify JSON");
     assert_eq!(rep["verdict"].as_str(), Some("VERIFIED_CAUSAL_LEARNING"), "{rep}");
-    assert_eq!(rep["passed_stages"].as_u64(), Some(10), "{rep}");
+    assert_eq!(rep["passed_stages"].as_u64(), Some(12), "{rep}");
     assert_eq!(rep["failed_stages"].as_u64(), Some(0), "{rep}");
     assert_eq!(rep["placebo_false_bindings"].as_u64(), Some(0), "{rep}");
     assert_eq!(rep["dead_bridges_retained"].as_u64(), Some(0), "{rep}");
@@ -346,9 +346,85 @@ fn learning_verify_and_bench_suite_prove_causal_learning_without_placebo_leaks()
     let brep: serde_json::Value = serde_json::from_slice(&bench_out.stdout)
         .expect("parse bench --suite learning JSON");
     assert_eq!(brep["verdict"].as_str(), Some("VERIFIED_CAUSAL_LEARNING"), "{brep}");
-    assert_eq!(brep["passed_stages"].as_u64(), Some(10), "{brep}");
+    assert_eq!(brep["passed_stages"].as_u64(), Some(12), "{brep}");
     assert_eq!(brep["failed_stages"].as_u64(), Some(0), "{brep}");
     assert_eq!(brep["placebo_false_bindings"].as_u64(), Some(0), "{brep}");
+
+    // Verify CLI learn-error, banal rejection, and learn-reflex --context/--supersedes/--outcome end-to-end
+    let g_cli = global_ldb.to_string_lossy().to_string();
+    let db_cli = ws.join(".agents/memory.ldb").to_string_lossy().to_string();
+    assert!(std::process::Command::new(bin)
+        .args(["trust", &ws.to_string_lossy(), "--global", &g_cli])
+        .output()
+        .expect("trust ws")
+        .status
+        .success());
+    let banal_cli = std::process::Command::new(bin)
+        .args([
+            "learn-error",
+            &db_cli,
+            "error: expected ';', found '}'",
+            "Add missing semicolon",
+            "--global",
+            &g_cli,
+        ])
+        .output()
+        .expect("learn-error banal");
+    assert!(banal_cli.status.success());
+    assert!(
+        String::from_utf8_lossy(&banal_cli.stdout).contains("Filtered banal syntax slip"),
+        "{}",
+        String::from_utf8_lossy(&banal_cli.stdout)
+    );
+    let real_cli = std::process::Command::new(bin)
+        .args([
+            "learn-error",
+            &db_cli,
+            "error[E0425]: cannot find value 'tx_budget_limit' in this scope",
+            "Thread tx_budget_limit through execute_plan",
+            "--symbols",
+            "src/m0.rs::alpha_pipeline",
+            "--global",
+            &g_cli,
+        ])
+        .output()
+        .expect("learn-error real");
+    assert!(real_cli.status.success());
+    assert!(
+        String::from_utf8_lossy(&real_cli.stdout).contains("Learned error-recovery pitfall"),
+        "{}",
+        String::from_utf8_lossy(&real_cli.stdout)
+    );
+    let sup_cli = std::process::Command::new(bin)
+        .args([
+            "learn-reflex",
+            &db_cli,
+            "v15-ctx-rule",
+            "Use v15 specialized context method.",
+            "--action",
+            "refactor",
+            "--context",
+            "inplace,strict",
+            "--supersedes",
+            "v15-old-rule",
+            "--utility",
+            "0.85",
+            "--global",
+            &g_cli,
+        ])
+        .output()
+        .expect("learn-reflex with options");
+    assert!(sup_cli.status.success(), "{}", String::from_utf8_lossy(&sup_cli.stderr));
+    let out_cli = std::process::Command::new(bin)
+        .args(["learn-reflex", &db_cli, "v15-ctx-rule", "--outcome", "fail", "--global", &g_cli])
+        .output()
+        .expect("learn-reflex outcome fail");
+    assert!(out_cli.status.success(), "{}", String::from_utf8_lossy(&out_cli.stderr));
+    assert!(
+        String::from_utf8_lossy(&out_cli.stdout).contains("Recorded fail outcome"),
+        "{}",
+        String::from_utf8_lossy(&out_cli.stdout)
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }

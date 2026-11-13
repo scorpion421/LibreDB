@@ -24,6 +24,17 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 pub const PENDING_MISS_CUES_KEY: &str = "sys::pending_miss_cues";
 /// Internal causal symbol-alias bridge key mapping `cue_token -> Vec<(symbol_key, weight)>`.
 pub const SYMBOL_CUE_BRIDGES_KEY: &str = "sys::symbol_cue_bridges";
+/// Internal ring-buffer key storing non-banal observed errors awaiting a structural fix edit.
+pub const PENDING_ERROR_CUES_KEY: &str = "sys::pending_error_cues";
+/// Internal procedural error-recovery pitfall book (`NodeKind::Generic`, seal-neutral).
+pub const ERROR_PITFALL_BOOK_KEY: &str = "sys::error_pitfall_book";
+/// Minimum confidence required for a learned pitfall entry to fire proactively in `ReflexEngine`.
+pub const ACTIVE_PITFALL_MIN_CONFIDENCE: f64 = 0.75;
+/// Maximum pending error cues retained in `sys::pending_error_cues`.
+pub const MAX_PENDING_ERROR_CUES: usize = 32;
+/// Maximum learned error pitfalls retained in `sys::error_pitfall_book`.
+pub const MAX_LEARNED_PITFALLS: usize = 128;
+const PITFALL_ID_HASH_SEED: u8 = 0xE1;
 /// Internal learning counters (`misses_recorded`, `bindings_learned`, ...).
 pub const LEARNING_COUNTERS_KEY: &str = "sys::learning_counters";
 /// Maximum pending search-miss cues retained in `sys::pending_miss_cues`.
@@ -105,6 +116,86 @@ pub struct SymbolCueBridgeBook {
     pub bridges: BTreeMap<String, Vec<(String, f64)>>,
 }
 
+/// Pending non-banal error observed during execution awaiting a structural fix edit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingErrorCue {
+    pub fingerprint_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    pub error_tokens: Vec<String>,
+    pub raw_excerpt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_hint: Option<String>,
+    pub recorded_at_ns: u128,
+}
+
+/// Verified procedural error-recovery entry persisted inside `sys::error_pitfall_book`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LearnedPitfallEntry {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    pub trigger_tokens: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub action_tokens: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub affected_symbols: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resolution_tokens: Vec<String>,
+    pub directive: String,
+    pub confidence: f64,
+    pub occurrences: u32,
+    pub last_learned_ns: u128,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supersedes: Vec<String>,
+}
+
+impl LearnedPitfallEntry {
+    /// Converts a matured error-recovery pitfall into a runtime `ReflexRule` so `ReflexEngine`
+    /// can fire it proactively during subsequent similar tasks/errors.
+    pub fn to_reflex_rule(&self) -> crate::reflex::ReflexRule {
+        let mut triggers = self.trigger_tokens.clone();
+        for sym in &self.affected_symbols {
+            if let Some((_, sym_part)) = sym.split_once("::") {
+                let short = sym_part.split('@').next().unwrap_or(sym_part);
+                if short.len() >= 4 && !triggers.iter().any(|t| t.eq_ignore_ascii_case(short)) {
+                    triggers.push(short.to_owned());
+                }
+            }
+        }
+        crate::reflex::ReflexRule {
+            id: format!("pitfall::{}", self.id),
+            stack_any: Vec::new(),
+            action_any: self.action_tokens.clone(),
+            env_or_error_any: triggers,
+            context_tags: Vec::new(),
+            supersedes: self
+                .supersedes
+                .iter()
+                .map(|s| {
+                    if s.starts_with("pitfall::") {
+                        s.clone()
+                    } else {
+                        format!("pitfall::{s}")
+                    }
+                })
+                .collect(),
+            base_utility: Some(self.confidence.clamp(0.10, 0.99)),
+            directive: self.directive.clone(),
+            code_anchors: self.affected_symbols.clone(),
+            anchor_contract_hash: None,
+            anchor_contracts: Vec::new(),
+        }
+    }
+}
+
+/// Persisted procedural error-recovery knowledge (`NodeKind::Generic`, seal-neutral).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ErrorPitfallBook {
+    #[serde(default)]
+    pub pitfalls: BTreeMap<String, LearnedPitfallEntry>,
+}
+
 /// Cumulative learning counters persisted in `sys::learning_counters`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LearningCounters {
@@ -116,6 +207,14 @@ pub struct LearningCounters {
     pub broad_edits_skipped: u64,
     #[serde(default)]
     pub bulk_scans_skipped: u64,
+    #[serde(default)]
+    pub error_cues_recorded: u64,
+    #[serde(default)]
+    pub trivial_errors_filtered: u64,
+    #[serde(default)]
+    pub pitfalls_learned: u64,
+    #[serde(default)]
+    pub method_supersedes_applied: u64,
 }
 
 /// Where a verified edit was observed.
@@ -134,6 +233,9 @@ pub(crate) struct EditEvidence {
     pub edit_ns: u128,
     /// Stripped symbol keys whose bodies actually changed (`diff_symbol_bodies`).
     pub touched: Vec<String>,
+    /// Newly added non-punctuation identifier/code tokens across `touched` symbols.
+    /// Empty when the edit only touched `;`, `,`, `)`, comments, or whitespace.
+    pub added_body_tokens: Vec<String>,
     #[allow(dead_code)]
     pub origin: EditOrigin,
 }
@@ -240,6 +342,371 @@ pub fn record_search_miss_cue_with_source(
         bump_learning_counters(db, |c| c.misses_recorded += 1);
     }
     Ok(true)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Procedural error-recovery & 2-stage banality filter (Stage 1: lex/pattern, Stage 2: AST diff)
+// ---------------------------------------------------------------------------------------------
+
+const SYNTAX_SLIP_PATTERNS: &[&str] = &[
+    "expected ';'",
+    "expected ','",
+    "expected ')'",
+    "expected '}'",
+    "expected ']'",
+    "unclosed delimiter",
+    "unexpected token",
+    "unexpected end of input",
+    "unexpected eof",
+    "missing semicolon",
+    "trailing comma",
+    "unterminated string",
+];
+
+const ERROR_BOILERPLATE_WORDS: &[&str] = &[
+    "error", "warning", "note", "help", "cannot", "could", "find", "found", "expected",
+    "unexpected", "this", "that", "with", "from", "into", "have", "here", "line", "column",
+    "near", "before", "after", "eof", "end", "input", "value", "variable", "scope",
+    "syntax", "syntaxerror", "parse", "parser", "token", "delimiter", "unclosed", "missing",
+    "semicolon", "colon", "comma", "brace", "bracket", "paren", "parenthesis", "trailing",
+    "quote", "unterminated", "character", "indent", "indentation", "whitespace", "mismatched",
+    "mismatch", "expression", "statement", "declaration", "identifier", "type", "types",
+];
+
+fn extract_error_code(text: &str) -> Option<String> {
+    for raw in text.split(|c: char| !c.is_ascii_alphanumeric()) {
+        if raw.len() >= 4 && raw.len() <= 8 {
+            let bytes = raw.as_bytes();
+            let alpha_prefix = bytes.iter().take_while(|b| b.is_ascii_uppercase()).count();
+            let digit_suffix = bytes[alpha_prefix..]
+                .iter()
+                .filter(|b| b.is_ascii_digit())
+                .count();
+            if (1..=3).contains(&alpha_prefix)
+                && digit_suffix >= 3
+                && alpha_prefix + digit_suffix == bytes.len()
+            {
+                return Some(raw.to_ascii_lowercase());
+            }
+        }
+    }
+    None
+}
+
+fn is_error_boilerplate(tok: &str) -> bool {
+    ERROR_BOILERPLATE_WORDS.contains(&tok)
+}
+
+/// Extracts `(optional_error_code, ordered_meaningful_tokens, deterministic_fingerprint_id)`
+/// from raw error diagnostic text.
+fn extract_error_signature(error_text: &str) -> (Option<String>, Vec<String>, String) {
+    let error_code = extract_error_code(error_text);
+    let mut tokens: Vec<String> = Vec::new();
+    let mut push_unique = |tok: String| {
+        if !tok.is_empty() && !tokens.contains(&tok) {
+            tokens.push(tok);
+        }
+    };
+
+    if let Some(ref ec) = error_code {
+        push_unique(ec.clone());
+    }
+
+    // Preserve compound identifiers (`workspace_scope_root`, `CamelCaseId`) ahead of split subtokens.
+    for ident in error_text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+        if ident.len() < 4 {
+            continue;
+        }
+        let has_alpha = ident.chars().any(|c| c.is_ascii_alphabetic());
+        if !has_alpha {
+            continue;
+        }
+        let low = ident.to_ascii_lowercase();
+        if error_code.as_deref() == Some(low.as_str()) || is_error_boilerplate(&low) {
+            continue;
+        }
+        if ident.contains('_') || ident.chars().any(|c| c.is_ascii_uppercase()) {
+            push_unique(low);
+        }
+    }
+
+    for sub in libredb_index::segment_universal_tokens(error_text) {
+        if sub.chars().count() < 4 || sub.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        if is_error_boilerplate(&sub) {
+            continue;
+        }
+        push_unique(sub);
+    }
+
+    tokens.truncate(6);
+    let basis = tokens.join("|");
+    let h = libredb_core::crc::hash_key(PITFALL_ID_HASH_SEED, basis.as_bytes()) as u32;
+    let fp = match error_code.as_deref() {
+        Some(ec) => format!("{ec}_{h:08x}"),
+        None => format!("pitfall_{h:08x}"),
+    };
+    (error_code, tokens, fp)
+}
+
+/// Stage 1 of the 2-stage Banality Filter: returns `true` when `error_text` is empty, too short,
+/// or represents a trivial punctuation/delimiter/typo syntax slip carrying zero transferable
+/// architectural or scoping signal.
+pub fn is_banal_syntax_error(error_text: &str) -> bool {
+    let trimmed = error_text.trim();
+    if trimmed.len() < 6 {
+        return true;
+    }
+    let lc = trimmed.to_ascii_lowercase();
+    let (code_opt, specific_tokens, _) = extract_error_signature(trimmed);
+    if code_opt.is_none() && specific_tokens.is_empty() {
+        return true;
+    }
+    let has_compound_ident = specific_tokens.iter().any(|t| t.contains('_'));
+    if code_opt.is_none()
+        && SYNTAX_SLIP_PATTERNS.iter().any(|p| lc.contains(p))
+        && !has_compound_ident
+        && specific_tokens.len() <= 1
+    {
+        return true;
+    }
+    false
+}
+
+fn compact_error_excerpt(error_text: &str) -> String {
+    let single_line = error_text
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    let mut out = String::with_capacity(single_line.len().min(96));
+    for ch in single_line.chars().take(96) {
+        out.push(ch);
+    }
+    out
+}
+
+/// Stages a non-banal observed error into `sys::pending_error_cues` (`NodeKind::Generic`,
+/// seal-neutral). Banal syntax/delimiter slips are rejected at Stage 1 and counted in
+/// `LearningCounters.trivial_errors_filtered`.
+pub fn record_error_cue(
+    db: &LibreDb,
+    error_text: &str,
+    action_hint: Option<&str>,
+) -> Result<bool> {
+    if is_banal_syntax_error(error_text) {
+        bump_learning_counters(db, |c| c.trivial_errors_filtered += 1);
+        return Ok(false);
+    }
+    let (error_code, error_tokens, fingerprint_id) = extract_error_signature(error_text);
+    if error_code.is_none() && error_tokens.is_empty() {
+        bump_learning_counters(db, |c| c.trivial_errors_filtered += 1);
+        return Ok(false);
+    }
+    let now_ns = current_unix_ns();
+    let excerpt = compact_error_excerpt(error_text);
+    let hint_clean = action_hint
+        .map(str::trim)
+        .filter(|h| !h.is_empty() && h.len() <= 80)
+        .map(ToOwned::to_owned);
+    let mut counted = false;
+
+    db.transact_key(NodeKind::Generic, PENDING_ERROR_CUES_KEY, |existing| {
+        let mut cues: Vec<PendingErrorCue> = existing
+            .and_then(|rec| serde_json::from_slice(&rec.payload).ok())
+            .unwrap_or_default();
+        cues.retain(|c| now_ns.saturating_sub(c.recorded_at_ns) <= MISS_CUE_TTL_NS);
+        if let Some(prev) = cues.iter_mut().find(|c| c.fingerprint_id == fingerprint_id) {
+            prev.recorded_at_ns = now_ns;
+            if hint_clean.is_some() {
+                prev.action_hint = hint_clean.clone();
+            }
+        } else {
+            cues.push(PendingErrorCue {
+                fingerprint_id: fingerprint_id.clone(),
+                error_code: error_code.clone(),
+                error_tokens: error_tokens.clone(),
+                raw_excerpt: excerpt.clone(),
+                action_hint: hint_clean.clone(),
+                recorded_at_ns: now_ns,
+            });
+            counted = true;
+        }
+        if cues.len() > MAX_PENDING_ERROR_CUES {
+            let drop_n = cues.len() - MAX_PENDING_ERROR_CUES;
+            cues.drain(0..drop_n);
+        }
+        let bytes = serde_json::to_vec(&cues)
+            .map_err(|_| LibreDbError::CorruptFormat("pending error cues serialize"))?;
+        Ok(Some(WriteRequest::new(NodeKind::Generic, bytes).with_importance(32)))
+    })?;
+
+    if counted {
+        bump_learning_counters(db, |c| c.error_cues_recorded += 1);
+    }
+    Ok(true)
+}
+
+/// Explicitly records a verified `(error_text -> fix_directive)` resolution (via CLI/MCP) in
+/// `sys::error_pitfall_book` after passing the Stage 1 banality filter.
+pub fn learn_explicit_error_resolution(
+    db: &LibreDb,
+    error_text: &str,
+    fix_directive: &str,
+    action_hint: Option<&str>,
+    symbols: &[String],
+    supersedes: &[String],
+) -> Result<Option<LearnedPitfallEntry>> {
+    if is_banal_syntax_error(error_text) {
+        bump_learning_counters(db, |c| c.trivial_errors_filtered += 1);
+        return Ok(None);
+    }
+    let fix_tokens = extract_cue_tokens(fix_directive);
+    if fix_tokens.is_empty() {
+        bump_learning_counters(db, |c| c.trivial_errors_filtered += 1);
+        return Ok(None);
+    }
+    let (error_code, error_tokens, fingerprint_id) = extract_error_signature(error_text);
+    if error_code.is_none() && error_tokens.is_empty() {
+        bump_learning_counters(db, |c| c.trivial_errors_filtered += 1);
+        return Ok(None);
+    }
+    let now_ns = current_unix_ns();
+    let action_tokens: Vec<String> = action_hint
+        .map(extract_cue_tokens)
+        .unwrap_or_default()
+        .into_iter()
+        .take(4)
+        .collect();
+    let affected_symbols: Vec<String> = symbols
+        .iter()
+        .map(|s| s.trim().replace('\\', "/"))
+        .filter(|s| !s.is_empty())
+        .collect();
+    let supersedes_clean: Vec<String> = supersedes
+        .iter()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let mut stored_entry: Option<LearnedPitfallEntry> = None;
+    let mut supersedes_applied = 0u64;
+    db.transact_key(NodeKind::Generic, ERROR_PITFALL_BOOK_KEY, |existing| {
+        let mut book: ErrorPitfallBook = existing
+            .and_then(|rec| serde_json::from_slice(&rec.payload).ok())
+            .unwrap_or_default();
+        for old_id in &supersedes_clean {
+            let key_no_pfx = old_id.strip_prefix("pitfall::").unwrap_or(old_id);
+            if let Some(old_entry) = book.pitfalls.get_mut(key_no_pfx) {
+                old_entry.confidence = (old_entry.confidence * 0.65).clamp(0.10, 0.98);
+                supersedes_applied += 1;
+            }
+        }
+        let entry = book
+            .pitfalls
+            .entry(fingerprint_id.clone())
+            .and_modify(|cur| {
+                if cur.directive != fix_directive.trim() {
+                    cur.directive = fix_directive.trim().to_owned();
+                    supersedes_applied += 1;
+                }
+                cur.resolution_tokens = fix_tokens.clone();
+                if !affected_symbols.is_empty() {
+                    cur.affected_symbols = affected_symbols.clone();
+                }
+                for sp in &supersedes_clean {
+                    if !cur.supersedes.contains(sp) {
+                        cur.supersedes.push(sp.clone());
+                    }
+                }
+                cur.confidence = (1.0 - (1.0 - cur.confidence) * 0.40).clamp(0.10, 0.98);
+                cur.occurrences = cur.occurrences.saturating_add(1);
+                cur.last_learned_ns = now_ns;
+            })
+            .or_insert_with(|| LearnedPitfallEntry {
+                id: fingerprint_id.clone(),
+                error_code: error_code.clone(),
+                trigger_tokens: error_tokens.clone(),
+                action_tokens: action_tokens.clone(),
+                affected_symbols: affected_symbols.clone(),
+                resolution_tokens: fix_tokens.clone(),
+                directive: fix_directive.trim().to_owned(),
+                confidence: 0.85,
+                occurrences: 1,
+                last_learned_ns: now_ns,
+                supersedes: supersedes_clean.clone(),
+            })
+            .clone();
+        stored_entry = Some(entry);
+        evict_pitfall_book_overflow(&mut book);
+        let bytes = serde_json::to_vec(&book)
+            .map_err(|_| LibreDbError::CorruptFormat("error pitfall book serialize"))?;
+        Ok(Some(WriteRequest::new(NodeKind::Generic, bytes).with_importance(64)))
+    })?;
+
+    // Retire matching pending error cue if staged earlier.
+    let _ = db.transact_key(NodeKind::Generic, PENDING_ERROR_CUES_KEY, |existing| {
+        let Some(rec) = existing else {
+            return Ok(None);
+        };
+        let Ok(mut cues) = serde_json::from_slice::<Vec<PendingErrorCue>>(&rec.payload) else {
+            return Ok(None);
+        };
+        let before = cues.len();
+        cues.retain(|c| c.fingerprint_id != fingerprint_id);
+        if cues.len() == before {
+            return Ok(None);
+        }
+        let bytes = serde_json::to_vec(&cues)
+            .map_err(|_| LibreDbError::CorruptFormat("pending error cues serialize"))?;
+        Ok(Some(WriteRequest::new(NodeKind::Generic, bytes).with_importance(32)))
+    });
+
+    bump_learning_counters(db, |c| {
+        c.pitfalls_learned += 1;
+        c.method_supersedes_applied += supersedes_applied + u64::from(!supersedes_clean.is_empty());
+    });
+    Ok(stored_entry)
+}
+
+pub(crate) fn load_matured_pitfalls(db: &LibreDb) -> Vec<LearnedPitfallEntry> {
+    db.get_by_key(NodeKind::Generic, ERROR_PITFALL_BOOK_KEY)
+        .ok()
+        .and_then(|rec| serde_json::from_slice::<ErrorPitfallBook>(&rec.payload).ok())
+        .map(|b| {
+            b.pitfalls
+                .into_values()
+                .filter(|p| p.confidence >= ACTIVE_PITFALL_MIN_CONFIDENCE)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub(crate) fn note_method_supersede(db: &LibreDb) {
+    bump_learning_counters(db, |c| c.method_supersedes_applied += 1);
+}
+
+fn evict_pitfall_book_overflow(book: &mut ErrorPitfallBook) {
+    while book.pitfalls.len() > MAX_LEARNED_PITFALLS {
+        let victim = book
+            .pitfalls
+            .iter()
+            .min_by(|a, b| {
+                a.1.confidence
+                    .partial_cmp(&b.1.confidence)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.1.last_learned_ns.cmp(&b.1.last_learned_ns))
+                    .then_with(|| a.0.cmp(b.0))
+            })
+            .map(|(k, _)| k.clone());
+        match victim {
+            Some(k) => {
+                book.pitfalls.remove(&k);
+            }
+            None => break,
+        }
+    }
 }
 
 fn bump_learning_counters(db: &LibreDb, apply: impl FnOnce(&mut LearningCounters)) {
@@ -528,13 +995,15 @@ struct CueBinding {
     symbols: Vec<String>,
 }
 
-/// Binds all causally eligible pending cues to the symbols modified by a verified edit.
-/// Returns the number of `(token, symbol)` bridge links created or reinforced.
+/// Binds all causally eligible pending miss cues and error cues to the symbols modified by a
+/// verified edit. Returns the number of learned symbol bridges + error pitfalls created/updated.
 pub(crate) fn learn_from_verified_edit(db: &LibreDb, ev: &EditEvidence) -> usize {
     if ev.touched.is_empty() {
         return 0;
     }
-    if db.get_by_key(NodeKind::Generic, PENDING_MISS_CUES_KEY).is_err() {
+    let has_miss_cues = db.get_by_key(NodeKind::Generic, PENDING_MISS_CUES_KEY).is_ok();
+    let has_error_cues = db.get_by_key(NodeKind::Generic, PENDING_ERROR_CUES_KEY).is_ok();
+    if !has_miss_cues && !has_error_cues {
         return 0;
     }
     if ev.touched.len() > MAX_TOUCHED_PER_EDIT {
@@ -542,109 +1011,257 @@ pub(crate) fn learn_from_verified_edit(db: &LibreDb, ev: &EditEvidence) -> usize
         return 0;
     }
 
-    let mut bindings: Vec<CueBinding> = Vec::new();
-    let pending_tx = db.transact_key(NodeKind::Generic, PENDING_MISS_CUES_KEY, |existing| {
+    let mut total_learned = 0usize;
+
+    if has_miss_cues {
+        let mut bindings: Vec<CueBinding> = Vec::new();
+        let pending_tx = db.transact_key(NodeKind::Generic, PENDING_MISS_CUES_KEY, |existing| {
+            let Some(rec) = existing else {
+                return Ok(None);
+            };
+            let Ok(mut cues) = serde_json::from_slice::<Vec<PendingMissCue>>(&rec.payload) else {
+                return Ok(None);
+            };
+            let now_ns = current_unix_ns();
+            let before = cues.len();
+            cues.retain(|c| !is_cue_retired(c, ev.edit_ns, now_ns));
+            let mut changed = cues.len() != before;
+            for c in &mut cues {
+                if !is_cue_causally_bindable(c, ev.edit_ns) {
+                    continue;
+                }
+                let new_syms: Vec<String> = ev
+                    .touched
+                    .iter()
+                    .filter(|s| !c.bound_symbols.contains(s))
+                    .cloned()
+                    .collect();
+                if new_syms.is_empty() {
+                    continue;
+                }
+                let new_file = !c.bound_files.contains(&ev.rel_path);
+                if c.bound_files.len() + usize::from(new_file) > MAX_CUE_BOUND_FILES
+                    || c.bound_symbols.len() + new_syms.len() > MAX_CUE_BOUND_SYMBOLS
+                {
+                    continue;
+                }
+                c.first_bound_edit_ns.get_or_insert(ev.edit_ns);
+                if new_file {
+                    c.bound_files.push(ev.rel_path.clone());
+                }
+                c.bound_symbols.extend(new_syms.iter().cloned());
+                bindings.push(CueBinding {
+                    tokens: c.tokens.clone(),
+                    whole: whole_identifier(&c.raw_query),
+                    source: c.source,
+                    symbols: new_syms,
+                });
+                changed = true;
+            }
+            if !changed {
+                return Ok(None);
+            }
+            let bytes = serde_json::to_vec(&cues)
+                .map_err(|_| LibreDbError::CorruptFormat("pending miss cues serialize"))?;
+            Ok(Some(WriteRequest::new(NodeKind::Generic, bytes).with_importance(32)))
+        });
+
+        if pending_tx.is_ok() && !bindings.is_empty() {
+            let vocab = SymbolVocabulary::from_db(db);
+            let mut updated_links = 0usize;
+            let bridge_tx = db.transact_key(NodeKind::Generic, SYMBOL_CUE_BRIDGES_KEY, |existing| {
+                let mut book: SymbolCueBridgeBook = existing
+                    .and_then(|rec| serde_json::from_slice(&rec.payload).ok())
+                    .unwrap_or_default();
+                for b in &bindings {
+                    let init_w = b.source.initial_weight();
+                    for tok in &b.tokens {
+                        let is_whole = b.whole.as_deref() == Some(tok.as_str());
+                        let fanout = book.bridges.get(tok).map_or(0, |l| l.len() as u32);
+                        if !is_whole && vocab.specificity(tok, fanout) < MIN_BIND_TOKEN_SPECIFICITY {
+                            continue;
+                        }
+                        let list = book.bridges.entry(tok.clone()).or_default();
+                        for sym_k in &b.symbols {
+                            if let Some(existing_link) = list.iter_mut().find(|(k, _)| k == sym_k) {
+                                existing_link.1 = (1.0 - (1.0 - existing_link.1) * BRIDGE_REINFORCE_RETAIN)
+                                    .clamp(0.10, 0.95);
+                            } else {
+                                list.push((sym_k.clone(), init_w));
+                            }
+                            updated_links += 1;
+                        }
+                        list.sort_by(|a, b| {
+                            b.1.partial_cmp(&a.1)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                                .then_with(|| a.0.cmp(&b.0))
+                        });
+                        list.truncate(MAX_TARGETS_PER_CUE_TOKEN);
+                    }
+                }
+                evict_bridge_book_overflow(&mut book);
+                if updated_links == 0 {
+                    return Ok(None);
+                }
+                let bytes = serde_json::to_vec(&book)
+                    .map_err(|_| LibreDbError::CorruptFormat("symbol cue bridges serialize"))?;
+                Ok(Some(WriteRequest::new(NodeKind::Generic, bytes).with_importance(64)))
+            });
+            if bridge_tx.is_ok() && updated_links > 0 {
+                let n = bindings.len() as u64;
+                bump_learning_counters(db, |c| c.bindings_learned += n);
+                total_learned += updated_links;
+            }
+        }
+    }
+
+    if has_error_cues {
+        total_learned += bind_error_cues_for_edit(db, ev);
+    }
+
+    total_learned
+}
+
+fn bind_error_cues_for_edit(db: &LibreDb, ev: &EditEvidence) -> usize {
+    let mut causal_errors: Vec<PendingErrorCue> = Vec::new();
+    let tx = db.transact_key(NodeKind::Generic, PENDING_ERROR_CUES_KEY, |existing| {
         let Some(rec) = existing else {
             return Ok(None);
         };
-        let Ok(mut cues) = serde_json::from_slice::<Vec<PendingMissCue>>(&rec.payload) else {
+        let Ok(cues) = serde_json::from_slice::<Vec<PendingErrorCue>>(&rec.payload) else {
             return Ok(None);
         };
         let now_ns = current_unix_ns();
         let before = cues.len();
-        cues.retain(|c| !is_cue_retired(c, ev.edit_ns, now_ns));
-        let mut changed = cues.len() != before;
-        for c in &mut cues {
-            if !is_cue_causally_bindable(c, ev.edit_ns) {
+        let mut remaining = Vec::with_capacity(cues.len());
+        for c in cues {
+            if now_ns.saturating_sub(c.recorded_at_ns) > MISS_CUE_TTL_NS {
                 continue;
             }
-            let new_syms: Vec<String> = ev
-                .touched
-                .iter()
-                .filter(|s| !c.bound_symbols.contains(s))
-                .cloned()
-                .collect();
-            if new_syms.is_empty() {
-                continue;
+            if c.recorded_at_ns <= ev.edit_ns {
+                causal_errors.push(c);
+            } else {
+                remaining.push(c);
             }
-            let new_file = !c.bound_files.contains(&ev.rel_path);
-            if c.bound_files.len() + usize::from(new_file) > MAX_CUE_BOUND_FILES
-                || c.bound_symbols.len() + new_syms.len() > MAX_CUE_BOUND_SYMBOLS
-            {
-                continue;
-            }
-            c.first_bound_edit_ns.get_or_insert(ev.edit_ns);
-            if new_file {
-                c.bound_files.push(ev.rel_path.clone());
-            }
-            c.bound_symbols.extend(new_syms.iter().cloned());
-            bindings.push(CueBinding {
-                tokens: c.tokens.clone(),
-                whole: whole_identifier(&c.raw_query),
-                source: c.source,
-                symbols: new_syms,
-            });
-            changed = true;
         }
-        if !changed {
+        if causal_errors.is_empty() && remaining.len() == before {
             return Ok(None);
         }
-        let bytes = serde_json::to_vec(&cues)
-            .map_err(|_| LibreDbError::CorruptFormat("pending miss cues serialize"))?;
+        let bytes = serde_json::to_vec(&remaining)
+            .map_err(|_| LibreDbError::CorruptFormat("pending error cues serialize"))?;
         Ok(Some(WriteRequest::new(NodeKind::Generic, bytes).with_importance(32)))
     });
-    if pending_tx.is_err() || bindings.is_empty() {
+    if tx.is_err() || causal_errors.is_empty() {
         return 0;
     }
 
-    let vocab = SymbolVocabulary::from_db(db);
-    let mut updated_links = 0usize;
-    let bridge_tx = db.transact_key(NodeKind::Generic, SYMBOL_CUE_BRIDGES_KEY, |existing| {
-        let mut book: SymbolCueBridgeBook = existing
-            .and_then(|rec| serde_json::from_slice(&rec.payload).ok())
-            .unwrap_or_default();
-        for b in &bindings {
-            let init_w = b.source.initial_weight();
-            for tok in &b.tokens {
-                let is_whole = b.whole.as_deref() == Some(tok.as_str());
-                let fanout = book.bridges.get(tok).map_or(0, |l| l.len() as u32);
-                if !is_whole && vocab.specificity(tok, fanout) < MIN_BIND_TOKEN_SPECIFICITY {
-                    continue;
-                }
-                let list = book.bridges.entry(tok.clone()).or_default();
-                for sym_k in &b.symbols {
-                    if let Some(existing_link) = list.iter_mut().find(|(k, _)| k == sym_k) {
-                        existing_link.1 =
-                            (1.0 - (1.0 - existing_link.1) * BRIDGE_REINFORCE_RETAIN).clamp(0.10, 0.95);
-                    } else {
-                        list.push((sym_k.clone(), init_w));
-                    }
-                    updated_links += 1;
-                }
-                list.sort_by(|a, b| {
-                    b.1.partial_cmp(&a.1)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| a.0.cmp(&b.0))
-                });
-                list.truncate(MAX_TARGETS_PER_CUE_TOKEN);
-            }
-        }
-        evict_bridge_book_overflow(&mut book);
-        if updated_links == 0 {
-            return Ok(None);
-        }
-        let bytes = serde_json::to_vec(&book)
-            .map_err(|_| LibreDbError::CorruptFormat("symbol cue bridges serialize"))?;
-        Ok(Some(WriteRequest::new(NodeKind::Generic, bytes).with_importance(64)))
-    });
-    if bridge_tx.is_err() {
+    // Stage 2 Banality Filter: if the verified edit introduced zero meaningful body tokens
+    // (only `;`, `,`, `)`, comments, or formatting changed), retire these cues cleanly.
+    if ev.added_body_tokens.is_empty() {
+        let filtered_n = causal_errors.len() as u64;
+        bump_learning_counters(db, |c| c.trivial_errors_filtered += filtered_n);
         return 0;
     }
-    if updated_links > 0 {
-        let n = bindings.len() as u64;
-        bump_learning_counters(db, |c| c.bindings_learned += n);
+
+    let now_ns = current_unix_ns();
+    let mut learned_count = 0usize;
+    let mut supersedes_applied = 0u64;
+    let book_tx = db.transact_key(NodeKind::Generic, ERROR_PITFALL_BOOK_KEY, |existing| {
+        let mut book: ErrorPitfallBook = existing
+            .and_then(|rec| serde_json::from_slice(&rec.payload).ok())
+            .unwrap_or_default();
+        for cue in &causal_errors {
+            let mut supersedes_for_cue: Vec<String> = Vec::new();
+            for (old_id, old_p) in book.pitfalls.iter_mut() {
+                if old_id == &cue.fingerprint_id {
+                    continue;
+                }
+                let shares_symbol = old_p
+                    .affected_symbols
+                    .iter()
+                    .any(|s| ev.touched.contains(s));
+                let shares_trigger = old_p
+                    .trigger_tokens
+                    .iter()
+                    .any(|t| cue.error_tokens.contains(t));
+                if shares_symbol && shares_trigger && old_p.resolution_tokens != ev.added_body_tokens {
+                    old_p.confidence = (old_p.confidence * 0.65).clamp(0.10, 0.98);
+                    supersedes_for_cue.push(old_id.clone());
+                    supersedes_applied += 1;
+                }
+            }
+
+            let directive = format!(
+                "Avoid repeat error ({}) in [{}]: apply verified fix tokens [{}].",
+                cue.raw_excerpt,
+                ev.touched.join(", "),
+                ev.added_body_tokens.join(", ")
+            );
+            let action_tokens = cue
+                .action_hint
+                .as_deref()
+                .map(extract_cue_tokens)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|t| t.len() >= 3)
+                .take(4)
+                .collect::<Vec<_>>();
+
+            match book.pitfalls.get_mut(&cue.fingerprint_id) {
+                Some(cur) => {
+                    if !cur.resolution_tokens.is_empty()
+                        && cur.resolution_tokens != ev.added_body_tokens
+                    {
+                        supersedes_applied += 1;
+                    }
+                    cur.resolution_tokens = ev.added_body_tokens.clone();
+                    cur.affected_symbols = ev.touched.clone();
+                    cur.directive = directive;
+                    for sp in &supersedes_for_cue {
+                        if !cur.supersedes.contains(sp) {
+                            cur.supersedes.push(sp.clone());
+                        }
+                    }
+                    cur.confidence = (1.0 - (1.0 - cur.confidence) * 0.50).clamp(0.10, 0.98);
+                    cur.occurrences = cur.occurrences.saturating_add(1);
+                    cur.last_learned_ns = now_ns;
+                }
+                None => {
+                    book.pitfalls.insert(
+                        cue.fingerprint_id.clone(),
+                        LearnedPitfallEntry {
+                            id: cue.fingerprint_id.clone(),
+                            error_code: cue.error_code.clone(),
+                            trigger_tokens: cue.error_tokens.clone(),
+                            action_tokens,
+                            affected_symbols: ev.touched.clone(),
+                            resolution_tokens: ev.added_body_tokens.clone(),
+                            directive,
+                            confidence: 0.80,
+                            occurrences: 1,
+                            last_learned_ns: now_ns,
+                            supersedes: supersedes_for_cue,
+                        },
+                    );
+                }
+            }
+            learned_count += 1;
+        }
+        evict_pitfall_book_overflow(&mut book);
+        let bytes = serde_json::to_vec(&book)
+            .map_err(|_| LibreDbError::CorruptFormat("error pitfall book serialize"))?;
+        Ok(Some(WriteRequest::new(NodeKind::Generic, bytes).with_importance(64)))
+    });
+
+    if book_tx.is_ok() && learned_count > 0 {
+        let added = learned_count as u64;
+        bump_learning_counters(db, |c| {
+            c.pitfalls_learned += added;
+            c.method_supersedes_applied += supersedes_applied;
+        });
+        return learned_count;
     }
-    updated_links
+    0
 }
 
 /// Records that an index scan skipped learning because too many files changed at once.
@@ -711,6 +1328,84 @@ pub(crate) fn prune_deleted_file_symbols_from_bridges(
             .map_err(|_| LibreDbError::CorruptFormat("symbol cue bridges serialize"))?;
         Ok(Some(WriteRequest::new(NodeKind::Generic, bytes).with_importance(64)))
     });
+    prune_deleted_file_symbols_from_pitfalls(db, rel_path, live_stripped_keys_in_file);
+}
+
+fn prune_deleted_file_symbols_from_pitfalls(
+    db: &LibreDb,
+    rel_path: &str,
+    live_stripped_keys_in_file: &HashSet<String>,
+) {
+    let prefix = format!("{rel_path}::");
+    let _ = db.transact_key(NodeKind::Generic, ERROR_PITFALL_BOOK_KEY, |existing| {
+        let Some(rec) = existing else {
+            return Ok(None);
+        };
+        let Ok(mut book) = serde_json::from_slice::<ErrorPitfallBook>(&rec.payload) else {
+            return Ok(None);
+        };
+        let mut modified = false;
+        book.pitfalls.retain(|_, p| {
+            if p.affected_symbols.is_empty() {
+                return true;
+            }
+            let before = p.affected_symbols.len();
+            p.affected_symbols.retain(|sym_k| {
+                let stripped = strip_line_disambiguator(sym_k);
+                !stripped.starts_with(&prefix) || live_stripped_keys_in_file.contains(stripped)
+            });
+            if p.affected_symbols.len() != before {
+                modified = true;
+            }
+            !p.affected_symbols.is_empty()
+        });
+        if !modified {
+            return Ok(None);
+        }
+        let bytes = serde_json::to_vec(&book)
+            .map_err(|_| LibreDbError::CorruptFormat("error pitfall book serialize"))?;
+        Ok(Some(WriteRequest::new(NodeKind::Generic, bytes).with_importance(64)))
+    });
+}
+
+/// Removes pitfall entries pointing to files/symbols that vanished during an index scan.
+pub(crate) fn prune_stale_error_pitfalls(
+    db: &LibreDb,
+    live_rel_paths: &HashSet<&str>,
+    live_stripped: &HashSet<String>,
+) {
+    let _ = db.transact_key(NodeKind::Generic, ERROR_PITFALL_BOOK_KEY, |existing| {
+        let Some(rec) = existing else {
+            return Ok(None);
+        };
+        let Ok(mut book) = serde_json::from_slice::<ErrorPitfallBook>(&rec.payload) else {
+            return Ok(None);
+        };
+        let mut modified = false;
+        book.pitfalls.retain(|_, p| {
+            if p.affected_symbols.is_empty() {
+                return true;
+            }
+            let before = p.affected_symbols.len();
+            p.affected_symbols.retain(|sym_k| {
+                let stripped = strip_line_disambiguator(sym_k);
+                let file_ok = stripped
+                    .split_once("::")
+                    .is_some_and(|(fp, _)| live_rel_paths.contains(fp));
+                file_ok && (live_stripped.contains(stripped) || live_stripped.contains(sym_k))
+            });
+            if p.affected_symbols.len() != before {
+                modified = true;
+            }
+            !p.affected_symbols.is_empty()
+        });
+        if !modified {
+            return Ok(None);
+        }
+        let bytes = serde_json::to_vec(&book)
+            .map_err(|_| LibreDbError::CorruptFormat("error pitfall book serialize"))?;
+        Ok(Some(WriteRequest::new(NodeKind::Generic, bytes).with_importance(64)))
+    });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -728,6 +1423,8 @@ pub struct BridgeSummary {
 #[derive(Debug, Clone, Serialize)]
 pub struct LearningStateReport {
     pub pending_cues: Vec<PendingMissCue>,
+    pub pending_errors: Vec<PendingErrorCue>,
+    pub learned_pitfalls: Vec<LearnedPitfallEntry>,
     pub bridge_token_count: usize,
     pub top_bridges: Vec<BridgeSummary>,
     pub reflexes: Vec<ReflexStatus>,
@@ -745,6 +1442,26 @@ pub fn learning_state_report(db: &LibreDb, top_n: usize) -> LearningStateReport 
         .into_iter()
         .filter(|c| !is_cue_retired(c, now_ns, now_ns))
         .collect();
+    let pending_errors: Vec<PendingErrorCue> = db
+        .get_by_key(NodeKind::Generic, PENDING_ERROR_CUES_KEY)
+        .ok()
+        .and_then(|rec| serde_json::from_slice::<Vec<PendingErrorCue>>(&rec.payload).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|c| now_ns.saturating_sub(c.recorded_at_ns) <= MISS_CUE_TTL_NS)
+        .collect();
+    let mut learned_pitfalls: Vec<LearnedPitfallEntry> = db
+        .get_by_key(NodeKind::Generic, ERROR_PITFALL_BOOK_KEY)
+        .ok()
+        .and_then(|rec| serde_json::from_slice::<ErrorPitfallBook>(&rec.payload).ok())
+        .map(|b| b.pitfalls.into_values().collect())
+        .unwrap_or_default();
+    learned_pitfalls.sort_by(|a, b| {
+        b.confidence
+            .partial_cmp(&a.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.id.cmp(&b.id))
+    });
     let vocab = SymbolVocabulary::from_db(db);
     let book = load_bridge_book(db).unwrap_or_default();
     let mut ranked: Vec<BridgeSummary> = book
@@ -778,6 +1495,8 @@ pub fn learning_state_report(db: &LibreDb, top_n: usize) -> LearningStateReport 
         .unwrap_or_default();
     LearningStateReport {
         pending_cues,
+        pending_errors,
+        learned_pitfalls,
         bridge_token_count: live_token_count,
         top_bridges: ranked,
         reflexes: ReflexEngine::describe_all(db),
@@ -833,6 +1552,47 @@ pub fn format_learning_report(rep: &LearningStateReport) -> String {
     let falsified = rep.reflexes.iter().filter(|r| r.status == "falsified").count();
     let drift = rep.reflexes.iter().filter(|r| r.status == "drift").count();
     lines.push(format!(
+        "Pending error cues ({}/{MAX_PENDING_ERROR_CUES}, TTL 30 min):",
+        rep.pending_errors.len()
+    ));
+    if rep.pending_errors.is_empty() {
+        lines.push("  (none)".to_owned());
+    }
+    for e in &rep.pending_errors {
+        let age_s = now_ns.saturating_sub(e.recorded_at_ns) / 1_000_000_000;
+        lines.push(format!(
+            "  * [{}] \"{}\" ({}s ago)",
+            e.fingerprint_id, e.raw_excerpt, age_s
+        ));
+    }
+    lines.push(format!(
+        "Learned error pitfalls ({} stored, {} active >= {ACTIVE_PITFALL_MIN_CONFIDENCE:.2}):",
+        rep.learned_pitfalls.len(),
+        rep.learned_pitfalls
+            .iter()
+            .filter(|p| p.confidence >= ACTIVE_PITFALL_MIN_CONFIDENCE)
+            .count()
+    ));
+    if rep.learned_pitfalls.is_empty() {
+        lines.push("  (none)".to_owned());
+    }
+    for p in rep.learned_pitfalls.iter().take(12) {
+        let syms = if p.affected_symbols.is_empty() {
+            "-".to_owned()
+        } else {
+            p.affected_symbols.join(", ")
+        };
+        let sup = if p.supersedes.is_empty() {
+            String::new()
+        } else {
+            format!(" | supersedes [{}]", p.supersedes.join(", "))
+        };
+        lines.push(format!(
+            "  * [{}] conf={:.2} n={} ({}) -> {}{sup}",
+            p.id, p.confidence, p.occurrences, syms, p.directive
+        ));
+    }
+    lines.push(format!(
         "Reflexes ({active} active, {falsified} falsified, {drift} contract drift):"
     ));
     for r in &rep.reflexes {
@@ -841,14 +1601,31 @@ pub fn format_learning_report(rep: &LearningStateReport) -> String {
         } else {
             format!(" -> {}", r.anchors.join(", "))
         };
-        lines.push(format!("  * [{}] {}{anchors}", r.status, r.id));
+        let ctx = if r.context_tags.is_empty() {
+            String::new()
+        } else {
+            format!(" ctx=[{}]", r.context_tags.join(","))
+        };
+        let sup = if r.supersedes.is_empty() {
+            String::new()
+        } else {
+            format!(" supersedes=[{}]", r.supersedes.join(","))
+        };
+        lines.push(format!(
+            "  * [{}] {} (util={:.2}){ctx}{sup}{anchors}",
+            r.status, r.id, r.utility
+        ));
     }
     lines.push(format!(
-        "Counters: misses {}, bindings {}, broad edits skipped {}, bulk scans skipped {}",
+        "Counters: misses {}, bindings {}, broad edits skipped {}, bulk scans skipped {}, error cues {}, trivial filtered {}, pitfalls {}, supersedes {}",
         rep.counters.misses_recorded,
         rep.counters.bindings_learned,
         rep.counters.broad_edits_skipped,
-        rep.counters.bulk_scans_skipped
+        rep.counters.bulk_scans_skipped,
+        rep.counters.error_cues_recorded,
+        rep.counters.trivial_errors_filtered,
+        rep.counters.pitfalls_learned,
+        rep.counters.method_supersedes_applied
     ));
     lines.join("\n")
 }

@@ -78,6 +78,20 @@ impl OverlayBrain {
         if self.global.is_none() {
             return self.project.pulse(req);
         }
+        if let Some(err_str) = req
+            .error_context
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let recorded = crate::learning::record_error_cue(self.project.db(), err_str, None)
+                .unwrap_or(false);
+            if recorded {
+                if let Ok(st) = self.project.db().stats() {
+                    self.last_project_seq.store(st.commit_seq, Ordering::Relaxed);
+                }
+            }
+        }
         let global_eng = self.global.as_ref().unwrap();
 
         let mut session = if let Some(ref cid) = req.conversation_id {

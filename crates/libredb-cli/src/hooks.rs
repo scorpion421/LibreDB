@@ -884,12 +884,13 @@ fn build_project_memory_hydration(
         naive_baseline_bytes += g.len() + 1;
     }
 
-    // Tier 1 (with Git): learned situational reflexes matching the current prompt. Reflexes are
-    // `NodeKind::Rule` capsules covered by the `hmac-sha256:v4` workspace seal, so injecting them
-    // keeps the sealed-capsules-only invariant. Falsified reflexes are suppressed by `ReflexEngine`.
+    // Tier 1 (with Git): learned situational reflexes matching the current prompt. `load_sealed_only`
+    // loads exclusively `NodeKind::Rule` capsules covered by the `hmac-sha256:v4` workspace seal,
+    // so unsealed `NodeKind::Generic` text can never enter `<SYSTEM_MESSAGE>`.
     if let Some(hint) = prompt_hint.map(str::trim).filter(|h| !h.is_empty()) {
-        if let Ok(rx) = libredb_cognitive::ReflexEngine::load(proj_db) {
-            let fired = rx.evaluate(ws_root, hint, None);
+        if let Ok(rx) = libredb_cognitive::ReflexEngine::load_sealed_only(proj_db) {
+            let prompt_err: String = hint.chars().take(256).collect();
+            let fired = rx.evaluate(ws_root, hint, Some(&prompt_err));
             if !fired.is_empty() {
                 let mut block = vec!["Learned Reflexes:".to_owned()];
                 for rf in fired.iter().take(MAX_PRE_INVOCATION_REFLEXES) {

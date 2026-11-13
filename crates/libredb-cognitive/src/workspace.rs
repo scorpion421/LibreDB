@@ -26,8 +26,8 @@ pub use crate::learning::{
 };
 use crate::learning::{
     compose_tiers_with_bridges, diff_symbol_bodies, learn_from_verified_edit,
-    note_bulk_scan_skipped, prune_deleted_file_symbols_from_bridges, BridgeScorer, EditEvidence,
-    EditOrigin, MAX_INDEX_SCAN_LEARN_FILES,
+    note_bulk_scan_skipped, prune_deleted_file_symbols_from_bridges, prune_stale_error_pitfalls,
+    BridgeScorer, EditEvidence, EditOrigin, MAX_INDEX_SCAN_LEARN_FILES,
 };
 /// Maximum number of source files allowed in a single Git commit for co-change coupling learning.
 pub const MAX_COCHANGE_COMMIT_FILES: usize = 12;
@@ -60,6 +60,8 @@ pub struct TentativeFileEdit {
     pub post_skeleton: FileSkeleton,
     #[serde(default)]
     pub touched_symbol_keys: Vec<String>,
+    #[serde(default)]
+    pub added_body_tokens: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -463,6 +465,14 @@ pub fn stage_tentative_file_edit(
         .as_deref()
         .map(|b| FileSkeleton::extract_from_bytes(rel_path.clone(), b));
     let touched_symbol_keys = diff_symbol_bodies(&rel_path, old_skeleton.as_ref(), &post_skeleton);
+    let added_body_tokens = crate::skeleton::diff_symbol_body_tokens(
+        &rel_path,
+        old_disk_bytes.as_deref(),
+        old_skeleton.as_ref(),
+        post_edit_bytes,
+        &post_skeleton,
+        &touched_symbol_keys,
+    );
     let tentative = TentativeFileEdit {
         rel_path: rel_path.clone(),
         pre_edit_hash,
@@ -471,6 +481,7 @@ pub fn stage_tentative_file_edit(
         created_ns: current_unix_ns(),
         post_skeleton,
         touched_symbol_keys,
+        added_body_tokens,
     };
     let payload = serde_json::to_vec(&tentative)
         .map_err(|_| LibreDbError::CorruptFormat("tentative edit serialize"))?;
@@ -530,6 +541,7 @@ pub fn reconcile_tentative_edits(db: &LibreDb, ws_root: &Path) -> Result<(usize,
                     // `touched_symbol_keys` was computed at staging time against the exact pre-edit
                     // disk bytes; staging time (`created_ns`) is the causal edit timestamp.
                     let touched = tentative.touched_symbol_keys.clone();
+                    let added_body_tokens = tentative.added_body_tokens.clone();
                     apply_skeleton_symbols_atomic(
                         db,
                         &tentative.rel_path,
@@ -542,6 +554,7 @@ pub fn reconcile_tentative_edits(db: &LibreDb, ws_root: &Path) -> Result<(usize,
                             rel_path: tentative.rel_path.clone(),
                             edit_ns: tentative.created_ns,
                             touched,
+                            added_body_tokens,
                             origin: EditOrigin::Hook,
                         },
                     );
@@ -561,6 +574,14 @@ pub fn reconcile_tentative_edits(db: &LibreDb, ws_root: &Path) -> Result<(usize,
                             .as_ref()
                             .map(|old| diff_symbol_bodies(&tentative.rel_path, Some(old), &actual_skel))
                             .unwrap_or_default();
+                        let added_body_tokens = crate::skeleton::diff_symbol_body_tokens(
+                            &tentative.rel_path,
+                            None,
+                            baseline.as_ref(),
+                            &disk_bytes,
+                            &actual_skel,
+                            &touched,
+                        );
                         let edit_ns = std::fs::symlink_metadata(&candidate_path)
                             .map(|m| file_mtime_ns(&m))
                             .unwrap_or_else(|_| current_unix_ns());
@@ -576,6 +597,7 @@ pub fn reconcile_tentative_edits(db: &LibreDb, ws_root: &Path) -> Result<(usize,
                                 rel_path: tentative.rel_path.clone(),
                                 edit_ns,
                                 touched,
+                                added_body_tokens,
                                 origin: EditOrigin::DiskSync,
                             },
                         );
@@ -635,6 +657,14 @@ pub fn sync_single_file_symbols(
         .as_ref()
         .map(|old| diff_symbol_bodies(&rel_path, Some(old), &new_skel))
         .unwrap_or_default();
+    let added_body_tokens = crate::skeleton::diff_symbol_body_tokens(
+        &rel_path,
+        None,
+        baseline.as_ref(),
+        post_edit_bytes,
+        &new_skel,
+        &touched,
+    );
     let count = apply_skeleton_symbols_atomic(
         db,
         &rel_path,
@@ -647,6 +677,7 @@ pub fn sync_single_file_symbols(
             rel_path,
             edit_ns: current_unix_ns(),
             touched,
+            added_body_tokens,
             origin: EditOrigin::DiskSync,
         },
     );
@@ -962,12 +993,27 @@ pub fn index_workspace_with_exclusions(
             for (rel, old_skel, mtime) in &learn_candidates {
                 if let Some(pf) = changed_files.iter().find(|pf| &pf.rel_path == rel) {
                     let touched = diff_symbol_bodies(rel, Some(old_skel), &pf.skeleton);
+                    let new_text_bytes = all_skeletons
+                        .iter()
+                        .find(|(r, _, _)| r == rel)
+                        .and_then(|(_, _, t)| t.as_deref())
+                        .map(str::as_bytes)
+                        .unwrap_or(&[]);
+                    let added_body_tokens = crate::skeleton::diff_symbol_body_tokens(
+                        rel,
+                        None,
+                        Some(old_skel),
+                        new_text_bytes,
+                        &pf.skeleton,
+                        &touched,
+                    );
                     let _ = learn_from_verified_edit(
                         db,
                         &EditEvidence {
                             rel_path: rel.clone(),
                             edit_ns: *mtime,
                             touched,
+                            added_body_tokens,
                             origin: EditOrigin::IndexScan,
                         },
                     );
@@ -1578,6 +1624,7 @@ fn prune_stale_symbol_cue_bridges(
             .map_err(|_| LibreDbError::CorruptFormat("symbol cue bridges serialize"))?;
         Ok(Some(WriteRequest::new(NodeKind::Generic, bytes).with_importance(64)))
     });
+    prune_stale_error_pitfalls(db, live_rel_paths, &live_stripped);
 }
 
 fn resolve_git_head_oid_fast(root: &Path) -> String {

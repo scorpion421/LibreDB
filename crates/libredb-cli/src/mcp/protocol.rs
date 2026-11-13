@@ -438,8 +438,23 @@ pub fn handle_rpc_method(
                                     "stack": { "type": "array", "items": { "type": "string" } },
                                     "action": { "type": "array", "items": { "type": "string" } },
                                     "env": { "type": "array", "items": { "type": "string" } },
-                                    "anchors": { "type": "array", "items": { "type": "string" } }
+                                    "anchors": { "type": "array", "items": { "type": "string" } },
+                                    "context_tags": { "type": "array", "items": { "type": "string" } },
+                                    "supersedes": { "type": "array", "items": { "type": "string" } },
+                                    "base_utility": { "type": "number" },
+                                    "outcome": { "type": "string", "enum": ["pass", "fail"] }
                                 }
+                            },
+                            "learn_error": {
+                                "type": "object",
+                                "properties": {
+                                    "error_text": { "type": "string" },
+                                    "fix_directive": { "type": "string" },
+                                    "action_hint": { "type": "string" },
+                                    "symbols": { "type": "array", "items": { "type": "string" } },
+                                    "supersedes": { "type": "array", "items": { "type": "string" } }
+                                },
+                                "required": ["error_text", "fix_directive"]
                             },
                             "sync_central_sqlite": { "type": "boolean" }
                         }
