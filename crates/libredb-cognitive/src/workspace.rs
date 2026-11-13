@@ -26,7 +26,8 @@ pub use crate::learning::{
 };
 use crate::learning::{
     compose_tiers_with_bridges, diff_symbol_bodies, learn_from_verified_edit,
-    note_bulk_scan_skipped, BridgeScorer, EditEvidence, EditOrigin, MAX_INDEX_SCAN_LEARN_FILES,
+    note_bulk_scan_skipped, prune_deleted_file_symbols_from_bridges, BridgeScorer, EditEvidence,
+    EditOrigin, MAX_INDEX_SCAN_LEARN_FILES,
 };
 /// Maximum number of source files allowed in a single Git commit for co-change coupling learning.
 pub const MAX_COCHANGE_COMMIT_FILES: usize = 12;
@@ -407,6 +408,13 @@ fn apply_skeleton_symbols_atomic(
     deprecate_keys.extend_from_slice(extra_deprecate_keys);
 
     let _ = db.commit_batch_with_tombstones(&prepared, &stale_ids, &deprecate_keys)?;
+    if !stale_ids.is_empty() {
+        let live_stripped: HashSet<String> = new_key_set
+            .iter()
+            .map(|k| strip_line_disambiguator(k).to_owned())
+            .collect();
+        prune_deleted_file_symbols_from_bridges(db, rel_path, &live_stripped);
+    }
     let _ = db.maybe_auto_compact();
     Ok(sym_count)
 }
@@ -1537,40 +1545,39 @@ fn prune_stale_symbol_cue_bridges(
     live_rel_paths: &HashSet<&str>,
     by_full_key: &HashMap<String, u64>,
 ) {
-    let Ok(rec) = db.get_by_key(NodeKind::Generic, SYMBOL_CUE_BRIDGES_KEY) else {
-        return;
-    };
-    let Ok(mut book) = serde_json::from_slice::<SymbolCueBridgeBook>(&rec.payload) else {
-        return;
-    };
     let mut live_stripped: HashSet<String> = HashSet::with_capacity(by_full_key.len());
     for full_k in by_full_key.keys() {
         live_stripped.insert(strip_line_disambiguator(full_k).to_owned());
     }
-    let mut modified = false;
-    book.bridges.retain(|_, list| {
-        let before = list.len();
-        list.retain(|(sym_k, _)| {
-            let stripped = strip_line_disambiguator(sym_k);
-            let file_ok = stripped
-                .split_once("::")
-                .is_some_and(|(fp, _)| live_rel_paths.contains(fp));
-            file_ok && (live_stripped.contains(stripped) || by_full_key.contains_key(sym_k))
+    let _ = db.transact_key(NodeKind::Generic, SYMBOL_CUE_BRIDGES_KEY, |existing| {
+        let Some(rec) = existing else {
+            return Ok(None);
+        };
+        let Ok(mut book) = serde_json::from_slice::<SymbolCueBridgeBook>(&rec.payload) else {
+            return Ok(None);
+        };
+        let mut modified = false;
+        book.bridges.retain(|_, list| {
+            let before = list.len();
+            list.retain(|(sym_k, _)| {
+                let stripped = strip_line_disambiguator(sym_k);
+                let file_ok = stripped
+                    .split_once("::")
+                    .is_some_and(|(fp, _)| live_rel_paths.contains(fp));
+                file_ok && (live_stripped.contains(stripped) || by_full_key.contains_key(sym_k))
+            });
+            if list.len() != before {
+                modified = true;
+            }
+            !list.is_empty()
         });
-        if list.len() != before {
-            modified = true;
+        if !modified {
+            return Ok(None);
         }
-        !list.is_empty()
+        let bytes = serde_json::to_vec(&book)
+            .map_err(|_| LibreDbError::CorruptFormat("symbol cue bridges serialize"))?;
+        Ok(Some(WriteRequest::new(NodeKind::Generic, bytes).with_importance(64)))
     });
-    if modified {
-        if let Ok(bytes) = serde_json::to_vec(&book) {
-            let _ = db.put(
-                WriteRequest::new(NodeKind::Generic, bytes)
-                    .with_key(SYMBOL_CUE_BRIDGES_KEY)
-                    .with_importance(64),
-            );
-        }
-    }
 }
 
 fn resolve_git_head_oid_fast(root: &Path) -> String {

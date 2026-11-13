@@ -179,8 +179,8 @@ pub fn record_search_miss_cue(db: &LibreDb, raw_query: &str) -> Result<bool> {
 }
 
 /// Records an unresolved query with an explicit source atomically (`transact_key`).
-/// Re-recording an already pending, still unbound query refreshes its timestamp; a query that is
-/// already bound inside an open episode is left untouched (no duplicate evidence).
+/// Re-recording an already pending cue refreshes its timestamp (or re-opens a previously bound
+/// episode when the same query STILL misses later, enabling Noisy-OR reinforcement on retry).
 pub fn record_search_miss_cue_with_source(
     db: &LibreDb,
     raw_query: &str,
@@ -192,18 +192,27 @@ pub fn record_search_miss_cue_with_source(
     }
     let now_ns = current_unix_ns();
     let trimmed = raw_query.trim().to_owned();
-    let mut inserted = false;
+    let mut count_as_miss = false;
     db.transact_key(NodeKind::Generic, PENDING_MISS_CUES_KEY, |existing| {
         let mut cues: Vec<PendingMissCue> = existing
             .and_then(|rec| serde_json::from_slice(&rec.payload).ok())
             .unwrap_or_default();
-        cues.retain(|c| now_ns.saturating_sub(c.recorded_at_ns) <= MISS_CUE_TTL_NS);
+        cues.retain(|c| {
+            !is_cue_retired(c, now_ns, now_ns)
+                && !(c.first_bound_edit_ns.is_some() && !c.raw_query.eq_ignore_ascii_case(&trimmed))
+        });
         if let Some(existing_cue) = cues
             .iter_mut()
             .find(|c| c.raw_query.eq_ignore_ascii_case(&trimmed))
         {
-            if existing_cue.first_bound_edit_ns.is_some() {
-                return Ok(None);
+            if let Some(fb) = existing_cue.first_bound_edit_ns {
+                if now_ns < fb {
+                    return Ok(None);
+                }
+                existing_cue.first_bound_edit_ns = None;
+                existing_cue.bound_files.clear();
+                existing_cue.bound_symbols.clear();
+                count_as_miss = true;
             }
             existing_cue.recorded_at_ns = now_ns;
             existing_cue.source = source;
@@ -217,7 +226,7 @@ pub fn record_search_miss_cue_with_source(
                 bound_files: Vec::new(),
                 bound_symbols: Vec::new(),
             });
-            inserted = true;
+            count_as_miss = true;
         }
         if cues.len() > MAX_PENDING_MISS_CUES {
             let drop_n = cues.len() - MAX_PENDING_MISS_CUES;
@@ -227,7 +236,7 @@ pub fn record_search_miss_cue_with_source(
             .map_err(|_| LibreDbError::CorruptFormat("pending miss cues serialize"))?;
         Ok(Some(WriteRequest::new(NodeKind::Generic, bytes).with_importance(32)))
     })?;
-    if inserted {
+    if count_as_miss {
         bump_learning_counters(db, |c| c.misses_recorded += 1);
     }
     Ok(true)
@@ -357,7 +366,7 @@ impl SymbolVocabulary {
     /// `ln(1 + N / (1 + df)) / ln(1 + N)`, clamped to `[0.05, 1.0]`.
     pub(crate) fn specificity(&self, token: &str, bridge_fanout: u32) -> f64 {
         let n = f64::from(self.n_symbols.max(1));
-        let df = self.token_df.get(token).copied().unwrap_or(0) + bridge_fanout;
+        let df = self.token_df.get(token).copied().unwrap_or(0) + bridge_fanout.saturating_sub(1);
         let denom = (1.0 + n).ln();
         if denom <= f64::EPSILON {
             return 1.0;
@@ -454,6 +463,7 @@ impl BridgeScorer {
 
 /// Shared tier resolution for `locate` and `impact`:
 /// exact (tier 1) > case-insensitive (tier 2) > confident learned bridges > substring (tier 3).
+/// Direct Tier-1/Tier-2 hits stay first while non-duplicate confident bridges join slots `2..K`.
 /// Records a miss whenever neither tier 1, tier 2, nor a confident bridge matched, even if weak
 /// substring hits exist (they are still returned).
 pub(crate) fn compose_tiers_with_bridges(
@@ -466,18 +476,21 @@ pub(crate) fn compose_tiers_with_bridges(
     full_key_by_id: &HashMap<u64, String>,
     source: MissCueSource,
 ) -> Vec<(u64, String)> {
-    if !tier1.is_empty() {
-        return tier1;
-    }
-    if !tier2.is_empty() {
-        return tier2;
-    }
     let bridged: Vec<(u64, String)> = scorer
         .map(|s| s.score_query(raw_query))
         .unwrap_or_default()
         .into_iter()
         .filter_map(|(id, _)| full_key_by_id.get(&id).map(|k| (id, k.clone())))
         .collect();
+    if !tier1.is_empty() || !tier2.is_empty() {
+        let mut out = if !tier1.is_empty() { tier1 } else { tier2 };
+        for b in bridged {
+            if !out.iter().any(|(id, _)| *id == b.0) {
+                out.push(b);
+            }
+        }
+        return out;
+    }
     if bridged.is_empty() {
         let _ = record_search_miss_cue_with_source(db, raw_query, source);
         return tier3;
@@ -665,6 +678,41 @@ fn evict_bridge_book_overflow(book: &mut SymbolCueBridgeBook) {
     }
 }
 
+/// Removes bridge links pointing to symbols deleted from `rel_path` during a single-file sync.
+pub(crate) fn prune_deleted_file_symbols_from_bridges(
+    db: &LibreDb,
+    rel_path: &str,
+    live_stripped_keys_in_file: &HashSet<String>,
+) {
+    let prefix = format!("{rel_path}::");
+    let _ = db.transact_key(NodeKind::Generic, SYMBOL_CUE_BRIDGES_KEY, |existing| {
+        let Some(rec) = existing else {
+            return Ok(None);
+        };
+        let Ok(mut book) = serde_json::from_slice::<SymbolCueBridgeBook>(&rec.payload) else {
+            return Ok(None);
+        };
+        let mut modified = false;
+        book.bridges.retain(|_, list| {
+            let before = list.len();
+            list.retain(|(sym_k, _)| {
+                let stripped = strip_line_disambiguator(sym_k);
+                !stripped.starts_with(&prefix) || live_stripped_keys_in_file.contains(stripped)
+            });
+            if list.len() != before {
+                modified = true;
+            }
+            !list.is_empty()
+        });
+        if !modified {
+            return Ok(None);
+        }
+        let bytes = serde_json::to_vec(&book)
+            .map_err(|_| LibreDbError::CorruptFormat("symbol cue bridges serialize"))?;
+        Ok(Some(WriteRequest::new(NodeKind::Generic, bytes).with_importance(64)))
+    });
+}
+
 // ---------------------------------------------------------------------------------------------
 // Learning state report (`libredb learning`)
 // ---------------------------------------------------------------------------------------------
@@ -695,17 +743,26 @@ pub fn learning_state_report(db: &LibreDb, top_n: usize) -> LearningStateReport 
         .and_then(|rec| serde_json::from_slice::<Vec<PendingMissCue>>(&rec.payload).ok())
         .unwrap_or_default()
         .into_iter()
-        .filter(|c| now_ns.saturating_sub(c.recorded_at_ns) <= MISS_CUE_TTL_NS)
+        .filter(|c| !is_cue_retired(c, now_ns, now_ns))
         .collect();
+    let vocab = SymbolVocabulary::from_db(db);
     let book = load_bridge_book(db).unwrap_or_default();
     let mut ranked: Vec<BridgeSummary> = book
         .bridges
         .iter()
-        .map(|(tok, list)| BridgeSummary {
-            token: tok.clone(),
-            targets: list.clone(),
+        .filter_map(|(tok, list)| {
+            let live_targets: Vec<(String, f64)> = list
+                .iter()
+                .filter(|(k, _)| vocab.key_to_node.contains_key(strip_line_disambiguator(k)))
+                .cloned()
+                .collect();
+            (!live_targets.is_empty()).then(|| BridgeSummary {
+                token: tok.clone(),
+                targets: live_targets,
+            })
         })
         .collect();
+    let live_token_count = ranked.len();
     ranked.sort_by(|a, b| {
         let wa = a.targets.first().map_or(0.0, |t| t.1);
         let wb = b.targets.first().map_or(0.0, |t| t.1);
@@ -721,7 +778,7 @@ pub fn learning_state_report(db: &LibreDb, top_n: usize) -> LearningStateReport 
         .unwrap_or_default();
     LearningStateReport {
         pending_cues,
-        bridge_token_count: book.bridges.len(),
+        bridge_token_count: live_token_count,
         top_bridges: ranked,
         reflexes: ReflexEngine::describe_all(db),
         counters,

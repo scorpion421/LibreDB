@@ -1455,36 +1455,43 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "learning" => {
             let cli = CliSpec::new(
                 "learning",
-                "libredb learning [<db.ldb>] [--cwd <dir>] [--db <db.ldb>] [--top <n>] [--json] [--global <customizations.ldb>]",
+                "libredb learning [<db.ldb>] [--verify] [--cwd <dir>] [--db <db.ldb>] [--top <n>] [--json] [--global <customizations.ldb>]",
             )
             .positionals(0, Some(1))
             .allow_global()
-            .switches(&["--json"])
+            .switches(&["--json", "--verify"])
             .values(&["--cwd", "--db", "--top"])
             .parse(sub_args)?;
             let top_n = cli.parse_value::<usize>("--top")?.unwrap_or(10).clamp(1, 100);
             let ws_dir_opt = cli.path_value("--cwd").or_else(|| env::current_dir().ok());
-            let explicit_db_opt = cli
-                .path_value("--db")
-                .or_else(|| cli.positionals.first().map(PathBuf::from));
-            let glob_db = match cli.global_deref() {
-                Some(gp) => Some(hooks::open_global_ldb(Some(gp))?),
-                None => hooks::open_global_ldb_checked(None)?,
-            };
-            let db = if let Some(ref db_p) = explicit_db_opt {
-                open_cli_verified_project_db(cli.global_deref(), db_p)?
-            } else {
-                resolve_default_cli_project_db(
-                    cli.global_deref(),
-                    glob_db.as_ref(),
+            if cli.has_switch("--verify") {
+                bench::run_learning_verification_suite(
                     ws_dir_opt.as_deref(),
-                )?
-            };
-            let rep = libredb_cognitive::learning_state_report(&db, top_n);
-            if cli.has_switch("--json") {
-                println!("{}", serde_json::to_string_pretty(&rep)?);
+                    cli.has_switch("--json"),
+                )?;
             } else {
-                println!("{}", libredb_cognitive::format_learning_report(&rep));
+                let explicit_db_opt = cli
+                    .path_value("--db")
+                    .or_else(|| cli.positionals.first().map(PathBuf::from));
+                let glob_db = match cli.global_deref() {
+                    Some(gp) => Some(hooks::open_global_ldb(Some(gp))?),
+                    None => hooks::open_global_ldb_checked(None)?,
+                };
+                let db = if let Some(ref db_p) = explicit_db_opt {
+                    open_cli_verified_project_db(cli.global_deref(), db_p)?
+                } else {
+                    resolve_default_cli_project_db(
+                        cli.global_deref(),
+                        glob_db.as_ref(),
+                        ws_dir_opt.as_deref(),
+                    )?
+                };
+                let rep = libredb_cognitive::learning_state_report(&db, top_n);
+                if cli.has_switch("--json") {
+                    println!("{}", serde_json::to_string_pretty(&rep)?);
+                } else {
+                    println!("{}", libredb_cognitive::format_learning_report(&rep));
+                }
             }
         }
         "import-sqlite" => {
@@ -1964,7 +1971,7 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "bench" => {
             let cli = CliSpec::new(
                 "bench",
-                "libredb bench [--suite kernel|full|audit] [--workspace <dir>] [--filter <p1,p2>] [--ext <e1,e2>] [--max-files <n>] [--nodes <n>] [--threads <t>] [--json]",
+                "libredb bench [--suite kernel|full|audit|learning] [--workspace <dir>] [--filter <p1,p2>] [--ext <e1,e2>] [--max-files <n>] [--nodes <n>] [--threads <t>] [--json]",
             )
             .positionals(0, Some(0))
             .allow_global()
@@ -2012,9 +2019,12 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 "audit" | "verify" => {
                     bench::run_feature_and_security_audit(as_json)?;
                 }
+                "learning" => {
+                    bench::run_learning_verification_suite(ws_opt.as_deref(), as_json)?;
+                }
                 other => {
                     return Err(format!(
-                        "Unknown --suite '{other}' in 'bench'; expected 'kernel', 'full', or 'audit'"
+                        "Unknown --suite '{other}' in 'bench'; expected 'kernel', 'full', 'audit', or 'learning'"
                     )
                     .into());
                 }

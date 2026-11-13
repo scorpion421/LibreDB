@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.1] - 2026-11-13
+
+### Added
+
+- Added the 10-stage adversarial counterfactual learning verification suite (`L1..L10`, `LearningStageRow`, `LearningVerificationReport`, `run_learning_verification_suite`, and `LearningFixture` in `crates/libredb-cli/src/bench.rs`), runnable read-only against isolated sham/control fixtures plus live workspace snapshots via `libredb learning --verify [--cwd <dir>] [--json]` and `libredb bench --suite learning [--workspace <dir>] [--json]` (`crates/libredb-cli/src/main.rs`): verifies counterfactual A/B superiority (`L1`), 5 isolated sham interventions with zero placebo false bindings plus `specificity >= 0.20` noise gating (`L2`), holdout phrase generalization and unrelated distractor rejection (`L3`), Noisy-OR multi-observation reinforcement and rival cue revision (`L4`), 15-symbol baseline `MRR` preservation across 8 learning episodes (`L5`), multi-file `120 s` episode linking while keeping Tier-1 exact matches at `#1` (`L6`), grounded reflex `active -> drift -> falsified` lifecycle and dead bridge pruning (`L7`), `Hook` / `DiskSync` / `IndexScan` origin parity and `BridgeScorer` retrieval under 80 trigram noise distractors (`L8`), 8-thread concurrent stress integrity with `hmac-sha256:v4` workspace seal invariance (`L9`), and live workspace counterfactual A/B token savings deltas (`L10`).
+- Added end-to-end subprocess CLI verification `learning_verify_and_bench_suite_prove_causal_learning_without_placebo_leaks` in `crates/libredb-cli/tests/v140_learning_e2e.rs` (bringing the automated workspace test suite to 133 tests + 12 `A1..A12` audit checks + 10 `L1..L10` causal learning checks + 10k crash simulations across Linux, macOS, and Windows).
+
+### Fixed
+
+- Fixed cross-episode stale miss-cue contamination in `record_search_miss_cue_with_source` (`crates/libredb-cognitive/src/learning.rs`) by retiring previously bound cues (`first_bound_edit_ns.is_some()`) as soon as a new distinct search miss opens a new episode, eliminating silent cross-episode false bindings.
+- Fixed specificity attenuation on 1-to-1 learned bridges in `SymbolVocabulary::specificity` (`crates/libredb-cognitive/src/learning.rs`) by counting only excess cross-symbol bridge fanout (`bridge_fanout.saturating_sub(1)`) instead of treating a symbol's first learned bridge as extra document frequency, ensuring exact rare cue tokens retain `df = 0` (`specificity = 1.0`) while multi-target bridge hubs (`fanout >= 2`) and high-DF symbol tokens stay attenuated.
+
 ## [1.4.0] - 2026-11-13
 
 ### Added

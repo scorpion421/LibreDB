@@ -263,3 +263,92 @@ fn learning_cli_reports_cues_bridges_reflex_status_and_counters() {
     assert!(txt.contains("Reflexes ("), "{txt}");
     assert!(txt.contains("Counters:"), "{txt}");
 }
+
+#[test]
+fn learning_verify_and_bench_suite_prove_causal_learning_without_placebo_leaks() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let root = std::env::temp_dir().join(format!(
+        "libredb_learn_verify_e2e_{}_{nonce}",
+        std::process::id()
+    ));
+    let ws = root.join("ws");
+    let global_ldb = root.join("global.ldb");
+    std::fs::create_dir_all(ws.join("src")).unwrap();
+    std::fs::write(
+        ws.join("Cargo.toml"),
+        "[package]\nname = \"e2e_verify_ws\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    for (i, name) in ["alpha_pipeline", "beta_router", "gamma_store", "delta_sham"]
+        .iter()
+        .enumerate()
+    {
+        std::fs::write(
+            ws.join(format!("src/m{i}.rs")),
+            format!(
+                "pub fn {name}(val: u64) -> u64 {{\n    let acc = val + {i};\n    acc * 3\n}}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    let bin = env!("CARGO_BIN_EXE_libredb");
+
+    let verify_out = std::process::Command::new(bin)
+        .args([
+            "learning",
+            "--verify",
+            "--cwd",
+            &ws.to_string_lossy(),
+            "--global",
+            &global_ldb.to_string_lossy(),
+            "--json",
+        ])
+        .output()
+        .expect("run libredb learning --verify");
+    assert!(
+        verify_out.status.success(),
+        "learning --verify failed: {}\n{}",
+        String::from_utf8_lossy(&verify_out.stderr),
+        String::from_utf8_lossy(&verify_out.stdout)
+    );
+    let rep: serde_json::Value = serde_json::from_slice(&verify_out.stdout)
+        .expect("parse learning --verify JSON");
+    assert_eq!(rep["verdict"].as_str(), Some("VERIFIED_CAUSAL_LEARNING"), "{rep}");
+    assert_eq!(rep["passed_stages"].as_u64(), Some(10), "{rep}");
+    assert_eq!(rep["failed_stages"].as_u64(), Some(0), "{rep}");
+    assert_eq!(rep["placebo_false_bindings"].as_u64(), Some(0), "{rep}");
+    assert_eq!(rep["dead_bridges_retained"].as_u64(), Some(0), "{rep}");
+    assert!(
+        rep["causal_mrr_lift"].as_f64().unwrap_or(0.0) >= 0.99,
+        "expected causal_mrr_lift >= 0.99: {rep}"
+    );
+
+    let bench_out = std::process::Command::new(bin)
+        .args([
+            "bench",
+            "--suite",
+            "learning",
+            "--workspace",
+            &ws.to_string_lossy(),
+            "--json",
+        ])
+        .output()
+        .expect("run libredb bench --suite learning");
+    assert!(
+        bench_out.status.success(),
+        "bench --suite learning failed: {}\n{}",
+        String::from_utf8_lossy(&bench_out.stderr),
+        String::from_utf8_lossy(&bench_out.stdout)
+    );
+    let brep: serde_json::Value = serde_json::from_slice(&bench_out.stdout)
+        .expect("parse bench --suite learning JSON");
+    assert_eq!(brep["verdict"].as_str(), Some("VERIFIED_CAUSAL_LEARNING"), "{brep}");
+    assert_eq!(brep["passed_stages"].as_u64(), Some(10), "{brep}");
+    assert_eq!(brep["failed_stages"].as_u64(), Some(0), "{brep}");
+    assert_eq!(brep["placebo_false_bindings"].as_u64(), Some(0), "{brep}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
