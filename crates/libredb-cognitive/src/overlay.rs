@@ -78,20 +78,6 @@ impl OverlayBrain {
         if self.global.is_none() {
             return self.project.pulse(req);
         }
-        if let Some(err_str) = req
-            .error_context
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            let recorded = crate::learning::record_error_cue(self.project.db(), err_str, None)
-                .unwrap_or(false);
-            if recorded {
-                if let Ok(st) = self.project.db().stats() {
-                    self.last_project_seq.store(st.commit_seq, Ordering::Relaxed);
-                }
-            }
-        }
         let global_eng = self.global.as_ref().unwrap();
 
         let mut session = if let Some(ref cid) = req.conversation_id {
@@ -100,19 +86,37 @@ impl OverlayBrain {
             None
         };
         let mut session_dirty = false;
-
         let mut used_tokens = 0u32;
         let mut saved_by_delta = 0u32;
         let mut stubs = Vec::new();
         let mut fired_reflexes: Vec<FiredReflex> = Vec::new();
 
-        // 1. Evaluate reflexes across both layers in RAM (`0` disk reads).
+        // 1. Evaluate reflexes across both layers in RAM (`0` disk reads), and record any
+        //    unmatched non-banal error into `sys::pending_error_cues` without refuting a pitfall
+        //    that is actively being recalled on this `pulse` query.
         let proj_rf = self.project.evaluate_reflexes(
             req.workspace_dir.as_deref(),
             &req.query,
             req.error_context.as_deref(),
         );
         let project_reflex_fired = !proj_rf.is_empty();
+        let pitfall_recalled = proj_rf.iter().any(|r| r.id.starts_with("pitfall::"));
+        if !pitfall_recalled {
+            if let Some(err_str) = req
+                .error_context
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let recorded = crate::learning::record_error_cue(self.project.db(), err_str, None)
+                    .unwrap_or(false);
+                if recorded {
+                    if let Ok(st) = self.project.db().stats() {
+                        self.last_project_seq.store(st.commit_seq, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
         let glob_rf = global_eng.reflex_engine().evaluate_with_anchor_context(
             req.workspace_dir.as_deref(),
             &req.query,

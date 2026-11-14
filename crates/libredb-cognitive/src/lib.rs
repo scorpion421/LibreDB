@@ -35,7 +35,8 @@ pub use reflex::{
 };
 pub use session::SessionState;
 pub use skeleton::{
-    diff_symbol_body_tokens, extract_symbol_body_tokens, FileSkeleton, SectionSpan, SymbolContract,
+    diff_symbol_body_tokens, extract_ordered_symbol_body_tokens, extract_symbol_body_tokens,
+    FileSkeleton, SectionSpan, SymbolContract,
 };
 pub use transcript::{
     create_subagent_handoff, execute_atomic_batch, is_compaction_checkpoint_line,
@@ -418,20 +419,24 @@ impl CognitiveEngine {
         let mut session_dirty = false;
 
         // 1. Evaluate situational Reflexes first (highest-ROI mistake prevention!) and capture any
-        // non-banal observed error context into the procedural error-recovery cue buffer.
-        if let Some(err_str) = req
-            .error_context
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            let _ = learning::record_error_cue(&self.db, err_str, None);
-        }
+        // non-banal observed error context into the procedural error-recovery cue buffer without
+        // self-refuting an active `pitfall::` reflex that is being recalled here.
         let raw_reflexes = self.reflexes.evaluate(
             req.workspace_dir.as_deref(),
             &req.query,
             req.error_context.as_deref(),
         );
+        let pitfall_recalled = raw_reflexes.iter().any(|r| r.id.starts_with("pitfall::"));
+        if !pitfall_recalled {
+            if let Some(err_str) = req
+                .error_context
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let _ = learning::record_error_cue(&self.db, err_str, None);
+            }
+        }
         let mut fired_reflexes = Vec::new();
         for rf in raw_reflexes {
             let tracking_id = rf.node_id;

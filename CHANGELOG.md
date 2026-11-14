@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0] - 2026-11-14
+
+### Added
+
+- Added 3-mode ordered AST body-token diffing (`strip_code_line_comment`, `extract_ordered_symbol_body_tokens`, `SymbolContract::body_tokens`, and upgraded `diff_symbol_body_tokens` in `crates/libredb-cognitive/src/skeleton.rs` & `lib.rs`), capturing statement-reordering fixes (`<a_before_b>`) and deletion fixes (`avoid_<removed>`) alongside additive token deltas, stripping `//` and `#` comments so comment-only edits retire cleanly at Stage 2, and persisting per-symbol ordered `body_tokens` so `DiskSync` and `IndexScan` preserve Stage 2 AST diffing even when `old_bytes` is `None`.
+- Added outcome-gated refutation of failed fix attempts (`LearningCounters::failed_fixes_refuted` in `crates/libredb-cognitive/src/learning.rs`, `refuted {}` in `format_learning_report`, confidence decay `cur.confidence * 0.55` on recurring errors inside `record_error_cue`, and active recovery `>= 0.80` plus `method_supersedes_applied` inside `bind_error_cues_for_edit`), while keeping active `pitfall::` recall lookups inside `OverlayBrain::pulse` and `CognitiveEngine::pulse` non-destructive.
+- Added proactive `Known Pitfalls` surfacing in `FIM` (`FimSliceBundle::known_pitfalls`, `extract_fim_slice`) and `impact` (`SymbolImpactReport::known_pitfalls`, `query_symbol_impact`, `collect_symbol_pitfalls`, `format_impact_compact`, and `FimSliceBundle::format_compact` in `crates/libredb-cognitive/src/workspace.rs`).
+- Added causal `reconcile_tentative_edits -> harvest_recent_transcript_errors` ordering and error-triggered sealed-reflex `pre_inv_dedup` bypass inside `evaluate_pre_invocation_payload` (`crates/libredb-cli/src/hooks.rs`), plus `pre_invocation_refutes_failed_tentative_fix_and_hydrates_sealed_error_reflex`.
+- Extended `libredb learning --verify` (`crates/libredb-cli/src/bench.rs`) from 12 to 13 adversarial stages with `L13` (`Reordering/deletion fixes, failed-attempt refutation & FIM pitfalls`) and added integration test `s20_v160_reordering_deletion_refutation_and_fim_pitfall_surfacing` (`crates/libredb-cognitive/tests/v140_learning_real_world.rs`).
+
 ## [1.5.1] - 2026-11-14
 
 ### Fixed

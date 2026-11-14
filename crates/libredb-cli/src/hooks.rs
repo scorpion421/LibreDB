@@ -580,12 +580,6 @@ pub(crate) fn evaluate_pre_invocation_payload(
         }
     }
 
-    if let (Some(ref cid), Some(ref tp)) = (&cid_opt, &transcript_opt) {
-        if tp.is_file() {
-            harvest_recent_transcript_errors(&proj_db, cid, tp);
-        }
-    }
-
     if let Some(ref root) = ws_root {
         if let Ok((promoted, saved_tok)) =
             libredb_cognitive::reconcile_tentative_edits(&proj_db, root)
@@ -600,6 +594,25 @@ pub(crate) fn evaluate_pre_invocation_payload(
             }
         }
     }
+
+    let harvested_errors = if let (Some(ref cid), Some(ref tp)) = (&cid_opt, &transcript_opt) {
+        if tp.is_file() {
+            harvest_recent_transcript_errors(&proj_db, cid, tp)
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+    let error_hint = harvested_errors.first().map(String::as_str);
+    let has_sealed_reflex_for_error = error_hint
+        .filter(|h| !h.trim().is_empty())
+        .and_then(|err_s| {
+            libredb_cognitive::ReflexEngine::load_sealed_only(&proj_db)
+                .ok()
+                .map(|rx| !rx.evaluate(ws_root.as_deref(), err_s, Some(err_s)).is_empty())
+        })
+        .unwrap_or(false);
 
     let mut epoch = 1u32;
     if let (Some(ref cid), Some(ref tp)) = (&cid_opt, &transcript_opt) {
@@ -625,7 +638,9 @@ pub(crate) fn evaluate_pre_invocation_payload(
         if let Ok(cur_rec) = proj_db.get_by_key(NodeKind::TranscriptCursor, &proj_cur_key) {
             had_prior_cursor = true;
             if let Ok(cur_json) = serde_json::from_slice::<Value>(&cur_rec.payload) {
-                if cur_json.get("dedup_token").and_then(Value::as_str) == Some(dedup_token.as_str())
+                if !has_sealed_reflex_for_error
+                    && cur_json.get("dedup_token").and_then(Value::as_str)
+                        == Some(dedup_token.as_str())
                 {
                     let evt = crate::telemetry::TelemetryEvent::HookHydration {
                         dedup_skipped: true,
@@ -682,8 +697,12 @@ pub(crate) fn evaluate_pre_invocation_payload(
     }
 
     let prompt_hint = extract_prompt_hint(payload, transcript_opt.as_deref());
-    let (context_block, naive_baseline_bytes) =
-        build_project_memory_hydration(&proj_db, ws_root.as_deref(), prompt_hint.as_deref());
+    let (context_block, naive_baseline_bytes) = build_project_memory_hydration(
+        &proj_db,
+        ws_root.as_deref(),
+        prompt_hint.as_deref(),
+        error_hint,
+    );
     if context_block.is_empty() {
         Ok(json!({ "injectSteps": [] }))
     } else {
@@ -889,6 +908,7 @@ fn build_project_memory_hydration(
     proj_db: &LibreDb,
     ws_root: Option<&Path>,
     prompt_hint: Option<&str>,
+    error_hint: Option<&str>,
 ) -> (String, usize) {
     let mut naive_baseline_bytes = 64usize;
     let mut git_line_opt = ws_root.and_then(collect_git_telemetry_line);
@@ -896,13 +916,26 @@ fn build_project_memory_hydration(
         naive_baseline_bytes += g.len() + 1;
     }
 
-    // Tier 1 (with Git): learned situational reflexes matching the current prompt. `load_sealed_only`
-    // loads exclusively `NodeKind::Rule` capsules covered by the `hmac-sha256:v4` workspace seal,
-    // so unsealed `NodeKind::Generic` text can never enter `<SYSTEM_MESSAGE>`.
-    if let Some(hint) = prompt_hint.map(str::trim).filter(|h| !h.is_empty()) {
+    // Tier 1 (with Git): learned situational reflexes matching the current prompt or newly
+    // harvested error diagnostic. `load_sealed_only` loads exclusively `NodeKind::Rule` capsules
+    // covered by the `hmac-sha256:v4` workspace seal, so unsealed `NodeKind::Generic` text can
+    // never enter `<SYSTEM_MESSAGE>`.
+    let reflex_query_owned: String = [
+        prompt_hint.map(str::trim).filter(|s| !s.is_empty()),
+        error_hint.map(str::trim).filter(|s| !s.is_empty()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("\n");
+    if !reflex_query_owned.is_empty() {
         if let Ok(rx) = libredb_cognitive::ReflexEngine::load_sealed_only(proj_db) {
-            let prompt_err: String = hint.chars().take(256).collect();
-            let fired = rx.evaluate(ws_root, hint, Some(&prompt_err));
+            let err_arg: String = error_hint
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.chars().take(256).collect())
+                .unwrap_or_else(|| reflex_query_owned.chars().take(256).collect());
+            let fired = rx.evaluate(ws_root, &reflex_query_owned, Some(&err_arg));
             if !fired.is_empty() {
                 let mut block = vec!["Learned Reflexes:".to_owned()];
                 for rf in fired.iter().take(MAX_PRE_INVOCATION_REFLEXES) {
@@ -1752,7 +1785,7 @@ fn record_working_set_edit(
     // error cue timestamps causally precede the staged TentativeFileEdit (`edit_ns >= recorded_at_ns`).
     if let Some((cid, tp)) = cid_transcript {
         if tp.is_file() {
-            harvest_recent_transcript_errors(&proj_db, cid, tp);
+            let _ = harvest_recent_transcript_errors(&proj_db, cid, tp);
         }
     }
 
@@ -2008,9 +2041,14 @@ fn collect_contained_task_log_paths(content: &str, transcript_path: &Path) -> Ve
 /// Incrementally harvests non-banal errors and panics from the trailing window of `transcript_path`
 /// (plus strictly contained `.system_generated/tasks/task-*.log` files) into `sys::pending_error_cues`
 /// using seal-neutral `NodeKind::TranscriptCursor` (`sys::error_harvest_cursor::{cid}`).
-fn harvest_recent_transcript_errors(proj_db: &LibreDb, cid: &str, transcript_path: &Path) {
+/// Returns the error diagnostic strings newly recorded during this scan.
+fn harvest_recent_transcript_errors(
+    proj_db: &LibreDb,
+    cid: &str,
+    transcript_path: &Path,
+) -> Vec<String> {
     let Some(lines) = read_file_tail_lines(transcript_path, 65_536) else {
-        return;
+        return Vec::new();
     };
     let cursor_key = format!("sys::error_harvest_cursor::{cid}");
     let last_step_index = proj_db
@@ -2099,8 +2137,11 @@ fn harvest_recent_transcript_errors(proj_db: &LibreDb, cid: &str, transcript_pat
         }
     }
 
+    let mut newly_recorded = Vec::new();
     for (diag, hint) in queued_cues {
-        let _ = libredb_cognitive::record_error_cue(proj_db, &diag, Some(hint));
+        if libredb_cognitive::record_error_cue(proj_db, &diag, Some(hint)).unwrap_or(false) {
+            newly_recorded.push(diag);
+        }
     }
     if max_step_index > last_step_index {
         let cur_json = json!({ "last_step_index": max_step_index });
@@ -2112,6 +2153,7 @@ fn harvest_recent_transcript_errors(proj_db: &LibreDb, cid: &str, transcript_pat
             );
         }
     }
+    newly_recorded
 }
 
 fn resolve_hook_workspace(payload: &Value, transcript_opt: Option<&Path>) -> Option<PathBuf> {
@@ -3167,6 +3209,193 @@ mod tests {
             trusted_after,
             "Transcript error harvesting and pitfall learning must preserve hmac-sha256:v4 trust seal"
         );
+
+        let _ = fs::remove_dir_all(&base_dir);
+    }
+
+    #[test]
+    fn pre_invocation_refutes_failed_tentative_fix_and_hydrates_sealed_error_reflex() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join(format!("libredb_refute_hook_test_{}_{}", std::process::id(), nanos));
+        let ws_repo = base_dir.join("repo");
+        fs::create_dir_all(ws_repo.join("src")).unwrap();
+        fs::write(
+            ws_repo.join("Cargo.toml"),
+            "[package]\nname = \"refute_hook\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let src_path = ws_repo.join("src").join("lib.rs");
+        let orig_src = "pub fn clone_lease_token(tok: &str) -> String {\n    tok.to_owned()\n}\n\npub fn renew_session(lease_token: String) -> usize {\n    lease_token.len()\n}\n";
+        fs::write(&src_path, orig_src).unwrap();
+
+        let global_path = base_dir.join("customizations.ldb");
+        let proj_ldb = ws_repo.join(".agents").join("memory.ldb");
+        {
+            let gdb = libredb_core::LibreDb::open(&global_path).unwrap();
+            let pdb = std::sync::Arc::new(libredb_core::LibreDb::open(&proj_ldb).unwrap());
+            libredb_cognitive::index_workspace(&pdb, &ws_repo, false).unwrap();
+            let rx_rule = libredb_cognitive::ReflexRule {
+                id: "seal-borrow-lease-token".to_owned(),
+                env_or_error_any: vec!["E0382".to_owned(), "lease_token".to_owned()],
+                directive: "Borrow-check fix: call clone_lease_token before renewing session.".to_owned(),
+                code_anchors: vec!["src/lib.rs::renew_session".to_owned()],
+                ..Default::default()
+            };
+            libredb_cognitive::ReflexEngine::learn_reflex(&pdb, &rx_rule).unwrap();
+            crate::security::seal_workspace_memory(&gdb, &pdb, &ws_repo).unwrap();
+        }
+
+        let logs_dir = base_dir.join(".system_generated").join("logs");
+        fs::create_dir_all(&logs_dir).unwrap();
+        let transcript_path = logs_dir.join("transcript.jsonl");
+        let err_line = json!({
+            "step_index": 1,
+            "type": "GENERIC",
+            "content": "Command output:\nerror[E0382]: borrow of moved value 'lease_token' in renew_session\n"
+        })
+        .to_string();
+        fs::write(&transcript_path, format!("{err_line}\n")).unwrap();
+
+        // Turn 1: initial PreInvocation hydrates workspace and records pre_inv_dedup for @ep=1.
+        let inv1 = super::evaluate_pre_invocation_payload(
+            &json!({
+                "conversationId": "conv-hook-refute",
+                "transcriptPath": transcript_path.to_string_lossy().to_string(),
+                "workspacePaths": [ws_repo.to_string_lossy().to_string()],
+                "prompt": "Fix the lease_token borrow error in renew_session"
+            }),
+            Some(&global_path),
+        )
+        .unwrap();
+        assert!(!inv1["injectSteps"].as_array().unwrap().is_empty());
+
+        // Turn 1 tool: stage and write an ineffective edit (`bad_attempt()`).
+        let bad_src = orig_src.replace(
+            "    lease_token.len()\n",
+            "    let bad_attempt = lease_token.len();\n    bad_attempt\n",
+        );
+        let pt1 = super::evaluate_pre_tool_payload(
+            &json!({
+                "conversationId": "conv-hook-refute",
+                "transcriptPath": transcript_path.to_string_lossy().to_string(),
+                "workspacePaths": [ws_repo.to_string_lossy().to_string()],
+                "toolName": "edit_file",
+                "toolArgs": {
+                    "Path": src_path.to_string_lossy().to_string(),
+                    "Target": "    lease_token.len()",
+                    "Replacement": "    let bad_attempt = lease_token.len();\n    bad_attempt"
+                }
+            }),
+            Some(&global_path),
+        );
+        assert_eq!(pt1["decision"], "allow");
+        fs::write(&src_path, &bad_src).unwrap();
+
+        // Post-edit build fails again with the exact same error at step_index 2.
+        let err_line_2 = json!({
+            "step_index": 2,
+            "type": "GENERIC",
+            "content": "Command output:\nerror[E0382]: borrow of moved value 'lease_token' in renew_session\n"
+        })
+        .to_string();
+        fs::write(&transcript_path, format!("{err_line}\n{err_line_2}\n")).unwrap();
+
+        // Turn 2: PreInvocation reconciles bad_src first, then harvests step 2 -> refutes failed fix
+        // AND bypasses pre_inv_dedup to surface the sealed reflex!
+        let inv2 = super::evaluate_pre_invocation_payload(
+            &json!({
+                "conversationId": "conv-hook-refute",
+                "transcriptPath": transcript_path.to_string_lossy().to_string(),
+                "workspacePaths": [ws_repo.to_string_lossy().to_string()],
+                "prompt": "Continue checking the build"
+            }),
+            Some(&global_path),
+        )
+        .unwrap();
+        let msg2 = inv2["injectSteps"][0]["systemMessage"]["systemMessage"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            msg2.contains("seal-borrow-lease-token"),
+            "Expected PreInvocation to bypass dedup and hydrate sealed reflex on newly harvested error:\n{msg2}"
+        );
+
+        let rep_refuted = {
+            let pdb = libredb_core::LibreDb::open(&proj_ldb).unwrap();
+            libredb_cognitive::learning_state_report(&pdb, 10)
+        };
+        assert_eq!(rep_refuted.counters.failed_fixes_refuted, 1);
+        assert_eq!(rep_refuted.learned_pitfalls.len(), 1);
+        assert!(
+            rep_refuted.learned_pitfalls[0].confidence < libredb_cognitive::ACTIVE_PITFALL_MIN_CONFIDENCE,
+            "Refuted fix must drop below active threshold: {:?}",
+            rep_refuted.learned_pitfalls[0]
+        );
+
+        // Turn 2 tool + Turn 3: apply the verified fix (`clone_lease_token`).
+        let good_src = bad_src.replace(
+            "    let bad_attempt = lease_token.len();\n    bad_attempt\n",
+            "    clone_lease_token(&lease_token).len()\n",
+        );
+        let pt2 = super::evaluate_pre_tool_payload(
+            &json!({
+                "conversationId": "conv-hook-refute",
+                "transcriptPath": transcript_path.to_string_lossy().to_string(),
+                "workspacePaths": [ws_repo.to_string_lossy().to_string()],
+                "toolName": "edit_file",
+                "toolArgs": {
+                    "Path": src_path.to_string_lossy().to_string(),
+                    "Target": "    let bad_attempt = lease_token.len();\n    bad_attempt",
+                    "Replacement": "    clone_lease_token(&lease_token).len()"
+                }
+            }),
+            Some(&global_path),
+        );
+        assert_eq!(pt2["decision"], "allow");
+        fs::write(&src_path, &good_src).unwrap();
+
+        let _ = super::evaluate_pre_invocation_payload(
+            &json!({
+                "conversationId": "conv-hook-refute",
+                "transcriptPath": transcript_path.to_string_lossy().to_string(),
+                "workspacePaths": [ws_repo.to_string_lossy().to_string()],
+                "prompt": "Verify fix landed"
+            }),
+            Some(&global_path),
+        )
+        .unwrap();
+
+        let rep_fixed = {
+            let pdb = libredb_core::LibreDb::open(&proj_ldb).unwrap();
+            libredb_cognitive::learning_state_report(&pdb, 10)
+        };
+        assert!(
+            rep_fixed.learned_pitfalls[0].confidence >= libredb_cognitive::ACTIVE_PITFALL_MIN_CONFIDENCE,
+            "Verified fix after refutation must recover active confidence: {:?}",
+            rep_fixed.learned_pitfalls[0]
+        );
+        assert!(
+            rep_fixed.learned_pitfalls[0]
+                .resolution_tokens
+                .iter()
+                .any(|t| t == "clone_lease_token"),
+            "Expected clone_lease_token in updated pitfall: {:?}",
+            rep_fixed.learned_pitfalls[0]
+        );
+        assert!(rep_fixed.counters.method_supersedes_applied >= 1);
+
+        let trusted_after = {
+            let gdb = libredb_core::LibreDb::open(&global_path).unwrap();
+            crate::security::is_workspace_memory_trusted(Some(&gdb), &ws_repo)
+        };
+        assert!(trusted_after, "Workspace seal must remain valid after refutation and recovery");
 
         let _ = fs::remove_dir_all(&base_dir);
     }

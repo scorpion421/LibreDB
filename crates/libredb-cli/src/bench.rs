@@ -3779,6 +3779,165 @@ fn verify_l12_situational_superseding_and_belief_revision(
     ))
 }
 
+fn verify_l13_reordering_deletion_refutation_and_fim_pitfalls(
+    sbx_root: &Path,
+    global_ldb: &Path,
+    acc: &mut LearningMetricsAccumulator,
+) -> Result<String, String> {
+    // 1. Statement-reordering & deletion AST diffs without new identifier names.
+    let reorder_fx = LearningFixture::new(sbx_root, global_ldb, "l13_reorder_del")?;
+    let proc_init = "pub fn close_stdin() {}\npub fn wait_child() {}\npub fn kill_child() {\n    close_stdin();\n    wait_child();\n}\n\npub fn drop_early_handle() {}\npub fn finalize_fd() {}\npub fn safe_cleanup() {\n    drop_early_handle();\n    finalize_fd();\n}\n";
+    reorder_fx.write_src("src/proc_guard.rs", proc_init)?;
+    reorder_fx.index(false)?;
+    reorder_fx.seal()?;
+
+    let recorded_reorder = libredb_cognitive::record_error_cue(
+        &reorder_fx.pdb,
+        "error: child process woke on stdin EOF before SIGKILL in kill_child",
+        Some("cargo test"),
+    )
+    .map_err(|e| e.to_string())?;
+    if !recorded_reorder {
+        return Err("L13 expected reordering error cue to pass Stage 1".to_owned());
+    }
+    let proc_reordered = proc_init.replace(
+        "pub fn kill_child() {\n    close_stdin();\n    wait_child();\n}",
+        "pub fn kill_child() {\n    wait_child();\n    close_stdin();\n}",
+    );
+    reorder_fx.stage_and_write("src/proc_guard.rs", &proc_reordered)?;
+    let rep_reorder = libredb_cognitive::learning_state_report(&reorder_fx.pdb, 10);
+    if rep_reorder.counters.pitfalls_learned != 1
+        || !rep_reorder
+            .learned_pitfalls
+            .first()
+            .is_some_and(|p| p.resolution_tokens.iter().any(|t| t == "wait_child_before_close_stdin"))
+    {
+        return Err(format!(
+            "L13 statement-reordering fix was dropped or missed order cue: {rep_reorder:?}"
+        ));
+    }
+
+    let recorded_del = libredb_cognitive::record_error_cue(
+        &reorder_fx.pdb,
+        "error[E0382]: use of dropped early handle in safe_cleanup",
+        Some("cargo test"),
+    )
+    .map_err(|e| e.to_string())?;
+    if !recorded_del {
+        return Err("L13 expected deletion error cue to pass Stage 1".to_owned());
+    }
+    let proc_deleted = proc_reordered.replace(
+        "pub fn safe_cleanup() {\n    drop_early_handle();\n    finalize_fd();\n}",
+        "pub fn safe_cleanup() {\n    finalize_fd();\n}",
+    );
+    reorder_fx.stage_and_write("src/proc_guard.rs", &proc_deleted)?;
+    let rep_del = libredb_cognitive::learning_state_report(&reorder_fx.pdb, 10);
+    if rep_del.counters.pitfalls_learned != 2
+        || !rep_del
+            .learned_pitfalls
+            .iter()
+            .any(|p| p.resolution_tokens.iter().any(|t| t == "avoid_drop_early_handle"))
+    {
+        return Err(format!(
+            "L13 deletion-only fix did not emit avoid_drop_early_handle: {rep_del:?}"
+        ));
+    }
+
+    // 2. Failed-fix refutation & verified recovery + FIM/impact proactive pitfall surfacing.
+    let fx = LearningFixture::new(sbx_root, global_ldb, "l13_refute_fim")?;
+    let m1_init = "pub fn wrong_helper(tok: &str) -> usize {\n    tok.len()\n}\n\npub fn clone_lease_token(tok: &str) -> String {\n    tok.to_owned()\n}\n\npub fn beta_router(lease_token: String) -> usize {\n    lease_token.len()\n}\n";
+    fx.write_src("src/m1.rs", m1_init)?;
+    fx.index(false)?;
+    fx.seal()?;
+
+    let borrow_err = "error[E0382]: borrow of moved value 'lease_token' in renew_session";
+    if !libredb_cognitive::record_error_cue(&fx.pdb, borrow_err, Some("cargo check"))
+        .map_err(|e| e.to_string())?
+    {
+        return Err("L13 expected borrow_err to pass Stage 1".to_owned());
+    }
+    let m1_bad = m1_init.replace(
+        "pub fn beta_router(lease_token: String) -> usize {\n    lease_token.len()\n}",
+        "pub fn beta_router(lease_token: String) -> usize {\n    wrong_helper(&lease_token)\n}",
+    );
+    fx.stage_and_write("src/m1.rs", &m1_bad)?;
+
+    // Exact same error recurs -> refutes bad tentative fix and drops confidence below 0.75.
+    let _ = libredb_cognitive::record_error_cue(&fx.pdb, borrow_err, Some("cargo check"))
+        .map_err(|e| e.to_string())?;
+    let rep_mid = libredb_cognitive::learning_state_report(&fx.pdb, 10);
+    if rep_mid.counters.failed_fixes_refuted != 1
+        || rep_mid
+            .learned_pitfalls
+            .first()
+            .is_none_or(|p| p.confidence >= libredb_cognitive::ACTIVE_PITFALL_MIN_CONFIDENCE)
+    {
+        acc.placebo_false_bindings += 1;
+        return Err(format!(
+            "L13 failed-fix refutation did not deactivate bad attempt: {rep_mid:?}"
+        ));
+    }
+
+    // Verified recovery replaces wrong_helper with clone_lease_token.
+    let m1_good = m1_bad.replace(
+        "pub fn beta_router(lease_token: String) -> usize {\n    wrong_helper(&lease_token)\n}",
+        "pub fn beta_router(lease_token: String) -> usize {\n    clone_lease_token(&lease_token).len()\n}",
+    );
+    fx.stage_and_write("src/m1.rs", &m1_good)?;
+    let rep_fixed = libredb_cognitive::learning_state_report(&fx.pdb, 10);
+    let fixed_pitfall = rep_fixed
+        .learned_pitfalls
+        .first()
+        .ok_or_else(|| "L13 missing recovered pitfall".to_owned())?;
+    if fixed_pitfall.confidence < libredb_cognitive::ACTIVE_PITFALL_MIN_CONFIDENCE
+        || rep_fixed.counters.method_supersedes_applied < 1
+        || !fixed_pitfall
+            .resolution_tokens
+            .iter()
+            .any(|t| t == "clone_lease_token")
+    {
+        return Err(format!(
+            "L13 verified recovery did not restore active pitfall: {rep_fixed:?}"
+        ));
+    }
+
+    // 3. Proactive FIM and impact pitfall surfacing.
+    let fim = libredb_cognitive::extract_fim_slice(
+        &fx.pdb,
+        &fx.root.join("src/m1.rs"),
+        Some("beta_router"),
+        None,
+        6,
+    )
+    .map_err(|e| e.to_string())?;
+    let impacts = libredb_cognitive::query_symbol_impact(&fx.pdb, "beta_router")
+        .map_err(|e| e.to_string())?;
+    let fim_compact = fim.format_compact();
+    let impact_compact = libredb_cognitive::format_impact_compact("beta_router", &impacts);
+    if fim.known_pitfalls.is_empty()
+        || !fim_compact.contains("Known Pitfalls:")
+        || !fim_compact.contains("clone_lease_token")
+        || impacts
+            .first()
+            .is_none_or(|i| i.known_pitfalls.is_empty())
+        || !impact_compact.contains("Known Pitfalls")
+        || !impact_compact.contains("clone_lease_token")
+    {
+        return Err(format!(
+            "L13 FIM/impact did not surface matured pitfall:\nFIM:\n{fim_compact}\nIMPACT:\n{impact_compact}"
+        ));
+    }
+
+    if !reorder_fx.is_trusted()? || !fx.is_trusted()? {
+        return Err("L13 hmac-sha256:v4 workspace seal invalidated".to_owned());
+    }
+
+    Ok(format!(
+        "reordering (wait_child_before_close_stdin), deletion (avoid_drop_early_handle), refutation->recovery (conf={:.2}), FIM & impact pitfalls ok, seal=valid",
+        fixed_pitfall.confidence
+    ))
+}
+
 pub fn run_learning_verification_suite(
     workspace_source: Option<&Path>,
     as_json: bool,
@@ -3804,7 +3963,7 @@ pub fn run_learning_verification_suite(
         seed_bench_skill(&gdb)?;
     }
 
-    let mut stages = Vec::with_capacity(12);
+    let mut stages = Vec::with_capacity(13);
     let mut acc = LearningMetricsAccumulator::default();
     let mut resolved_source = workspace_source
         .map(|p| p.display().to_string())
@@ -3886,6 +4045,18 @@ pub fn run_learning_verification_suite(
         "L12",
         "Situational method superseding & empirical revision",
         || verify_l12_situational_superseding_and_belief_revision(&sbx_root, &global_ldb),
+    );
+    run_learning_stage(
+        &mut stages,
+        "L13",
+        "Reordering/deletion fixes, failed-attempt refutation & FIM pitfalls",
+        || {
+            verify_l13_reordering_deletion_refutation_and_fim_pitfalls(
+                &sbx_root,
+                &global_ldb,
+                &mut acc,
+            )
+        },
     );
 
     let passed = stages.iter().filter(|s| s.passed).count();

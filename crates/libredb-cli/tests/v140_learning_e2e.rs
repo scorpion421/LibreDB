@@ -317,7 +317,7 @@ fn learning_verify_and_bench_suite_prove_causal_learning_without_placebo_leaks()
     let rep: serde_json::Value = serde_json::from_slice(&verify_out.stdout)
         .expect("parse learning --verify JSON");
     assert_eq!(rep["verdict"].as_str(), Some("VERIFIED_CAUSAL_LEARNING"), "{rep}");
-    assert_eq!(rep["passed_stages"].as_u64(), Some(12), "{rep}");
+    assert_eq!(rep["passed_stages"].as_u64(), Some(13), "{rep}");
     assert_eq!(rep["failed_stages"].as_u64(), Some(0), "{rep}");
     assert_eq!(rep["placebo_false_bindings"].as_u64(), Some(0), "{rep}");
     assert_eq!(rep["dead_bridges_retained"].as_u64(), Some(0), "{rep}");
@@ -346,7 +346,7 @@ fn learning_verify_and_bench_suite_prove_causal_learning_without_placebo_leaks()
     let brep: serde_json::Value = serde_json::from_slice(&bench_out.stdout)
         .expect("parse bench --suite learning JSON");
     assert_eq!(brep["verdict"].as_str(), Some("VERIFIED_CAUSAL_LEARNING"), "{brep}");
-    assert_eq!(brep["passed_stages"].as_u64(), Some(12), "{brep}");
+    assert_eq!(brep["passed_stages"].as_u64(), Some(13), "{brep}");
     assert_eq!(brep["failed_stages"].as_u64(), Some(0), "{brep}");
     assert_eq!(brep["placebo_false_bindings"].as_u64(), Some(0), "{brep}");
 

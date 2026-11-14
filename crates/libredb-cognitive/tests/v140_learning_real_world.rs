@@ -691,6 +691,158 @@ fn s19_v150_error_recovery_banality_and_situational_superseding() {
     assert!(rep.counters.method_supersedes_applied >= 1);
 }
 
+// --- S20 (v1.6.0): Statement reordering, deletion fixes, comment filtering, DiskSync, refutation & FIM pitfalls ---
+#[test]
+fn s20_v160_reordering_deletion_refutation_and_fim_pitfall_surfacing() {
+    use libredb_cognitive::{
+        diff_symbol_body_tokens, extract_fim_slice, format_impact_compact, learning_state_report,
+        record_error_cue, sync_single_file_symbols, FileSkeleton, ACTIVE_PITFALL_MIN_CONFIDENCE,
+    };
+
+    // 1. AST diff: statement reordering, deletion fix, comment-only ignore, and DiskSync (old_bytes=None).
+    let base_src = "pub fn wait_child() {}\npub fn close_stdin() {}\npub fn drop_early_handle() {}\npub fn run_guard() {\n    close_stdin();\n    wait_child();\n    drop_early_handle();\n}\n";
+    let reordered_src = "pub fn wait_child() {}\npub fn close_stdin() {}\npub fn drop_early_handle() {}\npub fn run_guard() {\n    wait_child();\n    close_stdin();\n    drop_early_handle();\n}\n";
+    let deleted_src = "pub fn wait_child() {}\npub fn close_stdin() {}\npub fn drop_early_handle() {}\npub fn run_guard() {\n    wait_child();\n    close_stdin();\n}\n";
+    let comment_only_src = "pub fn wait_child() {}\npub fn close_stdin() {}\npub fn drop_early_handle() {}\npub fn run_guard() {\n    // Explanatory comment mentioning fake_new_identifier\n    close_stdin();\n    wait_child();\n    drop_early_handle();\n}\n";
+
+    let sk_base = FileSkeleton::extract_from_bytes("src/guard.rs", base_src.as_bytes());
+    let sk_reorder = FileSkeleton::extract_from_bytes("src/guard.rs", reordered_src.as_bytes());
+    let sk_del = FileSkeleton::extract_from_bytes("src/guard.rs", deleted_src.as_bytes());
+    let sk_comment = FileSkeleton::extract_from_bytes("src/guard.rs", comment_only_src.as_bytes());
+    let touched = vec!["src/guard.rs::run_guard".to_owned()];
+
+    // Statement reordering works both with old_bytes=Some and with old_bytes=None (DiskSync/IndexScan).
+    let tok_reorder_some = diff_symbol_body_tokens(
+        "src/guard.rs",
+        Some(base_src.as_bytes()),
+        Some(&sk_base),
+        reordered_src.as_bytes(),
+        &sk_reorder,
+        &touched,
+    );
+    let tok_reorder_none = diff_symbol_body_tokens(
+        "src/guard.rs",
+        None,
+        Some(&sk_base),
+        reordered_src.as_bytes(),
+        &sk_reorder,
+        &touched,
+    );
+    assert!(
+        tok_reorder_some
+            .iter()
+            .any(|t| t == "wait_child_before_close_stdin"),
+        "Expected wait_child_before_close_stdin: {tok_reorder_some:?}"
+    );
+    assert_eq!(tok_reorder_some, tok_reorder_none);
+
+    // Deletion fix works cleanly via avoid_<removed>.
+    let tok_del = diff_symbol_body_tokens(
+        "src/guard.rs",
+        None,
+        Some(&sk_reorder),
+        deleted_src.as_bytes(),
+        &sk_del,
+        &touched,
+    );
+    assert!(
+        tok_del.iter().any(|t| t == "avoid_drop_early_handle"),
+        "Expected avoid_drop_early_handle: {tok_del:?}"
+    );
+
+    // Comment-only edit emits 0 body tokens (Stage 2 banality filter discards it).
+    assert!(
+        diff_symbol_body_tokens(
+            "src/guard.rs",
+            Some(base_src.as_bytes()),
+            Some(&sk_base),
+            comment_only_src.as_bytes(),
+            &sk_comment,
+            &touched,
+        )
+        .is_empty(),
+        "Comment-only edits must produce 0 AST body tokens"
+    );
+
+    // 2. Comment-only edit retires pending error cue at Stage 2, while DiskSync reordering binds it.
+    let fx = fixture("s20");
+    let rel_p = fx.root.join("src/guard.rs");
+    std::fs::write(&rel_p, base_src).unwrap();
+    index_workspace(&fx.proj, &fx.root, false).unwrap();
+
+    record_error_cue(
+        &fx.proj,
+        "error: child woke on stdin EOF in run_guard",
+        Some("test"),
+    )
+    .unwrap();
+    std::fs::write(&rel_p, comment_only_src).unwrap();
+    sync_single_file_symbols(&fx.proj, &fx.root, &rel_p, comment_only_src.as_bytes()).unwrap();
+    let rep_comment = learning_state_report(&fx.proj, 10);
+    assert_eq!(rep_comment.counters.pitfalls_learned, 0);
+    assert!(rep_comment.counters.trivial_errors_filtered >= 1);
+
+    // Now test DiskSync reordering fix + failed-attempt refutation + recovery + FIM/impact surfacing.
+    record_error_cue(
+        &fx.proj,
+        "error[E0382]: borrow of moved value 'lease_token' in release_handle",
+        Some("check"),
+    )
+    .unwrap();
+    let rel_path_obj = fx.root.join("src/release.rs");
+    let orig_rel = std::fs::read_to_string(&rel_path_obj).unwrap();
+    let bad_rel = orig_rel.replace("id > 0", "let wrong_tmp = id;\n    wrong_tmp > 0");
+    stage_tentative_file_edit(
+        &fx.proj,
+        &fx.root,
+        &rel_path_obj,
+        Some(hash_key(SKELETON_HASH_SEED, orig_rel.as_bytes())),
+        bad_rel.as_bytes(),
+        32,
+    )
+    .unwrap();
+    std::fs::write(&rel_path_obj, &bad_rel).unwrap();
+    reconcile_tentative_edits(&fx.proj, &fx.root).unwrap();
+
+    // Error recurs -> refutes failed edit.
+    record_error_cue(
+        &fx.proj,
+        "error[E0382]: borrow of moved value 'lease_token' in release_handle",
+        Some("check"),
+    )
+    .unwrap();
+    let rep_mid = learning_state_report(&fx.proj, 10);
+    assert_eq!(rep_mid.counters.failed_fixes_refuted, 1);
+    assert!(rep_mid.learned_pitfalls[0].confidence < ACTIVE_PITFALL_MIN_CONFIDENCE);
+
+    // Verified replacement fix (`clone_lease_token`) via DiskSync restores active pitfall & surfaces in FIM/impact.
+    let good_rel = bad_rel.replace("wrong_tmp > 0", "let clone_lease_token = wrong_tmp;\n    clone_lease_token > 0");
+    std::fs::write(&rel_path_obj, &good_rel).unwrap();
+    sync_single_file_symbols(&fx.proj, &fx.root, &rel_path_obj, good_rel.as_bytes()).unwrap();
+
+    let rep_final = learning_state_report(&fx.proj, 10);
+    assert!(rep_final.learned_pitfalls[0].confidence >= ACTIVE_PITFALL_MIN_CONFIDENCE);
+    let fim = extract_fim_slice(&fx.proj, &rel_path_obj, Some("release_handle"), None, 4).unwrap();
+    let impacts = query_symbol_impact(&fx.proj, "release_handle").unwrap();
+    assert!(
+        fim.known_pitfalls
+            .iter()
+            .any(|p| p.contains("clone_lease_token")),
+        "FIM slice missing known pitfall: {:?}",
+        fim.known_pitfalls
+    );
+    assert!(
+        impacts[0]
+            .known_pitfalls
+            .iter()
+            .any(|p| p.contains("clone_lease_token")),
+        "Impact report missing known pitfall: {:?}",
+        impacts[0].known_pitfalls
+    );
+    assert!(fim.format_compact().contains("Known Pitfalls:"));
+    assert!(format_impact_compact("release_handle", &impacts).contains("Known Pitfalls"));
+}
+
 #[allow(dead_code)]
 fn assert_path_exists(p: &Path) {
     assert!(p.exists(), "missing {}", p.display());

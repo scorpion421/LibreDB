@@ -161,6 +161,9 @@ pub struct SymbolImpactReport {
     pub callees: Vec<String>,
     /// Architectural `Decision` or `Task` capsules governing why this symbol exists.
     pub governing_decisions: Vec<String>,
+    /// Matured procedural error-recovery pitfalls (`confidence >= 0.75`) bound to this symbol.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub known_pitfalls: Vec<String>,
     /// Statistically verified Git co-change partner files (`Conf >= 55%`, `Lift >= 1.8`, top 3).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub co_changed_files: Vec<String>,
@@ -179,6 +182,9 @@ pub struct FimSliceBundle {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub implementors: Vec<String>,
     pub governing_decisions: Vec<String>,
+    /// Matured procedural error-recovery pitfalls (`confidence >= 0.75`) bound to this symbol or file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub known_pitfalls: Vec<String>,
 }
 
 impl FimSliceBundle {
@@ -197,6 +203,12 @@ impl FimSliceBundle {
             for d in &self.governing_decisions {
                 out.push_str(&format!("  * {d}\n"));
             }
+        }
+        if !self.known_pitfalls.is_empty() {
+            out.push_str(&format!(
+                "Known Pitfalls: {}\n",
+                self.known_pitfalls.join(" | ")
+            ));
         }
         if !self.implementors.is_empty() {
             out.push_str(&format!("Implementors ({}):\n", self.implementors.len()));
@@ -2180,6 +2192,12 @@ pub fn format_impact_compact(symbol_query: &str, reports: &[SymbolImpactReport])
                 out.push_str(&format!("    ! {d}\n"));
             }
         }
+        if !rep.known_pitfalls.is_empty() {
+            out.push_str(&format!("  Known Pitfalls ({}):\n", rep.known_pitfalls.len()));
+            for p in &rep.known_pitfalls {
+                out.push_str(&format!("    * {p}\n"));
+            }
+        }
         if !rep.implementors.is_empty() {
             out.push_str(&format!("  Implementors ({}):\n", rep.implementors.len()));
             for imp in rep.implementors.iter().take(8) {
@@ -2365,6 +2383,7 @@ pub fn query_symbol_impact(db: &LibreDb, symbol_query: &str) -> Result<Vec<Symbo
     const MAX_SERIALIZED_CALLERS: usize = 20;
     const MAX_SERIALIZED_CALLEES: usize = 12;
 
+    let matured_pitfalls = crate::learning::load_matured_pitfalls(db);
     let mut reports = Vec::new();
     for (nid, sym_key) in matched_ids.into_iter().take(12) {
         let rec = db.get(nid)?;
@@ -2452,6 +2471,8 @@ pub fn query_symbol_impact(db: &LibreDb, symbol_query: &str) -> Result<Vec<Symbo
             }
         }
 
+        let known_pitfalls = collect_symbol_pitfalls(&matured_pitfalls, &sym_key);
+
         reports.push(SymbolImpactReport {
             node_id: nid,
             symbol_key: sym_key,
@@ -2462,11 +2483,58 @@ pub fn query_symbol_impact(db: &LibreDb, symbol_query: &str) -> Result<Vec<Symbo
             total_callees,
             callees,
             governing_decisions,
+            known_pitfalls,
             co_changed_files,
         });
     }
 
     Ok(reports)
+}
+
+fn clean_sym_key_ref(s: &str) -> &str {
+    let no_line = s.split('#').next().unwrap_or(s);
+    match no_line.split_once('@') {
+        Some((head, tail)) if tail.starts_with('(') || tail.starts_with(':') => head,
+        Some((head, _)) => head,
+        None => no_line,
+    }
+}
+
+fn collect_symbol_pitfalls(
+    matured: &[crate::learning::LearnedPitfallEntry],
+    sym_key: &str,
+) -> Vec<String> {
+    let clean_target = clean_sym_key_ref(sym_key);
+    let (target_rel, target_qname) = clean_target
+        .split_once("::")
+        .unwrap_or(("", clean_target));
+    let target_short = target_qname.rsplit("::").next().unwrap_or(target_qname);
+
+    let mut out = Vec::new();
+    for p in matured {
+        let matches = p.affected_symbols.iter().any(|raw_s| {
+            let cs = clean_sym_key_ref(raw_s);
+            if cs == clean_target {
+                return true;
+            }
+            if let Some((s_prefix, s_sym)) = cs.split_once("::") {
+                if s_prefix.contains('/') || s_prefix.contains('.') {
+                    s_prefix == target_rel && s_sym == target_qname
+                } else {
+                    cs == target_qname
+                }
+            } else {
+                cs == target_qname || (target_short.len() >= 4 && cs == target_short)
+            }
+        });
+        if matches {
+            out.push(format!("[{} conf={:.2}] {}", p.id, p.confidence, p.directive));
+            if out.len() >= 3 {
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// Extracts a minimal Fill-in-the-Middle (`FIM`) edit slice around `symbol_name` (or `center_line`),
@@ -2544,6 +2612,7 @@ pub fn extract_fim_slice(
     let mut callers = Vec::new();
     let mut implementors = Vec::new();
     let mut governing = Vec::new();
+    let mut known_pitfalls = Vec::new();
     if let Some(ref scoped_q) = matched_impact_query {
         if let Ok(impacts) = query_symbol_impact(db, scoped_q) {
             let best = impacts
@@ -2555,6 +2624,39 @@ pub fn extract_fim_slice(
                 callers = first.callers;
                 implementors = first.implementors;
                 governing = first.governing_decisions;
+                known_pitfalls = first.known_pitfalls;
+            }
+        }
+    }
+    if known_pitfalls.is_empty() {
+        let matured = crate::learning::load_matured_pitfalls(db);
+        if !matured.is_empty() {
+            let rel_target = infer_agents_ws_root(db)
+                .and_then(|ws| normalize_safe_workspace_rel_path(&ws, file_path))
+                .unwrap_or_else(|| label.clone());
+            if let Some(ref qn) = matched_sym {
+                let candidate_key = format!("{rel_target}::{qn}");
+                known_pitfalls = collect_symbol_pitfalls(&matured, &candidate_key);
+            }
+            if known_pitfalls.is_empty() {
+                let prefix = format!("{rel_target}::");
+                for p in &matured {
+                    let file_hit = p.affected_symbols.iter().any(|raw_s| {
+                        let cs = clean_sym_key_ref(raw_s);
+                        cs == rel_target
+                            || cs.starts_with(&prefix)
+                            || label.ends_with(cs.split_once("::").map_or(cs, |(f, _)| f))
+                    });
+                    if file_hit {
+                        known_pitfalls.push(format!(
+                            "[{} conf={:.2}] {}",
+                            p.id, p.confidence, p.directive
+                        ));
+                        if known_pitfalls.len() >= 3 {
+                            break;
+                        }
+                    }
+                }
             }
         }
     }
@@ -2569,6 +2671,7 @@ pub fn extract_fim_slice(
         callers,
         implementors,
         governing_decisions: governing,
+        known_pitfalls,
     })
 }
 

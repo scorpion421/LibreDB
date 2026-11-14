@@ -214,6 +214,8 @@ pub struct LearningCounters {
     #[serde(default)]
     pub pitfalls_learned: u64,
     #[serde(default)]
+    pub failed_fixes_refuted: u64,
+    #[serde(default)]
     pub method_supersedes_applied: u64,
 }
 
@@ -542,8 +544,34 @@ pub fn record_error_cue(
         Ok(Some(WriteRequest::new(NodeKind::Generic, bytes).with_importance(32)))
     })?;
 
-    if counted {
-        bump_learning_counters(db, |c| c.error_cues_recorded += 1);
+    let mut refuted_prior_fix = false;
+    let _ = db.transact_key(NodeKind::Generic, ERROR_PITFALL_BOOK_KEY, |existing| {
+        let Some(rec) = existing else {
+            return Ok(None);
+        };
+        let Ok(mut book) = serde_json::from_slice::<ErrorPitfallBook>(&rec.payload) else {
+            return Ok(None);
+        };
+        let Some(cur) = book.pitfalls.get_mut(&fingerprint_id) else {
+            return Ok(None);
+        };
+        cur.confidence = (cur.confidence * 0.55).clamp(0.10, 0.98);
+        cur.last_learned_ns = now_ns;
+        refuted_prior_fix = true;
+        let bytes = serde_json::to_vec(&book)
+            .map_err(|_| LibreDbError::CorruptFormat("error pitfall book serialize"))?;
+        Ok(Some(WriteRequest::new(NodeKind::Generic, bytes).with_importance(64)))
+    });
+
+    if counted || refuted_prior_fix {
+        bump_learning_counters(db, |c| {
+            if counted {
+                c.error_cues_recorded += 1;
+            }
+            if refuted_prior_fix {
+                c.failed_fixes_refuted = c.failed_fixes_refuted.saturating_add(1);
+            }
+        });
     }
     Ok(true)
 }
@@ -1247,7 +1275,8 @@ fn bind_error_cues_for_edit(db: &LibreDb, ev: &EditEvidence) -> usize {
 
             match book.pitfalls.get_mut(&cue.fingerprint_id) {
                 Some(cur) => {
-                    if !cur.resolution_tokens.is_empty()
+                    let was_refuted = cur.confidence < ACTIVE_PITFALL_MIN_CONFIDENCE;
+                    if (was_refuted || !cur.resolution_tokens.is_empty())
                         && cur.resolution_tokens != ev.added_body_tokens
                     {
                         supersedes_applied += 1;
@@ -1260,7 +1289,12 @@ fn bind_error_cues_for_edit(db: &LibreDb, ev: &EditEvidence) -> usize {
                             cur.supersedes.push(sp.clone());
                         }
                     }
-                    cur.confidence = (1.0 - (1.0 - cur.confidence) * 0.50).clamp(0.10, 0.98);
+                    let recovered = (1.0 - (1.0 - cur.confidence) * 0.50).clamp(0.10, 0.98);
+                    cur.confidence = if was_refuted {
+                        recovered.max(0.80)
+                    } else {
+                        recovered
+                    };
                     cur.occurrences = cur.occurrences.saturating_add(1);
                     cur.last_learned_ns = now_ns;
                 }
@@ -1655,7 +1689,7 @@ pub fn format_learning_report(rep: &LearningStateReport) -> String {
         ));
     }
     lines.push(format!(
-        "Counters: misses {}, bindings {}, broad edits skipped {}, bulk scans skipped {}, error cues {}, trivial filtered {}, pitfalls {}, supersedes {}",
+        "Counters: misses {}, bindings {}, broad edits skipped {}, bulk scans skipped {}, error cues {}, trivial filtered {}, pitfalls {}, refuted {}, supersedes {}",
         rep.counters.misses_recorded,
         rep.counters.bindings_learned,
         rep.counters.broad_edits_skipped,
@@ -1663,6 +1697,7 @@ pub fn format_learning_report(rep: &LearningStateReport) -> String {
         rep.counters.error_cues_recorded,
         rep.counters.trivial_errors_filtered,
         rep.counters.pitfalls_learned,
+        rep.counters.failed_fixes_refuted,
         rep.counters.method_supersedes_applied
     ));
     lines.join("\n")

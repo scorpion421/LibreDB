@@ -1232,6 +1232,9 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         for g in &r.governing_decisions {
                             println!("    [Governed by]:    {g}");
                         }
+                        for p in &r.known_pitfalls {
+                            println!("    [Known Pitfalls]: {p}");
+                        }
                         for imp in &r.implementors {
                             println!("    [Implemented by] <= {imp}");
                         }

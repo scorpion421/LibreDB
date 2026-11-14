@@ -86,10 +86,63 @@ pub struct SymbolContract {
     /// `0` means unknown (skeletons persisted before v1.4.0).
     #[serde(default)]
     pub body_hash: u64,
+    /// Ordered meaningful identifier/code tokens extracted from `[start_line..=end_line]`
+    /// (excluding comments) so structural reordering/deletion diffs work even when `old_bytes` is `None`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub body_tokens: Vec<String>,
 }
 
 /// Seed for `SymbolContract::body_hash` (distinct from `SKELETON_HASH_SEED`).
 pub const SYMBOL_BODY_HASH_SEED: u8 = 0xB1;
+
+const BODY_STOPWORDS: &[&str] = &[
+    "fn", "pub", "let", "mut", "ref", "use", "mod", "crate", "super", "self", "impl", "struct",
+    "enum", "trait", "type", "where", "for", "while", "loop", "if", "else", "match", "return",
+    "break", "continue", "async", "await", "const", "static", "true", "false", "as", "in", "of",
+    "to", "the", "and", "or", "def", "class", "var", "val", "fun", "func", "function", "import",
+    "export", "from", "with", "this", "null", "none", "void",
+];
+
+fn is_body_stopword(tok: &str) -> bool {
+    BODY_STOPWORDS.contains(&tok)
+}
+
+/// Strips trailing/full-line code comments (`// ...` outside double-quoted strings, and full-line
+/// `# ...` outside Rust attributes `#[]` / shebangs `#!`) so comment-only edits never produce spurious
+/// AST body tokens.
+fn strip_code_line_comment(line: &str) -> &str {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("//") {
+        return "";
+    }
+    if trimmed.starts_with('#') && !trimmed.starts_with("#[") && !trimmed.starts_with("#!") {
+        return "";
+    }
+    let bytes = line.as_bytes();
+    let mut in_dq = false;
+    let mut escape = false;
+    let mut i = 0usize;
+    while i + 1 < bytes.len() {
+        let b = bytes[i];
+        if escape {
+            escape = false;
+            i += 1;
+            continue;
+        }
+        if b == b'\\' && in_dq {
+            escape = true;
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_dq = !in_dq;
+        } else if !in_dq && b == b'/' && bytes[i + 1] == b'/' {
+            return &line[..i];
+        }
+        i += 1;
+    }
+    line
+}
 
 /// Computes the whitespace-insensitive body hash of lines `start_line..=end_line` (1-based).
 /// Formatting-only edits (indentation, spacing, blank lines) keep the hash stable, while any
@@ -112,29 +165,44 @@ pub fn compute_symbol_body_hash(lines: &[&str], start_line: usize, end_line: usi
     }
 }
 
-/// Extracts the set of meaningful lowercase tokens (`>= 2` chars, not purely numeric)
-/// from lines `start_line..=end_line` (1-based) of `source`.
-pub fn extract_symbol_body_tokens(
+/// Extracts up to `48` deduplicated meaningful lowercase tokens (`>= 2` chars, not purely numeric,
+/// non-stopword, excluding comments) in exact first-appearance order across `start_line..=end_line`.
+pub fn extract_ordered_symbol_body_tokens(
     lines: &[&str],
     start_line: usize,
     end_line: usize,
-) -> std::collections::BTreeSet<String> {
+) -> Vec<String> {
     let start = start_line.max(1);
     let end = end_line.min(lines.len());
-    let mut out = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut push_tok = |tok: String| {
+        if out.len() >= 48
+            || tok.chars().count() < 2
+            || tok.chars().all(|c| c.is_ascii_digit())
+            || is_body_stopword(&tok)
+        {
+            return;
+        }
+        if seen.insert(tok.clone()) {
+            out.push(tok);
+        }
+    };
     if start <= end {
         for line in &lines[start - 1..end] {
-            for raw in line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+            let code_only = strip_code_line_comment(line);
+            for raw in code_only.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+                if raw.is_empty() {
+                    continue;
+                }
                 if raw.len() >= 4
                     && raw.contains('_')
                     && raw.chars().any(|c| c.is_ascii_alphabetic())
                 {
-                    out.insert(raw.to_ascii_lowercase());
+                    push_tok(raw.to_ascii_lowercase());
                 }
-            }
-            for tok in libredb_index::segment_universal_tokens(line) {
-                if tok.chars().count() >= 2 && !tok.chars().all(|c| c.is_ascii_digit()) {
-                    out.insert(tok);
+                for tok in libredb_index::segment_universal_tokens(raw) {
+                    push_tok(tok);
                 }
             }
         }
@@ -142,8 +210,58 @@ pub fn extract_symbol_body_tokens(
     out
 }
 
-/// Computes up to 8 newly introduced meaningful body tokens across `touched_keys` (`rel_path::sym_name`)
-/// between `old_bytes`/`old_skel` and `new_bytes`/`new_skel`.
+/// Extracts the set of meaningful lowercase tokens (`>= 2` chars, not purely numeric, excluding
+/// comments) from lines `start_line..=end_line` (1-based) of `source`.
+pub fn extract_symbol_body_tokens(
+    lines: &[&str],
+    start_line: usize,
+    end_line: usize,
+) -> std::collections::BTreeSet<String> {
+    extract_ordered_symbol_body_tokens(lines, start_line, end_line)
+        .into_iter()
+        .collect()
+}
+
+fn find_reordered_statement_pair(prev_seq: &[String], new_seq: &[String]) -> Option<(String, String)> {
+    let mut prev_pos: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::with_capacity(prev_seq.len());
+    for (idx, t) in prev_seq.iter().enumerate() {
+        prev_pos.entry(t.as_str()).or_insert(idx);
+    }
+
+    // Prefer pairs where both tokens are compound identifiers (`a_b`), then mixed, then >= 3-char tokens.
+    for tier in 0..3 {
+        for i in 0..new_seq.len() {
+            let a = &new_seq[i];
+            let Some(&pa) = prev_pos.get(a.as_str()) else {
+                continue;
+            };
+            for b in &new_seq[(i + 1)..] {
+                let Some(&pb) = prev_pos.get(b.as_str()) else {
+                    continue;
+                };
+                if pa <= pb {
+                    continue;
+                }
+                let matches_tier = match tier {
+                    0 => a.contains('_') && b.contains('_'),
+                    1 => (a.contains('_') || b.contains('_')) && a.len() >= 3 && b.len() >= 3,
+                    _ => a.len() >= 3 && b.len() >= 3,
+                };
+                if matches_tier {
+                    return Some((a.clone(), b.clone()));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Computes up to 8 structural AST body-token delta cues across `touched_keys` (`rel_path::sym_name`)
+/// between `old_bytes`/`old_skel` and `new_bytes`/`new_skel`:
+/// 1. Added identifiers/tokens (`new \ old`),
+/// 2. Deletion fixes (`avoid_<removed>` when statements/calls were removed without additions),
+/// 3. Reordering fixes (`<a_before_b>` when statement execution order changed with identical tokens).
 /// If an edit only changed punctuation (`;`, `,`, `)`), comments, or whitespace, returns an empty `Vec`.
 pub fn diff_symbol_body_tokens(
     rel_path: &str,
@@ -156,39 +274,59 @@ pub fn diff_symbol_body_tokens(
     if touched_keys.is_empty() {
         return Vec::new();
     }
-    let old_text = old_bytes
-        .and_then(|b| std::str::from_utf8(b).ok())
-        .unwrap_or("");
-    let old_lines: Vec<&str> = old_text.lines().collect();
+    let old_text = old_bytes.and_then(|b| std::str::from_utf8(b).ok());
+    let old_lines: Vec<&str> = old_text.map(|t| t.lines().collect()).unwrap_or_default();
     let new_text = match std::str::from_utf8(new_bytes) {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
     let new_lines: Vec<&str> = new_text.lines().collect();
 
-    let mut old_sym_tokens: std::collections::HashMap<String, std::collections::BTreeSet<String>> =
+    let mut old_sym_seq: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
     if let Some(os) = old_skel {
         for sym in &os.symbols {
+            if matches!(sym.kind.as_str(), "impl" | "mod" | "namespace" | "section") {
+                continue;
+            }
+            let seq = if old_bytes.is_some() {
+                let extracted =
+                    extract_ordered_symbol_body_tokens(&old_lines, sym.start_line, sym.end_line);
+                if extracted.is_empty() && !sym.body_tokens.is_empty() {
+                    sym.body_tokens.clone()
+                } else {
+                    extracted
+                }
+            } else {
+                sym.body_tokens.clone()
+            };
             let key = format!("{rel_path}::{}", sym.qualified_name());
-            old_sym_tokens
-                .entry(key.clone())
-                .or_default()
-                .extend(extract_symbol_body_tokens(&old_lines, sym.start_line, sym.end_line));
+            old_sym_seq.insert(key, seq.clone());
             if sym.container.is_some() {
                 let short_key = format!("{rel_path}::{}", sym.name);
-                old_sym_tokens
-                    .entry(short_key)
-                    .or_default()
-                    .extend(extract_symbol_body_tokens(&old_lines, sym.start_line, sym.end_line));
+                old_sym_seq.entry(short_key).or_insert(seq);
             }
         }
     }
 
     let touched_set: std::collections::HashSet<&str> =
         touched_keys.iter().map(String::as_str).collect();
+    let has_leaf_touched = new_skel.symbols.iter().any(|sym| {
+        if matches!(sym.kind.as_str(), "impl" | "mod" | "namespace" | "section") {
+            return false;
+        }
+        let q_key = format!("{rel_path}::{}", sym.qualified_name());
+        let short_key = format!("{rel_path}::{}", sym.name);
+        touched_set.contains(q_key.as_str()) || touched_set.contains(short_key.as_str())
+    });
+
     let mut added = std::collections::BTreeSet::new();
     for sym in &new_skel.symbols {
+        if has_leaf_touched
+            && matches!(sym.kind.as_str(), "impl" | "mod" | "namespace" | "section")
+        {
+            continue;
+        }
         let q_key = format!("{rel_path}::{}", sym.qualified_name());
         let short_key = format!("{rel_path}::{}", sym.name);
         let matched_key = if touched_set.contains(q_key.as_str()) {
@@ -201,23 +339,76 @@ pub fn diff_symbol_body_tokens(
         let Some(ref key) = matched_key else {
             continue;
         };
-        let new_toks = extract_symbol_body_tokens(&new_lines, sym.start_line, sym.end_line);
-        if let Some(prev_toks) = old_sym_tokens.get(key) {
-            if old_bytes.is_some() {
-                for t in new_toks.difference(prev_toks) {
-                    added.insert(t.clone());
+
+        let new_seq = if !new_lines.is_empty() {
+            extract_ordered_symbol_body_tokens(&new_lines, sym.start_line, sym.end_line)
+        } else {
+            sym.body_tokens.clone()
+        };
+
+        match old_sym_seq.get(key) {
+            Some(prev_seq) if prev_seq.is_empty() => {
+                // Only emit additions for a previously empty body when exact `old_bytes` proved
+                // it was empty; legacy v1.4/v1.5 skeletons lacking `body_tokens` skip when `old_bytes` is `None`.
+                if old_bytes.is_some() {
+                    for t in new_seq {
+                        added.insert(t);
+                    }
                 }
             }
-        } else {
-            for t in new_toks {
-                added.insert(t);
+            Some(prev_seq) => {
+                let prev_set: std::collections::BTreeSet<&str> =
+                    prev_seq.iter().map(String::as_str).collect();
+                let new_set: std::collections::BTreeSet<&str> =
+                    new_seq.iter().map(String::as_str).collect();
+
+                let added_in_sym: Vec<String> = new_seq
+                    .iter()
+                    .filter(|t| !prev_set.contains(t.as_str()))
+                    .cloned()
+                    .collect();
+
+                if !added_in_sym.is_empty() {
+                    for t in added_in_sym {
+                        added.insert(t);
+                    }
+                } else {
+                    let mut removed_in_sym: Vec<String> = prev_seq
+                        .iter()
+                        .filter(|t| t.len() >= 3 && !new_set.contains(t.as_str()))
+                        .cloned()
+                        .collect();
+                    if !removed_in_sym.is_empty() {
+                        removed_in_sym.sort_by(|a, b| {
+                            b.contains('_')
+                                .cmp(&a.contains('_'))
+                                .then_with(|| b.len().cmp(&a.len()))
+                                .then_with(|| a.cmp(b))
+                        });
+                        for tok in removed_in_sym.into_iter().take(4) {
+                            added.insert(format!("avoid_{tok}"));
+                        }
+                    } else if new_seq != *prev_seq {
+                        if let Some((a, b)) = find_reordered_statement_pair(prev_seq, &new_seq) {
+                            added.insert(format!("{a}_before_{b}"));
+                            added.insert(a);
+                            added.insert(b);
+                        }
+                    }
+                }
+            }
+            None => {
+                for t in new_seq {
+                    added.insert(t);
+                }
             }
         }
     }
     let mut out: Vec<String> = added.into_iter().collect();
     out.sort_by(|a, b| {
-        b.contains('_')
-            .cmp(&a.contains('_'))
+        (b.contains("_before_") || b.starts_with("avoid_"))
+            .cmp(&(a.contains("_before_") || a.starts_with("avoid_")))
+            .then_with(|| b.contains('_').cmp(&a.contains('_')))
             .then_with(|| a.cmp(b))
     });
     out.truncate(8);
@@ -289,6 +480,12 @@ impl FileSkeleton {
         let mut symbols = symbols;
         for sym in &mut symbols {
             sym.body_hash = compute_symbol_body_hash(&lines, sym.start_line, sym.end_line);
+            if matches!(sym.kind.as_str(), "impl" | "mod" | "namespace" | "section") {
+                sym.body_tokens = Vec::new();
+            } else {
+                sym.body_tokens =
+                    extract_ordered_symbol_body_tokens(&lines, sym.start_line, sym.end_line);
+            }
         }
 
         let mut skel = Self {
@@ -777,6 +974,7 @@ fn extract_python_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContr
             start_line,
             end_line: resolved_end,
             body_hash: 0,
+            body_tokens: Vec::new(),
         });
     }
     out
@@ -827,6 +1025,7 @@ fn extract_smali_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContra
                         start_line: idx + 1,
                         end_line: total_lines.max(idx + 1),
                         body_hash: 0,
+                        body_tokens: Vec::new(),
                     });
                 }
             }
@@ -863,6 +1062,7 @@ fn extract_smali_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContra
                             start_line: idx + 1,
                             end_line: idx + 1,
                             body_hash: 0,
+                            body_tokens: Vec::new(),
                         });
                     }
                 }
@@ -892,6 +1092,7 @@ fn extract_smali_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContra
                             start_line: idx + 1,
                             end_line,
                             body_hash: 0,
+                            body_tokens: Vec::new(),
                         });
                     }
                 }
@@ -1044,6 +1245,7 @@ fn extract_asm_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContract
             start_line: start,
             end_line,
             body_hash: 0,
+            body_tokens: Vec::new(),
         });
     }
     out
@@ -1097,6 +1299,7 @@ fn extract_markdown_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolCon
             start_line: start,
             end_line,
             body_hash: 0,
+            body_tokens: Vec::new(),
         });
     }
     out
@@ -1182,6 +1385,7 @@ fn extract_makefile_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolCon
             start_line: start,
             end_line: end_line.min(total_lines.max(start)),
             body_hash: 0,
+            body_tokens: Vec::new(),
         });
     }
     out
@@ -1300,6 +1504,7 @@ fn extract_end_block_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolCo
             start_line: idx + 1,
             end_line: end_line.min(total_lines.max(idx + 1)),
             body_hash: 0,
+            body_tokens: Vec::new(),
         });
     }
 
@@ -1382,6 +1587,7 @@ fn extract_sql_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContract
             start_line: idx + 1,
             end_line: end_line.min(total_lines.max(1)),
             body_hash: 0,
+            body_tokens: Vec::new(),
         });
     }
     out
@@ -1422,6 +1628,7 @@ fn extract_powershell_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolC
                         start_line: idx + 1,
                         end_line,
                         body_hash: 0,
+                        body_tokens: Vec::new(),
                     });
                 }
                 break;
@@ -1474,6 +1681,7 @@ fn extract_shell_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContra
                 start_line: idx + 1,
                 end_line,
                 body_hash: 0,
+                body_tokens: Vec::new(),
             });
         }
     }
@@ -1685,6 +1893,7 @@ fn extract_brace_symbols(lines: &[&str], total_lines: usize, lang: &str) -> Vec<
                         start_line,
                         end_line,
                         body_hash: 0,
+                        body_tokens: Vec::new(),
                     });
                     pending_doc.clear();
                     continue;
