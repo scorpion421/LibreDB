@@ -548,6 +548,44 @@ pub fn record_error_cue(
     Ok(true)
 }
 
+/// Extracts up to `8` meaningful resolution tokens from prose `fix_directive` text without
+/// enforcing the short symbol-query length/path restrictions of `extract_cue_tokens`.
+fn extract_fix_directive_tokens(directive: &str) -> Vec<String> {
+    let trimmed = directive.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let mut tokens: Vec<String> = Vec::new();
+    let mut push_unique = |tok: String| {
+        if !tok.is_empty() && !tokens.contains(&tok) {
+            tokens.push(tok);
+        }
+    };
+    for ident in trimmed.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+        if ident.len() < 4 || !ident.chars().any(|c| c.is_ascii_alphabetic()) {
+            continue;
+        }
+        let low = ident.to_ascii_lowercase();
+        if is_error_boilerplate(&low) {
+            continue;
+        }
+        if ident.contains('_') || ident.chars().any(|c| c.is_ascii_uppercase()) {
+            push_unique(low);
+        }
+    }
+    for sub in libredb_index::segment_universal_tokens(trimmed) {
+        if sub.chars().count() < 3 || sub.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        if is_error_boilerplate(&sub) {
+            continue;
+        }
+        push_unique(sub);
+    }
+    tokens.truncate(8);
+    tokens
+}
+
 /// Explicitly records a verified `(error_text -> fix_directive)` resolution (via CLI/MCP) in
 /// `sys::error_pitfall_book` after passing the Stage 1 banality filter.
 pub fn learn_explicit_error_resolution(
@@ -562,7 +600,7 @@ pub fn learn_explicit_error_resolution(
         bump_learning_counters(db, |c| c.trivial_errors_filtered += 1);
         return Ok(None);
     }
-    let fix_tokens = extract_cue_tokens(fix_directive);
+    let fix_tokens = extract_fix_directive_tokens(fix_directive);
     if fix_tokens.is_empty() {
         bump_learning_counters(db, |c| c.trivial_errors_filtered += 1);
         return Ok(None);

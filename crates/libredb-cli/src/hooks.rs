@@ -437,8 +437,14 @@ pub(crate) fn evaluate_pre_tool_payload(payload: &Value, global_ldb_opt: Option<
 
         if target_file != "<tool_input>" && !is_test_or_scratch_path(target_file) {
             let target_path = Path::new(target_file);
-            let _ =
-                record_working_set_edit(target_path, tool_name, &args, global_db_ro.as_deref());
+            let cid_transcript = resolve_cid_and_transcript(payload);
+            let _ = record_working_set_edit(
+                target_path,
+                tool_name,
+                &args,
+                global_db_ro.as_deref(),
+                cid_transcript.as_ref().map(|(c, p)| (c.as_str(), p.as_path())),
+            );
         }
     }
 
@@ -571,6 +577,12 @@ pub(crate) fn evaluate_pre_invocation_payload(
                     }));
                 }
             }
+        }
+    }
+
+    if let (Some(ref cid), Some(ref tp)) = (&cid_opt, &transcript_opt) {
+        if tp.is_file() {
+            harvest_recent_transcript_errors(&proj_db, cid, tp);
         }
     }
 
@@ -1709,6 +1721,7 @@ fn record_working_set_edit(
     tool_name: &str,
     args: &Value,
     global_db: Option<&LibreDb>,
+    cid_transcript: Option<(&str, &Path)>,
 ) -> Result<(), String> {
     let Some(root) = find_workspace_root(target_file) else {
         return Ok(());
@@ -1733,6 +1746,14 @@ fn record_working_set_edit(
             "global customizations.ldb is required to seal migrated workspace".to_owned()
         })?;
         crate::security::seal_workspace_memory(gdb, &proj_db, &root)?;
+    }
+
+    // Harvest any unseen non-banal transcript/task errors BEFORE staging the edit so
+    // error cue timestamps causally precede the staged TentativeFileEdit (`edit_ns >= recorded_at_ns`).
+    if let Some((cid, tp)) = cid_transcript {
+        if tp.is_file() {
+            harvest_recent_transcript_errors(&proj_db, cid, tp);
+        }
     }
 
     // Stage tentative predicted edit in `WorkingSet` (`tentative_edit::<rel>`) without mutating
@@ -1807,6 +1828,290 @@ fn record_working_set_edit(
         .map_err(|e| e.to_string())?;
     let _ = proj_db.maybe_auto_compact();
     Ok(())
+}
+
+/// Reads the trailing `<= max_bytes` of `path`, discarding the truncated leading line when seeking
+/// past offset `0`.
+fn read_file_tail_lines(path: &Path, max_bytes: u64) -> Option<Vec<String>> {
+    use std::io::{Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    if len == 0 {
+        return None;
+    }
+    let read_len = len.min(max_bytes);
+    let offset = len - read_len;
+    f.seek(SeekFrom::Start(offset)).ok()?;
+    let mut buf = vec![0u8; read_len as usize];
+    f.read_exact(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf);
+    let mut lines: Vec<String> = text.lines().map(ToOwned::to_owned).collect();
+    if offset > 0 && !lines.is_empty() {
+        lines.remove(0);
+    }
+    Some(lines)
+}
+
+fn strip_ci_log_prefix(raw_line: &str) -> &str {
+    let after_step = if let Some(pos) = raw_line.find("\tUNKNOWN STEP\t") {
+        &raw_line[pos + "\tUNKNOWN STEP\t".len()..]
+    } else {
+        raw_line
+    };
+    let trimmed = after_step.trim_start();
+    if let Some((first_tok, rest)) = trimmed.split_once(' ') {
+        if first_tok.starts_with("20")
+            && first_tok.ends_with('Z')
+            && first_tok.contains('T')
+            && first_tok.len() >= 20
+        {
+            return rest;
+        }
+    }
+    after_step
+}
+
+fn is_numbered_source_line(t: &str) -> bool {
+    t.split_once(": ")
+        .is_some_and(|(num, _)| !num.is_empty() && num.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Extracts up to `4` deduplicated error/panic diagnostic lines from command or CI log text while
+/// ignoring numbered source-code listings (`"631: ..."`).
+pub(crate) fn extract_error_diagnostics_from_command_output(text: &str) -> Vec<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = Vec::new();
+    let push_unique = |out: &mut Vec<String>, cand: String| {
+        if !cand.is_empty() && !out.contains(&cand) && out.len() < 4 {
+            out.push(cand);
+        }
+    };
+
+    for i in 0..lines.len() {
+        if out.len() >= 4 {
+            break;
+        }
+        let t = strip_ci_log_prefix(lines[i]).trim();
+        if t.is_empty()
+            || is_numbered_source_line(t)
+            || t.starts_with("Task Description:")
+            || t.starts_with("CommandLine:")
+            || t.starts_with("\"CommandLine\"")
+            || t.starts_with(".\\")
+            || t.starts_with("./")
+            || t.contains("learn-error ")
+        {
+            continue;
+        }
+        if (t.starts_with("thread '") || t.starts_with("panicked at "))
+            && t.contains("panicked at ")
+        {
+            let mut next_msg = None;
+            for j in (i + 1)..=(i + 2).min(lines.len().saturating_sub(1)) {
+                let nt = strip_ci_log_prefix(lines[j]).trim();
+                if nt.is_empty()
+                    || is_numbered_source_line(nt)
+                    || nt.starts_with("note: ")
+                    || nt.starts_with("thread '")
+                    || nt.starts_with("---")
+                    || nt == "failures:"
+                {
+                    continue;
+                }
+                next_msg = Some(nt);
+                break;
+            }
+            let combined = match next_msg {
+                Some(nt) => format!("{t} {nt}"),
+                None => t.to_owned(),
+            };
+            push_unique(&mut out, combined);
+            continue;
+        }
+
+        let is_compiler_or_runtime_err = t.starts_with("error[E")
+            || ((t.starts_with("error: ") || t.starts_with("Error: "))
+                && !t.starts_with("error: test failed, to rerun")
+                && !t.contains("0 errors"))
+            || t.starts_with("SyntaxError:")
+            || t.starts_with("TypeError:")
+            || t.starts_with("ReferenceError:")
+            || t.starts_with("AssertionError:")
+            || t.starts_with("ImportError:");
+        if is_compiler_or_runtime_err {
+            push_unique(&mut out, t.to_owned());
+        }
+    }
+    out
+}
+
+/// Resolves local `file:///` task log URIs strictly contained in the conversation's non-symlink
+/// `.system_generated/tasks` sibling directory.
+fn collect_contained_task_log_paths(content: &str, transcript_path: &Path) -> Vec<PathBuf> {
+    let Some(sys_gen_dir) = transcript_path.parent().and_then(|p| p.parent()) else {
+        return Vec::new();
+    };
+    let tasks_dir = sys_gen_dir.join("tasks");
+    if std::fs::symlink_metadata(&tasks_dir)
+        .map_or(true, |m| m.file_type().is_symlink() || !m.is_dir())
+    {
+        return Vec::new();
+    }
+    let Ok(canon_tasks) = std::fs::canonicalize(&tasks_dir) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    let mut rest = content;
+    while let Some(pos) = rest.find("file:///") {
+        let after_scheme = &rest[pos + "file:///".len()..];
+        let uri_end = after_scheme
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '>' | ')' | ']'))
+            .unwrap_or(after_scheme.len());
+        let raw_path_part = &after_scheme[..uri_end];
+        rest = &after_scheme[uri_end..];
+
+        let raw_os = if raw_path_part.as_bytes().get(1) == Some(&b':') {
+            raw_path_part.to_owned()
+        } else {
+            format!("/{raw_path_part}")
+        };
+        let norm_forward = raw_os.replace('\\', "/");
+        if !norm_forward.contains(".system_generated/tasks/task-")
+            || !norm_forward.ends_with(".log")
+        {
+            continue;
+        }
+        let cand = PathBuf::from(&raw_os);
+        let Some(fname) = cand.file_name().and_then(|f| f.to_str()) else {
+            continue;
+        };
+        if !fname.starts_with("task-") || !fname.ends_with(".log") {
+            continue;
+        }
+        if std::fs::symlink_metadata(&cand)
+            .map_or(true, |m| m.file_type().is_symlink() || !m.is_file())
+        {
+            continue;
+        }
+        if let Some(parent) = cand.parent() {
+            if std::fs::canonicalize(parent).ok().as_ref() == Some(&canon_tasks)
+                && !out.contains(&cand)
+            {
+                out.push(cand);
+            }
+        }
+    }
+    out
+}
+
+/// Incrementally harvests non-banal errors and panics from the trailing window of `transcript_path`
+/// (plus strictly contained `.system_generated/tasks/task-*.log` files) into `sys::pending_error_cues`
+/// using seal-neutral `NodeKind::TranscriptCursor` (`sys::error_harvest_cursor::{cid}`).
+fn harvest_recent_transcript_errors(proj_db: &LibreDb, cid: &str, transcript_path: &Path) {
+    let Some(lines) = read_file_tail_lines(transcript_path, 65_536) else {
+        return;
+    };
+    let cursor_key = format!("sys::error_harvest_cursor::{cid}");
+    let last_step_index = proj_db
+        .get_by_key(NodeKind::TranscriptCursor, &cursor_key)
+        .ok()
+        .and_then(|rec| serde_json::from_slice::<Value>(&rec.payload).ok())
+        .and_then(|v| v.get("last_step_index").and_then(Value::as_u64))
+        .unwrap_or(0);
+
+    let start_idx = lines
+        .iter()
+        .rposition(|l| is_compaction_checkpoint_line(l))
+        .map_or(0, |k| k + 1);
+    let mut max_step_index = last_step_index;
+    let mut queued_cues: Vec<(String, &'static str)> = Vec::new();
+    let mut enqueue = |msg: String, hint: &'static str| {
+        if !msg.is_empty()
+            && !queued_cues.iter().any(|(m, _)| m == &msg)
+            && queued_cues.len() < 4
+        {
+            queued_cues.push((msg, hint));
+        }
+    };
+
+    for line in &lines[start_idx..] {
+        let Ok(obj) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let step_idx = obj.get("step_index").and_then(Value::as_u64).unwrap_or(0);
+        if step_idx > 0 && step_idx <= last_step_index {
+            continue;
+        }
+        max_step_index = max_step_index.max(step_idx);
+
+        // Source A: explicit error parameters inside planner MCP/pulse calls.
+        if obj.get("type").and_then(Value::as_str) == Some("PLANNER_RESPONSE") {
+            if let Some(tcs) = obj.get("tool_calls").and_then(Value::as_array) {
+                for tc in tcs {
+                    let raw_args = tc
+                        .get("args")
+                        .or_else(|| tc.get("arguments"))
+                        .unwrap_or(&Value::Null);
+                    let inner = raw_args.get("Arguments").unwrap_or(raw_args);
+                    let err_opt = inner
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .or_else(|| {
+                            inner
+                                .get("learn_error")
+                                .and_then(|le| le.get("error"))
+                                .and_then(Value::as_str)
+                        });
+                    if let Some(err_s) = err_opt.map(str::trim).filter(|s| !s.is_empty()) {
+                        enqueue(err_s.to_owned(), "pulse");
+                    }
+                }
+            }
+        }
+
+        // Source B: compiler errors, runtime errors, and test panics from command/task logs.
+        let content = obj.get("content").and_then(Value::as_str).unwrap_or("");
+        let is_read_file_view = content.contains("\nShowing lines ")
+            && !content.contains("UNKNOWN STEP")
+            && !content.contains("Command exited with code ")
+            && !content.contains("Command output:")
+            && !content.contains("Log output:");
+        if !is_read_file_view
+            && (content.contains("Command output:")
+                || content.contains("Log output:")
+                || content.contains("Command exited with code ")
+                || content.contains("panicked at ")
+                || content.contains("error[E")
+                || content.contains("Task logs are available at: "))
+        {
+            for diag in extract_error_diagnostics_from_command_output(content) {
+                enqueue(diag, "hook-transcript");
+            }
+            for log_path in collect_contained_task_log_paths(content, transcript_path) {
+                if let Some(log_lines) = read_file_tail_lines(&log_path, 16_384) {
+                    let joined = log_lines.join("\n");
+                    for diag in extract_error_diagnostics_from_command_output(&joined) {
+                        enqueue(diag, "hook-transcript");
+                    }
+                }
+            }
+        }
+    }
+
+    for (diag, hint) in queued_cues {
+        let _ = libredb_cognitive::record_error_cue(proj_db, &diag, Some(hint));
+    }
+    if max_step_index > last_step_index {
+        let cur_json = json!({ "last_step_index": max_step_index });
+        if let Ok(bytes) = serde_json::to_vec(&cur_json) {
+            let _ = proj_db.put(
+                WriteRequest::new(NodeKind::TranscriptCursor, bytes)
+                    .with_key(cursor_key)
+                    .with_importance(32),
+            );
+        }
+    }
 }
 
 fn resolve_hook_workspace(payload: &Value, transcript_opt: Option<&Path>) -> Option<PathBuf> {
@@ -2691,6 +2996,176 @@ mod tests {
         assert!(
             !sys_msg2.contains("migration-lock-guard"),
             "Non-matching prompt must not inject the reflex:\n{sys_msg2}"
+        );
+
+        let _ = fs::remove_dir_all(&base_dir);
+    }
+
+    #[test]
+    fn pre_tool_use_harvests_transcript_command_errors_and_binds_verified_edit_into_pitfall_book() {
+        let base_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join(format!(
+                "libredb_hook_err_harvest_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos())
+            ));
+        let ws_repo = base_dir.join("repo");
+        fs::create_dir_all(ws_repo.join("src")).unwrap();
+        fs::create_dir_all(ws_repo.join(".agents")).unwrap();
+        fs::write(
+            ws_repo.join("Cargo.toml"),
+            "[package]\nname = \"err_harvest\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let src_path = ws_repo.join("src").join("lib.rs");
+        let orig_src = "pub fn hard_kill_os_process() {\n    drop_stdin();\n}\n";
+        fs::write(&src_path, orig_src).unwrap();
+
+        let global_path = base_dir.join("customizations.ldb");
+        let proj_ldb = ws_repo.join(".agents").join("memory.ldb");
+        {
+            let gdb = libredb_core::LibreDb::open(&global_path).unwrap();
+            let pdb = std::sync::Arc::new(libredb_core::LibreDb::open(&proj_ldb).unwrap());
+            libredb_cognitive::index_workspace(&pdb, &ws_repo, false).unwrap();
+            crate::security::seal_workspace_memory(&gdb, &pdb, &ws_repo).unwrap();
+        }
+
+        let logs_dir = base_dir.join(".system_generated").join("logs");
+        let tasks_dir = base_dir.join(".system_generated").join("tasks");
+        fs::create_dir_all(&logs_dir).unwrap();
+        fs::create_dir_all(&tasks_dir).unwrap();
+        let transcript_path = logs_dir.join("transcript.jsonl");
+        let task_log_path = tasks_dir.join("task-42.log");
+        fs::write(
+            &task_log_path,
+            "running 1 test\ntest e2e_sigkill ... FAILED\n",
+        )
+        .unwrap();
+        let task_uri = format!(
+            "file:///{}",
+            task_log_path
+                .to_string_lossy()
+                .replace('\\', "/")
+                .trim_start_matches('/')
+        );
+
+        let lines = [
+            json!({
+                "step_index": 1,
+                "type": "GENERIC",
+                "content": "Created At: 2026-11-14T10:00:00Z\nShowing lines 1-20 of 20\n10: error: expected ';', found '}'\n"
+            })
+            .to_string(),
+            json!({
+                "step_index": 2,
+                "type": "GENERIC",
+                "content": "Command output:\nerror: expected ';', found '}'\n"
+            })
+            .to_string(),
+            json!({
+                "step_index": 3,
+                "type": "GENERIC",
+                "content": format!(
+                    "Task logs are available at: {task_uri}\nCommand output:\nTask Description: .\\target\\release\\libredb.exe learn-error \"thread 'x' panicked at y:1:1\"\nthread 'e2e_sigkill' panicked at crates/foo.rs:275:5:\nReal OS SIGKILL MUST bypass Drop!\n"
+                )
+            })
+            .to_string(),
+        ];
+        fs::write(&transcript_path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let new_src = "pub fn hard_kill_os_process() {\n    let keep_stdin_open_until_killed = stdin_take();\n    kill_and_wait(keep_stdin_open_until_killed);\n}\n";
+        let pre_tool_payload = json!({
+            "conversationId": "conv-hook-err-harvest",
+            "transcriptPath": transcript_path.to_string_lossy().to_string(),
+            "workspacePaths": [ws_repo.to_string_lossy().to_string()],
+            "toolName": "edit_file",
+            "toolArgs": {
+                "Path": src_path.to_string_lossy().to_string(),
+                "Target": "drop_stdin();",
+                "Replacement": "let keep_stdin_open_until_killed = stdin_take();\n    kill_and_wait(keep_stdin_open_until_killed);"
+            }
+        });
+        let pre_tool_out =
+            super::evaluate_pre_tool_payload(&pre_tool_payload, Some(&global_path));
+        assert_eq!(pre_tool_out["decision"], "allow");
+
+        let rep_mid = {
+            let pdb_mid = libredb_core::LibreDb::open(&proj_ldb).unwrap();
+            libredb_cognitive::learning_state_report(&pdb_mid, 10)
+        };
+        assert!(
+            rep_mid.counters.trivial_errors_filtered >= 1,
+            "Banal ';' slip in command output must be Stage-1 filtered: {:?}",
+            rep_mid.counters
+        );
+        assert_eq!(
+            rep_mid.pending_errors.len(),
+            1,
+            "Expected exactly 1 harvested non-banal panic cue (and read_file ignored): {:?}",
+            rep_mid.pending_errors
+        );
+        let cues_before_second_pass = rep_mid.counters.error_cues_recorded;
+
+        // Apply the verified edit to disk, then invoke PreInvocation to reconcile and bind.
+        fs::write(&src_path, new_src).unwrap();
+        let pre_inv_payload = json!({
+            "conversationId": "conv-hook-err-harvest",
+            "transcriptPath": transcript_path.to_string_lossy().to_string(),
+            "workspacePaths": [ws_repo.to_string_lossy().to_string()],
+            "prompt": "Check the test result"
+        });
+        let _ = super::evaluate_pre_invocation_payload(&pre_inv_payload, Some(&global_path))
+            .unwrap();
+
+        let rep_after = {
+            let pdb_after = libredb_core::LibreDb::open(&proj_ldb).unwrap();
+            libredb_cognitive::learning_state_report(&pdb_after, 10)
+        };
+        assert_eq!(
+            rep_after.counters.pitfalls_learned, 1,
+            "Verified structural fix must bind the harvested transcript panic cue into error_pitfall_book: {:?}",
+            rep_after
+        );
+        assert_eq!(rep_after.learned_pitfalls.len(), 1);
+        assert!(
+            rep_after.learned_pitfalls[0]
+                .resolution_tokens
+                .iter()
+                .any(|t| t == "keep_stdin_open_until_killed"),
+            "Expected structural fix token 'keep_stdin_open_until_killed' in pitfall resolution_tokens: {:?}",
+            rep_after.learned_pitfalls[0]
+        );
+
+        // Re-running PreInvocation must not re-harvest already processed transcript steps and
+        // must keep the workspace hmac-sha256:v4 trust seal valid.
+        let pre_inv_payload_2 = json!({
+            "conversationId": "conv-hook-err-harvest",
+            "transcriptPath": transcript_path.to_string_lossy().to_string(),
+            "workspacePaths": [ws_repo.to_string_lossy().to_string()],
+            "prompt": "Another prompt"
+        });
+        let _ = super::evaluate_pre_invocation_payload(&pre_inv_payload_2, Some(&global_path))
+            .unwrap();
+        let rep_recheck = {
+            let pdb_recheck = libredb_core::LibreDb::open(&proj_ldb).unwrap();
+            libredb_cognitive::learning_state_report(&pdb_recheck, 10)
+        };
+        assert_eq!(
+            rep_recheck.counters.error_cues_recorded, cues_before_second_pass,
+            "Already-harvested transcript steps must not be re-recorded"
+        );
+        let trusted_after = {
+            let gdb_recheck = libredb_core::LibreDb::open(&global_path).unwrap();
+            crate::security::is_workspace_memory_trusted(Some(&gdb_recheck), &ws_repo)
+        };
+        assert!(
+            trusted_after,
+            "Transcript error harvesting and pitfall learning must preserve hmac-sha256:v4 trust seal"
         );
 
         let _ = fs::remove_dir_all(&base_dir);

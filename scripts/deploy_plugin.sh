@@ -1,5 +1,5 @@
 #!/bin/sh
-# POSIX / Linux / macOS Antigravity plugin installer for LibreDB (v1.5.0)
+# POSIX / Linux / macOS Antigravity plugin installer for LibreDB (v1.5.1)
 # Enterprise-neutral by default (never installs personal rules or imports legacy SQLite unless requested).
 set -eu
 
@@ -134,7 +134,7 @@ cat > "$PLUGIN_DIR/plugin.json" <<'EOF'
 {
   "name": "libredb",
   "displayName": "LibreDB Cognitive Memory",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "description": "Enterprise-ready Rust cognitive memory, token-economy analytics & MCP code graph: single-file LIBREDB1 storage, silent SQLite auto-porter, sub-2ms hooks, content-bound HMAC-SHA256 workspace trust seals, ChaCha20-Poly1305 OS credential vault, zero-hardcode topology & Dalvik/DI causal code graph, built-in benchmarks & token-savings reports, and multi-remote Git/Gitea/GitHub automation.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
@@ -397,7 +397,7 @@ EOF
 
 # 7. Write user-facing README.md inside plugin bundle
 cat > "$PLUGIN_DIR/README.md" <<'EOF'
-# LibreDB cognitive memory plugin (v1.5.0)
+# LibreDB cognitive memory plugin (v1.5.1)
 
 Enterprise-ready standalone Rust cognitive memory, token-economy analytics & code-graph engine for `Antigravity`:
 - `libredb-mcp`: 3-tool multi-workspace cognitive memory & 25+ language zero-hardcode topology + exact Dalvik/DI + Git co-change `Lift` code-graph server with `< 0.5 ms` `locate`, closed-loop causal `Search-Miss -> Verified-Edit` bridging (body-hash diffs + calibrated `BridgeScorer`), procedural `Failure -> Fix -> Pass` pitfall learning (2-stage banality filter), situational reflex superseding + empirical Laplace utility revision, batched `impact` (`symbols`) & `fim` (`slices`), tentative-verified `PreToolUse` ACID symbol shifting, contract-drift grounded reflexes, subagent-aware priority-budgeted `BM25` `PreInvocation` hydration, zero-I/O RAM session delta, and `[Zero-Repeat Skeleton]` deduplication.
@@ -438,6 +438,6 @@ PYEOF
     fi
 fi
 
-echo "[OK] Deployed LibreDB v1.5.0 standalone binary to: $BIN_DIR (profile=$PROFILE)"
+echo "[OK] Deployed LibreDB v1.5.1 standalone binary to: $BIN_DIR (profile=$PROFILE)"
 echo "[OK] Hydrated and modernized global store at: $GLOBAL_LDB"
 echo "[OK] Installed complete Antigravity plugin at: $PLUGIN_DIR"

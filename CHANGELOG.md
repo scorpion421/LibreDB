@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.1] - 2026-11-14
+
+### Fixed
+
+- Fixed a multi-core Linux `SIGKILL` vs `stdin` pipe-`EOF` scheduler race in `LiveMcpSubprocess::hard_kill_os_process` (`crates/libredb-cli/tests/military_grade_mcp_security.rs`) by keeping `ChildStdin` open across `child.kill()` and `child.wait()` so the MCP child process remains blocked on `stdin` and cannot wake up to run clean `Drop` cleanup before `SIGKILL` terminates it.
+- Wired autonomous incremental transcript and task-log error harvesting (`harvest_recent_transcript_errors`, `extract_error_diagnostics_from_command_output`, and `collect_contained_task_log_paths` in `crates/libredb-cli/src/hooks.rs`) into `PreToolUse` (before `stage_tentative_file_edit`) and `PreInvocation` (before `reconcile_tentative_edits`) using seal-neutral `NodeKind::TranscriptCursor` (`sys::error_harvest_cursor::{cid}`), closing the `Failure -> Verified-Edit -> Pitfall Learned` loop automatically on file edits while ignoring `read_file` listings, echoed command-line / `Task Description:` wrappers, and banal syntax slips (and matching capitalized `Error:` CLI failures alongside compiler `error:`/`error[E...]`); added regression test `pre_tool_use_harvests_transcript_command_errors_and_binds_verified_edit_into_pitfall_book`.
+- Fixed `learn_explicit_error_resolution` (`crates/libredb-cognitive/src/learning.rs`) calling the short symbol-query tokenizer (`extract_cue_tokens`) on prose fix directives, adding `extract_fix_directive_tokens` so `learn-error` and MCP `learn_error` directives longer than 160 bytes or referencing file paths (`/` or `\`) retain their resolution tokens instead of being dropped at Stage 1.
+
 ## [1.5.0] - 2026-11-13
 
 ### Added

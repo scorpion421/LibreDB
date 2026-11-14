@@ -148,12 +148,15 @@ impl LiveMcpSubprocess {
     }
 
     fn hard_kill_os_process(mut self) {
-        let _ = self.stdin.take();
+        // Keep `stdin` open across `kill()` and `wait()` so the child stays blocked on `stdin`
+        // and cannot wake up on pipe `EOF` (`Drop` cleanup) before `SIGKILL` / `TerminateProcess` arrives.
+        let keep_stdin_open_until_killed = self.stdin.take();
         // Real OS uncatchable kill: `SIGKILL` on Unix, `TerminateProcess` on Windows.
         self.child
             .kill()
             .expect("Failed to issue OS SIGKILL / TerminateProcess");
         let _ = self.child.wait().expect("Failed waiting on killed child");
+        drop(keep_stdin_open_until_killed);
     }
 
     fn shutdown_clean(mut self) {
