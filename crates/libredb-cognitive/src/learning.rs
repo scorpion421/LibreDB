@@ -381,6 +381,31 @@ const NON_CAUSAL_ERROR_NOISE_PATTERNS: &[&str] = &[
     "unknown argument '--help'",
     "for more information, try '--help'",
     "check cli help.",
+    "unknown subcommand",
+    "unknown flag",
+    " flag '--",
+    " flag \"--",
+    "run 'libredb --help'",
+    "--help' for more",
+    "node id ",
+    " not found in skill ",
+    "os error 5",
+    "os error 32",
+    "access is denied",
+    "zugriff verweigert",
+    "being used by another process",
+    "der prozess kann nicht auf die datei zugreifen",
+];
+
+const DEAD_CODE_NOISE_PATTERNS: &[&str] = &[
+    "is never used",
+    "never constructed",
+    "never read",
+    "unused import",
+    "unused variable",
+    "unused_mut",
+    "dead_code",
+    "warning: ",
 ];
 
 const ERROR_BOILERPLATE_WORDS: &[&str] = &[
@@ -392,7 +417,9 @@ const ERROR_BOILERPLATE_WORDS: &[&str] = &[
     "quote", "unterminated", "character", "indent", "indentation", "whitespace", "mismatched",
     "mismatch", "expression", "statement", "declaration", "identifier", "type", "types",
     "compile", "previous", "errors", "warnings", "aborting", "due", "waiting", "jobs",
-    "finish", "flag", "unknown", "usage", "check",
+    "finish", "flag", "unknown", "usage", "check", "takes", "arguments", "argument",
+    "supplied", "function", "method", "trait", "bound", "satisfied", "falling", "back",
+    "subcommand",
 ];
 
 fn extract_error_code(text: &str) -> Option<String> {
@@ -488,12 +515,58 @@ pub fn is_non_causal_error_noise(error_text: &str) -> bool {
         .any(|p| lc.contains(p))
 }
 
+fn is_dead_code_or_unused_diagnostic(lc: &str) -> bool {
+    DEAD_CODE_NOISE_PATTERNS.iter().any(|p| lc.contains(p))
+}
+
+fn extract_backticked_identifiers(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find('`') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('`') else {
+            break;
+        };
+        let raw = after[..close].trim();
+        rest = &after[close + 1..];
+        if raw.is_empty() || raw.starts_with('-') || raw.contains(char::is_whitespace) {
+            continue;
+        }
+        let mut push_ident = |cand: &str| {
+            let clean = cand.trim_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '_'));
+            if clean.len() >= 3
+                && clean
+                    .bytes()
+                    .next()
+                    .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+                && clean.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            {
+                let low = clean.to_ascii_lowercase();
+                if !out.contains(&low) {
+                    out.push(low);
+                }
+            }
+        };
+        push_ident(raw);
+        if let Some((_, tail)) = raw.rsplit_once("::") {
+            push_ident(tail);
+        }
+        if let Some((_, tail)) = raw.rsplit_once('.') {
+            push_ident(tail);
+        }
+    }
+    out
+}
+
 pub fn is_banal_syntax_error(error_text: &str) -> bool {
     let trimmed = error_text.trim();
     if is_non_causal_error_noise(trimmed) {
         return true;
     }
     let lc = trimmed.to_ascii_lowercase();
+    if is_dead_code_or_unused_diagnostic(&lc) {
+        return true;
+    }
     let (code_opt, specific_tokens, _) = extract_error_signature(trimmed);
     if code_opt.is_none() && specific_tokens.is_empty() {
         return true;
@@ -1419,6 +1492,129 @@ pub(crate) fn learn_from_verified_edit(db: &LibreDb, ev: &EditEvidence) -> usize
     total_learned
 }
 
+fn is_error_code_token(tok: &str, cue_code: Option<&str>) -> bool {
+    if cue_code.is_some_and(|ec| ec.eq_ignore_ascii_case(tok)) {
+        return true;
+    }
+    let bytes = tok.as_bytes();
+    let alpha_prefix = bytes.iter().take_while(|b| b.is_ascii_alphabetic()).count();
+    let digit_suffix = bytes[alpha_prefix..]
+        .iter()
+        .filter(|b| b.is_ascii_digit())
+        .count();
+    (1..=3).contains(&alpha_prefix)
+        && digit_suffix >= 3
+        && alpha_prefix + digit_suffix == bytes.len()
+}
+
+fn push_anchor_token(tok: &str, out: &mut HashSet<String>) {
+    let low = tok.trim().to_ascii_lowercase();
+    if low.chars().count() < 2 {
+        return;
+    }
+    out.insert(low.clone());
+    for seg in libredb_index::segment_universal_tokens(&low) {
+        if seg.chars().count() >= 2 {
+            out.insert(seg);
+        }
+    }
+}
+
+fn collect_edit_anchor_sets(
+    db: &LibreDb,
+    ev: &EditEvidence,
+) -> (HashSet<String>, HashSet<String>, HashSet<String>) {
+    let rel_path_lc = ev.rel_path.to_ascii_lowercase();
+    let mut rel_path_tokens: HashSet<String> = HashSet::new();
+    for part in rel_path_lc.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+        if part.len() >= 3 {
+            rel_path_tokens.insert(part.to_owned());
+        }
+    }
+    for seg in libredb_index::segment_universal_tokens(&rel_path_lc) {
+        if seg.chars().count() >= 3 {
+            rel_path_tokens.insert(seg);
+        }
+    }
+
+    let mut touched_syms_lc: HashSet<String> = HashSet::new();
+    let mut touched_tails_no_line: HashSet<String> = HashSet::new();
+    let mut touched_exact_keys: HashSet<String> = HashSet::new();
+    let mut anchor_tokens: HashSet<String> = HashSet::new();
+
+    for sym in &ev.touched {
+        touched_exact_keys.insert(sym.to_ascii_lowercase());
+        touched_exact_keys.insert(strip_line_disambiguator(sym).to_ascii_lowercase());
+        let tail = sym.split_once("::").map(|(_, t)| t).unwrap_or(sym);
+        let tail_no_line = strip_line_disambiguator(tail).to_ascii_lowercase();
+        if !tail_no_line.is_empty() {
+            touched_tails_no_line.insert(tail_no_line.clone());
+            touched_syms_lc.insert(tail_no_line.clone());
+            push_anchor_token(&tail_no_line, &mut anchor_tokens);
+            if let Some((_, leaf)) = tail_no_line.rsplit_once("::") {
+                if !leaf.is_empty() {
+                    touched_syms_lc.insert(leaf.to_owned());
+                    push_anchor_token(leaf, &mut anchor_tokens);
+                }
+            }
+        }
+    }
+    for tok in &ev.added_body_tokens {
+        push_anchor_token(tok, &mut anchor_tokens);
+    }
+
+    let skel_key = format!("{}{}", crate::skeleton::SKELETON_KEY_PREFIX, ev.rel_path);
+    if let Ok(rec) = db.get_by_key(NodeKind::WorkingSet, &skel_key) {
+        if let Ok(skel) = serde_json::from_slice::<FileSkeleton>(&rec.payload) {
+            for sym in &skel.symbols {
+                let qname = sym.qualified_name().to_ascii_lowercase();
+                let sname = sym.name.to_ascii_lowercase();
+                let key_no_line = format!("{rel_path_lc}::{qname}");
+                let key_with_line = format!("{rel_path_lc}::{qname}@{}", sym.start_line);
+                if touched_exact_keys.contains(&key_with_line)
+                    || touched_exact_keys.contains(&key_no_line)
+                    || touched_tails_no_line.contains(&qname)
+                    || touched_tails_no_line.contains(&sname)
+                {
+                    touched_syms_lc.insert(sname.clone());
+                    touched_syms_lc.insert(qname.clone());
+                    push_anchor_token(&sname, &mut anchor_tokens);
+                    push_anchor_token(&qname, &mut anchor_tokens);
+                    for bt in &sym.body_tokens {
+                        push_anchor_token(bt, &mut anchor_tokens);
+                    }
+                    for raw_sig in sym
+                        .signature
+                        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    {
+                        if raw_sig.len() >= 2 {
+                            push_anchor_token(raw_sig, &mut anchor_tokens);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    (rel_path_tokens, touched_syms_lc, anchor_tokens)
+}
+
+fn cue_error_token_overlap(
+    cue: &PendingErrorCue,
+    touched_syms_lc: &HashSet<String>,
+    anchor_tokens: &HashSet<String>,
+) -> usize {
+    cue.error_tokens
+        .iter()
+        .filter(|tok| {
+            let tl = tok.to_ascii_lowercase();
+            tl.len() >= 3
+                && !is_error_code_token(&tl, cue.error_code.as_deref())
+                && (touched_syms_lc.contains(&tl) || anchor_tokens.contains(&tl))
+        })
+        .count()
+}
+
 fn bind_error_cues_for_edit(db: &LibreDb, ev: &EditEvidence) -> usize {
     if !is_code_learning_eligible_path(&ev.rel_path) {
         return 0;
@@ -1432,6 +1628,7 @@ fn bind_error_cues_for_edit(db: &LibreDb, ev: &EditEvidence) -> usize {
             Some(file_part.to_owned())
         })
         .collect();
+    let (rel_path_tokens, touched_syms_lc, anchor_tokens) = collect_edit_anchor_sets(db, ev);
     let mut causal_errors: Vec<PendingErrorCue> = Vec::new();
     let tx = db.transact_key(NodeKind::Generic, PENDING_ERROR_CUES_KEY, |existing| {
         let Some(rec) = existing else {
@@ -1447,6 +1644,10 @@ fn bind_error_cues_for_edit(db: &LibreDb, ev: &EditEvidence) -> usize {
             if now_ns.saturating_sub(c.recorded_at_ns) > MISS_CUE_TTL_NS {
                 continue;
             }
+            // Guard A: retire noise/banal cues even if staged by an older hook binary.
+            if is_banal_syntax_error(&c.raw_excerpt) || is_non_causal_error_noise(&c.raw_excerpt) {
+                continue;
+            }
             let hint_ok = c
                 .file_hint
                 .as_deref()
@@ -1455,7 +1656,44 @@ fn bind_error_cues_for_edit(db: &LibreDb, ev: &EditEvidence) -> usize {
                         || !tracked_files.iter().any(|tf| file_hint_matches(h, tf))
                 })
                 .unwrap_or(true);
-            if c.recorded_at_ns <= ev.edit_ns && hint_ok {
+            // Guard B: unanchored cues require >= 1 non-error-code >= 3-char token matching
+            // the edited file path, touched symbols, or edit/symbol anchors.
+            let unanchored_ok = if c.file_hint.is_some() {
+                true
+            } else {
+                c.error_tokens.iter().any(|tok| {
+                    let tl = tok.to_ascii_lowercase();
+                    tl.len() >= 3
+                        && !is_error_code_token(&tl, c.error_code.as_deref())
+                        && (rel_path_tokens.contains(&tl)
+                            || touched_syms_lc.contains(&tl)
+                            || anchor_tokens.contains(&tl))
+                })
+            };
+            // Guard C: errors naming backticked identifiers must touch/anchor one of them
+            // (except signature-change E0061/E0308 with a matching file hint).
+            let backticked = extract_backticked_identifiers(&c.raw_excerpt);
+            let backtick_ok = if backticked.is_empty() {
+                true
+            } else {
+                let sig_change_override =
+                    matches!(c.error_code.as_deref(), Some("e0061") | Some("e0308"))
+                        && c.file_hint
+                            .as_deref()
+                            .is_some_and(|h| file_hint_matches(h, &ev.rel_path));
+                sig_change_override
+                    || backticked.iter().any(|ident| {
+                        touched_syms_lc.contains(ident)
+                            || anchor_tokens.contains(ident)
+                            || ident
+                                .split('_')
+                                .filter(|sub| sub.len() >= 4)
+                                .any(|sub| {
+                                    touched_syms_lc.contains(sub) || anchor_tokens.contains(sub)
+                                })
+                    })
+            };
+            if c.recorded_at_ns <= ev.edit_ns && hint_ok && unanchored_ok && backtick_ok {
                 causal_errors.push(c);
             } else {
                 remaining.push(c);
@@ -1478,6 +1716,26 @@ fn bind_error_cues_for_edit(db: &LibreDb, ev: &EditEvidence) -> usize {
         let filtered_n = causal_errors.len() as u64;
         bump_learning_counters(db, |c| c.trivial_errors_filtered += filtered_n);
         return 0;
+    }
+
+    // Guard D: coalesce multiple co-occurring cues onto the highest-specificity cause for one edit.
+    if causal_errors.len() > 1 {
+        causal_errors.sort_by(|a, b| {
+            let ka = (
+                a.file_hint.is_some(),
+                a.error_code.is_some(),
+                cue_error_token_overlap(a, &touched_syms_lc, &anchor_tokens),
+                a.recorded_at_ns,
+            );
+            let kb = (
+                b.file_hint.is_some(),
+                b.error_code.is_some(),
+                cue_error_token_overlap(b, &touched_syms_lc, &anchor_tokens),
+                b.recorded_at_ns,
+            );
+            kb.cmp(&ka)
+        });
+        causal_errors.truncate(1);
     }
 
     let now_ns = current_unix_ns();
@@ -1754,8 +2012,116 @@ pub struct LearningStateReport {
     pub counters: LearningCounters,
 }
 
-/// Builds a read-only learning state report (`0` writes).
+fn extract_pitfall_directive_excerpt(directive: &str) -> Option<&str> {
+    let after = directive.strip_prefix("Avoid repeat error (")?;
+    let end = after.find(") in [")?;
+    Some(&after[..end])
+}
+
+/// Removes stale, banal, or non-causal pending error cues and deduplicates/cleans stored pitfalls
+/// (`NodeKind::Generic`, seal-neutral; performs zero disk writes when nothing needs pruning).
+pub fn sanitize_learning_artifacts(db: &LibreDb) -> Result<(usize, usize)> {
+    let now_ns = current_unix_ns();
+    let mut purged_cues = 0usize;
+    db.transact_key(NodeKind::Generic, PENDING_ERROR_CUES_KEY, |existing| {
+        let Some(rec) = existing else {
+            return Ok(None);
+        };
+        let Ok(mut cues) = serde_json::from_slice::<Vec<PendingErrorCue>>(&rec.payload) else {
+            return Ok(None);
+        };
+        let before = cues.len();
+        cues.retain(|c| {
+            now_ns.saturating_sub(c.recorded_at_ns) <= MISS_CUE_TTL_NS
+                && !is_banal_syntax_error(&c.raw_excerpt)
+                && !is_non_causal_error_noise(&c.raw_excerpt)
+        });
+        let dropped = before.saturating_sub(cues.len());
+        if dropped == 0 {
+            return Ok(None);
+        }
+        purged_cues = dropped;
+        let bytes = serde_json::to_vec(&cues)
+            .map_err(|_| LibreDbError::CorruptFormat("pending error cues serialize"))?;
+        Ok(Some(WriteRequest::new(NodeKind::Generic, bytes).with_importance(32)))
+    })?;
+
+    let mut purged_pitfalls = 0usize;
+    db.transact_key(NodeKind::Generic, ERROR_PITFALL_BOOK_KEY, |existing| {
+        let Some(rec) = existing else {
+            return Ok(None);
+        };
+        let Ok(mut book) = serde_json::from_slice::<ErrorPitfallBook>(&rec.payload) else {
+            return Ok(None);
+        };
+        let before = book.pitfalls.len();
+        book.pitfalls.retain(|_, p| {
+            !extract_pitfall_directive_excerpt(&p.directive)
+                .is_some_and(|ex| is_banal_syntax_error(ex) || is_non_causal_error_noise(ex))
+        });
+
+        // Deduplicate auto-learned pitfalls sharing `(sorted affected_symbols, resolution_tokens)`,
+        // preferring entries with an explicit error_code, higher occurrences, and higher confidence.
+        let mut groups: HashMap<(Vec<String>, Vec<String>), Vec<String>> = HashMap::new();
+        for (id, p) in &book.pitfalls {
+            if p.affected_symbols.is_empty()
+                || p.resolution_tokens.is_empty()
+                || !p.directive.starts_with("Avoid repeat error (")
+            {
+                continue;
+            }
+            let mut syms = p.affected_symbols.clone();
+            syms.sort();
+            groups
+                .entry((syms, p.resolution_tokens.clone()))
+                .or_default()
+                .push(id.clone());
+        }
+        let mut dup_losers: Vec<String> = Vec::new();
+        for (_, mut ids) in groups {
+            if ids.len() <= 1 {
+                continue;
+            }
+            ids.sort_by(|a, b| {
+                let pa = &book.pitfalls[a];
+                let pb = &book.pitfalls[b];
+                let ka = (
+                    pa.error_code.is_some(),
+                    pa.occurrences,
+                    (pa.confidence * 1_000_000.0).round() as i64,
+                    pa.last_learned_ns,
+                );
+                let kb = (
+                    pb.error_code.is_some(),
+                    pb.occurrences,
+                    (pb.confidence * 1_000_000.0).round() as i64,
+                    pb.last_learned_ns,
+                );
+                kb.cmp(&ka).then_with(|| a.cmp(b))
+            });
+            dup_losers.extend(ids.into_iter().skip(1));
+        }
+        for loser in dup_losers {
+            book.pitfalls.remove(&loser);
+        }
+
+        let dropped = before.saturating_sub(book.pitfalls.len());
+        if dropped == 0 {
+            return Ok(None);
+        }
+        purged_pitfalls = dropped;
+        let bytes = serde_json::to_vec(&book)
+            .map_err(|_| LibreDbError::CorruptFormat("error pitfall book serialize"))?;
+        Ok(Some(WriteRequest::new(NodeKind::Generic, bytes).with_importance(64)))
+    })?;
+
+    Ok((purged_cues, purged_pitfalls))
+}
+
+/// Builds a read-only learning state report (`0` writes once clean; prunes stale/noise artifacts
+/// automatically if any accumulated under older binaries).
 pub fn learning_state_report(db: &LibreDb, top_n: usize) -> LearningStateReport {
+    let _ = sanitize_learning_artifacts(db);
     let now_ns = current_unix_ns();
     let pending_cues: Vec<PendingMissCue> = db
         .get_by_key(NodeKind::Generic, PENDING_MISS_CUES_KEY)

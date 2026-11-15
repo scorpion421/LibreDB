@@ -1,7 +1,7 @@
 # LibreDB
 
-[![Version](https://img.shields.io/badge/version-1.6.3-blue.svg)](CHANGELOG.md)
-[![Tests](https://img.shields.io/badge/tests-passing%20(146%20tests%20%2B%2012%20audits%20%2B%2013%20learning%20checks%20%2B%2010k%20crash%20sims)-brightgreen.svg)](crates/libredb-cli/tests/)
+[![Version](https://img.shields.io/badge/version-1.6.4-blue.svg)](CHANGELOG.md)
+[![Tests](https://img.shields.io/badge/tests-passing%20(149%20tests%20%2B%2012%20audits%20%2B%2013%20learning%20checks%20%2B%2010k%20crash%20sims)-brightgreen.svg)](crates/libredb-cli/tests/)
 [![Tech Stack](https://img.shields.io/badge/rust-1.89%2B%20%7C%20PyO3%20abi3%20%7C%20MCP-orange.svg)](Cargo.toml)
 [![License](https://img.shields.io/badge/license-AGPLv3%20%2B%20Commons%20Clause-purple.svg)](LICENSE)
 
@@ -17,7 +17,7 @@
 
 ## Executive summary and impact
 
-| Dimension | Legacy Python + `SQLite` (`SkillsDB`) | `LibreDB v1.6.3` (`Rust` + `MCP` + `PyO3`) |
+| Dimension | Legacy Python + `SQLite` (`SkillsDB`) | `LibreDB v1.6.4` (`Rust` + `MCP` + `PyO3`) |
 | :--- | :--- | :--- |
 | **Hook response latency** | `350-500 ms` Python startup + `SQLite` WAL per edit or turn | **`< 2 ms` native hooks loading matching project decisions, facts, and coding rules** |
 | **Multi-turn recall & I/O** | Repeated subprocess spawns and full-file re-reads | **RAM-cached session delta skipping already-shown context with zero extra disk reads** |
@@ -72,7 +72,7 @@ pwsh -ExecutionPolicy Bypass -File .\scripts\deploy_plugin.ps1 -Profile Personal
 LibreDB/
 |-- Cargo.toml                                     # Rust workspace (5 default CLI/MCP crates + optional PyO3 crate)
 |-- Makefile                                       # Zero-dependency POSIX/Linux/macOS source build & installer
-|-- VERSION                                        # Semantic Version (1.6.3)
+|-- VERSION                                        # Semantic Version (1.6.4)
 |-- CHANGELOG.md                                   # Keep a Changelog 1.1.0 release history
 |-- LICENSE                                        # Commons Clause v1.0 + full verbatim GNU AGPL v3.0 text
 |-- README.md                                      # 9-block standardized documentation

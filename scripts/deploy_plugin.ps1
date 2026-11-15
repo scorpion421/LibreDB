@@ -97,7 +97,7 @@ $PluginJson = @'
 {
   "name": "libredb",
   "displayName": "LibreDB Cognitive Memory",
-  "version": "1.6.3",
+  "version": "1.6.4",
   "description": "Persistent project memory, fast code-graph search, and token-savings engine for Antigravity. Remembers architectural decisions and resolved bug fixes across sessions, locates functions and call dependencies without reading whole files, enforces workspace guardrails, and automates Git/Gitea releases.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
@@ -418,7 +418,7 @@ $LogoSvg = @'
 
 # 7. Write user-facing README.md inside plugin bundle
 $PluginReadme = @'
-# LibreDB cognitive memory plugin (v1.6.3)
+# LibreDB cognitive memory plugin (v1.6.4)
 
 `LibreDB` gives `Antigravity` persistent project memory, targeted code navigation, and automated release workflows in a single local Rust binary:
 
@@ -450,6 +450,6 @@ if (Test-Path $AgyConfigPath) {
     }
 }
 
-Write-Output "[OK] Deployed LibreDB v1.6.3 standalone binaries to: $BinDir (Profile=$Profile)"
+Write-Output "[OK] Deployed LibreDB v1.6.4 standalone binaries to: $BinDir (Profile=$Profile)"
 Write-Output "[OK] Hydrated and modernized global store at: $GlobalLdb"
 Write-Output "[OK] Installed complete Antigravity plugin at: $PluginDir"

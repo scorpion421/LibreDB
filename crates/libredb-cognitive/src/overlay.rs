@@ -154,7 +154,7 @@ impl OverlayBrain {
 
         // 2. Score candidates across both layers 100% in RAM (`0` payload disk I/O!).
         let proj_cands = self.project.score_candidates_in_ram(&req.query);
-        let glob_cands = global_eng.score_candidates_in_ram(&req.query);
+        let mut glob_cands = global_eng.score_candidates_in_ram(&req.query);
 
         // Only the project layer decides whether a query was a workspace miss: generic global
         // rule/skill matches must never mask an unresolved project-specific concept.
@@ -172,11 +172,44 @@ impl OverlayBrain {
             }
         }
 
+        // Attenuate global skill hits belonging to an unrelated framework stack when workspace
+        // markers establish the active project stack and the query did not ask for that stack.
+        let ws_markers = req
+            .workspace_dir
+            .as_deref()
+            .map(crate::reflex::detect_workspace_markers)
+            .unwrap_or_default();
+        let query_low = req.query.to_ascii_lowercase();
+        for c in &mut glob_cands {
+            c.score *= foreign_skill_stack_multiplier(
+                c.kind,
+                c.key.as_deref(),
+                &query_low,
+                &ws_markers,
+            );
+        }
+        let glob_peak = glob_cands.iter().map(|c| c.score).fold(0.0_f64, f64::max);
+        let glob_floor = (glob_peak * 0.35).max(0.80);
+        glob_cands.retain(|c| c.score >= glob_floor || c.via_bridge);
+
+        // Normalize project BM25 scores onto the global corpus scale so a large global store
+        // (high IDF) never starves project-local capsules (lower IDF) before budget reservation.
+        let proj_raw_peak = proj_cands.iter().map(|c| c.score).fold(0.0_f64, f64::max);
+        let idf_parity_scale = if proj_raw_peak > 0.0 && glob_peak > proj_raw_peak {
+            (glob_peak / proj_raw_peak).clamp(1.0, 3.5)
+        } else {
+            1.0
+        };
+        let proj_scaled_peak = proj_raw_peak * idf_parity_scale * 1.15;
+        let proj_floor = (proj_scaled_peak * 0.35).max(0.80);
+
         let mut merged: Vec<(bool, ScoredInodeCandidate)> =
             Vec::with_capacity(proj_cands.len() + glob_cands.len());
         for mut c in proj_cands {
-            c.score *= 1.15;
-            merged.push((false, c));
+            c.score *= idf_parity_scale * 1.15;
+            if c.score >= proj_floor || c.via_bridge {
+                merged.push((false, c));
+            }
         }
         for c in glob_cands {
             merged.push((true, c));
@@ -188,9 +221,6 @@ impl OverlayBrain {
                 .then_with(|| a.1.node_id.cmp(&b.1.node_id))
         });
 
-        let peak = merged.first().map_or(0.0, |x| x.1.score);
-        let floor = (peak * 0.35).max(0.80);
-
         // 3. Filter via `SessionState` BEFORE hydrating any extents from disk!
         let mut to_fetch_proj: Vec<ScoredInodeCandidate> = Vec::new();
         let mut to_fetch_glob: Vec<ScoredInodeCandidate> = Vec::new();
@@ -201,9 +231,6 @@ impl OverlayBrain {
         // and collect remaining eligible candidates in descending relevance order.
         let mut fresh: Vec<(bool, ScoredInodeCandidate)> = Vec::new();
         for (is_global, cand) in merged {
-            if cand.score < floor && !cand.via_bridge {
-                continue;
-            }
             let ns_id = if is_global {
                 GLOBAL_LAYER_TAG | cand.node_id
             } else {
@@ -359,4 +386,77 @@ impl OverlayBrain {
             coalesced_io_reads: proj_io + glob_io,
         })
     }
+}
+
+/// Attenuates global skill hits belonging to an unrelated framework stack when workspace markers
+/// establish the active project stack and the query did not ask for that stack.
+fn foreign_skill_stack_multiplier(
+    kind: libredb_core::NodeKind,
+    key_opt: Option<&str>,
+    query_low: &str,
+    ws_markers: &[String],
+) -> f64 {
+    if !matches!(
+        kind,
+        libredb_core::NodeKind::Skill | libredb_core::NodeKind::SkillSection
+    ) || ws_markers.is_empty()
+    {
+        return 1.0;
+    }
+    let Some(raw_key) = key_opt else {
+        return 1.0;
+    };
+    let skill_name = raw_key
+        .split_once("::")
+        .map_or(raw_key, |(head, _)| head)
+        .trim()
+        .to_ascii_lowercase();
+    let has_exact_tok = |hay: &str, needle: &str| {
+        hay.split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|tok| tok == needle)
+    };
+    let marker_has = |needles: &[&str]| {
+        ws_markers
+            .iter()
+            .any(|m| needles.iter().any(|n| m == n || m.contains(n)))
+    };
+
+    if skill_name.contains("flutter")
+        || has_exact_tok(&skill_name, "dart")
+        || skill_name.starts_with("dart-")
+        || skill_name.starts_with("dart_")
+    {
+        let q_wants = query_low.contains("flutter") || has_exact_tok(query_low, "dart");
+        let ws_uses = marker_has(&["pubspec.yaml", "pubspec.lock", ".dart_tool", ".flutter"]);
+        if !q_wants && !ws_uses {
+            return 0.25;
+        }
+    }
+
+    if skill_name.starts_with("chrome-extension") || skill_name.contains("chrome_extension") {
+        let q_wants = query_low.contains("chrome") && query_low.contains("extension");
+        let ws_uses = marker_has(&["manifest.json"]);
+        if !q_wants && !ws_uses {
+            return 0.25;
+        }
+    }
+
+    if skill_name.starts_with("android") || has_exact_tok(&skill_name, "android") {
+        let q_wants = query_low.contains("android")
+            || query_low.contains("kotlin")
+            || query_low.contains("gradle");
+        let ws_uses = marker_has(&[
+            "androidmanifest.xml",
+            "build.gradle",
+            "build.gradle.kts",
+            "settings.gradle",
+            "settings.gradle.kts",
+            "gradlew",
+        ]);
+        if !q_wants && !ws_uses {
+            return 0.25;
+        }
+    }
+
+    1.0
 }

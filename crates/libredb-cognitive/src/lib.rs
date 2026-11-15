@@ -25,9 +25,10 @@ pub use guardrail::{
 pub use learning::{
     extract_error_file_hint, format_learning_report, is_banal_syntax_error,
     is_code_learning_eligible_path, is_non_causal_error_noise, learn_explicit_error_resolution,
-    learning_state_report, record_error_cue, record_search_miss_cue_with_source, ErrorPitfallBook,
-    LearnedPitfallEntry, LearningCounters, LearningStateReport, MissCueSource, PendingErrorCue,
-    ACTIVE_PITFALL_MIN_CONFIDENCE, ERROR_PITFALL_BOOK_KEY, PENDING_ERROR_CUES_KEY,
+    learning_state_report, record_error_cue, record_search_miss_cue_with_source,
+    sanitize_learning_artifacts, ErrorPitfallBook, LearnedPitfallEntry, LearningCounters,
+    LearningStateReport, MissCueSource, PendingErrorCue, ACTIVE_PITFALL_MIN_CONFIDENCE,
+    ERROR_PITFALL_BOOK_KEY, PENDING_ERROR_CUES_KEY,
 };
 pub use overlay::OverlayBrain;
 pub use reflex::{

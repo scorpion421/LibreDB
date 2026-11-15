@@ -992,7 +992,8 @@ fn publish_gitea_release_internal(
         .any(|(n, u)| n == "github" || u.to_ascii_lowercase().contains("github.com"));
     if has_github_target {
         for entry in &selected {
-            publish_github_cli_release(project_root, &repo_name, entry);
+            let is_latest = entry.tag == entries[0].tag;
+            publish_github_cli_release(project_root, &repo_name, entry, is_latest);
         }
     }
 
@@ -1117,14 +1118,21 @@ fn publish_gitea_release_internal(
                 let existing_assets = robj
                     .get("assets")
                     .and_then(Value::as_array)
+                    .or_else(|| {
+                        existing_rel
+                            .and_then(|ex| ex.get("assets"))
+                            .and_then(Value::as_array)
+                    })
                     .cloned()
                     .unwrap_or_default();
+                let is_latest_release = entry.tag == entries[0].tag;
                 let attached = attach_release_assets(
                     cfg,
                     &effective_owner,
                     &repo_name,
                     rel_id,
                     &entry.tag,
+                    is_latest_release,
                     &existing_assets,
                     project_root,
                 );
@@ -1147,18 +1155,74 @@ fn publish_gitea_release_internal(
 const MAX_DELIVERABLE_ASSET_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_HTTP_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
 
+#[allow(clippy::too_many_arguments)]
 fn attach_release_assets(
     cfg: &GiteaConfig,
     repo_owner: &str,
     repo_name: &str,
     rel_id: u64,
     tag: &str,
+    is_latest_release: bool,
     existing_assets: &[Value],
     project_root: &Path,
 ) -> Vec<String> {
-    let deliverables = discover_deliverable_files(project_root, tag);
+    let clean_ver = tag.trim_start_matches(['v', 'V']).to_ascii_lowercase();
+    let deliverables = discover_deliverable_files(project_root, tag, is_latest_release);
     let mut uploaded = Vec::new();
     let enc_repo = percent_encode(repo_name);
+
+    let desired_names: std::collections::HashSet<String> = deliverables
+        .iter()
+        .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+        .map(|s| {
+            s.chars()
+                .filter(|&c| c != '"' && c != '\\' && c != '\r' && c != '\n' && !c.is_control())
+                .collect::<String>()
+        })
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let mut pruned_names = Vec::new();
+    for ex in existing_assets {
+        let Some(ex_name) = ex.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(aid) = ex.get("id").and_then(Value::as_u64) else {
+            continue;
+        };
+        let ex_low = ex_name.to_ascii_lowercase();
+        let is_replaced = desired_names.contains(ex_name);
+        let has_version_conflict = filename_conflicts_with_version(&ex_low, &clean_ver);
+        let stale_unversioned_on_historical = !is_latest_release
+            && !deliverables.is_empty()
+            && extract_filename_version(&ex_low).is_none()
+            && RELEASE_DELIVERABLE_EXTS.iter().any(|ext| ex_low.ends_with(ext));
+        if is_replaced || has_version_conflict || stale_unversioned_on_historical {
+            let del_url = format!(
+                "{}/api/v1/repos/{repo_owner}/{enc_repo}/releases/{rel_id}/assets/{aid}",
+                cfg.url
+            );
+            if let Ok((st, _)) = http_request(
+                "DELETE",
+                &del_url,
+                &cfg.token,
+                cfg.allow_insecure_http,
+                None,
+                None,
+            ) {
+                if (st == 200 || st == 204) && !is_replaced {
+                    pruned_names.push(ex_name.to_owned());
+                }
+            }
+        }
+    }
+    if !pruned_names.is_empty() {
+        println!(
+            "  [OK] Pruned {} stale/mismatched release asset(s) from {tag}: {}",
+            pruned_names.len(),
+            pruned_names.join(", ")
+        );
+    }
 
     for file_path in deliverables {
         let Ok(sym_meta) = fs::symlink_metadata(&file_path) else {
@@ -1180,26 +1244,6 @@ fn attach_release_assets(
         let Ok(file_bytes) = fs::read(&file_path) else {
             continue;
         };
-
-        // Replace existing asset of the same name if overwriting/updating release
-        for ex in existing_assets {
-            if ex.get("name").and_then(Value::as_str) == Some(safe_fname.as_str()) {
-                if let Some(aid) = ex.get("id").and_then(Value::as_u64) {
-                    let del_url = format!(
-                        "{}/api/v1/repos/{repo_owner}/{enc_repo}/releases/{rel_id}/assets/{aid}",
-                        cfg.url
-                    );
-                    let _ = http_request(
-                        "DELETE",
-                        &del_url,
-                        &cfg.token,
-                        cfg.allow_insecure_http,
-                        None,
-                        None,
-                    );
-                }
-            }
-        }
 
         let boundary = format!("----LibreDBAssetBoundary{}", std::process::id());
         let content_type_inner = if safe_fname.ends_with(".zip") || safe_fname.ends_with(".whl") {
@@ -1254,8 +1298,79 @@ fn is_release_deliverable_path(rel: &str) -> bool {
         && RELEASE_DELIVERABLE_EXTS.iter().any(|ext| low.ends_with(ext))
 }
 
-fn discover_deliverable_files(project_root: &Path, tag: &str) -> Vec<PathBuf> {
+/// Extracts an explicit `major.minor.patch` SemVer core string from a lowercase deliverable filename.
+fn extract_filename_version(filename_low: &str) -> Option<String> {
+    let b = filename_low.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        if !b[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let prefix_ok = i == 0
+            || matches!(b[i - 1], b'-' | b'_' | b' ')
+            || (b[i - 1] == b'v' && (i == 1 || matches!(b[i - 2], b'-' | b'_' | b' ')));
+        if !prefix_ok {
+            while i < b.len() && b[i].is_ascii_digit() {
+                i += 1;
+            }
+            continue;
+        }
+        let start = i;
+        let d1 = b[i..].iter().take_while(|c| c.is_ascii_digit()).count();
+        if !(1..=4).contains(&d1) || b.get(i + d1) != Some(&b'.') {
+            i += d1.max(1);
+            continue;
+        }
+        let p2 = i + d1 + 1;
+        let d2 = b[p2..].iter().take_while(|c| c.is_ascii_digit()).count();
+        if !(1..=4).contains(&d2) || b.get(p2 + d2) != Some(&b'.') {
+            i = p2;
+            continue;
+        }
+        let p3 = p2 + d2 + 1;
+        let d3 = b[p3..].iter().take_while(|c| c.is_ascii_digit()).count();
+        if !(1..=4).contains(&d3) {
+            i = p3;
+            continue;
+        }
+        let end = p3 + d3;
+        let next_is_dot_digit =
+            b.get(end) == Some(&b'.') && b.get(end + 1).is_some_and(|c| c.is_ascii_digit());
+        let suffix_ok = !next_is_dot_digit
+            && match b.get(end) {
+                None => true,
+                Some(&c) => matches!(c, b'-' | b'_' | b'.' | b' '),
+            };
+        if suffix_ok {
+            return Some(filename_low[start..end].to_owned());
+        }
+        i = end;
+    }
+    None
+}
+
+/// Returns `true` when `filename_low` carries an explicit SemVer version differing from `clean_ver`.
+fn filename_conflicts_with_version(filename_low: &str, clean_ver: &str) -> bool {
+    let target_core = clean_ver
+        .split(['-', '+'])
+        .next()
+        .unwrap_or(clean_ver)
+        .to_ascii_lowercase();
+    if target_core.is_empty() {
+        return false;
+    }
+    extract_filename_version(filename_low).is_some_and(|found| found != target_core)
+}
+
+fn discover_deliverable_files(
+    project_root: &Path,
+    tag: &str,
+    is_latest_release: bool,
+) -> Vec<PathBuf> {
     let exts = RELEASE_DELIVERABLE_EXTS;
+    let clean_ver = tag.trim_start_matches(['v', 'V']).to_ascii_lowercase();
+    let tag_low = tag.to_ascii_lowercase();
     let mut found = Vec::new();
     for sub in ["dist", "releases"] {
         let dir = project_root.join(sub);
@@ -1271,28 +1386,38 @@ fn discover_deliverable_files(project_root: &Path, tag: &str) -> Vec<PathBuf> {
                     })
                 })
                 .filter(|p| {
-                    let low = p.file_name().unwrap_or_default().to_string_lossy().to_ascii_lowercase();
-                    !low.starts_with('-') && exts.iter().any(|ext| low.ends_with(ext))
+                    let low = p
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_ascii_lowercase();
+                    !low.starts_with('-')
+                        && exts.iter().any(|ext| low.ends_with(ext))
+                        && !filename_conflicts_with_version(&low, &clean_ver)
                 })
                 .collect();
             entries.sort();
             found.extend(entries);
         }
     }
-    let clean_ver = tag.trim_start_matches(['v', 'V']).to_ascii_lowercase();
-    let tag_low = tag.to_ascii_lowercase();
     let tag_matched: Vec<PathBuf> = found
         .iter()
         .filter(|p| {
-            let n = p.file_name().unwrap_or_default().to_string_lossy().to_ascii_lowercase();
+            let n = p
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_ascii_lowercase();
             n.contains(&tag_low) || (!clean_ver.is_empty() && n.contains(&clean_ver))
         })
         .cloned()
         .collect();
-    if tag_matched.is_empty() {
+    if !tag_matched.is_empty() {
+        tag_matched
+    } else if is_latest_release {
         found
     } else {
-        tag_matched
+        Vec::new()
     }
 }
 
@@ -1688,12 +1813,17 @@ fn resolve_git_head_commit(root: &Path) -> String {
         .unwrap_or_default()
 }
 
-fn publish_github_cli_release(project_root: &Path, repo_name: &str, entry: &ChangelogEntry) {
+fn publish_github_cli_release(
+    project_root: &Path,
+    repo_name: &str,
+    entry: &ChangelogEntry,
+    is_latest_release: bool,
+) {
     if validate_safe_git_identifier(&entry.tag, "release tag").is_err() {
         return;
     }
     let title = format!("{repo_name} {}", entry.tag);
-    let deliverables = discover_deliverable_files(project_root, &entry.tag);
+    let deliverables = discover_deliverable_files(project_root, &entry.tag, is_latest_release);
     let view_ok = Command::new("gh")
         .args(["release", "view", "--", &entry.tag])
         .current_dir(project_root)
@@ -2583,6 +2713,49 @@ mod tests {
         assert_eq!(
             resolve_gitea_owner_and_repo(&tmp, &cfg, &[]),
             ("MickyFoley".to_owned(), "libredb_owner_res_test".to_owned())
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn discover_deliverable_files_excludes_conflicting_versions_and_historical_fallbacks() {
+        use crate::gitea::discover_deliverable_files;
+
+        let tmp = std::env::temp_dir().join(format!("libredb_deliverables_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join("dist")).unwrap();
+        fs::create_dir_all(tmp.join("releases")).unwrap();
+
+        fs::write(tmp.join("dist").join("libredb.exe"), b"unversioned").unwrap();
+        fs::write(tmp.join("dist").join("libredb-v1.5.1-windows-x64.exe"), b"151").unwrap();
+        fs::write(tmp.join("dist").join("libredb-v1.6.0-windows-x64.exe"), b"160").unwrap();
+        fs::write(tmp.join("dist").join("libredb-v1.6.2-windows-x64.exe"), b"162").unwrap();
+        fs::write(tmp.join("dist").join("libredb-v1.6.3-windows-x64.exe"), b"163").unwrap();
+        fs::write(tmp.join("releases").join("helper-v1.6.0.zip"), b"zip160").unwrap();
+
+        let exact_names = |files: Vec<PathBuf>| -> Vec<String> {
+            files
+                .into_iter()
+                .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .collect()
+        };
+
+        assert_eq!(
+            exact_names(discover_deliverable_files(&tmp, "v1.6.2", false)),
+            vec!["libredb-v1.6.2-windows-x64.exe".to_owned()],
+            "Matched release tag must upload only matching versioned assets and exclude v1.5.1/v1.6.0/v1.6.3"
+        );
+
+        fs::remove_file(tmp.join("dist").join("libredb-v1.6.2-windows-x64.exe")).unwrap();
+        assert!(
+            discover_deliverable_files(&tmp, "v1.6.2", false).is_empty(),
+            "Historical release without exact tag asset must never fall back to unversioned executables"
+        );
+        assert_eq!(
+            exact_names(discover_deliverable_files(&tmp, "v1.6.2", true)),
+            vec!["libredb.exe".to_owned()],
+            "Latest release fallback may upload unversioned binary while still excluding mismatched versions"
         );
 
         let _ = fs::remove_dir_all(&tmp);

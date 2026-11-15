@@ -1,5 +1,5 @@
 #!/bin/sh
-# POSIX / Linux / macOS Antigravity plugin installer for LibreDB (v1.6.3)
+# POSIX / Linux / macOS Antigravity plugin installer for LibreDB (v1.6.4)
 # Enterprise-neutral by default (never installs personal rules or imports legacy SQLite unless requested).
 set -eu
 
@@ -134,7 +134,7 @@ cat > "$PLUGIN_DIR/plugin.json" <<'EOF'
 {
   "name": "libredb",
   "displayName": "LibreDB Cognitive Memory",
-  "version": "1.6.3",
+  "version": "1.6.4",
   "description": "Persistent project memory, fast code-graph search, and token-savings engine for Antigravity. Remembers architectural decisions and resolved bug fixes across sessions, locates functions and call dependencies without reading whole files, enforces workspace guardrails, and automates Git/Gitea releases.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
@@ -403,7 +403,7 @@ EOF
 
 # 7. Write user-facing README.md inside plugin bundle
 cat > "$PLUGIN_DIR/README.md" <<'EOF'
-# LibreDB cognitive memory plugin (v1.6.3)
+# LibreDB cognitive memory plugin (v1.6.4)
 
 `LibreDB` gives `Antigravity` persistent project memory, targeted code navigation, and automated release workflows in a single local Rust binary:
 
@@ -447,6 +447,6 @@ PYEOF
     fi
 fi
 
-echo "[OK] Deployed LibreDB v1.6.3 standalone binary to: $BIN_DIR (profile=$PROFILE)"
+echo "[OK] Deployed LibreDB v1.6.4 standalone binary to: $BIN_DIR (profile=$PROFILE)"
 echo "[OK] Hydrated and modernized global store at: $GLOBAL_LDB"
 echo "[OK] Installed complete Antigravity plugin at: $PLUGIN_DIR"

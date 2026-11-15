@@ -1,7 +1,9 @@
 use libredb_cognitive::{
     check_german_prose_style, extract_error_file_hint, index_workspace, is_banal_syntax_error,
     is_code_learning_eligible_path, learning_state_report, reconcile_tentative_edits,
-    record_error_cue, stage_tentative_file_edit, OverlayBrain, PulseRequest,
+    record_error_cue, sanitize_learning_artifacts, stage_tentative_file_edit, ErrorPitfallBook,
+    LearnedPitfallEntry, OverlayBrain, PendingErrorCue, PulseRequest, ERROR_PITFALL_BOOK_KEY,
+    PENDING_ERROR_CUES_KEY,
 };
 use libredb_core::{LibreDb, NodeKind, WriteRequest};
 use std::fs;
@@ -264,4 +266,366 @@ User queues do not block UTF-8 parsing when code fences appear:\n\
         en_v.is_empty(),
         "English docs and code fences must produce 0 false positives: {en_v:?}"
     );
+}
+
+#[test]
+fn overlay_pulse_normalizes_cross_layer_idf_and_attenuates_foreign_stack_skills() {
+    let dir = temp_test_dir("overlay_idf_stack");
+    let proj_dir = dir.join("rust_proj");
+    fs::create_dir_all(proj_dir.join("src")).unwrap();
+    fs::create_dir_all(proj_dir.join(".agents")).unwrap();
+    fs::write(
+        proj_dir.join("Cargo.toml"),
+        "[package]\nname = \"winui_app\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(proj_dir.join("src").join("ui.rs"), "pub fn render_main() {}\n").unwrap();
+
+    let glob_db = Arc::new(LibreDb::open(dir.join("global.ldb")).unwrap());
+    for idx in 0..55 {
+        glob_db
+            .put(
+                WriteRequest::new(
+                    NodeKind::Fact,
+                    format!("Global background note {idx}: desktop ui layout window rendering guide")
+                        .into_bytes(),
+                )
+                .with_key(format!("filler::{idx:02}"))
+                .with_importance(64),
+            )
+            .unwrap();
+    }
+    glob_db
+        .put(
+            WriteRequest::new(
+                NodeKind::Skill,
+                b"Flutter desktop layout widgets architecture guide for Dart UI".to_vec(),
+            )
+            .with_key("flutter-layout")
+            .with_importance(200),
+        )
+        .unwrap();
+    glob_db
+        .put(
+            WriteRequest::new(
+                NodeKind::SkillSection,
+                b"Windows desktop Fluent design architecture layout using Flutter Scaffold".to_vec(),
+            )
+            .with_key("flutter-layout::Desktop Architecture")
+            .with_importance(200),
+        )
+        .unwrap();
+    glob_db
+        .put(
+            WriteRequest::new(
+                NodeKind::Decision,
+                b"Windows UI Fluent 2 design architecture rule: Segoe UI Variable, crisp 4px corners, high contrast".to_vec(),
+            )
+            .with_key("rule::windows-fluent-app-design")
+            .with_importance(220),
+        )
+        .unwrap();
+
+    let proj_db = Arc::new(LibreDb::open(proj_dir.join(".agents").join("memory.ldb")).unwrap());
+    proj_db
+        .put(
+            WriteRequest::new(
+                NodeKind::Decision,
+                b"Windows UI Fluent 2 design architecture decision for native WinUI 3 main shell".to_vec(),
+            )
+            .with_key("decision::ui_architecture")
+            .with_importance(220),
+        )
+        .unwrap();
+    proj_db
+        .put(
+            WriteRequest::new(
+                NodeKind::Fact,
+                b"WinUI 3 desktop design applies Fluent 2 surface layers".to_vec(),
+            )
+            .with_key("fact::ui_surface")
+            .with_importance(160),
+        )
+        .unwrap();
+
+    let brain = OverlayBrain::open(Some(Arc::clone(&glob_db)), Arc::clone(&proj_db)).unwrap();
+    let mut req = PulseRequest::new("Windows UI Fluent 2 design architecture", 1800);
+    req.workspace_dir = Some(proj_dir.clone());
+    let resp = brain.pulse(&req).unwrap();
+
+    let proj_keys: Vec<_> = resp
+        .capsules
+        .iter()
+        .filter(|c| {
+            c.key.as_deref().is_some_and(|k| {
+                matches!(
+                    k.strip_prefix("proj::").unwrap_or(k),
+                    "decision::ui_architecture" | "fact::ui_surface"
+                )
+            })
+        })
+        .collect();
+    assert!(
+        !proj_keys.is_empty(),
+        "Normalized cross-layer scoring must deliver project capsules despite a larger global corpus: {:?}",
+        resp.capsules.iter().map(|c| (&c.key, c.score)).collect::<Vec<_>>()
+    );
+
+    let top_proj_score = proj_keys.iter().map(|c| c.score).fold(0.0_f64, f64::max);
+    let max_flutter_score = resp
+        .capsules
+        .iter()
+        .filter(|c| {
+            c.key
+                .as_deref()
+                .is_some_and(|k| k.strip_prefix("global::").unwrap_or(k).starts_with("flutter-layout"))
+        })
+        .map(|c| c.score)
+        .fold(0.0_f64, f64::max);
+    assert!(
+        max_flutter_score == 0.0 || max_flutter_score < top_proj_score,
+        "Foreign flutter-layout skill must be attenuated/suppressed in Cargo.toml workspace: proj={top_proj_score:.2}, flutter={max_flutter_score:.2}"
+    );
+
+    let mut flutter_req = PulseRequest::new("flutter desktop layout architecture", 1800);
+    flutter_req.workspace_dir = Some(proj_dir);
+    flutter_req.epoch = 2;
+    let flutter_resp = brain.pulse(&flutter_req).unwrap();
+    assert!(
+        flutter_resp.capsules.iter().any(|c| {
+            c.key
+                .as_deref()
+                .is_some_and(|k| k.strip_prefix("global::").unwrap_or(k).starts_with("flutter-layout"))
+        }),
+        "Explicit query mentioning flutter must opt back in without foreign stack attenuation"
+    );
+
+    drop(brain);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn causal_error_binding_blocks_cli_noise_dead_code_neighbor_symbols_and_duplicates() {
+    let dir = temp_test_dir("causal_guards");
+    let src_dir = dir.join("src");
+    fs::create_dir_all(&src_dir).unwrap();
+    fs::create_dir_all(dir.join(".agents")).unwrap();
+
+    let initial_src = "\
+pub fn draw_status_icon(active: bool) -> u32 {
+    if active { 1 } else { 0 }
+}
+
+pub fn compute_metric_hash(seed: u64) -> u64 {
+    seed.wrapping_mul(31)
+}
+";
+    let src_file = src_dir.join("lib.rs");
+    fs::write(&src_file, initial_src).unwrap();
+    fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"guard_test\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+
+    let db = LibreDb::open(dir.join(".agents").join("memory.ldb")).unwrap();
+    index_workspace(&db, &dir, false).unwrap();
+
+    // 1. CLI flag/subcommand noise, OS lock/access errors, and dead_code/unused warnings are rejected.
+    for noise in [
+        "error: unexpected argument '--bogus' found\nUnknown flag '--bogus'\nFor more information, try '--help'",
+        "Error: Unknown subcommand 'bogus'",
+        "Access is denied. (os error 5)",
+        "warning: function `draw_status_icon` is never used",
+    ] {
+        assert!(
+            is_banal_syntax_error(noise),
+            "Noise diagnostic should fail Stage 1 filter: {noise}"
+        );
+        assert!(
+            !record_error_cue(&db, noise, Some("cargo test")).unwrap(),
+            "record_error_cue must reject non-causal noise: {noise}"
+        );
+    }
+
+    // 2. Guard C: neighbor-symbol isolation prevents unrelated edits in the same file from stealing cues.
+    assert!(record_error_cue(
+        &db,
+        "src/lib.rs:2:5: error[E0425]: cannot find value `draw_status_icon` in this scope",
+        Some("cargo check"),
+    )
+    .unwrap());
+    let edited_neighbor = initial_src.replace("seed.wrapping_mul(31)", "seed.wrapping_mul(37)");
+    stage_tentative_file_edit(&db, &dir, &src_file, None, edited_neighbor.as_bytes(), 12).unwrap();
+    fs::write(&src_file, &edited_neighbor).unwrap();
+    reconcile_tentative_edits(&db, &dir).unwrap();
+
+    let rep_neighbor = learning_state_report(&db, 10);
+    assert!(
+        rep_neighbor.learned_pitfalls.is_empty(),
+        "Editing compute_metric_hash must not consume an E0425 cue naming `draw_status_icon`: {:?}",
+        rep_neighbor.learned_pitfalls
+    );
+    assert_eq!(
+        rep_neighbor.pending_errors.len(),
+        1,
+        "Protected cue for `draw_status_icon` must remain pending after unrelated symbol edit"
+    );
+
+    // Editing the actual target symbol (`draw_status_icon`) consumes the pending E0425 cue.
+    let edited_draw_once = edited_neighbor.replace(
+        "pub fn draw_status_icon(active: bool) -> u32 {\n    if active { 1 } else { 0 }",
+        "pub fn draw_status_icon(active: bool) -> u32 {\n    let icon_state = if active { 2 } else { 0 };\n    icon_state",
+    );
+    stage_tentative_file_edit(&db, &dir, &src_file, None, edited_draw_once.as_bytes(), 16).unwrap();
+    fs::write(&src_file, &edited_draw_once).unwrap();
+    reconcile_tentative_edits(&db, &dir).unwrap();
+    let rep_once = learning_state_report(&db, 10);
+    assert_eq!(
+        rep_once.learned_pitfalls.len(),
+        1,
+        "Target edit on draw_status_icon must consume its E0425 cue: {:?}",
+        rep_once.learned_pitfalls
+    );
+
+    // 3. Guard D: two co-occurring cues on a matching edit coalesce into a single coded pitfall.
+    assert!(record_error_cue(
+        &db,
+        "error: wrong arity when calling draw_status_icon helper",
+        Some("cargo check"),
+    )
+    .unwrap());
+    assert!(record_error_cue(
+        &db,
+        "src/lib.rs:1:1: error[E0061]: this function takes 2 arguments but 1 argument was supplied",
+        Some("cargo check"),
+    )
+    .unwrap());
+    let edited_target = edited_draw_once.replace(
+        "pub fn draw_status_icon(active: bool) -> u32 {\n    let icon_state = if active { 2 } else { 0 };\n    icon_state",
+        "pub fn draw_status_icon(active: bool, force_redraw: bool) -> u32 {\n    if active || force_redraw { 1 } else { 0 }",
+    );
+    stage_tentative_file_edit(&db, &dir, &src_file, None, edited_target.as_bytes(), 16).unwrap();
+    fs::write(&src_file, &edited_target).unwrap();
+    reconcile_tentative_edits(&db, &dir).unwrap();
+
+    let rep_coalesced = learning_state_report(&db, 10);
+    assert_eq!(
+        rep_coalesced.learned_pitfalls.len(),
+        2,
+        "Guard D must coalesce the two co-occurring Step 3 cues into 1 additional pitfall (2 total): {:?}",
+        rep_coalesced.learned_pitfalls
+    );
+    assert!(
+        rep_coalesced
+            .learned_pitfalls
+            .iter()
+            .any(|p| p.error_code.as_deref() == Some("e0061")),
+        "Guard D must prefer the file-hinted + error-coded E0061 cue over the generic fallback: {:?}",
+        rep_coalesced.learned_pitfalls
+    );
+
+    // 4. sanitize_learning_artifacts cleans injected legacy noise cues, noise pitfalls, and duplicates.
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    db.put(
+        WriteRequest::new(
+            NodeKind::Generic,
+            serde_json::to_vec(&vec![
+                PendingErrorCue {
+                    fingerprint_id: "cue_noise".to_owned(),
+                    error_code: None,
+                    error_tokens: vec!["access".to_owned(), "denied".to_owned()],
+                    raw_excerpt: "Access is denied. (os error 5)".to_owned(),
+                    action_hint: None,
+                    file_hint: None,
+                    recorded_at_ns: now_ns,
+                },
+                PendingErrorCue {
+                    fingerprint_id: "cue_clean".to_owned(),
+                    error_code: Some("e0308".to_owned()),
+                    error_tokens: vec!["e0308".to_owned(), "compute_metric_hash".to_owned()],
+                    raw_excerpt: "error[E0308]: mismatched types in compute_metric_hash".to_owned(),
+                    action_hint: Some("cargo test".to_owned()),
+                    file_hint: Some("src/lib.rs".to_owned()),
+                    recorded_at_ns: now_ns,
+                },
+            ])
+            .unwrap(),
+        )
+        .with_key(PENDING_ERROR_CUES_KEY),
+    )
+    .unwrap();
+
+    let mut book = ErrorPitfallBook::default();
+    book.pitfalls.insert(
+        "pitfall_bogus_cli".to_owned(),
+        LearnedPitfallEntry {
+            id: "pitfall_bogus_cli".to_owned(),
+            error_code: None,
+            trigger_tokens: vec!["bogus".to_owned()],
+            action_tokens: vec!["libredb".to_owned()],
+            affected_symbols: vec!["src/lib.rs::compute_metric_hash".to_owned()],
+            resolution_tokens: vec!["wrapping_mul".to_owned()],
+            directive: "Avoid repeat error (Unknown flag '--bogus' in CLI) in [src/lib.rs::compute_metric_hash]: apply verified fix tokens [wrapping_mul].".to_owned(),
+            confidence: 0.80,
+            occurrences: 1,
+            last_learned_ns: now_ns,
+            supersedes: Vec::new(),
+        },
+    );
+    book.pitfalls.insert(
+        "pitfall_dup_uncoded".to_owned(),
+        LearnedPitfallEntry {
+            id: "pitfall_dup_uncoded".to_owned(),
+            error_code: None,
+            trigger_tokens: vec!["compute_metric_hash".to_owned()],
+            action_tokens: Vec::new(),
+            affected_symbols: vec!["src/lib.rs::compute_metric_hash".to_owned()],
+            resolution_tokens: vec!["wrapping_add".to_owned()],
+            directive: "Avoid repeat error (error: wrong arithmetic in compute_metric_hash) in [src/lib.rs::compute_metric_hash]: apply verified fix tokens [wrapping_add].".to_owned(),
+            confidence: 0.80,
+            occurrences: 1,
+            last_learned_ns: now_ns,
+            supersedes: Vec::new(),
+        },
+    );
+    book.pitfalls.insert(
+        "e0308_dup_coded".to_owned(),
+        LearnedPitfallEntry {
+            id: "e0308_dup_coded".to_owned(),
+            error_code: Some("e0308".to_owned()),
+            trigger_tokens: vec!["e0308".to_owned(), "compute_metric_hash".to_owned()],
+            action_tokens: Vec::new(),
+            affected_symbols: vec!["src/lib.rs::compute_metric_hash".to_owned()],
+            resolution_tokens: vec!["wrapping_add".to_owned()],
+            directive: "Avoid repeat error (error[E0308]: mismatched arithmetic in compute_metric_hash) in [src/lib.rs::compute_metric_hash]: apply verified fix tokens [wrapping_add].".to_owned(),
+            confidence: 0.80,
+            occurrences: 1,
+            last_learned_ns: now_ns,
+            supersedes: Vec::new(),
+        },
+    );
+    db.put(
+        WriteRequest::new(NodeKind::Generic, serde_json::to_vec(&book).unwrap())
+            .with_key(ERROR_PITFALL_BOOK_KEY),
+    )
+    .unwrap();
+
+    let (purged_cues, purged_pitfalls) = sanitize_learning_artifacts(&db).unwrap();
+    assert_eq!(purged_cues, 1, "Must purge 1 os error 5 cue");
+    assert_eq!(
+        purged_pitfalls, 2,
+        "Must purge 1 CLI-flag pitfall and 1 uncoded duplicate pitfall"
+    );
+    let rep_after = learning_state_report(&db, 10);
+    assert_eq!(rep_after.pending_errors.len(), 1);
+    assert_eq!(rep_after.pending_errors[0].fingerprint_id, "cue_clean");
+    assert_eq!(rep_after.learned_pitfalls.len(), 1);
+    assert_eq!(rep_after.learned_pitfalls[0].id, "e0308_dup_coded");
+
+    drop(db);
+    let _ = fs::remove_dir_all(&dir);
 }

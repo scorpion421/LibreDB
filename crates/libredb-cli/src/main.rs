@@ -33,18 +33,18 @@ fn print_usage() {
         "LibreDB v{} - Tailored cognitive memory, workspace graph & MCP engine for Antigravity
 
 Antigravity Cognitive & Code-Graph Commands:
-  libredb pulse [<db.ldb>] <query> [--global <g.ldb>] [--cid <id>] [--transcript <t.jsonl>] [--epoch <n>] [--budget <tok>] [--cwd <dir>] [--err <msg>]
+  libredb pulse [<db.ldb>] <query> [--global <g.ldb>] [--cid <id>] [--transcript <t.jsonl>] [--epoch <n>] [--budget <tok>] [--cwd <dir> | --project <dir>] [--err <msg>]
   libredb index-workspace <db.ldb> <workspace_dir> [--force]
   libredb skeleton <db.ldb> <source_file> [--filter <substr>]
-  libredb locate [<db.ldb>] <symbol_query...> [--cwd <dir>] [--json]
-  libredb impact [<db.ldb>] <symbol_query...> [--cwd <dir>] [--json]
+  libredb locate [<db.ldb>] <symbol_query...> [--cwd <dir> | --project <dir>] [--json]
+  libredb impact [<db.ldb>] <symbol_query...> [--cwd <dir> | --project <dir>] [--json]
   libredb fim <db.ldb> <source_file> [--symbol <name> | --line <n>] [--pad <lines>]
   libredb batch <db.ldb> [--fact k=v]... [--decision Title::Body]... [--task key::title::status::prio]... [--snapshot <summary>]
   libredb handoff <db.ldb> <handoff_id> <task_key> <role> [--notes <text>]
   libredb learn-assoc <db.ldb> <cue_phrase> <target_id_1,target_id_2>
   libredb learn-reflex <db.ldb> <id> [<directive>] [--stack <s1,s2>] [--action <a1,a2>] [--env <e1,e2>] [--anchor <a1,a2>] [--context <c1,c2>] [--supersedes <id1,id2>] [--utility <0.1..0.99>] [--outcome <pass|fail>]
   libredb learn-error <db.ldb> <error_text> <fix_directive> [--action <csv>] [--symbols <csv>] [--supersedes <id1,id2>]
-  libredb learning [<db.ldb>] [--verify] [--cwd <dir>] [--top <n>] [--json]
+  libredb learning [<db.ldb>] [--verify] [--cwd <dir> | --project <dir>] [--top <n>] [--json]
   libredb get-skill [<skill_name>] [--section <title> | --query <q> [--top <k>]] [--json] [--global <customizations.ldb>]
   libredb slice-skill <query> [--skill <skill_name>] [--top <k>] [--json] [--global <customizations.ldb>]
   libredb sync-skill <SKILL.md> [--name <skill_name>] [--global <customizations.ldb>]
@@ -53,20 +53,19 @@ Antigravity Cognitive & Code-Graph Commands:
   libredb list-reflexes [--global <customizations.ldb>]
   libredb modernize-global [--global <customizations.ldb>] [--skill-md <SKILL.md>] [--profile neutral|personal] [--migrate-legacy]
   libredb mcp-serve [<default_project.ldb>] [--global <customizations.ldb>] [--workspace-root <dir>]
-  libredb savings | report [--today] [--days <n>] [--cid <id>] [--project <dir>] [--json]
+  libredb savings | report [--today] [--days <n>] [--cid <id>] [--project <dir> | --cwd <dir>] [--json]
 
 Security, Trust & Universal Configuration Commands:
   libredb trust [<dir>] [--revoke] [--list] [--reinit-lost] [--accept-rollback] [--migrate-v3 [--confirm-metadata]] [--migrate-v2] [--if-clean] [--global <customizations.ldb>]
-  libredb config <get|set|unset|list> [<key>] [<value>] [--project <dir>] [--global <customizations.ldb>]
+  libredb config <get|set|unset|list> [<key>] [<value>] [--project <dir> | --cwd <dir>] [--global <customizations.ldb>]
   libredb guardrail check [--path <dir>] [--staged] [--strict]
   libredb hook-pre-tool [--global <customizations.ldb>]
   libredb hook-pre-invocation [--global <customizations.ldb>]
-  libredb gitea-status [--global <customizations.ldb>]
+  libredb gitea-status [--project <dir> | --cwd <dir>] [--global <customizations.ldb>]
   libredb gitea-config [--url <u>] [--user <usr>] [--token <tok> | --token-stdin] [--allow-insecure-http <bool>] [--register-helper]
-  libredb gitea-credential-helper [get]
-  libredb git-init | gitea-init [<dir>] [--name <repo>] [--use-existing] [--overwrite]
-  libredb git-sync | gitea-sync [-m <msg>] [--project <dir>] [--remote <r>] [--all-remotes] [--github] [--releases] [--allow-unversioned]
-  libredb git-release | gitea-release [vX.Y.Z] [--project <dir>] [--remote <r>] [--all-remotes] [--github]
+  libredb git-init | gitea-init [<dir>] [--project <dir>] [--name <repo>] [--use-existing] [--overwrite]
+  libredb git-sync | gitea-sync [-m <msg>] [--project <dir> | --cwd <dir>] [--remote <r>] [--all-remotes] [--github] [--releases] [--allow-unversioned]
+  libredb git-release | gitea-release [vX.Y.Z] [--project <dir> | --cwd <dir>] [--remote <r>] [--all-remotes] [--github]
 
 Lossless 1:1 SQLite Bridge Commands:
   libredb import-sqlite <db.ldb> <source.db> [--scope central|project]
@@ -83,9 +82,9 @@ Core Storage & Graph Commands:
   libredb trace <db.ldb> <node_id> [--depth <n>]
   libredb recall <db.ldb> <seed_id> [--hops <n>] [--budget <tokens>]
   libredb compact <db.ldb> [--prune]
-  libredb stats <db.ldb> [--json]
+  libredb stats | status [<db.ldb>] [--project <dir> | --cwd <dir>] [--json] [--global <customizations.ldb>]
   libredb verify <db.ldb>
-  libredb bench [--suite kernel|full|audit] [--workspace <dir>] [--filter <p1,p2>] [--ext <e1,e2>] [--max-files <n>] [--nodes <n>] [--threads <t>] [--json]",
+  libredb bench [--suite kernel|full|audit] [--workspace <dir> | --project <dir> | --cwd <dir>] [--filter <p1,p2>] [--ext <e1,e2>] [--max-files <n>] [--nodes <n>] [--threads <t>] [--json]",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -443,6 +442,7 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .raw_value_slots(&[2])
             .allow_global()
             .values(&["--project"])
+            .alias("--cwd", "--project")
             .parse(sub_args)?;
             let action = cli.positionals.first().map(String::as_str).unwrap_or("list");
             let positional = if cli.positionals.len() > 1 {
@@ -892,10 +892,15 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             gitea::cmd_gitea_credential_helper(action, cli.global_deref())?;
         }
         cmd @ ("gitea-status" | "git-status") => {
-            let cli = CliSpec::new(cmd, "libredb gitea-status [--global <customizations.ldb>]")
-                .positionals(0, Some(0))
-                .allow_global()
-                .parse(sub_args)?;
+            let cli = CliSpec::new(
+                cmd,
+                "libredb gitea-status [--project <dir>] [--global <customizations.ldb>]",
+            )
+            .positionals(0, Some(0))
+            .allow_global()
+            .values(&["--project"])
+            .alias("--cwd", "--project")
+            .parse(sub_args)?;
             gitea::cmd_gitea_status(cli.global_deref())?;
         }
         "gitea-config" => {
@@ -927,17 +932,19 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         cmd @ ("gitea-init" | "git-init") => {
             let cli = CliSpec::new(
                 cmd,
-                "libredb git-init [<dir>] [--name <repo>] [--use-existing] [--overwrite] [--global <customizations.ldb>]",
+                "libredb git-init [<dir>] [--project <dir>] [--name <repo>] [--use-existing] [--overwrite] [--global <customizations.ldb>]",
             )
             .positionals(0, Some(1))
             .allow_global()
             .switches(&["--use-existing", "--overwrite"])
-            .values(&["--name"])
+            .values(&["--name", "--project"])
+            .alias("--cwd", "--project")
             .parse(sub_args)?;
             let dir = cli
                 .positionals
                 .first()
                 .map(PathBuf::from)
+                .or_else(|| cli.path_value("--project"))
                 .map(Ok)
                 .unwrap_or_else(env::current_dir)?;
             gitea::cmd_gitea_init(
@@ -963,6 +970,7 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             ])
             .values(&["--message", "--project", "--remote"])
             .alias("-m", "--message")
+            .alias("--cwd", "--project")
             .parse(sub_args)?;
             let dir = cli
                 .path_value("--project")
@@ -989,6 +997,7 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .allow_global()
             .switches(&["--all-remotes", "--github"])
             .values(&["--project", "--remote"])
+            .alias("--cwd", "--project")
             .parse(sub_args)?;
             let dir = cli
                 .path_value("--project")
@@ -1019,6 +1028,7 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 "--cwd",
                 "--err",
             ])
+            .alias("--project", "--cwd")
             .parse(sub_args)?;
             let (explicit_db_opt, query_str) = if cli.positionals.len() == 2 {
                 (Some(PathBuf::from(&cli.positionals[0])), &cli.positionals[1])
@@ -1145,6 +1155,7 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .allow_global()
             .switches(&["--json"])
             .values(&["--cwd", "--db"])
+            .alias("--project", "--cwd")
             .parse(sub_args)?;
             let t0 = Instant::now();
             let ws_dir_opt = cli.path_value("--cwd").or_else(|| env::current_dir().ok());
@@ -1190,6 +1201,7 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .allow_global()
             .switches(&["--json"])
             .values(&["--cwd", "--db"])
+            .alias("--project", "--cwd")
             .parse(sub_args)?;
             let t0 = Instant::now();
             let ws_dir_opt = cli.path_value("--cwd").or_else(|| env::current_dir().ok());
@@ -1544,6 +1556,7 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .allow_global()
             .switches(&["--json", "--verify"])
             .values(&["--cwd", "--db", "--top"])
+            .alias("--project", "--cwd")
             .parse(sub_args)?;
             let top_n = cli.parse_value::<usize>("--top")?.unwrap_or(10).clamp(1, 100);
             let ws_dir_opt = cli.path_value("--cwd").or_else(|| env::current_dir().ok());
@@ -1971,17 +1984,34 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 rep.cold_nodes_archived
             );
         }
-        "stats" => {
-            let cli = CliSpec::new("stats", "libredb stats <db.ldb> [--json]")
-                .positionals(0, Some(1))
-                .switches(&["--json"])
-                .values(&["--db"])
-                .parse(sub_args)?;
-            let db_path = cli
-                .value("--db")
-                .or_else(|| cli.positionals.first().map(String::as_str))
-                .ok_or("Usage: libredb stats <db.ldb> [--json]")?;
-            let db = LibreDb::open(db_path)?;
+        cmd @ ("stats" | "status") => {
+            let cli = CliSpec::new(
+                cmd,
+                "libredb status [<db.ldb>] [--db <db.ldb>] [--project <dir>] [--json] [--global <customizations.ldb>]",
+            )
+            .positionals(0, Some(1))
+            .allow_global()
+            .switches(&["--json"])
+            .values(&["--db", "--project"])
+            .alias("--cwd", "--project")
+            .parse(sub_args)?;
+            let explicit_db = cli
+                .path_value("--db")
+                .or_else(|| cli.positionals.first().map(PathBuf::from));
+            let db: Arc<LibreDb> = if let Some(ref db_p) = explicit_db {
+                open_cli_verified_project_db(cli.global_deref(), db_p)?
+            } else {
+                let ws_dir_opt = cli.path_value("--project").or_else(|| env::current_dir().ok());
+                let glob_db = match cli.global_deref() {
+                    Some(gp) => Some(hooks::open_global_ldb(Some(gp))?),
+                    None => hooks::open_global_ldb_checked(None)?,
+                };
+                resolve_default_cli_project_db(
+                    cli.global_deref(),
+                    glob_db.as_ref(),
+                    ws_dir_opt.as_deref(),
+                )?
+            };
             let st = db.stats()?;
             if cli.has_switch("--json") {
                 println!("{}", serde_json::to_string_pretty(&st)?);
@@ -2022,6 +2052,7 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .positionals(0, Some(0))
             .switches(&["--today", "--json"])
             .values(&["--days", "--cid", "--project"])
+            .alias("--cwd", "--project")
             .parse(sub_args)?;
             let days_u64 = cli.parse_value::<u64>("--days")?;
             let days_u32 = match days_u64 {
@@ -2068,6 +2099,8 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 "--nodes",
                 "--threads",
             ])
+            .alias("--project", "--workspace")
+            .alias("--cwd", "--workspace")
             .parse(sub_args)?;
             let as_json = cli.has_switch("--json");
             let ws_opt = cli.path_value("--workspace");

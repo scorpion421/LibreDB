@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.4] - 2026-11-15
+
+### Added
+- **Consistent project flags across CLI commands (`--project`, `--cwd`, `status`)**: Added `--project` and `--cwd` as interchangeable aliases across workspace, analytics, benchmark, and Git commands (`pulse`, `locate`, `impact`, `learning`, `savings`, `config`, `bench`, `git-init`, `git-sync`, `git-release`, `gitea-status`), plus a unified `libredb status` alias for `libredb stats` so workspace inspection works with predictable flags everywhere.
+
+### Fixed
+- **Balanced project vs. global context ranking and framework filtering (`pulse`)**: Normalized project search scores against global store document frequency so large global rule collections no longer push workspace decisions out of recalled context, and lowered the priority of unrelated framework skills (such as `Flutter`, `Chrome` extensions, or `Android`) when project markers identify another tech stack unless explicitly queried.
+- **Stricter causal error learning and automatic cleanup (`learning`)**: Blocked CLI help/flag noise, OS file lock/access errors, and unused/dead-code compiler warnings from being recorded as learned pitfalls, prevented errors mentioning a specific identifier from binding to unrelated neighboring functions in the same file, coalesced duplicate error cues per edit onto the most specific compiler diagnostic, and automatically pruned legacy bogus or duplicate pitfalls when inspecting `libredb learning`.
+- **Version-safe Git/Gitea release asset uploads (`git-release`, `git-sync`)**: Filtered build deliverables strictly by matching SemVer version so older or newer binaries in `dist/` or `releases/` are never attached to another release tag, restricted unversioned fallback binaries to the newest changelog release, and pruned stale mismatched release assets on Gitea during sync.
+
 ## [1.6.3] - 2026-11-15
 
 ### Added
