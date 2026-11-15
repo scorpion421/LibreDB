@@ -820,7 +820,7 @@ pub fn cmd_gitea_sync(
     }
 
     if sync_releases && clean_root.join("CHANGELOG.md").is_file() {
-        let synced = publish_gitea_release_internal(&clean_root, None, &cfg, &target_remotes)?;
+        let (synced, _) = publish_gitea_release_internal(&clean_root, None, &cfg, &target_remotes)?;
         if !synced.is_empty() {
             println!("  [OK] Synced Keep a Changelog releases: {}", synced.join(", "));
         }
@@ -849,15 +849,61 @@ pub fn cmd_gitea_release(
         push_github,
     );
 
-    let synced = publish_gitea_release_internal(&clean_root, tag_opt, &cfg, &target_remotes)?;
-    let repo_name = resolve_repo_name_from_git_or_dir(&clean_root);
-    for t in &synced {
+    let (synced, effective_owner) =
+        publish_gitea_release_internal(&clean_root, tag_opt, &cfg, &target_remotes)?;
+    let (_, repo_name) = resolve_gitea_owner_and_repo(&clean_root, &cfg, &target_remotes);
+    if synced.is_empty() {
+        let tag_label = tag_opt.unwrap_or("latest");
         println!(
-            "  [OK] Published Release {t} for {repo_name} ({}/{}/{repo_name}/releases/tag/{t})",
-            cfg.url, cfg.user
+            "  [WARN] Processed tag {tag_label} for {effective_owner}/{repo_name}, but Gitea release API did not return a synced release (verify Gitea server at {} and token/permissions).",
+            cfg.url
         );
+    } else {
+        for t in &synced {
+            println!(
+                "  [OK] Published Release {t} for {repo_name} ({}/{effective_owner}/{repo_name}/releases/tag/{t})",
+                cfg.url
+            );
+        }
     }
     Ok(())
+}
+
+fn gitea_releases_base_url(cfg: &GiteaConfig, owner: &str, enc_repo: &str) -> String {
+    format!("{}/api/v1/repos/{owner}/{enc_repo}/releases", cfg.url)
+}
+
+fn fetch_gitea_releases_for_owner(
+    cfg: &GiteaConfig,
+    owner: &str,
+    enc_repo: &str,
+) -> Result<Vec<Value>, Option<u16>> {
+    let url = format!("{}?limit=100", gitea_releases_base_url(cfg, owner, enc_repo));
+    match http_request("GET", &url, &cfg.token, cfg.allow_insecure_http, None, None) {
+        Ok((200, body)) => Ok(serde_json::from_slice(&body).unwrap_or_default()),
+        Ok((st, _)) => Err(Some(st)),
+        Err(_) => Err(None),
+    }
+}
+
+fn patch_gitea_release(
+    cfg: &GiteaConfig,
+    base_url: &str,
+    rel_id: u64,
+    payload_bytes: &[u8],
+) -> Option<Value> {
+    let patch_url = format!("{base_url}/{rel_id}");
+    match http_request(
+        "PATCH",
+        &patch_url,
+        &cfg.token,
+        cfg.allow_insecure_http,
+        Some("application/json"),
+        Some(payload_bytes),
+    ) {
+        Ok((st, b)) if st == 200 || st == 201 => serde_json::from_slice(&b).ok(),
+        _ => None,
+    }
 }
 
 fn publish_gitea_release_internal(
@@ -865,11 +911,13 @@ fn publish_gitea_release_internal(
     target_tag_opt: Option<&str>,
     cfg: &GiteaConfig,
     target_remotes: &[(String, String)],
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+) -> Result<(Vec<String>, String), Box<dyn std::error::Error>> {
     let changelog_path = project_root.join("CHANGELOG.md");
     let entries = parse_keep_a_changelog(&changelog_path)?;
+    let (mut effective_owner, repo_name) =
+        resolve_gitea_owner_and_repo(project_root, cfg, target_remotes);
     if entries.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), effective_owner));
     }
 
     let clean_target = target_tag_opt.map(|t| t.trim().trim_start_matches(['v', 'V']).to_owned());
@@ -882,8 +930,10 @@ fn publish_gitea_release_internal(
         return Err(format!("Version {:?} not found in CHANGELOG.md", target_tag_opt).into());
     }
 
-    let repo_name = resolve_repo_name_from_git_or_dir(project_root);
     validate_safe_git_identifier(&repo_name, "repository name")?;
+    if !effective_owner.is_empty() {
+        validate_safe_git_identifier(&effective_owner, "repository owner")?;
+    }
 
     // Ensure local annotated Git tag exists for selected release(s) and verify SemVer tag immutability!
     let head_sha = resolve_git_head_commit(project_root);
@@ -946,21 +996,44 @@ fn publish_gitea_release_internal(
         }
     }
 
-    if cfg.user.is_empty() || cfg.token.is_empty() {
-        return Ok(selected.iter().map(|e| e.tag.clone()).collect());
+    if cfg.user.is_empty() || cfg.token.is_empty() || effective_owner.is_empty() {
+        return Ok((selected.iter().map(|e| e.tag.clone()).collect(), effective_owner));
     }
 
-    // Fetch existing Gitea releases
-    let rels_url = format!(
-        "{}/api/v1/repos/{}/{}/releases?limit=100",
-        cfg.url, cfg.user, percent_encode(&repo_name)
-    );
-    let existing_rels: Vec<Value> =
-        match http_request("GET", &rels_url, &cfg.token, cfg.allow_insecure_http, None, None) {
-            Ok((200, body)) => serde_json::from_slice(&body).unwrap_or_default(),
-            _ => Vec::new(),
-        };
+    let enc_repo = percent_encode(&repo_name);
+    // Fetch existing Gitea releases under resolved remote owner; retry once under cfg.user on 404.
+    let existing_rels: Vec<Value> = match fetch_gitea_releases_for_owner(cfg, &effective_owner, &enc_repo) {
+        Ok(rels) => rels,
+        Err(Some(404)) if !cfg.user.is_empty() && effective_owner != cfg.user => {
+            match fetch_gitea_releases_for_owner(cfg, &cfg.user, &enc_repo) {
+                Ok(rels) => {
+                    effective_owner = cfg.user.clone();
+                    rels
+                }
+                Err(status_opt) => {
+                    eprintln!(
+                        "  [WARN] Gitea releases lookup returned {} for both '{}/{}' and '{}/{}'.",
+                        status_opt.map(|s| s.to_string()).unwrap_or_else(|| "network error".to_owned()),
+                        effective_owner,
+                        repo_name,
+                        cfg.user,
+                        repo_name
+                    );
+                    Vec::new()
+                }
+            }
+        }
+        Err(status_opt) => {
+            eprintln!(
+                "  [WARN] Gitea releases lookup failed for {}/{repo_name}: {}.",
+                effective_owner,
+                status_opt.map(|s| format!("HTTP {s}")).unwrap_or_else(|| "network error".to_owned())
+            );
+            Vec::new()
+        }
+    };
 
+    let base_url = gitea_releases_base_url(cfg, &effective_owner, &enc_repo);
     let branch = current_git_branch(project_root);
     let mut synced_tags = Vec::new();
 
@@ -982,38 +1055,60 @@ fn publish_gitea_release_internal(
 
         let rel_obj: Option<Value> = if let Some(ex) = existing_rel {
             let rel_id = ex.get("id").and_then(Value::as_u64).unwrap_or(0);
-            let patch_url = format!(
-                "{}/api/v1/repos/{}/{}/releases/{rel_id}",
-                cfg.url, cfg.user, percent_encode(&repo_name)
-            );
-            match http_request(
-                "PATCH",
-                &patch_url,
-                &cfg.token,
-                cfg.allow_insecure_http,
-                Some("application/json"),
-                Some(&payload_bytes),
-            ) {
-                Ok((st, b)) if st == 200 || st == 201 => serde_json::from_slice(&b).ok(),
-                _ => Some(ex.clone()),
-            }
+            patch_gitea_release(cfg, &base_url, rel_id, &payload_bytes).or_else(|| Some(ex.clone()))
         } else {
-            let post_url = format!(
-                "{}/api/v1/repos/{}/{}/releases",
-                cfg.url,
-                cfg.user,
-                percent_encode(&repo_name)
-            );
             match http_request(
                 "POST",
-                &post_url,
+                &base_url,
                 &cfg.token,
                 cfg.allow_insecure_http,
                 Some("application/json"),
                 Some(&payload_bytes),
             ) {
                 Ok((st, b)) if st == 200 || st == 201 => serde_json::from_slice(&b).ok(),
-                _ => None,
+                Ok((st, _)) if st == 409 || st == 422 => {
+                    let by_tag_url = format!("{base_url}/tags/{}", percent_encode(&entry.tag));
+                    match http_request("GET", &by_tag_url, &cfg.token, cfg.allow_insecure_http, None, None) {
+                        Ok((200, tb)) => {
+                            let existing_by_tag: Option<Value> = serde_json::from_slice(&tb).ok();
+                            if let Some(ex) = existing_by_tag {
+                                let rel_id = ex.get("id").and_then(Value::as_u64).unwrap_or(0);
+                                patch_gitea_release(cfg, &base_url, rel_id, &payload_bytes)
+                                    .or(Some(ex))
+                            } else {
+                                None
+                            }
+                        }
+                        Ok((gs, _)) => {
+                            eprintln!(
+                                "  [WARN] Gitea release tag lookup {} returned HTTP {gs} after HTTP {st}.",
+                                entry.tag
+                            );
+                            None
+                        }
+                        Err(e) => {
+                            eprintln!("  [WARN] Gitea release tag lookup {} failed: {e}", entry.tag);
+                            None
+                        }
+                    }
+                }
+                Ok((st, b)) => {
+                    let msg = String::from_utf8_lossy(&b);
+                    eprintln!(
+                        "  [WARN] Gitea release creation for {}/{repo_name}@{} failed (HTTP {st}): {}",
+                        effective_owner,
+                        entry.tag,
+                        msg.trim()
+                    );
+                    None
+                }
+                Err(e) => {
+                    eprintln!(
+                        "  [WARN] Gitea release request for {}/{repo_name}@{} failed: {e}",
+                        effective_owner, entry.tag
+                    );
+                    None
+                }
             }
         };
 
@@ -1026,6 +1121,7 @@ fn publish_gitea_release_internal(
                     .unwrap_or_default();
                 let attached = attach_release_assets(
                     cfg,
+                    &effective_owner,
                     &repo_name,
                     rel_id,
                     &entry.tag,
@@ -1045,7 +1141,7 @@ fn publish_gitea_release_internal(
         }
     }
 
-    Ok(synced_tags)
+    Ok((synced_tags, effective_owner))
 }
 
 const MAX_DELIVERABLE_ASSET_BYTES: u64 = 256 * 1024 * 1024;
@@ -1053,6 +1149,7 @@ const MAX_HTTP_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
 
 fn attach_release_assets(
     cfg: &GiteaConfig,
+    repo_owner: &str,
     repo_name: &str,
     rel_id: u64,
     tag: &str,
@@ -1089,8 +1186,8 @@ fn attach_release_assets(
             if ex.get("name").and_then(Value::as_str) == Some(safe_fname.as_str()) {
                 if let Some(aid) = ex.get("id").and_then(Value::as_u64) {
                     let del_url = format!(
-                        "{}/api/v1/repos/{}/{enc_repo}/releases/{rel_id}/assets/{aid}",
-                        cfg.url, cfg.user
+                        "{}/api/v1/repos/{repo_owner}/{enc_repo}/releases/{rel_id}/assets/{aid}",
+                        cfg.url
                     );
                     let _ = http_request(
                         "DELETE",
@@ -1121,9 +1218,8 @@ fn attach_release_assets(
         write!(&mut body, "\r\n--{boundary}--\r\n").unwrap();
 
         let up_url = format!(
-            "{}/api/v1/repos/{}/{enc_repo}/releases/{rel_id}/assets?name={}",
+            "{}/api/v1/repos/{repo_owner}/{enc_repo}/releases/{rel_id}/assets?name={}",
             cfg.url,
-            cfg.user,
             percent_encode(&safe_fname)
         );
         let mp_hdr = format!("multipart/form-data; boundary={boundary}");
@@ -1377,6 +1473,70 @@ fn current_git_branch(root: &Path) -> String {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
         .filter(|b| !b.is_empty() && b != "HEAD")
         .unwrap_or_else(|| "main".to_owned())
+}
+
+fn parse_owner_and_repo_from_remote_url(raw_url: &str) -> Option<(String, String)> {
+    let trimmed = raw_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let path_part = if let Some((_, rest)) = trimmed.split_once("://") {
+        rest.split_once('/').map(|(_, p)| p)?
+    } else if let Some((_, after_colon)) = trimmed.split_once(':') {
+        after_colon.trim_start_matches('/')
+    } else {
+        trimmed
+    };
+    let path_clean = path_part.strip_suffix(".git").unwrap_or(path_part);
+    let mut rev_segs = path_clean.rsplit('/').filter(|s| !s.is_empty());
+    let repo = rev_segs.next()?.to_owned();
+    let owner = rev_segs.next()?.to_owned();
+    if validate_safe_git_identifier(&owner, "repository owner").is_ok()
+        && validate_safe_git_identifier(&repo, "repository name").is_ok()
+    {
+        Some((owner, repo))
+    } else {
+        None
+    }
+}
+
+pub(crate) fn resolve_gitea_owner_and_repo(
+    project_root: &Path,
+    cfg: &GiteaConfig,
+    remotes: &[(String, String)],
+) -> (String, String) {
+    let pick_from = |slice: &[(String, String)]| -> Option<(String, String)> {
+        if let Some((_, url)) = slice.iter().find(|(name, _)| name == "gitea") {
+            if let Some(pair) = parse_owner_and_repo_from_remote_url(url) {
+                return Some(pair);
+            }
+        }
+        if let Some((_, url)) = slice
+            .iter()
+            .find(|(name, url)| name == "origin" && cfg.is_gitea_remote_url(url))
+        {
+            if let Some(pair) = parse_owner_and_repo_from_remote_url(url) {
+                return Some(pair);
+            }
+        }
+        for (_, url) in slice {
+            if cfg.is_gitea_remote_url(url) {
+                if let Some(pair) = parse_owner_and_repo_from_remote_url(url) {
+                    return Some(pair);
+                }
+            }
+        }
+        None
+    };
+
+    if let Some(pair) = pick_from(remotes) {
+        return pair;
+    }
+    let all_remotes = list_git_remotes(project_root);
+    if let Some(pair) = pick_from(&all_remotes) {
+        return pair;
+    }
+    (cfg.user.clone(), resolve_repo_name_from_git_or_dir(project_root))
 }
 
 fn resolve_repo_name_from_git_or_dir(root: &Path) -> String {
@@ -2152,8 +2312,8 @@ fn percent_encode(s: &str) -> String {
 mod tests {
     use super::{
         ensure_no_http_header_chars, http_request, parse_http_response, record_learned_workspace,
-        should_supply_git_credentials, strip_verbatim_prefix, validate_safe_git_identifier,
-        GiteaConfig,
+        resolve_gitea_owner_and_repo, should_supply_git_credentials, strip_verbatim_prefix,
+        validate_safe_git_identifier, GiteaConfig,
     };
     use libredb_core::{LibreDb, NodeKind, WriteRequest};
     use std::fs;
@@ -2382,5 +2542,49 @@ mod tests {
         drop(gdb);
         let _ = fs::remove_dir_all(&tmp);
         let _ = fs::remove_dir_all(&os_temp_ws);
+    }
+
+    #[test]
+    fn resolve_gitea_owner_uses_remote_namespace_over_login_user() {
+        let cfg = GiteaConfig {
+            url: "http://localhost:3000".to_owned(),
+            user: "MickyFoley".to_owned(),
+            token: String::new(),
+            service_name: "gitea".to_owned(),
+            allow_insecure_http: true,
+        };
+        let tmp = std::env::temp_dir().join("libredb_owner_res_test");
+        let _ = fs::create_dir_all(&tmp);
+
+        let remotes = vec![(
+            "origin".to_owned(),
+            "http://localhost:3000/Antigravity/WgServerforWindows.git".to_owned(),
+        )];
+        assert_eq!(
+            resolve_gitea_owner_and_repo(&tmp, &cfg, &remotes),
+            ("Antigravity".to_owned(), "WgServerforWindows".to_owned())
+        );
+
+        let dual_remotes = vec![
+            (
+                "origin".to_owned(),
+                "https://github.com/someone/WgServerforWindows.git".to_owned(),
+            ),
+            (
+                "gitea".to_owned(),
+                "http://127.0.0.1:3000/OrgNamespace/MirrorRepo".to_owned(),
+            ),
+        ];
+        assert_eq!(
+            resolve_gitea_owner_and_repo(&tmp, &cfg, &dual_remotes),
+            ("OrgNamespace".to_owned(), "MirrorRepo".to_owned())
+        );
+
+        assert_eq!(
+            resolve_gitea_owner_and_repo(&tmp, &cfg, &[]),
+            ("MickyFoley".to_owned(), "libredb_owner_res_test".to_owned())
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

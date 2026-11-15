@@ -165,49 +165,70 @@ pub fn compute_symbol_body_hash(lines: &[&str], start_line: usize, end_line: usi
     }
 }
 
-/// Extracts up to `48` deduplicated meaningful lowercase tokens (`>= 2` chars, not purely numeric,
+fn collect_line_body_tokens<F>(line: &str, mut push_tok: F)
+where
+    F: FnMut(String),
+{
+    let code_only = strip_code_line_comment(line);
+    for raw in code_only.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+        if raw.is_empty() {
+            continue;
+        }
+        if raw.len() >= 4
+            && raw.contains('_')
+            && raw.chars().any(|c| c.is_ascii_alphabetic())
+        {
+            push_tok(raw.to_ascii_lowercase());
+        }
+        for tok in libredb_index::segment_universal_tokens(raw) {
+            push_tok(tok);
+        }
+    }
+}
+
+/// Extracts up to `max_tokens` deduplicated meaningful lowercase tokens (`>= 2` chars, not
+/// purely numeric, non-stopword, excluding comments) in exact first-appearance order across
+/// `start_line..=end_line` (1-based).
+pub fn extract_ordered_symbol_body_tokens_with_limit(
+    lines: &[&str],
+    start_line: usize,
+    end_line: usize,
+    max_tokens: usize,
+) -> Vec<String> {
+    let start = start_line.max(1);
+    let end = end_line.min(lines.len());
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    if start <= end && max_tokens > 0 {
+        for line in &lines[start - 1..end] {
+            if out.len() >= max_tokens {
+                break;
+            }
+            collect_line_body_tokens(line, |tok| {
+                if out.len() >= max_tokens
+                    || tok.chars().count() < 2
+                    || tok.chars().all(|c| c.is_ascii_digit())
+                    || is_body_stopword(&tok)
+                {
+                    return;
+                }
+                if seen.insert(tok.clone()) {
+                    out.push(tok);
+                }
+            });
+        }
+    }
+    out
+}
+
+/// Extracts up to `128` deduplicated meaningful lowercase tokens (`>= 2` chars, not purely numeric,
 /// non-stopword, excluding comments) in exact first-appearance order across `start_line..=end_line`.
 pub fn extract_ordered_symbol_body_tokens(
     lines: &[&str],
     start_line: usize,
     end_line: usize,
 ) -> Vec<String> {
-    let start = start_line.max(1);
-    let end = end_line.min(lines.len());
-    let mut out = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    let mut push_tok = |tok: String| {
-        if out.len() >= 48
-            || tok.chars().count() < 2
-            || tok.chars().all(|c| c.is_ascii_digit())
-            || is_body_stopword(&tok)
-        {
-            return;
-        }
-        if seen.insert(tok.clone()) {
-            out.push(tok);
-        }
-    };
-    if start <= end {
-        for line in &lines[start - 1..end] {
-            let code_only = strip_code_line_comment(line);
-            for raw in code_only.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
-                if raw.is_empty() {
-                    continue;
-                }
-                if raw.len() >= 4
-                    && raw.contains('_')
-                    && raw.chars().any(|c| c.is_ascii_alphabetic())
-                {
-                    push_tok(raw.to_ascii_lowercase());
-                }
-                for tok in libredb_index::segment_universal_tokens(raw) {
-                    push_tok(tok);
-                }
-            }
-        }
-    }
-    out
+    extract_ordered_symbol_body_tokens_with_limit(lines, start_line, end_line, 128)
 }
 
 /// Extracts the set of meaningful lowercase tokens (`>= 2` chars, not purely numeric, excluding
@@ -257,10 +278,118 @@ fn find_reordered_statement_pair(prev_seq: &[String], new_seq: &[String]) -> Opt
     None
 }
 
+fn is_meaningful_body_token(tok: &str) -> bool {
+    tok.chars().count() >= 2
+        && !tok.chars().all(|c| c.is_ascii_digit())
+        && !is_body_stopword(tok)
+}
+
+fn collect_norm_code_lines<'a>(
+    lines: &[&'a str],
+    (start_line, end_line): (usize, usize),
+) -> Vec<&'a str> {
+    let s = start_line.max(1);
+    let e = end_line.min(lines.len());
+    if s > e {
+        return Vec::new();
+    }
+    lines[s - 1..e]
+        .iter()
+        .filter_map(|raw| {
+            let norm = strip_code_line_comment(raw).trim();
+            if norm.is_empty() {
+                None
+            } else {
+                Some(norm)
+            }
+        })
+        .collect()
+}
+
+fn collect_line_multiset_diff_added_tokens(
+    old_lines: &[&str],
+    old_span: (usize, usize),
+    new_lines: &[&str],
+    new_span: (usize, usize),
+) -> Vec<String> {
+    let old_norm = collect_norm_code_lines(old_lines, old_span);
+    let new_norm = collect_norm_code_lines(new_lines, new_span);
+
+    let mut old_line_counts: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::with_capacity(old_norm.len());
+    for line in &old_norm {
+        *old_line_counts.entry(*line).or_insert(0) += 1;
+    }
+
+    let mut new_line_counts: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::with_capacity(new_norm.len());
+    for line in &new_norm {
+        *new_line_counts.entry(*line).or_insert(0) += 1;
+    }
+
+    let mut added_lines: Vec<&str> = Vec::new();
+    let mut rem_old_counts = old_line_counts;
+    for line in &new_norm {
+        if let Some(c) = rem_old_counts.get_mut(*line) {
+            if *c > 0 {
+                *c -= 1;
+                continue;
+            }
+        }
+        added_lines.push(*line);
+    }
+
+    let mut removed_lines: Vec<&str> = Vec::new();
+    let mut rem_new_counts = new_line_counts;
+    for line in &old_norm {
+        if let Some(c) = rem_new_counts.get_mut(*line) {
+            if *c > 0 {
+                *c -= 1;
+                continue;
+            }
+        }
+        removed_lines.push(*line);
+    }
+
+    if added_lines.is_empty() {
+        return Vec::new();
+    }
+
+    let mut removed_tok_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for line in removed_lines {
+        collect_line_body_tokens(line, |tok| {
+            if is_meaningful_body_token(&tok) {
+                *removed_tok_counts.entry(tok).or_insert(0) += 1;
+            }
+        });
+    }
+
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for line in added_lines {
+        collect_line_body_tokens(line, |tok| {
+            if !is_meaningful_body_token(&tok) {
+                return;
+            }
+            if let Some(c) = removed_tok_counts.get_mut(&tok) {
+                if *c > 0 {
+                    *c -= 1;
+                    return;
+                }
+            }
+            if seen.insert(tok.clone()) {
+                out.push(tok);
+            }
+        });
+    }
+    out
+}
+
 /// Computes up to 8 structural AST body-token delta cues across `touched_keys` (`rel_path::sym_name`)
 /// between `old_bytes`/`old_skel` and `new_bytes`/`new_skel`:
-/// 1. Added identifiers/tokens (`new \ old`),
-/// 2. Deletion fixes (`avoid_<removed>` when statements/calls were removed without additions),
+/// 1. Added identifiers/tokens (`new \ old` plus line-multiset additions for modified/added lines),
+/// 2. Deletion fixes (`avoid_<removed>` when identifiers were eliminated from the symbol),
 /// 3. Reordering fixes (`<a_before_b>` when statement execution order changed with identical tokens).
 /// If an edit only changed punctuation (`;`, `,`, `)`), comments, or whitespace, returns an empty `Vec`.
 pub fn diff_symbol_body_tokens(
@@ -284,14 +413,20 @@ pub fn diff_symbol_body_tokens(
 
     let mut old_sym_seq: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
+    let mut old_sym_spans: std::collections::HashMap<String, (usize, usize)> =
+        std::collections::HashMap::new();
     if let Some(os) = old_skel {
         for sym in &os.symbols {
             if matches!(sym.kind.as_str(), "impl" | "mod" | "namespace" | "section") {
                 continue;
             }
             let seq = if old_bytes.is_some() {
-                let extracted =
-                    extract_ordered_symbol_body_tokens(&old_lines, sym.start_line, sym.end_line);
+                let extracted = extract_ordered_symbol_body_tokens_with_limit(
+                    &old_lines,
+                    sym.start_line,
+                    sym.end_line,
+                    usize::MAX,
+                );
                 if extracted.is_empty() && !sym.body_tokens.is_empty() {
                     sym.body_tokens.clone()
                 } else {
@@ -300,11 +435,14 @@ pub fn diff_symbol_body_tokens(
             } else {
                 sym.body_tokens.clone()
             };
+            let span = (sym.start_line, sym.end_line);
             let key = format!("{rel_path}::{}", sym.qualified_name());
-            old_sym_seq.insert(key, seq.clone());
+            old_sym_seq.insert(key.clone(), seq.clone());
+            old_sym_spans.insert(key, span);
             if sym.container.is_some() {
                 let short_key = format!("{rel_path}::{}", sym.name);
-                old_sym_seq.entry(short_key).or_insert(seq);
+                old_sym_seq.entry(short_key.clone()).or_insert(seq);
+                old_sym_spans.entry(short_key).or_insert(span);
             }
         }
     }
@@ -320,6 +458,7 @@ pub fn diff_symbol_body_tokens(
         touched_set.contains(q_key.as_str()) || touched_set.contains(short_key.as_str())
     });
 
+    let sym_tok_limit = if old_bytes.is_some() { usize::MAX } else { 128 };
     let mut added = std::collections::BTreeSet::new();
     for sym in &new_skel.symbols {
         if has_leaf_touched
@@ -341,7 +480,12 @@ pub fn diff_symbol_body_tokens(
         };
 
         let new_seq = if !new_lines.is_empty() {
-            extract_ordered_symbol_body_tokens(&new_lines, sym.start_line, sym.end_line)
+            extract_ordered_symbol_body_tokens_with_limit(
+                &new_lines,
+                sym.start_line,
+                sym.end_line,
+                sym_tok_limit,
+            )
         } else {
             sym.body_tokens.clone()
         };
@@ -362,38 +506,53 @@ pub fn diff_symbol_body_tokens(
                 let new_set: std::collections::BTreeSet<&str> =
                     new_seq.iter().map(String::as_str).collect();
 
-                let added_in_sym: Vec<String> = new_seq
+                let mut combined_added: std::collections::BTreeSet<String> = new_seq
                     .iter()
                     .filter(|t| !prev_set.contains(t.as_str()))
                     .cloned()
                     .collect();
 
-                if !added_in_sym.is_empty() {
-                    for t in added_in_sym {
+                if old_bytes.is_some() && !new_lines.is_empty() {
+                    if let Some(&old_span) = old_sym_spans.get(key) {
+                        for t in collect_line_multiset_diff_added_tokens(
+                            &old_lines,
+                            old_span,
+                            &new_lines,
+                            (sym.start_line, sym.end_line),
+                        ) {
+                            combined_added.insert(t);
+                        }
+                    }
+                }
+
+                let mut removed_in_sym: Vec<String> = prev_seq
+                    .iter()
+                    .filter(|t| t.len() >= 3 && !new_set.contains(t.as_str()))
+                    .cloned()
+                    .collect();
+                removed_in_sym.sort_by(|a, b| {
+                    b.contains('_')
+                        .cmp(&a.contains('_'))
+                        .then_with(|| b.len().cmp(&a.len()))
+                        .then_with(|| a.cmp(b))
+                });
+
+                if !combined_added.is_empty() {
+                    for t in combined_added {
                         added.insert(t);
                     }
-                } else {
-                    let mut removed_in_sym: Vec<String> = prev_seq
-                        .iter()
-                        .filter(|t| t.len() >= 3 && !new_set.contains(t.as_str()))
-                        .cloned()
-                        .collect();
-                    if !removed_in_sym.is_empty() {
-                        removed_in_sym.sort_by(|a, b| {
-                            b.contains('_')
-                                .cmp(&a.contains('_'))
-                                .then_with(|| b.len().cmp(&a.len()))
-                                .then_with(|| a.cmp(b))
-                        });
-                        for tok in removed_in_sym.into_iter().take(4) {
-                            added.insert(format!("avoid_{tok}"));
-                        }
-                    } else if new_seq != *prev_seq {
-                        if let Some((a, b)) = find_reordered_statement_pair(prev_seq, &new_seq) {
-                            added.insert(format!("{a}_before_{b}"));
-                            added.insert(a);
-                            added.insert(b);
-                        }
+                    for tok in removed_in_sym.into_iter().take(2) {
+                        added.insert(format!("avoid_{tok}"));
+                    }
+                } else if !removed_in_sym.is_empty() {
+                    for tok in removed_in_sym.into_iter().take(4) {
+                        added.insert(format!("avoid_{tok}"));
+                    }
+                } else if new_seq != *prev_seq {
+                    if let Some((a, b)) = find_reordered_statement_pair(prev_seq, &new_seq) {
+                        added.insert(format!("{a}_before_{b}"));
+                        added.insert(a);
+                        added.insert(b);
                     }
                 }
             }
@@ -2963,5 +3122,54 @@ public sealed class SqlOrderRepo(IDbConnection db) : BaseRepo, IOrderRepo {
             .symbols
             .iter()
             .any(|s| s.qualified_name() == "M::dispatch" && s.start_line == 2 && s.end_line == 4));
+    }
+
+    #[test]
+    fn line_deletion_and_existing_identifier_reuse_never_pollute_resolution_tokens() {
+        let mut filler = String::new();
+        for i in 1..=25 {
+            filler.push_str(&format!("    let tok_slot_{i:02} = metric_alpha_{i:02} + metric_beta_{i:02};\n"));
+        }
+        let old_src = format!(
+            "fn apply_theme(visuals: &mut Visuals) {{\n\
+             {filler}\
+                 visuals.panel_fill = bg_canvas;\n\
+                 visuals.weak_text_color = Some(text_muted);\n\
+                 visuals.widgets.open.bg_fill = accent_fallback;\n\
+                 visuals.menu_corner_radius = corner_sm;\n\
+                 visuals.window_stroke = stroke_border;\n\
+             }}\n"
+        );
+        let new_src = format!(
+            "fn apply_theme(visuals: &mut Visuals) {{\n\
+             {filler}\
+                 visuals.panel_fill = bg_canvas;\n\
+                 visuals.widgets.open.bg_fill = bg_canvas;\n\
+                 visuals.menu_corner_radius = corner_sm;\n\
+                 visuals.window_stroke = stroke_border;\n\
+             }}\n"
+        );
+        let old_skel = FileSkeleton::extract("src/theme.rs", &old_src);
+        let new_skel = FileSkeleton::extract("src/theme.rs", &new_src);
+        let delta = diff_symbol_body_tokens(
+            "src/theme.rs",
+            Some(old_src.as_bytes()),
+            Some(&old_skel),
+            new_src.as_bytes(),
+            &new_skel,
+            &["src/theme.rs::apply_theme".to_owned()],
+        );
+        assert!(
+            delta.iter().any(|t| t == "avoid_weak_text_color"),
+            "expected deleted field cue in delta, got {delta:?}"
+        );
+        assert!(
+            delta.iter().any(|t| t == "bg_canvas"),
+            "expected modified-line reused token 'bg_canvas' in delta, got {delta:?}"
+        );
+        assert!(
+            !delta.iter().any(|t| t == "menu_corner_radius" || t == "window_stroke"),
+            "unchanged bottom-of-function tokens must never leak into delta: {delta:?}"
+        );
     }
 }

@@ -97,7 +97,7 @@ $PluginJson = @'
 {
   "name": "libredb",
   "displayName": "LibreDB Cognitive Memory",
-  "version": "1.6.1",
+  "version": "1.6.2",
   "description": "Enterprise-ready Rust cognitive memory, token-economy analytics & MCP code graph: single-file LIBREDB1 storage, silent SQLite auto-porter, sub-2ms hooks, content-bound HMAC-SHA256 workspace trust seals, DPAPI / ChaCha20-Poly1305 credential vault, zero-hardcode topology & Dalvik/DI causal code graph, built-in benchmarks & token-savings reports, and multi-remote Git/Gitea/GitHub automation.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
@@ -283,6 +283,11 @@ All system rules, coding standards, administrative credentials, and skills live 
 
 7. **Model & concurrency catalog**:
    - `ultra` (16 reader lanes) and `pro` (8 lanes) across `Gemini 4 Argon`, `Gemini 4 Carbon`, `Gemini 3.8 Flash`, `Claude Opus 5.5`, `Claude Sonnet 5.5`, `GPT-OSS 120B`. Keep 100% of code generation on `Argon`, `Carbon`, or `Claude 5.5`; route only read-only `research` subagents to `Model="flash"`.
+
+8. **Native Windows app design & anti-AI-slop UI standard (`Fluent 2`)**:
+   - Ban AI-slop aesthetics across all desktop/Windows GUIs (`WinUI`, `WPF`, `egui`/`eframe`, `Tauri`, tray UIs): zero neon purple/cyan/rainbow gradients, zero oversized `>= 16px` rounded cards, zero glassmorphism blobs, zero gratuitous animations, and zero heavy Bold-all-over text.
+   - Enforce Microsoft `Fluent 2` (`https://learn.microsoft.com/en-us/windows/apps/design/guidelines-overview`): `Segoe UI Variable` type ramp (`Caption 12/16`, `Body 14/20`, `Body Strong 14/20`, `Body Large 18/24`, `Subtitle 20/28`, `Title 28/36`, `Title Large 40/52`, `Display 68/92`) using ONLY Regular (`400`) and Semibold (`600`), sharp semantic corner radii (`8px` `OverlayCornerRadius`, `4px` `ControlCornerRadius`, `2px` micro badges), neutral layered surfaces (`LayerFillColorDefault`, `SolidBackgroundFillColorBase`, `CardBackgroundFillColorDefault`, `ControlFillColorDefault`) with `1px` hairline borders (`CardStrokeColorDefault`/`ControlStrokeColorDefault`), `Mica`/`Acrylic` backdrops, and a single restrained Windows system `AccentFillColorDefault` strictly for primary actions and active states.
+   - Enforce Microsoft Windows best practices (`https://learn.microsoft.com/en-us/windows/apps/get-started/best-practices`): respect system Light/Dark and Windows Contrast themes (`>= 4.5:1` text contrast), scale via effective pixels (`epx`) across monitors/DPI, support complete `Tab`/`Arrow`/`Enter`/`Escape` keyboard focus and UI Automation accessibility, preserve flexible localized layout bounds, and keep controls crisp and responsive without blocking prompts. Recall details anytime via `libredb get-skill windows-app-design`.
 '@
     $UmlautList = "$([char]0x00E4), $([char]0x00F6), $([char]0x00FC), $([char]0x00DF)"
     $TokenOek = "Token$([char]0x00F6)konomie"
@@ -412,7 +417,7 @@ $LogoSvg = @'
 
 # 7. Write user-facing README.md inside plugin bundle
 $PluginReadme = @'
-# LibreDB cognitive memory plugin (v1.6.1)
+# LibreDB cognitive memory plugin (v1.6.2)
 
 Enterprise-ready standalone Rust cognitive memory, token-economy analytics & code-graph engine for `Antigravity`:
 - `libredb-mcp`: 3-tool multi-workspace cognitive memory & 25+ language zero-hardcode topology + exact Dalvik/DI + Git co-change `Lift` code-graph server with `< 0.5 ms` `locate`, closed-loop causal `Search-Miss -> Verified-Edit` bridging (body-hash diffs + calibrated `BridgeScorer`), procedural `Failure -> Fix -> Pass` pitfall learning (3-mode ordered/deletion AST diff, 2-stage banality filter & outcome-gated refutation), situational reflex superseding + empirical Laplace utility revision, batched `impact` (`symbols`) & `fim` (`slices`) with proactive symbol pitfalls, tentative-verified `PreToolUse` ACID symbol shifting, contract-drift grounded reflexes, subagent-aware priority-budgeted `BM25` `PreInvocation` hydration, zero-I/O RAM session delta, and `[Zero-Repeat Skeleton]` deduplication.
@@ -441,6 +446,6 @@ if (Test-Path $AgyConfigPath) {
     }
 }
 
-Write-Output "[OK] Deployed LibreDB v1.6.1 standalone binaries to: $BinDir (Profile=$Profile)"
+Write-Output "[OK] Deployed LibreDB v1.6.2 standalone binaries to: $BinDir (Profile=$Profile)"
 Write-Output "[OK] Hydrated and modernized global store at: $GlobalLdb"
 Write-Output "[OK] Installed complete Antigravity plugin at: $PluginDir"

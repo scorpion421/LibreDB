@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.2] - 2026-11-15
+
+### Added
+- **Windows Fluent 2 app design & anti-AI-slop UI standard (`main.rs`, `deploy_plugin.*`, `windows-app-design`)**: Anchored official Microsoft Learn UI/UX guidelines (`guidelines-overview`, `best-practices`), `Segoe UI Variable` type ramp (`400`/`600` weights only), semantic corner radii (`8px` overlay / `4px` control / `2px` micro), neutral layered luminance + `1px` strokes, `Mica`/`Acrylic` backdrops, single Windows system accent, `>= 4.5:1` contrast, DPI scaling, keyboard/UI Automation accessibility, and explicit rejection of AI-slop neon gradients and oversized cards directly in `AGENTS.md`, `rule:global::windows-fluent-app-design`, `reflex::windows-fluent-app-design`, and the `windows-app-design` skill.
+
+### Fixed
+- **Line-diff-aware AST resolution tokens & unshifted body comparison (`skeleton.rs`)**: Added `extract_ordered_symbol_body_tokens_with_limit` (`128` stored / `usize::MAX` in-memory diffing) and `collect_line_multiset_diff_added_tokens` in `diff_symbol_body_tokens` so line deletions never pull unchanged bottom-of-function tokens into `resolution_tokens`, modified/added lines capture reused identifiers (such as `bg_canvas`), `avoid_<tok>` emits up to `2` eliminated identifiers alongside additions, and comment/whitespace/punctuation edits continue returning empty deltas.
+- **Remote-URL Gitea owner resolution & deterministic CLI output (`gitea.rs`)**: Added `parse_owner_and_repo_from_remote_url` and `resolve_gitea_owner_and_repo` so `libredb git-release` and `git-sync --releases` target the project remote owner namespace (`<owner>/<repo>`, falling back to `cfg.user` once on HTTP `404`), recover existing releases on HTTP `409`/`422` via tag lookup + `PATCH`, log API diagnostics on `stderr`, and always print release confirmation or tag-warning status lines.
+
 ## [1.6.1] - 2026-11-15
 
 ### Fixed

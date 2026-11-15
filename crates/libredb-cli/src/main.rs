@@ -2376,10 +2376,15 @@ fn modernize_global_db(
         }
     } else {
         // Enterprise-neutral profile (`--profile neutral`, default): remove ONLY the exact personal
-        // rule and the 7 exact personal author reflexes seeded by `--profile personal`, preserving 100%
+        // rules and the 8 exact personal author reflexes seeded by `--profile personal`, preserving 100%
         // of custom organization-defined rules (including any custom `rule:global::*` keys).
-        if gdb.deprecate_key(NodeKind::Rule, "rule:global::candid-architectural-pushback")? {
-            deprecated_legacy += 1;
+        for personal_rule_key in [
+            "rule:global::candid-architectural-pushback",
+            "rule:global::windows-fluent-app-design",
+        ] {
+            if gdb.deprecate_key(NodeKind::Rule, personal_rule_key)? {
+                deprecated_legacy += 1;
+            }
         }
         for personal_reflex_id in [
             "rust-guardrail-staged",
@@ -2389,6 +2394,7 @@ fn modernize_global_db(
             "windows-soc-admin-audit",
             "formatting-and-language-boundary",
             "rust-gitea-dist",
+            "windows-fluent-app-design",
         ] {
             if gdb.deprecate_key(NodeKind::Rule, &format!("reflex::{personal_reflex_id}"))? {
                 deprecated_legacy += 1;
@@ -2524,6 +2530,34 @@ fn modernize_global_db(
             directive: "Copy compiled release deliverables into dist/ before running 'libredb gitea-release' so assets attach automatically.".to_owned(),
             ..Default::default()
         },
+        ReflexRule {
+            id: "windows-fluent-app-design".to_owned(),
+            stack_any: vec![
+                "egui".to_owned(),
+                "eframe".to_owned(),
+                "winui".to_owned(),
+                "wpf".to_owned(),
+                "windows".to_owned(),
+                "tauri".to_owned(),
+                "xaml".to_owned(),
+                "ui".to_owned(),
+                "gui".to_owned(),
+                "theme".to_owned(),
+            ],
+            action_any: vec![
+                "ui".to_owned(),
+                "theme".to_owned(),
+                "design".to_owned(),
+                "color".to_owned(),
+                "layout".to_owned(),
+                "window".to_owned(),
+                "button".to_owned(),
+                "style".to_owned(),
+            ],
+            env_or_error_any: Vec::new(),
+            directive: "Apply Microsoft Fluent 2 Windows design natively: Segoe UI Variable (400/600 weights only), 8px overlay / 4px control corner radii, neutral layered fills + 1px hairline strokes, single system accent, >=4.5:1 contrast, DPI scaling, full keyboard/UI Automation focus, and zero AI-slop gradients or pill-heavy cards (see 'libredb get-skill windows-app-design').".to_owned(),
+            ..Default::default()
+        },
     ];
 
     for r in &technical_reflexes {
@@ -2541,6 +2575,14 @@ fn modernize_global_db(
         gdb.put(
             WriteRequest::new(NodeKind::Rule, pushback_rule.as_bytes().to_vec())
                 .with_key("rule:global::candid-architectural-pushback")
+                .with_importance(245)
+                .with_pinned(true),
+        )?;
+
+        let fluent_rule = "[Rule: windows-fluent-app-design | priority=100 | enforcement=CRITICAL]\nSummary: Mandatory native Windows Fluent 2 UI/UX standard enforcing Microsoft Learn design guidelines and banning generic AI-slop styling.\nFor every Windows or desktop GUI, tray app, setup wizard, or custom-drawn interface: (1) Ban AI-slop aesthetics - zero neon purple/cyan/rainbow gradients, zero oversized >=16px rounded cards, zero glassmorphism blobs, zero gratuitous animations, zero heavy bold-all-over typography. (2) Enforce Fluent 2 tokens: Segoe UI Variable type ramp (Caption 12/16, Body 14/20, Body Strong 14/20, Subtitle 20/28, Title 28/36), weights Regular (400) and Semibold (600) only (avoid Bold 700+ and Italics), crisp semantic radii (8px OverlayCornerRadius for windows/dialogs/flyouts, 4px ControlCornerRadius for buttons/inputs/list rows, 2px micro badges/bars), neutral layered luminance (LayerFillColorDefault, SolidBackgroundFillColorBase, CardBackgroundFillColorDefault, ControlFillColorDefault) with 1px CardStrokeColorDefault/ControlStrokeColorDefault borders, Mica/Acrylic backdrop materials, and a single restrained Windows system AccentFillColorDefault strictly for primary actions and active indicators. (3) Meet Windows best practices: respect Light/Dark and Windows Contrast themes (>=4.5:1 text contrast), per-monitor DPI scaling (epx), explicit Left/Right/Up/Down/Tab/Enter/Escape keyboard navigation with visible focus rects, UI Automation labels/roles, localized layout tolerance, and instant responsive feedback without blocking dialogs.";
+        gdb.put(
+            WriteRequest::new(NodeKind::Rule, fluent_rule.as_bytes().to_vec())
+                .with_key("rule:global::windows-fluent-app-design")
                 .with_importance(245)
                 .with_pinned(true),
         )?;
@@ -2906,13 +2948,13 @@ mod tests {
         assert_eq!(count_non_reflex_rules(&gdb), 0);
         assert_eq!(count_reflexes(&gdb), 3);
 
-        // 2. Switching to personal profile adds personal pushback rule + all 10 reflexes
+        // 2. Switching to personal profile adds personal rules (pushback + Fluent app design) + all 11 reflexes
         modernize_global_db(&gdb, Some(&dummy_skill), true).unwrap();
-        assert_eq!(count_non_reflex_rules(&gdb), 1);
-        assert_eq!(count_reflexes(&gdb), 10);
+        assert_eq!(count_non_reflex_rules(&gdb), 2);
+        assert_eq!(count_reflexes(&gdb), 11);
 
         // 3. Preserving corporate custom rules (including custom `rule:global::*` keys!) while downgrading
-        //    back to neutral removes ONLY the exact personal rule/reflexes!
+        //    back to neutral removes ONLY the exact personal rules/reflexes!
         gdb.put(
             WriteRequest::new(NodeKind::Rule, b"Corporate SOC policy".to_vec())
                 .with_key("corp:soc-policy")
@@ -2932,6 +2974,9 @@ mod tests {
         assert_eq!(count_non_reflex_rules(&gdb), 2);
         assert!(gdb
             .get_by_key(NodeKind::Rule, "rule:global::candid-architectural-pushback")
+            .is_err());
+        assert!(gdb
+            .get_by_key(NodeKind::Rule, "rule:global::windows-fluent-app-design")
             .is_err());
         assert!(gdb.get_by_key(NodeKind::Rule, "corp:soc-policy").is_ok());
         assert!(gdb
