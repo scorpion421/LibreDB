@@ -413,16 +413,28 @@ pub(crate) fn evaluate_pre_tool_payload(payload: &Value, global_ldb_opt: Option<
             let is_full_file = matches!(tool_name, "write_file" | "write_to_file")
                 && args.get("Append").and_then(Value::as_bool) != Some(true);
             for txt in texts_to_check {
-                let violations = check_text_guardrails_with_options(
+                let mut violations = check_text_guardrails_with_options(
                     txt,
                     target_file,
                     is_full_file,
                     &custom_prefixes,
                 );
+                if enforce_style {
+                    violations.extend(libredb_cognitive::check_german_prose_style(
+                        txt,
+                        target_file,
+                    ));
+                }
                 if let Some(first_crit) = violations.into_iter().find(|v| {
                     v.severity == "CRITICAL"
                         && (enforce_style
-                            || !matches!(v.rule.as_str(), "no-em-en-dash" | "no-emojis"))
+                            || !matches!(
+                                v.rule.as_str(),
+                                "no-em-en-dash"
+                                    | "no-emojis"
+                                    | "german-ascii-umlaut"
+                                    | "german-deppenbindestrich"
+                            ))
                 }) {
                     return json!({
                         "decision": "deny",
@@ -697,12 +709,37 @@ pub(crate) fn evaluate_pre_invocation_payload(
     }
 
     let prompt_hint = extract_prompt_hint(payload, transcript_opt.as_deref());
-    let (context_block, naive_baseline_bytes) = build_project_memory_hydration(
+    let (mut context_block, naive_baseline_bytes) = build_project_memory_hydration(
         &proj_db,
         ws_root.as_deref(),
         prompt_hint.as_deref(),
         error_hint,
     );
+    let gdb_opt = open_global_ldb_checked(global_ldb_opt).ok().flatten();
+    let enforce_style = crate::security::load_bool_config(
+        gdb_opt.as_deref(),
+        Some(&proj_db),
+        "guardrail:style_rules",
+        false,
+    );
+    if enforce_style && !context_block.is_empty() {
+        const STYLE_INVARIANT: &str = "Style Invariant: Informal German ('Du'), natural umlauts (never ae/oe/ue), closed German Komposita (zero Deppenbindestriche), zero em/en-dashes or emojis, 100% ASCII English in code/commits.";
+        const MAX_PRE_INV_BYTES: usize = 1800;
+        let needed = STYLE_INVARIANT.len() + 1;
+        while context_block.len() + needed > MAX_PRE_INV_BYTES {
+            let Some(pos) = context_block.rfind('\n') else {
+                break;
+            };
+            if pos == 0 {
+                break;
+            }
+            context_block.truncate(pos);
+        }
+        if context_block.len() + needed <= MAX_PRE_INV_BYTES {
+            context_block.push('\n');
+            context_block.push_str(STYLE_INVARIANT);
+        }
+    }
     if context_block.is_empty() {
         Ok(json!({ "injectSteps": [] }))
     } else {
@@ -1962,7 +1999,12 @@ pub(crate) fn extract_error_diagnostics_from_command_output(text: &str) -> Vec<S
             continue;
         }
 
-        let is_compiler_or_runtime_err = t.starts_with("error[E")
+        let is_short_compiler_err = (t.contains(": error[E")
+            || t.contains(": error: ")
+            || t.contains("): error TS"))
+            && libredb_cognitive::extract_error_file_hint(t).is_some();
+        let is_compiler_or_runtime_err = (is_short_compiler_err
+            || t.starts_with("error[E")
             || ((t.starts_with("error: ") || t.starts_with("Error: "))
                 && !t.starts_with("error: test failed, to rerun")
                 && !t.contains("0 errors"))
@@ -1970,7 +2012,8 @@ pub(crate) fn extract_error_diagnostics_from_command_output(text: &str) -> Vec<S
             || t.starts_with("TypeError:")
             || t.starts_with("ReferenceError:")
             || t.starts_with("AssertionError:")
-            || t.starts_with("ImportError:");
+            || t.starts_with("ImportError:"))
+            && !libredb_cognitive::is_non_causal_error_noise(t);
         if is_compiler_or_runtime_err {
             push_unique(&mut out, t.to_owned());
         }
@@ -2228,17 +2271,31 @@ pub fn find_workspace_root(start: &Path) -> Option<PathBuf> {
     if is_protected_profile_dir(dir) {
         return None;
     }
+    let mut fallback_marker: Option<PathBuf> = None;
     let mut curr = Some(dir);
     while let Some(c) = curr {
-        if c.parent().is_none() || is_protected_profile_dir(c) {
+        if c.parent().is_none()
+            || is_protected_profile_dir(c)
+            || c.file_name().and_then(|s| s.to_str()) == Some("target")
+        {
             break;
         }
-        if has_project_root_marker(c) {
+        // Prefer an initialized `.agents` memory database first, then the `.git`
+        // repository boundary, so nested workspace sub-crates resolve to the repo root.
+        if c.join(".agents").join("memory.ldb").exists()
+            || c.join(".agents").join("memory.db").exists()
+        {
             return Some(c.to_path_buf());
+        }
+        if c.join(".git").exists() {
+            return Some(c.to_path_buf());
+        }
+        if has_project_root_marker(c) {
+            fallback_marker = Some(c.to_path_buf());
         }
         curr = c.parent();
     }
-    None
+    fallback_marker
 }
 
 pub fn is_protected_profile_dir(p: &Path) -> bool {
@@ -3396,6 +3453,129 @@ mod tests {
             crate::security::is_workspace_memory_trusted(Some(&gdb), &ws_repo)
         };
         assert!(trusted_after, "Workspace seal must remain valid after refutation and recovery");
+
+        let _ = fs::remove_dir_all(&base_dir);
+    }
+
+    #[test]
+    fn find_workspace_root_prefers_memory_and_git_root_over_subcrate_cargo_toml() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join(format!("libredb_root_res_{}_{}", std::process::id(), nanos));
+
+        // Case 1: Cargo workspace with `.agents/memory.ldb` and `.git` at root, nested sub-crate Cargo.toml.
+        let repo_a = base_dir.join("repo_a");
+        let sub_a = repo_a.join("crates").join("ws4w-core").join("src");
+        fs::create_dir_all(&sub_a).unwrap();
+        fs::create_dir_all(repo_a.join(".git")).unwrap();
+        fs::write(repo_a.join("Cargo.toml"), "[workspace]\nmembers = [\"crates/ws4w-core\"]\n").unwrap();
+        fs::write(repo_a.join("crates").join("ws4w-core").join("Cargo.toml"), "[package]\nname = \"ws4w-core\"\n").unwrap();
+        let nested_file = sub_a.join("firewall.rs");
+        fs::write(&nested_file, "pub fn check() {}\n").unwrap();
+
+        // Even before `.agents/memory.ldb` is created, `.git` boundary beats inner `Cargo.toml`.
+        assert_eq!(super::find_workspace_root(&nested_file), Some(repo_a.clone()));
+
+        // Once `.agents/memory.ldb` exists at root, it resolves directly to root.
+        fs::create_dir_all(repo_a.join(".agents")).unwrap();
+        {
+            let _ = libredb_core::LibreDb::open(&repo_a.join(".agents").join("memory.ldb")).unwrap();
+        }
+        assert_eq!(super::find_workspace_root(&nested_file), Some(repo_a.clone()));
+
+        // Case 2: Pure Cargo workspace without `.git` or `.agents/` stops cleanly at `target` boundary.
+        let repo_b = base_dir.join("repo_b");
+        let sub_b = repo_b.join("crates").join("sub").join("src");
+        fs::create_dir_all(&sub_b).unwrap();
+        fs::write(repo_b.join("Cargo.toml"), "[workspace]\n").unwrap();
+        fs::write(repo_b.join("crates").join("sub").join("Cargo.toml"), "[package]\nname = \"sub\"\n").unwrap();
+        let file_b = sub_b.join("lib.rs");
+        fs::write(&file_b, "").unwrap();
+        assert_eq!(super::find_workspace_root(&file_b), Some(repo_b));
+
+        let _ = fs::remove_dir_all(&base_dir);
+    }
+
+    #[test]
+    fn extract_error_diagnostics_parses_short_cargo_and_drops_summary_noise() {
+        let output = "\
+error: could not compile `ws4w-core` (lib) due to 12 previous errors\n\
+Error: Unknown 'git-init' flag '--help'. Check CLI help.\n\
+crates/ws4w-core/src/lib.rs:10:5: error: unclosed delimiter\n\
+crates/ws4w-core/src/firewall.rs:42:13: error[E0425]: cannot find value `netfw_policy` in this scope\n\
+src/app.ts(18,7): error TS2345: Argument of type 'string' is not assignable.\n";
+        let diags = super::extract_error_diagnostics_from_command_output(output);
+        assert_eq!(diags.len(), 2, "Expected only genuine causal errors: {diags:?}");
+        assert!(diags[0].contains("E0425"));
+        assert!(diags[1].contains("TS2345"));
+    }
+
+    #[test]
+    fn pre_invocation_injects_style_invariant_within_byte_budget() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join(format!("libredb_style_inv_{}_{}", std::process::id(), nanos));
+        let ws_repo = base_dir.join("repo");
+        fs::create_dir_all(ws_repo.join("src")).unwrap();
+        fs::write(ws_repo.join("Cargo.toml"), "[package]\nname = \"style_inv\"\nversion = \"0.1.0\"\n").unwrap();
+        fs::write(ws_repo.join("src").join("lib.rs"), "pub fn ping() -> u32 { 1 }\n").unwrap();
+
+        let global_path = base_dir.join("customizations.ldb");
+        let proj_ldb = ws_repo.join(".agents").join("memory.ldb");
+        {
+            let gdb = libredb_core::LibreDb::open(&global_path).unwrap();
+            let _ = gdb.put(
+                libredb_core::WriteRequest::new(libredb_core::NodeKind::Config, b"true".to_vec())
+                    .with_key("guardrail:style_rules"),
+            );
+            let pdb = std::sync::Arc::new(libredb_core::LibreDb::open(&proj_ldb).unwrap());
+            pdb.put(
+                libredb_core::WriteRequest::new(
+                    libredb_core::NodeKind::Fact,
+                    b"Ping service responds on port 8080".to_vec(),
+                )
+                .with_key("ping_port"),
+            )
+            .unwrap();
+            libredb_cognitive::index_workspace(&pdb, &ws_repo, false).unwrap();
+            crate::security::seal_workspace_memory(&gdb, &pdb, &ws_repo).unwrap();
+        }
+
+        let res = super::evaluate_pre_invocation_payload(
+            &json!({
+                "conversationId": "conv-style-inv",
+                "workspacePaths": [ws_repo.to_string_lossy().to_string()],
+                "prompt": "Check ping implementation"
+            }),
+            Some(&global_path),
+        )
+        .unwrap();
+        let serialized = res.to_string();
+        assert!(
+            serialized.contains("Style Invariant:"),
+            "Expected compact Style Invariant line when guardrail:style_rules=true: {serialized}"
+        );
+        let injected = res["injectSteps"][0]["content"]
+            .as_str()
+            .or_else(|| res["injectSteps"][0]["text"].as_str())
+            .unwrap_or("");
+        assert!(
+            injected.len() <= 2100,
+            "Injected PreInvocation block exceeded compact ceiling ({} bytes)",
+            injected.len()
+        );
 
         let _ = fs::remove_dir_all(&base_dir);
     }

@@ -18,15 +18,16 @@ pub mod workspace;
 
 pub use guardrail::{
     audit_workspace_guardrails, audit_workspace_guardrails_with_prefixes,
-    check_command_guardrails, check_text_guardrails, check_text_guardrails_with_mode,
-    check_text_guardrails_with_options, is_sensitive_staged_file, is_test_or_scratch_path,
-    GuardrailAuditReport, GuardrailViolation,
+    check_command_guardrails, check_german_prose_style, check_text_guardrails,
+    check_text_guardrails_with_mode, check_text_guardrails_with_options,
+    is_sensitive_staged_file, is_test_or_scratch_path, GuardrailAuditReport, GuardrailViolation,
 };
 pub use learning::{
-    format_learning_report, is_banal_syntax_error, learn_explicit_error_resolution,
-    learning_state_report, record_error_cue, record_search_miss_cue_with_source,
-    ErrorPitfallBook, LearnedPitfallEntry, LearningCounters, LearningStateReport, MissCueSource,
-    PendingErrorCue, ACTIVE_PITFALL_MIN_CONFIDENCE, ERROR_PITFALL_BOOK_KEY, PENDING_ERROR_CUES_KEY,
+    extract_error_file_hint, format_learning_report, is_banal_syntax_error,
+    is_code_learning_eligible_path, is_non_causal_error_noise, learn_explicit_error_resolution,
+    learning_state_report, record_error_cue, record_search_miss_cue_with_source, ErrorPitfallBook,
+    LearnedPitfallEntry, LearningCounters, LearningStateReport, MissCueSource, PendingErrorCue,
+    ACTIVE_PITFALL_MIN_CONFIDENCE, ERROR_PITFALL_BOOK_KEY, PENDING_ERROR_CUES_KEY,
 };
 pub use overlay::OverlayBrain;
 pub use reflex::{

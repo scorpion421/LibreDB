@@ -197,6 +197,9 @@ impl OverlayBrain {
         // Preserve display rank order `(is_global, local_idx)`
         let mut order_plan: Vec<(bool, usize)> = Vec::new();
 
+        // Phase 3a: Apply Zero-Repeat Delta stubs first so fresh budget reflects freed tokens,
+        // and collect remaining eligible candidates in descending relevance order.
+        let mut fresh: Vec<(bool, ScoredInodeCandidate)> = Vec::new();
         for (is_global, cand) in merged {
             if cand.score < floor && !cand.via_bridge {
                 continue;
@@ -228,25 +231,69 @@ impl OverlayBrain {
                     continue;
                 }
             }
+            fresh.push((is_global, cand));
+        }
 
+        // Phase 3b: Reserve at least 50% of remaining token budget for local project memories
+        // (`!is_global`) so global skill hits cannot crowd out project facts and decisions.
+        let remaining_after_stubs = req.token_budget.saturating_sub(used_tokens);
+        let local_quota = (remaining_after_stubs + 1) / 2;
+        let first_local_cap = ((remaining_after_stubs * 3) / 5).max(local_quota);
+        let mut local_reserved_tok = 0u32;
+        let mut picked = vec![false; fresh.len()];
+
+        for (idx, (is_global, cand)) in fresh.iter().enumerate() {
+            if *is_global {
+                continue;
+            }
+            let tok = cand.token_count.max(1);
+            let fits_quota = local_reserved_tok.saturating_add(tok) <= local_quota
+                || (local_reserved_tok == 0 && tok <= first_local_cap);
+            if fits_quota && used_tokens.saturating_add(tok) <= req.token_budget {
+                picked[idx] = true;
+                local_reserved_tok = local_reserved_tok.saturating_add(tok);
+                used_tokens = used_tokens.saturating_add(tok);
+            }
+        }
+
+        // Phase 3c: Fill remaining budget across all unselected candidates in original score order.
+        let mut any_picked = picked.iter().any(|&p| p);
+        for (idx, (_, cand)) in fresh.iter().enumerate() {
+            if picked[idx] {
+                continue;
+            }
             let tok = cand.token_count.max(1);
             if used_tokens.saturating_add(tok) <= req.token_budget
-                || (order_plan.is_empty() && fired_reflexes.is_empty() && tok <= req.token_budget)
+                || (!any_picked && fired_reflexes.is_empty() && tok <= req.token_budget)
             {
-                used_tokens += tok;
-                if let Some(ref mut sess) = session {
-                    sess.mark_delivered(ns_id, cand.generation);
-                    session_dirty = true;
-                }
-                if is_global {
-                    let idx = to_fetch_glob.len();
-                    to_fetch_glob.push(cand);
-                    order_plan.push((true, idx));
-                } else {
-                    let idx = to_fetch_proj.len();
-                    to_fetch_proj.push(cand);
-                    order_plan.push((false, idx));
-                }
+                picked[idx] = true;
+                any_picked = true;
+                used_tokens = used_tokens.saturating_add(tok);
+            }
+        }
+
+        // Phase 3d: Emit selected items in their original descending relevance rank order.
+        for (selected_flag, (is_global, cand)) in picked.into_iter().zip(fresh.into_iter()) {
+            if !selected_flag {
+                continue;
+            }
+            let ns_id = if is_global {
+                GLOBAL_LAYER_TAG | cand.node_id
+            } else {
+                cand.node_id
+            };
+            if let Some(ref mut sess) = session {
+                sess.mark_delivered(ns_id, cand.generation);
+                session_dirty = true;
+            }
+            if is_global {
+                let idx = to_fetch_glob.len();
+                to_fetch_glob.push(cand);
+                order_plan.push((true, idx));
+            } else {
+                let idx = to_fetch_proj.len();
+                to_fetch_proj.push(cand);
+                order_plan.push((false, idx));
             }
         }
 

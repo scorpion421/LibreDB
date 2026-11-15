@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.1] - 2026-11-15
+
+### Fixed
+- **Workspace sub-crate root resolution (`hooks.rs`)**: Updated `find_workspace_root` to prefer initialized `.agents/memory.ldb` / `.git` boundaries (and stop at Cargo `target/` sandboxes) so edits inside workspace sub-crates (`crates/<subcrate>/...`) resolve to the repository root memory store.
+- **Spurious error-cue binding & Cargo noise filtering (`learning.rs`, `hooks.rs`)**: Added `file_hint` extraction (Cargo `--message-format=short`, Rust `--> path:line:col`, `tsc`, Python tracebacks) on `PendingErrorCue`, excluded non-code paths (`.gitignore`, lockfiles, `.md`, `.agents/`) from consuming pending error cues, filtered Cargo summary banners (`could not compile ... due to ...`), `unclosed delimiter` noise, and CLI `--help` errors via `is_banal_syntax_error`, and harvested compiler short-format diagnostics in `extract_error_diagnostics_from_command_output`.
+- **Overlay budget fairness (`overlay.rs`)**: Reserved at least 50% of post-stub token budget for project-local nodes (`!is_global`) inside `OverlayBrain::pulse` before filling remaining budget across global skills, preventing generic skill hits from crowding out workspace facts and architectural decisions.
+- **Conversational German style & guardrail alignment (`guardrail.rs`, `hooks.rs`, `main.rs`)**: Added `german-ascii-umlaut` and `german-deppenbindestrich` rules in `check_german_prose_style` (gated in `PreToolUse` via `guardrail:style_rules`, active in workspace audits with zero English false positives), injected a 1-line `Style Invariant:` hint in `PreInvocation` when style guardrails are enabled, and broadened `formatting-and-language-boundary` triggers in `modernize_global_db`.
+
 ## [1.6.0] - 2026-11-14
 
 ### Added

@@ -326,6 +326,344 @@ fn detect_git_exec_or_vault_tamper_command(cmd_low: &str) -> Option<&'static str
     None
 }
 
+fn strip_inline_code_and_urls(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut in_tick = false;
+    for ch in line.chars() {
+        if ch == '`' {
+            in_tick = !in_tick;
+            out.push(' ');
+        } else if in_tick {
+            out.push(' ');
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn has_german_prose_context(text: &str) -> bool {
+    const GERMAN_MARKERS: &[&str] = &[
+        concat!("ni", "cht"),
+        concat!("au", "ch"),
+        concat!("no", "ch"),
+        concat!("od", "er"),
+        concat!("ab", "er"),
+        concat!("we", "il"),
+        concat!("da", "ss"),
+        concat!("si", "nd"),
+        concat!("wi", "rd"),
+        concat!("wer", "den"),
+        concat!("ka", "nn"),
+        concat!("ei", "ne"),
+        concat!("ei", "nen"),
+        concat!("ei", "ner"),
+        concat!("ei", "nem"),
+        concat!("fu", "er"),
+        concat!("ue", "ber"),
+        concat!("mi", "t"),
+        concat!("au", "f"),
+        concat!("be", "i"),
+        concat!("na", "ch"),
+        concat!("zu", "m"),
+        concat!("zu", "r"),
+        concat!("vo", "m"),
+        concat!("se", "hr"),
+        concat!("me", "hr"),
+        concat!("sc", "hon"),
+        concat!("die", "ser"),
+        concat!("die", "se"),
+        concat!("die", "ses"),
+    ];
+    let mut hits = 0usize;
+    let mut seen = [false; 30];
+    let mut in_fence = false;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        let cleaned = strip_inline_code_and_urls(line);
+        for word in cleaned.split(|c: char| !c.is_alphabetic()) {
+            if word.len() < 2 {
+                continue;
+            }
+            let lc = word.to_lowercase();
+            for (idx, marker) in GERMAN_MARKERS.iter().enumerate() {
+                if !seen[idx] && lc == *marker {
+                    seen[idx] = true;
+                    hits += 1;
+                    if hits >= 2 {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Checks German prose/Markdown/artifact text for ASCII umlaut substitutions (`ae`/`oe`/`ue`)
+/// and hyphen-split German compound nouns (Deppenbindestriche), skipping code fences and inline code.
+pub fn check_german_prose_style(text: &str, filename: &str) -> Vec<GuardrailViolation> {
+    const ASCII_UMLAUT_WORDS: &[&str] = &[
+        concat!("lae", "sst"),
+        concat!("lae", "ngst"),
+        concat!("lae", "nge"),
+        concat!("wae", "re"),
+        concat!("wae", "ren"),
+        concat!("hae", "tte"),
+        concat!("hae", "tten"),
+        concat!("nae", "chste"),
+        concat!("nae", "chsten"),
+        concat!("nae", "chstes"),
+        concat!("nae", "chster"),
+        concat!("zae", "hlt"),
+        concat!("ae", "hnlich"),
+        concat!("ae", "hnliche"),
+        concat!("ae", "nderung"),
+        concat!("ae", "nderungen"),
+        concat!("stae", "rker"),
+        concat!("spae", "ter"),
+        concat!("mae", "ssig"),
+        concat!("trae", "gt"),
+        concat!("fae", "llt"),
+        concat!("hae", "lt"),
+        concat!("schlae", "gt"),
+        concat!("wae", "hlt"),
+        concat!("wae", "hrend"),
+        concat!("erwae", "hnt"),
+        concat!("vertrae", "gt"),
+        concat!("bewae", "hrt"),
+        concat!("prae", "zise"),
+        concat!("tempo", "raer"),
+        concat!("pri", "maer"),
+        concat!("sekun", "daer"),
+        concat!("koe", "nnen"),
+        concat!("koe", "nnte"),
+        concat!("koe", "nnten"),
+        concat!("koe", "nnt"),
+        concat!("moe", "glich"),
+        concat!("moe", "gliche"),
+        concat!("moe", "glichen"),
+        concat!("moe", "glichkeit"),
+        concat!("moe", "chte"),
+        concat!("moe", "chten"),
+        concat!("groe", "sser"),
+        concat!("groe", "sste"),
+        concat!("groe", "ssten"),
+        concat!("groe", "sse"),
+        concat!("hoe", "her"),
+        concat!("hoe", "chste"),
+        concat!("loe", "sen"),
+        concat!("loe", "sung"),
+        concat!("loe", "sungen"),
+        concat!("loe", "schen"),
+        concat!("gehoe", "rt"),
+        concat!("stoe", "rt"),
+        concat!("voe", "llig"),
+        concat!("noe", "tig"),
+        concat!("benoe", "tigt"),
+        concat!("persoe", "nlich"),
+        concat!("woe", "rtlich"),
+        concat!("unmoe", "glich"),
+        concat!("ausloe", "sen"),
+        concat!("abloe", "sen"),
+        concat!("oeko", "nomie"),
+        concat!("fu", "er"),
+        concat!("fue", "rs"),
+        concat!("fue", "hrt"),
+        concat!("fue", "hren"),
+        concat!("fue", "hrte"),
+        concat!("fue", "hlen"),
+        concat!("ue", "ber"),
+        concat!("ue", "bersicht"),
+        concat!("ueb", "rig"),
+        concat!("ueb", "ung"),
+        concat!("ueb", "lich"),
+        concat!("rue", "ck"),
+        concat!("zurue", "ck"),
+        concat!("prue", "fen"),
+        concat!("prue", "fung"),
+        concat!("geprue", "ft"),
+        concat!("mue", "ssen"),
+        concat!("mue", "sste"),
+        concat!("mue", "ssten"),
+        concat!("gru", "en"),
+        concat!("grue", "nde"),
+        concat!("grue", "ndung"),
+        concat!("gue", "ltig"),
+        concat!("ungue", "ltig"),
+        concat!("kue", "rzen"),
+        concat!("frue", "h"),
+        concat!("frue", "her"),
+        concat!("natue", "rlich"),
+        concat!("wue", "rde"),
+        concat!("wue", "rden"),
+        concat!("stue", "tzt"),
+        concat!("unterstue", "tzt"),
+        concat!("unterstue", "tzen"),
+        concat!("verfue", "gbar"),
+        concat!("fu", "enf"),
+        concat!("schue", "tzt"),
+        concat!("schlue", "ssel"),
+        concat!("ausfue", "hren"),
+        concat!("ausfue", "hrung"),
+        concat!("einfue", "hren"),
+        concat!("einfue", "hrung"),
+        concat!("aufgefue", "hrt"),
+        concat!("durchgefue", "hrt"),
+        concat!("lue", "cke"),
+        concat!("due", "rfen"),
+        concat!("due", "rfte"),
+        concat!("brue", "cke"),
+        concat!("bue", "ro"),
+        concat!("spue", "rbar"),
+        concat!("verknue", "pft"),
+    ];
+    const GERMAN_NOUN_ROOTS: &[&str] = &[
+        concat!("pra", "xis"),
+        concat!("archi", "tektur"),
+        concat!("feh", "ler"),
+        concat!("bef", "und"),
+        concat!("kon", "text"),
+        concat!("kontin", "gent"),
+        concat!("spei", "cher"),
+        concat!("re", "gel"),
+        concat!("steue", "rung"),
+        concat!("verwal", "tung"),
+        concat!("daten", "bank"),
+        concat!("oeko", "nomie"),
+        concat!("prue", "fung"),
+        concat!("ue", "bersicht"),
+        concat!("umset", "zung"),
+        concat!("auswer", "tung"),
+        concat!("einstel", "lung"),
+        concat!("abfr", "age"),
+        concat!("zugr", "iff"),
+        concat!("lauf", "zeit"),
+    ];
+
+    let lines: Vec<&str> = text.lines().collect();
+    let mut line_german_ctx = vec![false; lines.len()];
+    {
+        let mut start = 0usize;
+        let mut in_blk_fence = false;
+        while start < lines.len() {
+            if lines[start].trim().is_empty() {
+                start += 1;
+                continue;
+            }
+            let mut end = start;
+            let mut para_buf = String::new();
+            while end < lines.len() && !lines[end].trim().is_empty() {
+                let t = lines[end].trim_start();
+                if t.starts_with("```") {
+                    in_blk_fence = !in_blk_fence;
+                } else if !in_blk_fence {
+                    para_buf.push_str(lines[end]);
+                    para_buf.push('\n');
+                }
+                end += 1;
+            }
+            if has_german_prose_context(&para_buf) {
+                for flag in &mut line_german_ctx[start..end] {
+                    *flag = true;
+                }
+            }
+            start = end;
+        }
+    }
+
+    let mut violations = Vec::new();
+    let mut in_fence = false;
+
+    for (idx, &line) in lines.iter().enumerate() {
+        let line_no = idx + 1;
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        let cleaned = strip_inline_code_and_urls(line);
+
+        // 1. ASCII umlaut substitution check (`ae`/`oe`/`ue` in German words).
+        // Preserve `'_'` inside tokens so snake_case code identifiers or template placeholders
+        // such as `__TOKEN_...__` do not trigger prose umlaut matches.
+        for word in cleaned.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+            if word.len() < 4 || word.contains('_') {
+                continue;
+            }
+            let lc = word.to_ascii_lowercase();
+            if ASCII_UMLAUT_WORDS.contains(&lc.as_str()) {
+                violations.push(GuardrailViolation {
+                    rule: "german-ascii-umlaut".to_owned(),
+                    severity: "CRITICAL".to_owned(),
+                    file: filename.to_owned(),
+                    line: line_no,
+                    message: format!(
+                        "Replace ASCII umlaut substitution '{word}' with natural German umlauts."
+                    ),
+                    snippet: truncate_ascii_safe(line.trim(), 100),
+                });
+                break;
+            }
+        }
+
+        // 2. Deppenbindestrich check (`Upper+lower+ - Upper+lower+` in German prose or German nouns).
+        let german_ctx = line_german_ctx[idx];
+        for raw_tok in cleaned.split_whitespace() {
+            let low_tok = raw_tok.to_ascii_lowercase();
+            if low_tok.contains("://") || low_tok.contains("file:") {
+                continue;
+            }
+            let tok = raw_tok.trim_matches(|c: char| {
+                !c.is_alphabetic() && c != '-'
+            });
+            let mut parts = tok.split('-');
+            let (Some(left), Some(right), None) = (parts.next(), parts.next(), parts.next()) else {
+                continue;
+            };
+            let valid_side = |s: &str| {
+                s.chars().count() >= 2
+                    && s.chars().all(|c| c.is_alphabetic())
+                    && s.chars().next().is_some_and(|c| c.is_uppercase())
+                    && s.chars().any(|c| c.is_lowercase())
+            };
+            if !valid_side(left) || !valid_side(right) {
+                continue;
+            }
+            let l_low = left.to_lowercase();
+            let r_low = right.to_lowercase();
+            let has_non_ascii = tok.chars().any(|c| !c.is_ascii());
+            let has_german_noun = GERMAN_NOUN_ROOTS.contains(&l_low.as_str())
+                || GERMAN_NOUN_ROOTS.contains(&r_low.as_str());
+            if german_ctx || has_non_ascii || has_german_noun {
+                violations.push(GuardrailViolation {
+                    rule: "german-deppenbindestrich".to_owned(),
+                    severity: "CRITICAL".to_owned(),
+                    file: filename.to_owned(),
+                    line: line_no,
+                    message: format!(
+                        "Join German compound noun '{tok}' without a Deppenbindestrich."
+                    ),
+                    snippet: truncate_ascii_safe(line.trim(), 100),
+                });
+                break;
+            }
+        }
+    }
+
+    violations
+}
+
 /// Audits a workspace directory (either Git-staged files only or full source tree, skipping build/binary artifacts).
 pub fn audit_workspace_guardrails(
     project_dir: &Path,
@@ -385,6 +723,7 @@ pub fn audit_workspace_guardrails_with_prefixes(
             true,
             custom_secret_prefixes,
         ));
+        violations.extend(check_german_prose_style(text, &rel));
     }
 
     Ok(GuardrailAuditReport {

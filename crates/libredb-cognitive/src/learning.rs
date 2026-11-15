@@ -126,6 +126,8 @@ pub struct PendingErrorCue {
     pub raw_excerpt: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_hint: Option<String>,
     pub recorded_at_ns: u128,
 }
 
@@ -365,6 +367,22 @@ const SYNTAX_SLIP_PATTERNS: &[&str] = &[
     "unterminated string",
 ];
 
+const NON_CAUSAL_ERROR_NOISE_PATTERNS: &[&str] = &[
+    "could not compile ",
+    "aborting due to ",
+    "build failed, waiting for other jobs",
+    "unclosed delimiter",
+    "unexpected closing delimiter",
+    "this file contains an unclosed delimiter",
+    "flag '--help'",
+    "flag \"--help\"",
+    "option '--help'",
+    "unrecognized option '--help'",
+    "unknown argument '--help'",
+    "for more information, try '--help'",
+    "check cli help.",
+];
+
 const ERROR_BOILERPLATE_WORDS: &[&str] = &[
     "error", "warning", "note", "help", "cannot", "could", "find", "found", "expected",
     "unexpected", "this", "that", "with", "from", "into", "have", "here", "line", "column",
@@ -373,6 +391,8 @@ const ERROR_BOILERPLATE_WORDS: &[&str] = &[
     "semicolon", "colon", "comma", "brace", "bracket", "paren", "parenthesis", "trailing",
     "quote", "unterminated", "character", "indent", "indentation", "whitespace", "mismatched",
     "mismatch", "expression", "statement", "declaration", "identifier", "type", "types",
+    "compile", "previous", "errors", "warnings", "aborting", "due", "waiting", "jobs",
+    "finish", "flag", "unknown", "usage", "check",
 ];
 
 fn extract_error_code(text: &str) -> Option<String> {
@@ -455,9 +475,22 @@ fn extract_error_signature(error_text: &str) -> (Option<String>, Vec<String>, St
 /// Stage 1 of the 2-stage Banality Filter: returns `true` when `error_text` is empty, too short,
 /// or represents a trivial punctuation/delimiter/typo syntax slip carrying zero transferable
 /// architectural or scoping signal.
-pub fn is_banal_syntax_error(error_text: &str) -> bool {
+/// Returns `true` for non-causal build summary banners, CLI `--help` noise, or unbalanced
+/// delimiter cascade lines that should never be harvested as error cues.
+pub fn is_non_causal_error_noise(error_text: &str) -> bool {
     let trimmed = error_text.trim();
     if trimmed.len() < 6 {
+        return true;
+    }
+    let lc = trimmed.to_ascii_lowercase();
+    NON_CAUSAL_ERROR_NOISE_PATTERNS
+        .iter()
+        .any(|p| lc.contains(p))
+}
+
+pub fn is_banal_syntax_error(error_text: &str) -> bool {
+    let trimmed = error_text.trim();
+    if is_non_causal_error_noise(trimmed) {
         return true;
     }
     let lc = trimmed.to_ascii_lowercase();
@@ -474,6 +507,196 @@ pub fn is_banal_syntax_error(error_text: &str) -> bool {
         return true;
     }
     false
+}
+
+/// Returns `true` only when `rel_path` represents source code or a build manifest eligible
+/// to consume pending compiler/runtime error cues (blocking dotfiles, lockfiles, and prose docs).
+pub fn is_code_learning_eligible_path(rel_path: &str) -> bool {
+    let norm = rel_path.replace('\\', "/");
+    let lower = norm.trim_start_matches("./").to_ascii_lowercase();
+    if lower.is_empty()
+        || lower.starts_with(".agents/")
+        || lower.starts_with(".git/")
+        || lower.starts_with("target/")
+        || lower.starts_with("node_modules/")
+    {
+        return false;
+    }
+    let file_name = lower.rsplit('/').next().unwrap_or(&lower);
+    if file_name.starts_with('.')
+        || matches!(
+            file_name,
+            "cargo.lock"
+                | "package-lock.json"
+                | "yarn.lock"
+                | "pnpm-lock.yaml"
+                | "poetry.lock"
+                | "uv.lock"
+        )
+    {
+        return false;
+    }
+    let ext = file_name.rsplit('.').next().unwrap_or("");
+    if file_name.contains('.')
+        && matches!(
+            ext,
+            "rs" | "py"
+                | "ts"
+                | "tsx"
+                | "js"
+                | "jsx"
+                | "mjs"
+                | "cjs"
+                | "go"
+                | "c"
+                | "cc"
+                | "cpp"
+                | "cxx"
+                | "h"
+                | "hpp"
+                | "hh"
+                | "cs"
+                | "java"
+                | "kt"
+                | "kts"
+                | "swift"
+                | "rb"
+                | "php"
+                | "ps1"
+                | "psm1"
+                | "sh"
+                | "bash"
+                | "zsh"
+                | "sql"
+                | "zig"
+                | "nim"
+                | "lua"
+                | "scala"
+                | "ex"
+                | "exs"
+        )
+    {
+        return true;
+    }
+    matches!(
+        file_name,
+        "cargo.toml" | "pyproject.toml" | "package.json" | "tsconfig.json" | "makefile"
+    )
+}
+
+fn clean_extracted_file_hint(raw: &str) -> Option<String> {
+    let mut norm = raw
+        .trim()
+        .trim_matches(|c| matches!(c, '"' | '\'' | '`'))
+        .replace('\\', "/");
+    let has_drive_prefix = norm.as_bytes().len() >= 3
+        && norm.as_bytes()[0].is_ascii_alphabetic()
+        && norm.as_bytes()[1] == b':'
+        && norm.as_bytes()[2] == b'/';
+    if !has_drive_prefix && !norm.starts_with('/') && norm.contains(char::is_whitespace) {
+        norm = norm.split_whitespace().last()?.to_owned();
+    }
+    let stripped = norm
+        .trim()
+        .trim_matches(|c| matches!(c, '"' | '\'' | '`'))
+        .trim_start_matches("./");
+    if stripped.is_empty()
+        || stripped.contains('\'')
+        || stripped.contains('"')
+        || stripped.contains('<')
+        || stripped.contains('>')
+        || stripped.contains('|')
+        || stripped.contains('\n')
+        || stripped.contains('\r')
+    {
+        return None;
+    }
+    if is_code_learning_eligible_path(stripped) {
+        Some(stripped.to_owned())
+    } else {
+        None
+    }
+}
+
+/// Extracts a source file path hint from compiler/runtime diagnostics (`short` Cargo format,
+/// Rust `--> path:line:col`, TypeScript `path(line,col)`, or Python `File "path", line N`).
+pub fn extract_error_file_hint(error_text: &str) -> Option<String> {
+    for line in error_text.lines() {
+        let mut s = line.trim();
+        if let Some(idx) = s.find("File \"") {
+            let after = &s[idx + 6..];
+            if let Some(end_q) = after.find('"') {
+                if let Some(clean) = clean_extracted_file_hint(&after[..end_q]) {
+                    return Some(clean);
+                }
+            }
+        }
+        if let Some(arrow_idx) = s.find("--> ") {
+            s = s[arrow_idx + 4..].trim();
+        }
+        if let Some(panic_idx) = s.find(" panicked at ") {
+            s = s[panic_idx + 13..].trim_start();
+        }
+        for prefix in ["at ", "in "] {
+            if let Some(rest) = s.strip_prefix(prefix) {
+                s = rest.trim_start();
+            }
+        }
+        // Check TypeScript / MSBuild `path(line,col): ...`
+        if let Some(paren_close) = s.find("): ") {
+            if let Some(paren_open) = s[..paren_close].rfind('(') {
+                let inner = &s[paren_open + 1..paren_close];
+                let looks_coords = !inner.is_empty()
+                    && inner
+                        .split(',')
+                        .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+                if looks_coords {
+                    if let Some(clean) = clean_extracted_file_hint(&s[..paren_open]) {
+                        return Some(clean);
+                    }
+                }
+            }
+        }
+        // Check `<path>:<line>[:<col>][: ...]` while skipping Windows drive colon (`C:\...`).
+        let bytes = s.as_bytes();
+        for (idx, &b) in bytes.iter().enumerate() {
+            if b != b':' {
+                continue;
+            }
+            if idx == 1
+                && bytes[0].is_ascii_alphabetic()
+                && matches!(bytes.get(2), Some(b'\\') | Some(b'/'))
+            {
+                continue;
+            }
+            let after = &s[idx + 1..];
+            let digits_len = after.bytes().take_while(|c| c.is_ascii_digit()).count();
+            if digits_len > 0 {
+                let next_ch = after.as_bytes().get(digits_len).copied();
+                if matches!(next_ch, None | Some(b':') | Some(b' ') | Some(b',')) {
+                    if let Some(clean) = clean_extracted_file_hint(&s[..idx]) {
+                        return Some(clean);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn file_hint_matches(hint: &str, rel_path: &str) -> bool {
+    let h = hint
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .to_ascii_lowercase();
+    let e = rel_path
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .to_ascii_lowercase();
+    if h.is_empty() || e.is_empty() {
+        return true;
+    }
+    h == e || e.ends_with(&format!("/{h}")) || h.ends_with(&format!("/{e}"))
 }
 
 fn compact_error_excerpt(error_text: &str) -> String {
@@ -512,6 +735,7 @@ pub fn record_error_cue(
         .map(str::trim)
         .filter(|h| !h.is_empty() && h.len() <= 80)
         .map(ToOwned::to_owned);
+    let file_hint = extract_error_file_hint(error_text);
     let mut counted = false;
 
     db.transact_key(NodeKind::Generic, PENDING_ERROR_CUES_KEY, |existing| {
@@ -519,10 +743,16 @@ pub fn record_error_cue(
             .and_then(|rec| serde_json::from_slice(&rec.payload).ok())
             .unwrap_or_default();
         cues.retain(|c| now_ns.saturating_sub(c.recorded_at_ns) <= MISS_CUE_TTL_NS);
-        if let Some(prev) = cues.iter_mut().find(|c| c.fingerprint_id == fingerprint_id) {
+        if let Some(prev) = cues
+            .iter_mut()
+            .find(|c| c.fingerprint_id == fingerprint_id && c.file_hint == file_hint)
+        {
             prev.recorded_at_ns = now_ns;
             if hint_clean.is_some() {
                 prev.action_hint = hint_clean.clone();
+            }
+            if prev.file_hint.is_none() && file_hint.is_some() {
+                prev.file_hint = file_hint.clone();
             }
         } else {
             cues.push(PendingErrorCue {
@@ -531,6 +761,7 @@ pub fn record_error_cue(
                 error_tokens: error_tokens.clone(),
                 raw_excerpt: excerpt.clone(),
                 action_hint: hint_clean.clone(),
+                file_hint: file_hint.clone(),
                 recorded_at_ns: now_ns,
             });
             counted = true;
@@ -1189,6 +1420,18 @@ pub(crate) fn learn_from_verified_edit(db: &LibreDb, ev: &EditEvidence) -> usize
 }
 
 fn bind_error_cues_for_edit(db: &LibreDb, ev: &EditEvidence) -> usize {
+    if !is_code_learning_eligible_path(&ev.rel_path) {
+        return 0;
+    }
+    let tracked_files: Vec<String> = db
+        .list_inodes(Some(NodeKind::Symbol), false)
+        .into_iter()
+        .filter_map(|(_, key_opt, _)| {
+            let k = key_opt?;
+            let (file_part, _) = k.split_once("::")?;
+            Some(file_part.to_owned())
+        })
+        .collect();
     let mut causal_errors: Vec<PendingErrorCue> = Vec::new();
     let tx = db.transact_key(NodeKind::Generic, PENDING_ERROR_CUES_KEY, |existing| {
         let Some(rec) = existing else {
@@ -1204,7 +1447,15 @@ fn bind_error_cues_for_edit(db: &LibreDb, ev: &EditEvidence) -> usize {
             if now_ns.saturating_sub(c.recorded_at_ns) > MISS_CUE_TTL_NS {
                 continue;
             }
-            if c.recorded_at_ns <= ev.edit_ns {
+            let hint_ok = c
+                .file_hint
+                .as_deref()
+                .map(|h| {
+                    file_hint_matches(h, &ev.rel_path)
+                        || !tracked_files.iter().any(|tf| file_hint_matches(h, tf))
+                })
+                .unwrap_or(true);
+            if c.recorded_at_ns <= ev.edit_ns && hint_ok {
                 causal_errors.push(c);
             } else {
                 remaining.push(c);
