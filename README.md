@@ -1,11 +1,11 @@
 # LibreDB
 
-[![Version](https://img.shields.io/badge/version-1.6.2-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.6.3-blue.svg)](CHANGELOG.md)
 [![Tests](https://img.shields.io/badge/tests-passing%20(146%20tests%20%2B%2012%20audits%20%2B%2013%20learning%20checks%20%2B%2010k%20crash%20sims)-brightgreen.svg)](crates/libredb-cli/tests/)
 [![Tech Stack](https://img.shields.io/badge/rust-1.89%2B%20%7C%20PyO3%20abi3%20%7C%20MCP-orange.svg)](Cargo.toml)
 [![License](https://img.shields.io/badge/license-AGPLv3%20%2B%20Commons%20Clause-purple.svg)](LICENSE)
 
-`LibreDB` is an enterprise-ready, local-first, zero-configuration, single-file cognitive database, token-economy analytics & benchmark suite, lifecycle hook engine, dynamic multi-remote Git/Gitea automation suite, and multi-workspace `MCP` memory substrate (`*.ldb`) built in Rust for `Antigravity` and `MCP`-compatible `LLM` clients. It replaces `SQLite` + Python memory overhead with zero-I/O RAM-first `Zero-Repeat Delta` deduplication, cross-process-serialized revision-and-metadata-bound `HMAC-SHA256` workspace trust seals (`libredb trust`, `hmac-sha256:v4:r<rev>:` with crash-consistent CAS anti-rollback and anti-deletion ratchets), standards-compliant OS/AEAD secret protection (Windows `DPAPI` / RFC 8439 `ChaCha20-Poly1305`), `< 2 ms` compiled `PreInvocation` (subagent-aware priority-budgeted `BM25` `<= 450`-token hydration with sealed situational reflexes) and `PreToolUse` (tentative-verified ACID symbol-span shifting + causal `Search-Miss -> Verified-Edit` bridging + procedural error-recovery with a 2-stage banality filter & outcome-gated refutation) hooks, `< 5 us` local topology-inferred 25+ language exact Dalvik/DI code-graph (`locate`, batched `fim`, batched `impact` with Git co-change `Lift` mining & proactive symbol pitfalls, `skeleton`), situational method superseding with empirical belief revision, calibrated always-on `BridgeScorer`, `libredb learning [--verify]` (`L1..L13` counterfactual causal learning verification), native 3-tier `libredb savings` & `libredb bench` (`--suite kernel|full|audit|learning`) verification, and strictly neutral default installation across Windows, Linux, and macOS.
+`LibreDB` is a single-binary local memory database, code-graph indexer, and release automation tool built in Rust for `Antigravity` and `MCP`-compatible AI coding assistants. Instead of re-reading entire source files or losing project context across turns, it stores decisions, tasks, skills, and resolved bug patterns in a compact `.agents/memory.ldb` file, locates exact symbols and call dependencies on demand, and deduplicates session context automatically. It also encrypts repository credentials via OS keystores, seals workspace databases against tampering, checks staged commits against project guardrails, and publishes Git/Gitea releases with binary assets across Windows, Linux, and macOS.
 
 ## Table of contents
 
@@ -17,14 +17,13 @@
 
 ## Executive summary and impact
 
-| Dimension | Legacy Python + `SQLite` (`SkillsDB`) | `LibreDB v1.6.2` (Pure `Rust` + `MCP` + `PyO3`) |
+| Dimension | Legacy Python + `SQLite` (`SkillsDB`) | `LibreDB v1.6.3` (`Rust` + `MCP` + `PyO3`) |
 | :--- | :--- | :--- |
-| **Lifecycle hook latency** | `350-500 ms` Python startup + `SQLite` WAL per edit/turn | **`< 2 ms` in-engine (subagent-aware priority `BM25` + sealed reflexes `PreInvocation` + tentative ACID `PreToolUse` shift, causal bridge, error recovery & refutation)** |
-| **Turn 2+ recall & I/O** | `300-1500 ms` subprocess + repeated full text output | **`0` disk I/O reads (`< 3 ms` warm `MCP` / `locate` / `fim` / `impact`) via RAM-first `Zero-Repeat Delta` & stat+hash cache** |
-| **Cryptography & trust** | Plaintext DB tokens & unverified `.agents/memory.db` loads | **Windows `DPAPI` + RFC 8439 `ChaCha20-Poly1305` `AEAD` + monotonic `HMAC-SHA256` (`v4:r<rev>`)** |
-| **Symlink-safe path policy** | Lexical-only path checks vulnerable to symlink aliases | **Canonicalized symlink/junction, NTFS ADS (`:stream`) & `..` containment across `MCP`, `CLI` & hooks** |
-| **Topology & DI code graph** | Full `read_file` scans + blind to Dalvik/R8 & interfaces | **`< 5 us` structural topology + exact Dalvik/R8 + Git co-change `Lift` + calibrated `BridgeScorer`, 3-mode AST diff & FIM/impact pitfalls, situational superseding** |
-| **Built-in economy & audit** | External ad-hoc Python scripts required to measure savings | **Native `libredb learning [--verify]`, 3-tier `libredb savings` (`report`) & `libredb bench --suite kernel\|full\|audit\|learning` (`C1..C6` + `A1..A12` + `L1..L13`, `--json`)** |
+| **Hook response latency** | `350-500 ms` Python startup + `SQLite` WAL per edit or turn | **`< 2 ms` native hooks loading matching project decisions, facts, and coding rules** |
+| **Multi-turn recall & I/O** | Repeated subprocess spawns and full-file re-reads | **RAM-cached session delta skipping already-shown context with zero extra disk reads** |
+| **Security & credential storage** | Plaintext tokens and unverified local memory files | **OS keystores (`Windows DPAPI` / `ChaCha20-Poly1305`), `HMAC-SHA256` database seals, and symlink checks** |
+| **Code navigation & learning** | Blind file reads without call-graph awareness | **Symbol index across 25+ languages (`locate`, `skeleton`, `impact`, `fim`) with automatic fix learning** |
+| **Diagnostics & releases** | External ad-hoc scripts for metrics and release uploads | **Built-in token-savings reports (`savings`), verification benchmarks (`bench`), and Git/Gitea release automation** |
 
 ## Installation and quickstart
 
@@ -57,15 +56,15 @@ pwsh -ExecutionPolicy Bypass -File .\scripts\deploy_plugin.ps1 -Profile Personal
 
 | Command / MCP tool | Description |
 | :--- | :--- |
-| `libredb_pulse` (`MCP`) / `libredb pulse [<db.ldb>] <query>` | Zero-boilerplate dual-layer associative recall with hands-free `/compact` sync & zero-I/O `Zero-Repeat Delta` |
-| `libredb_code` (`MCP`) / `locate`, `skeleton`, `impact`, `fim`, `index-workspace` | Topology + Dalvik/R8 + `DI` + Git co-change `Lift` code graph supporting `< 0.5 ms` `locate`, closed-loop `Search-Miss -> Verified-Edit` bridging, batched `impact` (`symbols`) & `fim` (`slices`), `[Lstart-Lend]` slices, and `savings` |
-| `libredb slice-skill <query>` / `get-skill [--section \| --query]` | Direct `BM25` + `HybridIndex` progressive-disclosure skill-section search across `customizations.ldb` |
-| `libredb learning [--verify]` / `savings` / `bench` | Read-only learning state inspection (`cues`, `errors`, `pitfalls`, `bridges`, `reflexes`, `counters`) & `L1..L13` counterfactual causal learning proof (`--verify`), 3-tier token-consumption & savings analytics (`--today`, `--days`, `--cid`, `--project`, `--json`), and `C1..C6` / `A1..A12` / `L1..L13` benchmark & security verification suite (`--suite kernel\|full\|audit\|learning`, `--workspace`) |
-| `libredb_memorize` (`MCP`) / `batch`, `learn-assoc`, `learn-reflex`, `learn-error` | Atomic multi-capsule commits, tasks, language-agnostic Hebbian learning, contextual superseding reflexes (`--context`, `--supersedes`, `--outcome`), and procedural error-recovery pitfalls (`learn-error`) |
-| `libredb mcp-serve` / `hook-pre-invocation` / `hook-pre-tool` / `guardrail check` | Multi-workspace or `--workspace-root`-pinned `MCP` server, sub-2ms lifecycle hooks, symlink-resolved path protection & guardrail scanner |
-| `libredb trust` / `libredb config` | Monotonic `HMAC-SHA256` (`v4:r<rev>`) workspace trust seals (`--accept-rollback`, `--reinit-lost`, `--migrate-v3`, `--migrate-v2`) & dynamic settings |
-| `libredb git-init` / `git-sync` / `git-release` (aliases: `gitea-*`) | Provider-aware multi-remote Git, Keep a Changelog release, and binary asset automation |
-| `libredb import-sqlite` / `export-sqlite` / `verify-roundtrip` | Explicit lossless `19`-table + `5`-`FTS5` `SQLite <-> LibreDB` migration and parity verification |
+| `libredb_pulse` / `libredb pulse "<query>"` | Recalls relevant rules, skills, decisions, and tasks for the current workspace while suppressing duplicates already shown in the session |
+| `libredb_code` / `locate`, `skeleton`, `impact`, `fim` | Searches symbol definitions, shows compact file outlines, traces affected callers, and reads surgical line ranges across 25+ languages |
+| `libredb slice-skill` / `get-skill` | Finds and returns relevant sections from installed skills on demand instead of loading full manuals |
+| `libredb learning [--verify]` / `savings` / `bench` | Inspects learned search bridges and error pitfalls, measures token savings across transcripts, and runs built-in audit and learning checks |
+| `libredb_memorize` / `learn-reflex`, `learn-error` | Saves project facts, architectural decisions, tasks, snapshots, and verified bug-fix rules atomically |
+| `libredb mcp-serve` / `guardrail check` | Starts the workspace-scoped MCP server or checks staged commits against formatting, style, and security rules |
+| `libredb trust` / `libredb config` | Seals and verifies workspace memory databases (`HMAC-SHA256`) and manages global or per-project settings |
+| `libredb git-init` / `git-sync` / `git-release` | Initializes repositories, pushes commits cleanly, creates Keep a Changelog releases on Gitea/GitHub, and attaches build artifacts |
+| `libredb import-sqlite` / `export-sqlite` / `verify-roundtrip` | Migrates legacy `SQLite` memory stores losslessly to and from `.ldb` format and verifies data parity |
 
 ## Architecture and project structure
 
@@ -73,7 +72,7 @@ pwsh -ExecutionPolicy Bypass -File .\scripts\deploy_plugin.ps1 -Profile Personal
 LibreDB/
 |-- Cargo.toml                                     # Rust workspace (5 default CLI/MCP crates + optional PyO3 crate)
 |-- Makefile                                       # Zero-dependency POSIX/Linux/macOS source build & installer
-|-- VERSION                                        # Semantic Version (1.6.2)
+|-- VERSION                                        # Semantic Version (1.6.3)
 |-- CHANGELOG.md                                   # Keep a Changelog 1.1.0 release history
 |-- LICENSE                                        # Commons Clause v1.0 + full verbatim GNU AGPL v3.0 text
 |-- README.md                                      # 9-block standardized documentation

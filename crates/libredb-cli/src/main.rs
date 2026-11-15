@@ -2381,6 +2381,7 @@ fn modernize_global_db(
         for personal_rule_key in [
             "rule:global::candid-architectural-pushback",
             "rule:global::windows-fluent-app-design",
+            "rule:global::human-readable-technical-writing",
         ] {
             if gdb.deprecate_key(NodeKind::Rule, personal_rule_key)? {
                 deprecated_legacy += 1;
@@ -2470,10 +2471,31 @@ fn modernize_global_db(
         },
         ReflexRule {
             id: "semver-changelog-discipline".to_owned(),
-            stack_any: vec!["semver".to_owned(), "changelog".to_owned(), "release".to_owned()],
-            action_any: vec!["release".to_owned(), "tag".to_owned(), "version".to_owned(), "gitea-release".to_owned()],
+            stack_any: vec![
+                "semver".to_owned(),
+                "changelog".to_owned(),
+                "release".to_owned(),
+                "readme".to_owned(),
+                "plugin".to_owned(),
+                "docs".to_owned(),
+                "markdown".to_owned(),
+                "gitea".to_owned(),
+            ],
+            action_any: vec![
+                "release".to_owned(),
+                "tag".to_owned(),
+                "version".to_owned(),
+                "gitea-release".to_owned(),
+                "git-release".to_owned(),
+                "git-sync".to_owned(),
+                "gitea-sync".to_owned(),
+                "changelog".to_owned(),
+                "readme".to_owned(),
+                "write".to_owned(),
+                "edit".to_owned(),
+            ],
             env_or_error_any: Vec::new(),
-            directive: "Never overwrite an existing release tag in place; increment SemVer X.Y.Z, document under Keep a Changelog 1.1.0 in CHANGELOG.md, and attach deliverables from dist/ or releases/.".to_owned(),
+            directive: "Never overwrite an existing release tag in place; increment SemVer X.Y.Z, attach deliverables from dist/ or releases/, and write CHANGELOG.md, README.md, plugin overviews, and release notes in clear, human-readable IT prose (what changed and why it matters to users/engineers) without dumping internal function names or buzzword walls.".to_owned(),
             ..Default::default()
         },
         ReflexRule {
@@ -2583,6 +2605,14 @@ fn modernize_global_db(
         gdb.put(
             WriteRequest::new(NodeKind::Rule, fluent_rule.as_bytes().to_vec())
                 .with_key("rule:global::windows-fluent-app-design")
+                .with_importance(245)
+                .with_pinned(true),
+        )?;
+
+        let docs_rule = "[Rule: human-readable-technical-writing | priority=100 | enforcement=CRITICAL]\nSummary: Write all README overviews, plugin descriptions, changelogs, and release notes for human engineers and users in clear, logical IT prose rather than internal symbol dumps.\nAcross every project: (1) Audience first: assume the reader is a developer or administrator who does not know internal struct or function names. Explain clearly what the tool or change does, what problem it solves, and how to use it. (2) Readable CHANGELOG.md and release descriptions: each bullet must be 1-2 clear sentences in normal IT terminology describing the user-visible behavior, fix, or improvement. Reference at most the module, CLI command, or setting (e.g. libredb git-release, code indexer), never a laundry list of private helper functions or internal storage keys. (3) Clean README and plugin overviews: keep opening summaries to 2-3 clear sentences without run-on buzzword chains, and make suggested prompts and feature bullets immediately understandable at a glance.";
+        gdb.put(
+            WriteRequest::new(NodeKind::Rule, docs_rule.as_bytes().to_vec())
+                .with_key("rule:global::human-readable-technical-writing")
                 .with_importance(245)
                 .with_pinned(true),
         )?;
@@ -2948,9 +2978,9 @@ mod tests {
         assert_eq!(count_non_reflex_rules(&gdb), 0);
         assert_eq!(count_reflexes(&gdb), 3);
 
-        // 2. Switching to personal profile adds personal rules (pushback + Fluent app design) + all 11 reflexes
+        // 2. Switching to personal profile adds personal rules (pushback + Fluent app design + human-readable docs) + all 11 reflexes
         modernize_global_db(&gdb, Some(&dummy_skill), true).unwrap();
-        assert_eq!(count_non_reflex_rules(&gdb), 2);
+        assert_eq!(count_non_reflex_rules(&gdb), 3);
         assert_eq!(count_reflexes(&gdb), 11);
 
         // 3. Preserving corporate custom rules (including custom `rule:global::*` keys!) while downgrading
@@ -2977,6 +3007,9 @@ mod tests {
             .is_err());
         assert!(gdb
             .get_by_key(NodeKind::Rule, "rule:global::windows-fluent-app-design")
+            .is_err());
+        assert!(gdb
+            .get_by_key(NodeKind::Rule, "rule:global::human-readable-technical-writing")
             .is_err());
         assert!(gdb.get_by_key(NodeKind::Rule, "corp:soc-policy").is_ok());
         assert!(gdb

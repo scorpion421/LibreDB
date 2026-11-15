@@ -1,5 +1,5 @@
 #!/bin/sh
-# POSIX / Linux / macOS Antigravity plugin installer for LibreDB (v1.6.2)
+# POSIX / Linux / macOS Antigravity plugin installer for LibreDB (v1.6.3)
 # Enterprise-neutral by default (never installs personal rules or imports legacy SQLite unless requested).
 set -eu
 
@@ -134,13 +134,13 @@ cat > "$PLUGIN_DIR/plugin.json" <<'EOF'
 {
   "name": "libredb",
   "displayName": "LibreDB Cognitive Memory",
-  "version": "1.6.2",
-  "description": "Enterprise-ready Rust cognitive memory, token-economy analytics & MCP code graph: single-file LIBREDB1 storage, silent SQLite auto-porter, sub-2ms hooks, content-bound HMAC-SHA256 workspace trust seals, ChaCha20-Poly1305 OS credential vault, zero-hardcode topology & Dalvik/DI causal code graph, built-in benchmarks & token-savings reports, and multi-remote Git/Gitea/GitHub automation.",
+  "version": "1.6.3",
+  "description": "Persistent project memory, fast code-graph search, and token-savings engine for Antigravity. Remembers architectural decisions and resolved bug fixes across sessions, locates functions and call dependencies without reading whole files, enforces workspace guardrails, and automates Git/Gitea releases.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
-    "Show my LibreDB token savings report for today and all workspaces",
-    "Run a LibreDB cognitive pulse on the active workspace to load deduplicated context",
-    "Extract a surgical FIM code slice and DI blast-radius impact map with libredb_code"
+    "Show how many tokens LibreDB saved today and across my projects",
+    "Load the project context, active decisions, and open tasks for this workspace",
+    "Find where a function is defined and check which callers are affected before editing"
   ]
 }
 EOF
@@ -259,6 +259,7 @@ All system rules, coding standards, administrative credentials, and skills live 
 3. **Coding, SemVer 2.0.0, and Keep a Changelog 1.1.0**:
    - **Language boundary**: 100% grammatically correct ASCII English in all code, comments, logs, UI strings, and commits. Never translate UI strings to German.
    - **SemVer & releases**: Follow https://semver.org/ (`MAJOR.MINOR.PATCH`) and https://keepachangelog.com/en/1.1.0/. Never overwrite published tags; bump version, update `CHANGELOG.md` (`## [X.Y.Z] - YYYY-MM-DD`), place deliverables (`.apk`, `.aab`, `.exe`, `.msi`, `.xpi`, `.vsix`, `.whl`, `.jar`, `.zip`) in `dist/` or `releases/`, and sync via `libredb git-sync -m "<msg>" --project "<dir>" --releases` / `libredb git-release vX.Y.Z --project "<dir>"`.
+   - **Human-readable changelogs, release notes & overviews**: Write all `README.md` summaries, plugin overviews, `CHANGELOG.md` entries, and Git/Gitea release descriptions in clear, logical IT prose for human engineers and users. Explain what changed, why it matters, and how to use it in 1-2 concise sentences per bullet - never dump internal helper function names, storage keys, or run-on buzzword chains.
    - **Authoring & README**: Commit as `Antigravity <antigravity@local.dev>`. Strictly no VBScript (`.vbs`, `cscript`, `wscript`). Follow the 9-block `README.md` blueprint: (1) `# Title`, (2) Shields.io badges (`Version`, `Tests`, stack, `AGPLv3 + Commons Clause`), (3) 1-3 sentence summary, (4) `## Table of contents`, (5) executive summary table, (6) installation & quickstart, (7) usage & commands, (8) architecture & ASCII tree (`|--`), (9) SemVer & license.
 
 4. **Admin elevation and SOC audit standard (`C:\IT_ADMIN_LOGS\<USERNAME>\<TASK>\<TARGET>\<Date>\<hh_mm_ss>\`)**:
@@ -303,15 +304,15 @@ cat > "$SKILL_MD_PATH" <<'EOF'
 ---
 name: libredb
 description: >-
-  Primary Rust cognitive memory, silent SQLite auto-porter, Zero-Repeat Delta context deduplicator,
-  guardrail scanner, causal code-graph slicer, and local Gitea release engine for Antigravity.
-  Activate whenever recalling rules or skills, inspecting large files, persisting project memory,
-  checking guardrails, or syncing repositories and releases to local Gitea.
+  Persistent project memory, surgical code-graph search, token-savings analytics,
+  guardrail scanner, and Git/Gitea release automation for Antigravity. Activate when
+  recalling project context or skills, inspecting large files, saving architectural
+  decisions, checking guardrails, or publishing releases.
 ---
 
 # LibreDB cognitive memory, code graph, and Gitea suite
 
-`LibreDB` unites global customizations (`~/.gemini/libredb/customizations.ldb`) and per-workspace/per-chat memory (`.agents/memory.ldb`) with native `< 2 ms` lifecycle hooks and zero-dependency Gitea automation. Pre-existing `.agents/memory.db` databases in older projects or chats are automatically migrated 1:1 into `.agents/memory.ldb` in the background on first touch; new projects and chats use `.agents/memory.ldb` exclusively.
+`LibreDB` gives `Antigravity` global customizations (`~/.gemini/libredb/customizations.ldb`) and per-workspace project memory (`.agents/memory.ldb`) with fast lifecycle hooks and built-in Git/Gitea release automation. Existing legacy `.agents/memory.db` SQLite databases are automatically migrated 1:1 into `.agents/memory.ldb` on first access.
 
 ## MCP tools (`libredb-mcp`)
 
@@ -402,13 +403,16 @@ EOF
 
 # 7. Write user-facing README.md inside plugin bundle
 cat > "$PLUGIN_DIR/README.md" <<'EOF'
-# LibreDB cognitive memory plugin (v1.6.2)
+# LibreDB cognitive memory plugin (v1.6.3)
 
-Enterprise-ready standalone Rust cognitive memory, token-economy analytics & code-graph engine for `Antigravity`:
-- `libredb-mcp`: 3-tool multi-workspace cognitive memory & 25+ language zero-hardcode topology + exact Dalvik/DI + Git co-change `Lift` code-graph server with `< 0.5 ms` `locate`, closed-loop causal `Search-Miss -> Verified-Edit` bridging (body-hash diffs + calibrated `BridgeScorer`), procedural `Failure -> Fix -> Pass` pitfall learning (3-mode ordered/deletion AST diff, 2-stage banality filter & outcome-gated refutation), situational reflex superseding + empirical Laplace utility revision, batched `impact` (`symbols`) & `fim` (`slices`) with proactive symbol pitfalls, tentative-verified `PreToolUse` ACID symbol shifting, contract-drift grounded reflexes, subagent-aware priority-budgeted `BM25` `PreInvocation` hydration, zero-I/O RAM session delta, and `[Zero-Repeat Skeleton]` deduplication.
-- Built-in analytics, benchmarks & verification suite: `libredb savings` (`report`) combines cross-process-atomic `~/.gemini/libredb/telemetry.ldb` counters with bounded streaming `Antigravity` transcript parsing (`<= 8 MiB/line`, 3-tier observed vs counterfactual vs provider usage), `libredb learning [--verify]` inspects cues/bridges/pitfalls/reflex drift/counters read-only and proves causal learning via `L1..L13`, and `libredb bench` (`--suite kernel|full|audit|learning`, `--workspace`) runs `C1..C6` token-economy benchmarks, `A1..A12` security/feature audits, and `L1..L13` learning verification natively without external scripts.
-- Standards-compliant security: monotonic content-and-metadata-bound RFC 2104 `HMAC-SHA256` (`v4:r<rev>`) workspace trust seals (`libredb trust`), RFC 8439 `ChaCha20-Poly1305` AEAD OS credential vault (`0600` `.vault.key` with safe `vault:v1` -> `vault:v2` migration and symlink guards), symlink-canonicalized control-plane & credential path protection, and universal `libredb config` customization.
-- Strictly neutral by default: `deploy_plugin.sh` installs `libredb-mcp` and security guardrails with `0` personal rules, `0` implicit legacy DB imports, and preserved corporate `git config` identity.
+`LibreDB` gives `Antigravity` persistent project memory, targeted code navigation, and automated release workflows in a single local Rust binary:
+
+- **Persistent project memory (`libredb_pulse`, `libredb_memorize`)**: Stores architectural decisions, project facts, open tasks, and global rules in a single `.agents/memory.ldb` file (automatically migrating legacy `.db` SQLite databases). Injects only relevant context at the start of each turn and skips entries already shown in the current session.
+- **Targeted code navigation (`libredb_code`)**: Indexes functions, classes, and call relationships across 25+ languages so the agent can jump directly to symbol definitions (`locate`), inspect file outlines (`skeleton`), check affected callers (`impact`), and read exact code slices (`fim`) instead of loading entire large files.
+- **Automatic learning from searches and errors**: Remembers which code symbol solved a failed search and which fix resolved a compiler or test error, surfacing those hints automatically when similar code is touched later.
+- **Token-savings reports and verification (`libredb savings`, `libredb bench`, `libredb learning`)**: Tracks real token savings across sessions and workspaces and includes built-in performance, security, and learning verification suites.
+- **Workspace security and Git/Gitea releases (`libredb trust`, `libredb guardrail`, `libredb git-sync`)**: Encrypts credentials via OS keystores (`Windows DPAPI` / `ChaCha20-Poly1305`), seals workspace databases against tampering (`HMAC-SHA256`), checks staged commits against project guardrails, and publishes versioned Git/Gitea releases with binary deliverables.
+- **Neutral default profile**: `deploy_plugin.sh` (neutral default) installs the MCP server and security guardrails with zero personal rules and preserves existing Git identities.
 EOF
 
 # 8. Enable "libredb" in ~/.gemini/config/config.json if present and python3 is available
@@ -443,6 +447,6 @@ PYEOF
     fi
 fi
 
-echo "[OK] Deployed LibreDB v1.6.2 standalone binary to: $BIN_DIR (profile=$PROFILE)"
+echo "[OK] Deployed LibreDB v1.6.3 standalone binary to: $BIN_DIR (profile=$PROFILE)"
 echo "[OK] Hydrated and modernized global store at: $GLOBAL_LDB"
 echo "[OK] Installed complete Antigravity plugin at: $PLUGIN_DIR"
