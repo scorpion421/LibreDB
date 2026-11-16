@@ -108,27 +108,11 @@ $PluginJson = @'
 '@.Replace("__VERSION__", $LibreVersion)
 [System.IO.File]::WriteAllText((Join-Path $PluginDir "plugin.json"), $PluginJson, $Utf8NoBom)
 
-# 2. Write mcp_config.json (prefixed server name libredb-mcp)
-$McpJson = @"
-{
-  "mcpServers": {
-    "libredb-mcp": {
-      "command": "$ExeForward",
-      "args": [
-        "mcp-serve",
-        "--global",
-        "$GlobalForward"
-      ]
-    }
-  }
-}
-"@
-[System.IO.File]::WriteAllText((Join-Path $PluginDir "mcp_config.json"), $McpJson, $Utf8NoBom)
-
-# 3. Write hooks.json with Enterprise GPO / AppLocker, ACL verification & stable non-target staging
-# Note: Antigravity executes hooks via Go `exec.Command("cmd", "/C", cmd)`. On Enterprise AD workstations
-# where AppLocker/SRP blocks `cmd.exe /c` inside `%USERPROFILE%`, we stage a dedicated binary outside `target\`
-# (so `cargo clean` never breaks hooks) and verify directory ACLs before enabling it.
+# 2. Verify executable launch permission across Enterprise GPO / AppLocker & stage fallback outside target\ if needed.
+# Note: Antigravity executes hooks via Go `exec.Command("cmd", "/C", cmd)` and MCP servers via Go `fork/exec`.
+# On Enterprise AD workstations where AppLocker/SRP blocks unsigned binaries under `%USERPROFILE%`,
+# we stage a dedicated binary outside `target\` on an ACL-restricted workspace drive (e.g. `Q:\`) and
+# point both `mcp_config.json` and `hooks.json` to the verified executable while keeping `customizations.ldb` local.
 function Test-SafeBinaryAcl {
     param([string]$CheckPath)
     try {
@@ -164,27 +148,28 @@ function Test-SafeBinaryAcl {
 }
 
 $PrimaryHookCandidates = @(
-    "%USERPROFILE%\.gemini\libredb\bin\libredb.exe",
-    "%USERPROFILE%\.gemini\antigravity\bin\libredb.exe"
+    @{ Hook = "%USERPROFILE%\.gemini\libredb\bin\libredb.exe"; Path = $TargetExe },
+    @{ Hook = "%USERPROFILE%\.gemini\antigravity\bin\libredb.exe"; Path = (Join-Path $DefaultAgyBin "libredb.exe") }
 )
 $VerifiedHookCmd = $null
-if (-not $NoHooks) {
-    foreach ($CandExe in $PrimaryHookCandidates) {
-        $FormattedCmd = if ($CandExe.Contains(' ')) { '"' + $CandExe + '"' } else { $CandExe }
-        try {
-            $ProbeOut = "{}" | & $env:ComSpec /c "$FormattedCmd hook-pre-invocation" 2>$null
-            if ($LASTEXITCODE -eq 0 -and ($ProbeOut -join "") -match "injectSteps") {
-                $VerifiedHookCmd = $FormattedCmd
-                break
-            }
-        } catch {
+$VerifiedExePath = $null
+foreach ($Cand in $PrimaryHookCandidates) {
+    $CandCmd = $Cand.Hook
+    $FormattedCmd = if ($CandCmd.Contains(' ')) { '"' + $CandCmd + '"' } else { $CandCmd }
+    try {
+        $ProbeOut = "{}" | & $env:ComSpec /c "$FormattedCmd hook-pre-invocation" 2>$null
+        if ($LASTEXITCODE -eq 0 -and ($ProbeOut -join "") -match "injectSteps") {
+            $VerifiedHookCmd = $FormattedCmd
+            $VerifiedExePath = $Cand.Path
+            break
         }
+    } catch {
     }
 }
 
 # Fallback for Enterprise AD workstations where `%USERPROFILE%` is SRP-blocked and `$ProjectRoot`
 # resides on an ACL-restricted personal network home share (e.g. `Q:\`): stage outside `target\`!
-if ((-not $NoHooks) -and ($null -eq $VerifiedHookCmd)) {
+if ($null -eq $VerifiedHookCmd) {
     $HomeRoot = [System.IO.Path]::GetPathRoot($UserHome)
     $ProjDriveRoot = [System.IO.Path]::GetPathRoot($ProjectRoot)
     if ($ProjDriveRoot -and (-not $ProjDriveRoot.Equals($HomeRoot, [System.StringComparison]::OrdinalIgnoreCase))) {
@@ -199,6 +184,7 @@ if ((-not $NoHooks) -and ($null -eq $VerifiedHookCmd)) {
                     $ProbeOut = "{}" | & $env:ComSpec /c "$FormattedCmd hook-pre-invocation" 2>$null
                     if ($LASTEXITCODE -eq 0 -and ($ProbeOut -join "") -match "injectSteps") {
                         $VerifiedHookCmd = $FormattedCmd
+                        $VerifiedExePath = $DriveHookExe
                     }
                 }
             } catch {
@@ -209,7 +195,27 @@ if ((-not $NoHooks) -and ($null -eq $VerifiedHookCmd)) {
     }
 }
 
-if ($null -ne $VerifiedHookCmd) {
+$McpExeForward = if ($VerifiedExePath) { $VerifiedExePath.Replace('\', '/') } else { $ExeForward }
+
+# 3. Write mcp_config.json (prefixed server name libredb-mcp using SRP-verified executable path)
+$McpJson = @"
+{
+  "mcpServers": {
+    "libredb-mcp": {
+      "command": "$McpExeForward",
+      "args": [
+        "mcp-serve",
+        "--global",
+        "$GlobalForward"
+      ]
+    }
+  }
+}
+"@
+[System.IO.File]::WriteAllText((Join-Path $PluginDir "mcp_config.json"), $McpJson, $Utf8NoBom)
+
+# 4. Write hooks.json
+if ((-not $NoHooks) -and ($null -ne $VerifiedHookCmd)) {
     $VerifiedEscaped = $VerifiedHookCmd.Replace('\', '\\').Replace('"', '\"')
     $HooksJson = @"
 {
@@ -237,7 +243,7 @@ if ($null -ne $VerifiedHookCmd) {
 }
 "@
     [System.IO.File]::WriteAllText((Join-Path $PluginDir "hooks.json"), $HooksJson, $Utf8NoBom)
-    Write-Output "[OK] Verified cmd.exe hook execution and enabled hooks.json via: $VerifiedHookCmd"
+    Write-Output "[OK] Verified execution and enabled hooks/MCP via: $McpExeForward"
 } else {
     $DisabledHooksJson = @'
 {
@@ -248,7 +254,7 @@ if ($null -ne $VerifiedHookCmd) {
 '@
     [System.IO.File]::WriteAllText((Join-Path $PluginDir "hooks.json"), $DisabledHooksJson, $Utf8NoBom)
     if ($NoHooks) {
-        Write-Output "[OK] Installed hooks.json with enabled=false (-NoHooks MCP-only mode)."
+        Write-Output "[OK] Installed hooks.json with enabled=false (-NoHooks MCP-only mode; MCP command: $McpExeForward)."
     } else {
         Write-Output "[WARN] Enterprise GPO/AppLocker blocked cmd.exe /c hook execution; set enabled=false in hooks.json so tool calls are never blocked."
     }

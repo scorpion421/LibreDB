@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Multibyte UTF-8 UNC path handling and Windows lock error propagation**: Prevented byte-boundary panics when inspecting non-ASCII workspace paths on storage open, propagated non-contention `LockFileEx` OS errors immediately instead of masking them as timeouts, and guarded against stale snapshot regression during concurrent recovery or compaction.
 - **Concurrent federated hydration and suppression accounting**: Matched coalesced node reads by `NodeID` rather than positional slice indexing to prevent out-of-bounds panics during concurrent compaction, counted small suppressed duplicates accurately, and removed remaining reachable `.unwrap()` calls across MCP server and benchmark verification paths.
 - **`LIBREDB_GITEA_*` environment variables and installer version sync**: Added primary `LIBREDB_GITEA_*` environment variable support (with `SKILLSDB_GITEA_*` fallback), UTF-8-safe API token masking in `gitea-config`, and dynamic `VERSION` resolution inside both deployment scripts.
+- **Enterprise AppLocker/SRP executable path in `mcp_config.json` (`deploy_plugin.ps1`)**: Pointed `mcp_config.json` as well as `hooks.json` to the SRP-verified executable path (including fallback workspace-drive staging when `%USERPROFILE%` execution is blocked by policy, even in `-NoHooks` mode).
 
 ## [2.0.0] - 2026-11-16
 
