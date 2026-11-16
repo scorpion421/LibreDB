@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0] - 2026-11-16
+
+### Added
+
+- Added the in-memory `MCP`-to-hook `IPC` coordinator (`McpIpcServer`, `try_invoke_ipc_hook`, and `control_plane_endpoint_id` in `crates/libredb-cli/src/ipc.rs`): `libredb mcp-serve` now exposes a local Windows Named Pipe (`\\.\pipe\libredb-ipc-v1-<24hex>` with `PIPE_REJECT_REMOTE_CLIENTS` and default user `DACL`) or `0600` Unix Domain Socket listener backed by `Arc<Mutex<McpServerState>>` (`process_mcp_stream_shared` in `crates/libredb-cli/src/mcp/protocol.rs` and `lookup_or_cache_trusted_workspace_db` in `crates/libredb-cli/src/mcp/mod.rs`), allowing concurrent `PreToolUse` and `PreInvocation` hooks (`evaluate_pre_tool_payload_with_ram_state` and `evaluate_pre_invocation_payload_with_ram_state` in `crates/libredb-cli/src/hooks.rs`) to execute directly in RAM without opening `.ldb` files across `SMB` shares, falling back seamlessly to direct file evaluation whenever no coordinator is active.
+- Added `O(1)` incremental tail-sync and single-read superblock recovery in `crates/libredb-core/src/engine.rs`: `read_disk_superblock` reads both 4-KB ping-pong slots (`0..8192`) in a single `8 KB` read, `replay_delta_range` buffers delta slices up to `256 KiB` in one `read_at` call, `sync_from_disk_if_changed` replays only newly appended `[mem_tail..disk_tail]` frames when no compaction occurred (`2` read ops total), and `DeferredSyncGuard` (`LibreDb::begin_deferred_sync`, `sync_or_defer`) coalesces hook `WorkingSet`/`TranscriptCursor` commits on network shares into a single durable flush.
+- Added preventive Tier-1 task-switch shielding (`PendingMissCue::shielded_symbols` and `shield_unrelated_pending_miss_cues` in `crates/libredb-cognitive/src/learning.rs`) so exact Tier-1/Tier-2 lookups with disjoint query tokens shield those looked-up symbols from being bound to an earlier unrelated open `PendingMissCue` on subsequent edits.
+- Added outcome-gated served-bridge tracking and self-healing refutation (`PendingServedBridge`, `PENDING_SERVED_BRIDGES_KEY`, `BRIDGE_REFUTE_DECAY`, `record_served_bridge_hit`, `reconcile_served_bridges_for_edit`, and `LearningCounters::failed_bridges_refuted` in `crates/libredb-cognitive/src/learning.rs`, wired across `compose_tiers_with_bridges` and `CognitiveEngine::pulse` in `crates/libredb-cognitive/src/lib.rs`): when a learned bridge hit is served and the user edits a different file within the `120 s` episode window instead of the served target, the ignored bridge target weight decays by `0.55` (`0.60 -> 0.33`, below the `0.80` score acceptance floor) while the actually edited symbol is bound cleanly.
+- Added bounded non-blocking SMB/network lock helpers (`OsFileBackend::try_lock_write_region_bounded` in `crates/libredb-core/src/io.rs`, `LibreDb::is_network_share` in `crates/libredb-core/src/engine.rs`, and `WorkspaceTrustLockGuard::try_acquire_bounded` in `crates/libredb-cli/src/security/seals.rs`).
+- Extended `libredb learning --verify` (`run_learning_verification_suite` in `crates/libredb-cli/src/bench.rs`) from 13 to 15 adversarial stages with `L14` (`Task-switch Tier-1 shield & served-bridge refutation`) and `L15` (`In-memory MCP IPC coordinator & O(1) incremental tail-sync`), updated `crates/libredb-cli/tests/v140_learning_e2e.rs` (`passed_stages == 15`), and added integration test `s21_v170_task_switch_shield_and_served_bridge_refutation` (`crates/libredb-cognitive/tests/v140_learning_real_world.rs`).
+
+### Changed
+
+- Increased Antigravity lifecycle hook timeouts from `5` to `15` seconds in `scripts/deploy_plugin.ps1` and `scripts/deploy_plugin.sh` to provide ample headroom for EDR scanning and mapped Enterprise SMB shares.
+
+### Fixed
+
+- Fixed parallel `PreToolUse` timeouts and redundant `.agents/memory.ldb` opens on Enterprise SMB/network drives (`evaluate_pre_tool_payload_inner`, `record_working_set_edit`, and `harvest_recent_transcript_errors` in `crates/libredb-cli/src/hooks.rs`, plus `stage_tentative_file_edit` in `crates/libredb-cognitive/src/workspace.rs`): hooks now route through the in-memory `MCP` `IPC` coordinator when available and, on direct fallback, reuse the verified `.agents/memory.ldb` handle, coalesce commits via `DeferredSyncGuard`, skip cross-file tentative reconciliation/auto-compaction on network shares during `PreToolUse`, and use a bounded `250 ms` `WorkspaceTrustLockGuard::try_acquire_bounded` fallback instead of queuing past the hook timeout.
+
 ## [1.6.1] - 2026-11-15
 
 ### Fixed

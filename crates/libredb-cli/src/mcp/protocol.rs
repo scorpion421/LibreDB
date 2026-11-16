@@ -185,17 +185,13 @@ impl McpServerState {
     }
 }
 
-/// Processes a newline-delimited JSON-RPC 2.0 MCP stream, handling requests, client notifications
-/// (`notifications/initialized`, `notifications/roots/list_changed`), and client responses to
-/// server-initiated `roots/list` refreshes.
-pub fn process_mcp_stream<R: BufRead, W: Write>(
+fn read_next_jsonrpc_line<R: BufRead, W: Write>(
     reader: &mut R,
     writer: &mut W,
-    state: &mut McpServerState,
-) -> io::Result<()> {
+) -> io::Result<Option<String>> {
     loop {
-        let line = match read_bounded_jsonrpc_line(reader, MAX_MCP_LINE_BYTES) {
-            Ok(BoundedLineRead::Eof) => break,
+        match read_bounded_jsonrpc_line(reader, MAX_MCP_LINE_BYTES) {
+            Ok(BoundedLineRead::Eof) => return Ok(None),
             Ok(BoundedLineRead::Oversized) => {
                 let err_resp = json!({
                     "jsonrpc": "2.0",
@@ -204,9 +200,13 @@ pub fn process_mcp_stream<R: BufRead, W: Write>(
                 });
                 writeln!(writer, "{err_resp}")?;
                 writer.flush()?;
-                continue;
             }
-            Ok(BoundedLineRead::Line(l)) => l,
+            Ok(BoundedLineRead::Line(l)) => {
+                let trimmed = l.trim();
+                if !trimmed.is_empty() {
+                    return Ok(Some(trimmed.to_owned()));
+                }
+            }
             Err(e) => {
                 let err_resp = json!({
                     "jsonrpc": "2.0",
@@ -215,106 +215,134 @@ pub fn process_mcp_stream<R: BufRead, W: Write>(
                 });
                 writeln!(writer, "{err_resp}")?;
                 writer.flush()?;
-                continue;
             }
-        };
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
         }
+    }
+}
 
-        let req: Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(e) => {
-                let err_resp = json!({
-                    "jsonrpc": "2.0",
-                    "id": Value::Null,
-                    "error": { "code": -32700, "message": format!("Parse error: {e}") }
-                });
-                writeln!(writer, "{err_resp}")?;
-                writer.flush()?;
-                continue;
-            }
-        };
-
-        // Handle JSON-RPC responses from the MCP host client to server-initiated `roots/list` queries:
-        if req.get("method").is_none() {
-            if let (Some(resp_id), Some(expected_id)) = (
-                req.get("id").and_then(Value::as_str),
-                state.pending_roots_request_id.as_deref(),
-            ) {
-                if resp_id == expected_id {
-                    state.pending_roots_request_id = None;
-                    state.client_roots_refresh_pending = false;
-                    if let Some(result_obj) = req.get("result") {
-                        let updated = extract_workspace_roots_from_value(result_obj);
-                        state.replace_client_workspace_roots(updated);
-                    } else {
-                        state.replace_client_workspace_roots(Vec::new());
-                    }
-                }
-            }
-            continue;
-        }
-
-        let id = req.get("id").cloned();
-        let method = req.get("method").and_then(Value::as_str).unwrap_or("");
-        let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
-
-        // Handle JSON-RPC notifications (no `id` member):
-        if id.is_none() {
-            match method {
-                "notifications/roots/list_changed" => {
-                    state.client_supports_roots = true;
-                    if has_explicit_root_fields(&params) {
-                        state.pending_roots_request_id = None;
-                        state.client_roots_refresh_pending = false;
-                        let updated = extract_workspace_roots_from_value(&params);
-                        state.replace_client_workspace_roots(updated);
-                    } else {
-                        // Suspend client-root authorization fail-closed immediately while preserving
-                        // cached `OverlayBrain`s, `SessionState`s, and ephemeral `.ldb` files for
-                        // workspaces that remain open when the `roots/list` response arrives.
-                        state.client_roots_refresh_pending = true;
-                        let roots_req = state.issue_roots_list_request();
-                        writeln!(writer, "{roots_req}")?;
-                        writer.flush()?;
-                    }
-                }
-                "notifications/initialized" => {
-                    if state.client_supports_roots
-                        && state.client_workspace_roots.is_empty()
-                        && state.pending_roots_request_id.is_none()
-                    {
-                        state.client_roots_refresh_pending = true;
-                        let roots_req = state.issue_roots_list_request();
-                        writeln!(writer, "{roots_req}")?;
-                        writer.flush()?;
-                    }
-                }
-                _ => {}
-            }
-            continue;
-        }
-        let req_id = id.unwrap();
-
-        let response = match handle_rpc_method(method, &params, state) {
-            Ok(result_val) => json!({
+fn dispatch_jsonrpc_line<W: Write>(
+    trimmed: &str,
+    writer: &mut W,
+    state: &mut McpServerState,
+) -> io::Result<()> {
+    let req: Value = match serde_json::from_str(trimmed) {
+        Ok(v) => v,
+        Err(e) => {
+            let err_resp = json!({
                 "jsonrpc": "2.0",
-                "id": req_id,
-                "result": result_val
-            }),
-            Err(err_msg) => json!({
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "error": { "code": -32000, "message": err_msg }
-            }),
-        };
+                "id": Value::Null,
+                "error": { "code": -32700, "message": format!("Parse error: {e}") }
+            });
+            writeln!(writer, "{err_resp}")?;
+            writer.flush()?;
+            return Ok(());
+        }
+    };
 
-        writeln!(writer, "{response}")?;
-        writer.flush()?;
+    // Handle JSON-RPC responses from the MCP host client to server-initiated `roots/list` queries:
+    if req.get("method").is_none() {
+        if let (Some(resp_id), Some(expected_id)) = (
+            req.get("id").and_then(Value::as_str),
+            state.pending_roots_request_id.as_deref(),
+        ) {
+            if resp_id == expected_id {
+                state.pending_roots_request_id = None;
+                state.client_roots_refresh_pending = false;
+                if let Some(result_obj) = req.get("result") {
+                    let updated = extract_workspace_roots_from_value(result_obj);
+                    state.replace_client_workspace_roots(updated);
+                } else {
+                    state.replace_client_workspace_roots(Vec::new());
+                }
+            }
+        }
+        return Ok(());
     }
 
+    let id = req.get("id").cloned();
+    let method = req.get("method").and_then(Value::as_str).unwrap_or("");
+    let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
+
+    // Handle JSON-RPC notifications (no `id` member):
+    if id.is_none() {
+        match method {
+            "notifications/roots/list_changed" => {
+                state.client_supports_roots = true;
+                if has_explicit_root_fields(&params) {
+                    state.pending_roots_request_id = None;
+                    state.client_roots_refresh_pending = false;
+                    let updated = extract_workspace_roots_from_value(&params);
+                    state.replace_client_workspace_roots(updated);
+                } else {
+                    // Suspend client-root authorization fail-closed immediately while preserving
+                    // cached `OverlayBrain`s, `SessionState`s, and ephemeral `.ldb` files for
+                    // workspaces that remain open when the `roots/list` response arrives.
+                    state.client_roots_refresh_pending = true;
+                    let roots_req = state.issue_roots_list_request();
+                    writeln!(writer, "{roots_req}")?;
+                    writer.flush()?;
+                }
+            }
+            "notifications/initialized" => {
+                if state.client_supports_roots
+                    && state.client_workspace_roots.is_empty()
+                    && state.pending_roots_request_id.is_none()
+                {
+                    state.client_roots_refresh_pending = true;
+                    let roots_req = state.issue_roots_list_request();
+                    writeln!(writer, "{roots_req}")?;
+                    writer.flush()?;
+                }
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+    let req_id = id.unwrap();
+
+    let response = match handle_rpc_method(method, &params, state) {
+        Ok(result_val) => json!({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": result_val
+        }),
+        Err(err_msg) => json!({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "error": { "code": -32000, "message": err_msg }
+        }),
+    };
+
+    writeln!(writer, "{response}")?;
+    writer.flush()
+}
+
+/// Processes a newline-delimited JSON-RPC 2.0 MCP stream, handling requests, client notifications
+/// (`notifications/initialized`, `notifications/roots/list_changed`), and client responses to
+/// server-initiated `roots/list` refreshes.
+pub fn process_mcp_stream<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    state: &mut McpServerState,
+) -> io::Result<()> {
+    while let Some(trimmed) = read_next_jsonrpc_line(reader, writer)? {
+        dispatch_jsonrpc_line(&trimmed, writer, state)?;
+    }
+    Ok(())
+}
+
+/// Processes a JSON-RPC 2.0 MCP stream backed by a shared `Mutex<McpServerState>`, locking the
+/// shared state ONLY after a complete line arrives so the in-memory IPC hook coordinator stays
+/// non-blocking while the server idles on `stdin`.
+pub(super) fn process_mcp_stream_shared<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    shared_state: &parking_lot::Mutex<McpServerState>,
+) -> io::Result<()> {
+    while let Some(trimmed) = read_next_jsonrpc_line(reader, writer)? {
+        let mut state = shared_state.lock();
+        dispatch_jsonrpc_line(&trimmed, writer, &mut state)?;
+    }
     Ok(())
 }
 

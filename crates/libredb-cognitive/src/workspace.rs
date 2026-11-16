@@ -453,7 +453,20 @@ pub fn stage_tentative_file_edit(
     post_edit_bytes: &[u8],
     raw_tokens: u64,
 ) -> Result<(bool, usize, u64)> {
-    let (promoted_prior, saved_prior) = reconcile_tentative_edits(db, ws_root)?;
+    let rel_path_opt = normalize_safe_workspace_rel_path(ws_root, target_file);
+    let should_reconcile_now = if db.is_network_share() {
+        rel_path_opt.as_ref().is_some_and(|rel| {
+            db.get_by_key(NodeKind::WorkingSet, &format!("{TENTATIVE_EDIT_PREFIX}{rel}"))
+                .is_ok()
+        })
+    } else {
+        true
+    };
+    let (promoted_prior, saved_prior) = if should_reconcile_now {
+        reconcile_tentative_edits(db, ws_root)?
+    } else {
+        (0, 0)
+    };
     if post_edit_bytes.len() > crate::skeleton::MAX_SKELETON_FILE_BYTES as usize {
         return Ok((false, promoted_prior, saved_prior));
     }
@@ -461,7 +474,7 @@ pub fn stage_tentative_file_edit(
     if post_edit_bytes[..probe_len].contains(&0u8) {
         return Ok((false, promoted_prior, saved_prior));
     }
-    let Some(rel_path) = normalize_safe_workspace_rel_path(ws_root, target_file) else {
+    let Some(rel_path) = rel_path_opt else {
         return Ok((false, promoted_prior, saved_prior));
     };
 

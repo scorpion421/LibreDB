@@ -4,6 +4,7 @@ mod bench;
 mod cli_args;
 mod gitea;
 mod hooks;
+mod ipc;
 mod mcp;
 mod security;
 mod telemetry;

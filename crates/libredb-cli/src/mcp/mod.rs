@@ -327,6 +327,69 @@ impl McpServerState {
             "guardrail:protected_paths",
         )
     }
+
+    /// Returns a cached in-RAM `Arc<LibreDb>` handle for an already-trusted workspace, verifying
+    /// trust once on cache miss and checking revocation/sync on cache hits without reopening the
+    /// `.ldb` file from disk on every hook invocation.
+    pub(crate) fn lookup_or_cache_trusted_workspace_db(
+        &mut self,
+        ws_root: &Path,
+    ) -> Option<Arc<LibreDb>> {
+        let is_private = crate::security::is_private_brain_workspace(ws_root);
+        if !is_private {
+            if let Some(ref pin) = self.pinned_workspace_root {
+                if crate::security::check_mcp_workspace_containment(ws_root, pin).is_some() {
+                    return None;
+                }
+            }
+        }
+        let ldb_path = ws_root.join(".agents").join("memory.ldb");
+        let cache_key = canonical_brain_cache_key(&ldb_path);
+
+        if !is_private {
+            if let Some(ref gdb) = self.global_db {
+                let norm = crate::security::normalize_workspace_key(ws_root);
+                if crate::security::has_config_key_fail_closed(
+                    gdb,
+                    &format!("trust:revoked::{norm}"),
+                ) != Ok(false)
+                {
+                    self.brains.remove(&cache_key);
+                    self.clear_ram_sessions_for_cache_key(&cache_key);
+                    return None;
+                }
+            }
+        }
+
+        if let Some(brain) = self.brains.get(&cache_key) {
+            if !ldb_path.is_file() {
+                self.brains.remove(&cache_key);
+                self.clear_ram_sessions_for_cache_key(&cache_key);
+                return None;
+            }
+            let pdb = Arc::clone(brain.project_db());
+            if pdb.sync_from_disk_if_changed().is_err() {
+                self.brains.remove(&cache_key);
+                self.clear_ram_sessions_for_cache_key(&cache_key);
+                return None;
+            }
+            return Some(pdb);
+        }
+
+        if !ldb_path.is_file() {
+            return None;
+        }
+        if !is_private
+            && !crate::security::is_workspace_memory_trusted(self.global_db.as_deref(), ws_root)
+        {
+            return None;
+        }
+
+        let pdb = LibreDb::open(&ldb_path).ok().map(Arc::new)?;
+        let brain = OverlayBrain::open(self.global_db.clone(), Arc::clone(&pdb)).ok()?;
+        insert_brain_bounded(&mut self.brains, cache_key, brain);
+        Some(pdb)
+    }
 }
 
 pub fn run_mcp_stdio_server_with_workspace_root(
@@ -338,12 +401,14 @@ pub fn run_mcp_stdio_server_with_workspace_root(
         .filter(|v| !v.is_empty())
         .map(PathBuf::from);
     let effective_ws = workspace_root.or(env_ws.as_deref());
-    let mut state =
+    let state =
         McpServerState::new_with_workspace_root(default_project_db, global_db_path, effective_ws)?;
+    let shared_state = Arc::new(parking_lot::Mutex::new(state));
+    let _ipc_guard = crate::ipc::McpIpcServer::start(global_db_path, Arc::clone(&shared_state));
 
     let stdin = io::stdin();
     let mut reader = stdin.lock();
     let mut stdout = io::stdout();
-    process_mcp_stream(&mut reader, &mut stdout, &mut state)?;
+    protocol::process_mcp_stream_shared(&mut reader, &mut stdout, &shared_state)?;
     Ok(())
 }

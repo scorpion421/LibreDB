@@ -843,6 +843,90 @@ fn s20_v160_reordering_deletion_refutation_and_fim_pitfall_surfacing() {
     assert!(format_impact_compact("release_handle", &impacts).contains("Known Pitfalls"));
 }
 
+// --- S21 (v1.7.0): Preventive Tier-1 task-switch shielding & outcome-gated served-bridge refutation ---
+#[test]
+fn s21_v170_task_switch_shield_and_served_bridge_refutation() {
+    use libredb_cognitive::learning_state_report;
+
+    // Part A: Preventive Tier-1 task-switch shielding.
+    let fx = fixture("s21");
+    assert!(locate_names(&fx.proj, "quorum fencing lease").is_empty());
+
+    // Switch abruptly to topic B: exact Tier-1 lookup on release_handle shields it from the open miss cue.
+    assert_eq!(
+        locate_names(&fx.proj, "release_handle"),
+        vec!["release_handle".to_owned()]
+    );
+    hook_edit(
+        &fx,
+        "src/release.rs",
+        "pub fn release_handle(id: u64) -> bool {\n    id > 10\n}\n",
+    );
+    reconcile_tentative_edits(&fx.proj, &fx.root).unwrap();
+    assert!(
+        bridge_targets(&fx.proj, "quorum").is_empty(),
+        "Shielded Tier-1 symbol must not bind unrelated open miss cue: {}",
+        bridge_book(&fx.proj)
+    );
+
+    // Returning to topic A edits the actual target and binds the still-open miss cue cleanly.
+    hook_edit(&fx, ENGINE_REL, &engine_source_with(&[(4, engine_fn(4, "444"))]));
+    reconcile_tentative_edits(&fx.proj, &fx.root).unwrap();
+    assert_eq!(
+        locate_names(&fx.proj, "quorum fencing lease")
+            .first()
+            .map(String::as_str),
+        Some("compute_engine_step_4")
+    );
+
+    // Part B: Outcome-gated served-bridge refutation & re-binding after unshielded task-switch edit.
+    assert!(locate_names(&fx.proj, "backpressure token valve").is_empty());
+    hook_edit(
+        &fx,
+        "src/util_a.rs",
+        "pub fn util_alpha_value() -> u32 {\n    99\n}\n",
+    );
+    reconcile_tentative_edits(&fx.proj, &fx.root).unwrap();
+    assert_eq!(
+        locate_names(&fx.proj, "backpressure token valve"),
+        vec!["util_alpha_value".to_owned()],
+        "Precondition: wrong bridge was served via locate"
+    );
+
+    // Agent ignores src/util_a.rs and edits the real target src/util_b.rs::util_beta_value.
+    hook_edit(
+        &fx,
+        "src/util_b.rs",
+        "pub fn util_beta_value() -> u32 {\n    77\n}\n",
+    );
+    reconcile_tentative_edits(&fx.proj, &fx.root).unwrap();
+
+    let rep = learning_state_report(&fx.proj, 20);
+    assert_eq!(
+        rep.counters.failed_bridges_refuted, 1,
+        "Ignored served bridge must increment failed_bridges_refuted: {rep:?}"
+    );
+    let alpha_w = bridge_book(&fx.proj)
+        .pointer("/bridges/backpressure")
+        .and_then(Value::as_array)
+        .and_then(|arr| {
+            arr.iter()
+                .find(|p| p.get(0).and_then(Value::as_str) == Some("src/util_a.rs::util_alpha_value"))
+                .and_then(|p| p.get(1))
+                .and_then(Value::as_f64)
+        })
+        .unwrap_or(0.0);
+    assert!(
+        (alpha_w - 0.33).abs() < 1e-6,
+        "Wrong bridge weight must decay 0.60 * 0.55 = 0.33, got {alpha_w}"
+    );
+    assert_eq!(
+        locate_names(&fx.proj, "backpressure token valve"),
+        vec!["util_beta_value".to_owned()],
+        "Re-bound real target must replace refuted bridge at Rank #1"
+    );
+}
+
 #[allow(dead_code)]
 fn assert_path_exists(p: &Path) {
     assert!(p.exists(), "missing {}", p.display());

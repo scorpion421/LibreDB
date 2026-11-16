@@ -3938,6 +3938,273 @@ fn verify_l13_reordering_deletion_refutation_and_fim_pitfalls(
     ))
 }
 
+fn verify_l14_task_switch_shield_and_bridge_refutation(
+    sbx_root: &Path,
+    global_ldb: &Path,
+    acc: &mut LearningMetricsAccumulator,
+) -> Result<String, String> {
+    let fx = LearningFixture::new(sbx_root, global_ldb, "l14_task_switch")?;
+    let engine_init = "pub fn acquire_quorum_lease(epoch: u64) -> u64 {\n    epoch + 1\n}\n";
+    let metrics_init = "pub fn bump_metric_counter(val: u64) -> u64 {\n    val + 1\n}\n";
+    let util_a_init = "pub fn util_alpha_value() -> u32 {\n    1\n}\n";
+    let util_b_init = "pub fn util_beta_value() -> u32 {\n    2\n}\n";
+    fx.write_src("src/consensus.rs", engine_init)?;
+    fx.write_src("src/metrics.rs", metrics_init)?;
+    fx.write_src("src/util_a.rs", util_a_init)?;
+    fx.write_src("src/util_b.rs", util_b_init)?;
+    fx.index(false)?;
+    fx.seal()?;
+
+    // 1. Preventive Tier-1 task-switch shielding: miss on topic A, exact Tier-1 lookup + edit on topic B.
+    if !locate_symbol_names(&fx.pdb, "quorum fencing lease")?.is_empty() {
+        return Err("L14 expected initial miss for 'quorum fencing lease'".to_owned());
+    }
+    let direct_hit = locate_symbol_names(&fx.pdb, "bump_metric_counter")?;
+    if direct_hit != ["bump_metric_counter"] {
+        return Err(format!("L14 expected Tier-1 hit on bump_metric_counter: {direct_hit:?}"));
+    }
+    fx.stage_and_write("src/metrics.rs", &metrics_init.replace("val + 1", "val + 2"))?;
+    if !read_bridge_weights_for(&fx.pdb, "bump_metric_counter").is_empty() {
+        acc.placebo_false_bindings += 1;
+        return Err("L14 shielded Tier-1 symbol falsely bound unrelated miss cue".to_owned());
+    }
+    fx.stage_and_write("src/consensus.rs", &engine_init.replace("epoch + 1", "epoch + 5"))?;
+    let shield_resolved = locate_symbol_names(&fx.pdb, "quorum fencing lease")?;
+    if shield_resolved.first().map(String::as_str) != Some("acquire_quorum_lease") {
+        return Err(format!(
+            "L14 failed to resolve open miss cue onto real target after shield: {shield_resolved:?}"
+        ));
+    }
+
+    // 2. Post-binding outcome-gated bridge refutation: unshielded wrong edit creates bridge -> served -> ignored -> refuted & re-bound.
+    if !locate_symbol_names(&fx.pdb, "backpressure token valve")?.is_empty() {
+        return Err("L14 expected initial miss for 'backpressure token valve'".to_owned());
+    }
+    fx.stage_and_write("src/util_a.rs", &util_a_init.replace("1", "11"))?;
+    let wrong_served = locate_symbol_names(&fx.pdb, "backpressure token valve")?;
+    if wrong_served != ["util_alpha_value"] {
+        return Err(format!(
+            "L14 expected initial wrong bridge onto util_alpha_value: {wrong_served:?}"
+        ));
+    }
+    // Agent ignores src/util_a.rs and edits the real target src/util_b.rs::util_beta_value.
+    fx.stage_and_write("src/util_b.rs", &util_b_init.replace("2", "22"))?;
+    let rep = libredb_cognitive::learning_state_report(&fx.pdb, 20);
+    let decayed_w = read_bridge_weights_for(&fx.pdb, "util_alpha_value")
+        .into_iter()
+        .find(|(tok, _, _)| tok == "backpressure")
+        .map(|(_, _, w)| w)
+        .unwrap_or(0.0);
+    let healed = locate_symbol_names(&fx.pdb, "backpressure token valve")?;
+    if rep.counters.failed_bridges_refuted != 1
+        || (decayed_w - 0.33).abs() > 1e-4
+        || healed != ["util_beta_value"]
+    {
+        acc.placebo_false_bindings += 1;
+        return Err(format!(
+            "L14 served-bridge refutation failed (refuted={}, decayed_w={decayed_w:.3}, healed={healed:?})",
+            rep.counters.failed_bridges_refuted
+        ));
+    }
+
+    if !fx.is_trusted()? {
+        return Err("L14 hmac-sha256:v4 workspace seal invalidated".to_owned());
+    }
+
+    Ok(format!(
+        "Tier-1 shield ok (0 leaks), served bridge decayed 0.60->{decayed_w:.2}, re-bound to util_beta_value @ Rank #1, seal=valid"
+    ))
+}
+
+fn verify_l15_ipc_coordinator_and_incremental_tail_sync(
+    sbx_root: &Path,
+    global_ldb: &Path,
+) -> Result<String, String> {
+    let fx = LearningFixture::new(sbx_root, global_ldb, "l15_ipc_tail")?;
+    let billing_src = "pub fn compute_total(cents: u64) -> u64 {\n    cents + 1\n}\n";
+    let billing_path = fx.write_src("src/billing.rs", billing_src)?;
+    fx.index(false)?;
+
+    for i in 0..10usize {
+        fx.pdb
+            .put(
+                WriteRequest::new(NodeKind::Fact, format!("l15_fact_{i} = val_{i}").into_bytes())
+                    .with_key(format!("l15_fact_{i}")),
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    fx.pdb.compact_with_gravity().map_err(|e| e.to_string())?;
+    for i in 0..20usize {
+        fx.pdb
+            .put(
+                WriteRequest::new(NodeKind::WorkingSet, format!("ws_delta_{i}").into_bytes())
+                    .with_key(format!("ws_delta_{i}")),
+            )
+            .map_err(|e| e.to_string())?;
+    }
+
+    // Part A: Incremental Tail-Sync + Single-Read Superblock (exact 2 read_ops for delta sync).
+    let ldb_path = fx.root.join(".agents").join("memory.ldb");
+    let db_reader = LibreDb::open(&ldb_path).map_err(|e| e.to_string())?;
+    let r0 = db_reader.stats().map_err(|e| e.to_string())?.backend_read_ops;
+    fx.pdb
+        .put(
+            WriteRequest::new(NodeKind::WorkingSet, b"v170_tail_probe".to_vec())
+                .with_key("l15_tail_probe"),
+        )
+        .map_err(|e| e.to_string())?;
+    let synced = db_reader
+        .sync_from_disk_if_changed()
+        .map_err(|e| e.to_string())?;
+    let read_delta = db_reader
+        .stats()
+        .map_err(|e| e.to_string())?
+        .backend_read_ops
+        .saturating_sub(r0);
+    let probe = db_reader
+        .get_by_key(NodeKind::WorkingSet, "l15_tail_probe")
+        .map_err(|e| e.to_string())?;
+    if !synced || read_delta != 2 || probe.payload != b"v170_tail_probe" {
+        return Err(format!(
+            "L15 incremental tail-sync failed (synced={synced}, read_delta={read_delta}, expected=2)"
+        ));
+    }
+
+    // Part B: DeferredSyncGuard write coalescing & integrity verification.
+    {
+        let _deferred = fx.pdb.begin_deferred_sync();
+        for j in 0..8usize {
+            fx.pdb
+                .put(
+                    WriteRequest::new(NodeKind::WorkingSet, format!("defer_{j}").into_bytes())
+                        .with_key(format!("l15_defer_{j}")),
+                )
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    db_reader
+        .sync_from_disk_if_changed()
+        .map_err(|e| e.to_string())?;
+    for j in 0..8usize {
+        let rec = db_reader
+            .get_by_key(NodeKind::WorkingSet, &format!("l15_defer_{j}"))
+            .map_err(|e| e.to_string())?;
+        if rec.payload != format!("defer_{j}").as_bytes() {
+            return Err(format!("L15 deferred sync mismatch for l15_defer_{j}"));
+        }
+    }
+    db_reader.verify_integrity().map_err(|e| e.to_string())?;
+    drop(db_reader);
+
+    // Part C: Live 16-thread parallel IPC hook burst + seamless direct fallback after drop.
+    fx.seal()?;
+    let state = McpServerState::new_with_workspace_root(None, Some(global_ldb), Some(&fx.root))?;
+    let shared_state = Arc::new(parking_lot::Mutex::new(state));
+    let ipc_server = crate::ipc::McpIpcServer::start(Some(global_ldb), Arc::clone(&shared_state))
+        .ok_or_else(|| "L15 failed to start in-memory IPC server".to_owned())?;
+
+    let ws_str = fx.root.to_string_lossy().into_owned();
+    let billing_str = billing_path.to_string_lossy().into_owned();
+    let barrier = Arc::new(std::sync::Barrier::new(16));
+    let mut handles = Vec::with_capacity(16);
+    for tid in 0..16usize {
+        let b = Arc::clone(&barrier);
+        let g_path = global_ldb.to_path_buf();
+        let ws_s = ws_str.clone();
+        let bill_s = billing_str.clone();
+        handles.push(thread::spawn(move || -> Result<(), String> {
+            b.wait();
+            let payload = if tid == 0 {
+                json!({
+                    "toolName": "run_command",
+                    "toolArgs": { "CommandLine": "git tag -f v1.0.0" }
+                })
+            } else {
+                json!({
+                    "toolName": "edit_file",
+                    "workspacePaths": [ws_s],
+                    "toolArgs": {
+                        "Path": bill_s,
+                        "Target": "    cents + 1",
+                        "Replacement": "    cents + 2"
+                    }
+                })
+            };
+            let resp = crate::ipc::try_invoke_ipc_hook("pre_tool", Some(&g_path), &payload)
+                .ok_or_else(|| format!("L15 thread {tid} IPC call returned None"))?;
+            let decision = resp.get("decision").and_then(Value::as_str);
+            let expected = if tid == 0 { Some("deny") } else { Some("allow") };
+            if decision != expected {
+                return Err(format!(
+                    "L15 thread {tid} expected {expected:?}, got {resp}"
+                ));
+            }
+            Ok(())
+        }));
+    }
+    for h in handles {
+        h.join()
+            .map_err(|_| "L15 worker thread panicked".to_owned())??;
+    }
+
+    let pre_inv_resp = crate::ipc::try_invoke_ipc_hook(
+        "pre_invocation",
+        Some(global_ldb),
+        &json!({
+            "conversationId": "l15-ipc-cid",
+            "workspacePaths": [ws_str],
+            "prompt": "Tell me about l15_fact_0"
+        }),
+    )
+    .ok_or_else(|| "L15 pre_invocation IPC hook returned None".to_owned())?;
+    let sys_msg = pre_inv_resp["injectSteps"][0]["systemMessage"]["systemMessage"]
+        .as_str()
+        .unwrap_or("");
+    if sys_msg.is_empty() || !sys_msg.contains("l15_fact_") {
+        return Err(format!(
+            "L15 pre_invocation IPC returned unexpected hydration: {pre_inv_resp}"
+        ));
+    }
+
+    let served = ipc_server.served_count();
+    if served < 17 {
+        return Err(format!(
+            "L15 expected ipc_server.served_count() >= 17, got {served}"
+        ));
+    }
+
+    drop(ipc_server);
+    drop(shared_state);
+
+    let deny_payload = json!({
+        "toolName": "run_command",
+        "toolArgs": { "CommandLine": "git tag -f v1.0.0" }
+    });
+    if crate::ipc::try_invoke_ipc_hook("pre_tool", Some(global_ldb), &deny_payload).is_some() {
+        return Err("L15 IPC endpoint stayed reachable after McpIpcServer drop".to_owned());
+    }
+    let allow_payload = json!({
+        "toolName": "edit_file",
+        "workspacePaths": [fx.root.to_string_lossy().to_string()],
+        "toolArgs": {
+            "Path": billing_path.to_string_lossy().to_string(),
+            "Target": "    cents + 1",
+            "Replacement": "    cents + 2"
+        }
+    });
+    let fallback = evaluate_pre_tool_payload(&allow_payload, Some(global_ldb));
+    if fallback.get("decision").and_then(Value::as_str) != Some("allow") {
+        return Err(format!("L15 direct fallback failed: {fallback}"));
+    }
+    if !fx.is_trusted()? {
+        return Err("L15 hmac-sha256:v4 workspace seal invalidated".to_owned());
+    }
+
+    Ok(format!(
+        "tail-sync=2 reads, deferred-sync=8 puts verified, 16-thread IPC burst={served} ok, fallback=valid, seal=valid"
+    ))
+}
+
 pub fn run_learning_verification_suite(
     workspace_source: Option<&Path>,
     as_json: bool,
@@ -3963,7 +4230,7 @@ pub fn run_learning_verification_suite(
         seed_bench_skill(&gdb)?;
     }
 
-    let mut stages = Vec::with_capacity(13);
+    let mut stages = Vec::with_capacity(15);
     let mut acc = LearningMetricsAccumulator::default();
     let mut resolved_source = workspace_source
         .map(|p| p.display().to_string())
@@ -4057,6 +4324,18 @@ pub fn run_learning_verification_suite(
                 &mut acc,
             )
         },
+    );
+    run_learning_stage(
+        &mut stages,
+        "L14",
+        "Task-switch Tier-1 shield & served-bridge refutation",
+        || verify_l14_task_switch_shield_and_bridge_refutation(&sbx_root, &global_ldb, &mut acc),
+    );
+    run_learning_stage(
+        &mut stages,
+        "L15",
+        "In-memory MCP IPC coordinator & O(1) incremental tail-sync",
+        || verify_l15_ipc_coordinator_and_incremental_tail_sync(&sbx_root, &global_ldb),
     );
 
     let passed = stages.iter().filter(|s| s.passed).count();
