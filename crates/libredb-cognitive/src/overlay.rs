@@ -241,10 +241,8 @@ impl OverlayBrain {
             if let Some(ref mut sess) = session {
                 if sess.is_already_in_context(ns_id, cand.generation) {
                     let stub_tok = 6u32;
-                    if cand.token_count > stub_tok {
-                        sess.record_suppression(cand.token_count, stub_tok);
-                        saved_by_delta += cand.token_count - stub_tok;
-                    }
+                    sess.record_suppression(cand.token_count, stub_tok);
+                    saved_by_delta += cand.token_count.saturating_sub(stub_tok);
                     let k_lbl = cand.key.as_deref().unwrap_or("-");
                     stubs.push(format!(
                         "{}#{} {}:{} gen={}",
@@ -330,42 +328,36 @@ impl OverlayBrain {
 
         let (proj_recs, proj_io) = self.project.db().get_many_coalesced(&proj_ids)?;
         let (glob_recs, glob_io) = global_eng.db().get_many_coalesced(&glob_ids)?;
+        let mut proj_map: std::collections::HashMap<u64, _> =
+            proj_recs.into_iter().map(|r| (r.node_id, r)).collect();
+        let mut glob_map: std::collections::HashMap<u64, _> =
+            glob_recs.into_iter().map(|r| (r.node_id, r)).collect();
 
         let mut selected = Vec::with_capacity(order_plan.len());
         for (is_global, idx) in order_plan {
-            if is_global {
-                let cand = &to_fetch_glob[idx];
-                let rec = &glob_recs[idx];
-                let key = Some(match &cand.key {
-                    Some(k) => format!("global::{k}"),
-                    None => "global".to_owned(),
-                });
-                selected.push(DeliveredCapsule {
-                    node_id: rec.node_id,
-                    kind: rec.kind,
-                    key,
-                    generation: rec.generation,
-                    token_count: rec.token_count,
-                    score: cand.score,
-                    content: String::from_utf8_lossy(&rec.payload).into_owned(),
-                });
+            let (prefix, cand, rec_opt) = if is_global {
+                let c = &to_fetch_glob[idx];
+                ("global", c, glob_map.remove(&c.node_id))
             } else {
-                let cand = &to_fetch_proj[idx];
-                let rec = &proj_recs[idx];
-                let key = Some(match &cand.key {
-                    Some(k) => format!("proj::{k}"),
-                    None => "proj".to_owned(),
-                });
-                selected.push(DeliveredCapsule {
-                    node_id: rec.node_id,
-                    kind: rec.kind,
-                    key,
-                    generation: rec.generation,
-                    token_count: rec.token_count,
-                    score: cand.score,
-                    content: String::from_utf8_lossy(&rec.payload).into_owned(),
-                });
-            }
+                let c = &to_fetch_proj[idx];
+                ("proj", c, proj_map.remove(&c.node_id))
+            };
+            let Some(rec) = rec_opt else {
+                continue;
+            };
+            let key = Some(match &cand.key {
+                Some(k) => format!("{prefix}::{k}"),
+                None => prefix.to_owned(),
+            });
+            selected.push(DeliveredCapsule {
+                node_id: rec.node_id,
+                kind: rec.kind,
+                key,
+                generation: rec.generation,
+                token_count: rec.token_count,
+                score: cand.score,
+                content: String::from_utf8_lossy(&rec.payload).into_owned(),
+            });
         }
 
         // Only write `SessionState` to disk if `delivered_generations` actually gained a new item!

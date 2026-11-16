@@ -4,7 +4,7 @@ use crate::crc::crc32;
 use crate::error::{LibreDbError, Result};
 use serde::{Deserialize, Serialize};
 
-/// 8-byte file header magic identifying a LibreDB v1 file.
+/// 8-byte file header magic identifying a LibreDB format version 1 (`LIBREDB1`) file.
 pub const MAGIC: [u8; 8] = *b"LIBREDB1";
 /// 4-byte marker identifying an incremental chaos commit frame.
 pub const COMMIT_FRAME_MAGIC: [u8; 4] = *b"LDBC";

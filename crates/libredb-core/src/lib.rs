@@ -25,7 +25,7 @@ pub use io::{FaultInjectingBackend, OsFileBackend, StorageBackend};
 /// Returns true if `key` addresses a security-critical internal configuration namespace
 /// (`sys::*`, `trust:*`, `workspace:*`, `workspace_id::*`) that must never be written,
 /// overwritten, or deprecated via generic configuration commands, low-level `put`/`deprecate`,
-/// or SQLite imports.
+/// or external imports.
 pub fn is_reserved_security_config_key(key: &str) -> bool {
     let low = key.trim().to_ascii_lowercase();
     low.starts_with("sys::")
@@ -37,7 +37,7 @@ pub fn is_reserved_security_config_key(key: &str) -> bool {
 /// Returns true if `key` addresses either a reserved internal trust/system namespace
 /// (`is_reserved_security_config_key`) or a privileged host/MCP/guardrail security policy
 /// switch (`mcp:*`, `gitea_allow_insecure_http`, `guardrail:allow_staged_files`) that must
-/// never be imported from SQLite `runtime_config` or mutated via low-level `put`/`deprecate`.
+/// never be imported from untrusted configuration payloads or mutated via low-level `put`/`deprecate`.
 pub fn is_admin_only_security_config_key(key: &str) -> bool {
     if is_reserved_security_config_key(key) {
         return true;

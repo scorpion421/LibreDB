@@ -7,6 +7,9 @@ param(
 $ErrorActionPreference = "Stop"
 
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
+$VersionFile = Join-Path $ProjectRoot "VERSION"
+$LibreVersion = if (Test-Path $VersionFile) { (Get-Content -Raw $VersionFile).Trim() } else { "2.0.1" }
+if (-not $LibreVersion) { $LibreVersion = "2.0.1" }
 $UserHome = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
 $GeminiDir = Join-Path $UserHome ".gemini"
 $LibreHome = Join-Path $GeminiDir "libredb"
@@ -93,7 +96,7 @@ $PluginJson = @'
 {
   "name": "libredb",
   "displayName": "LibreDB Cognitive Memory",
-  "version": "2.0.0",
+  "version": "__VERSION__",
   "description": "Persistent project memory, fast code-graph search, and token-savings engine for Antigravity. Routes sub-millisecond lifecycle hooks via an in-memory MCP IPC coordinator with O(1) tail-sync, locates functions and call dependencies without reading whole files, enforces workspace guardrails, and automates Git/Gitea releases.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
@@ -102,7 +105,7 @@ $PluginJson = @'
     "Find where a function is defined and check which callers are affected before editing"
   ]
 }
-'@
+'@.Replace("__VERSION__", $LibreVersion)
 [System.IO.File]::WriteAllText((Join-Path $PluginDir "plugin.json"), $PluginJson, $Utf8NoBom)
 
 # 2. Write mcp_config.json (prefixed server name libredb-mcp)
@@ -425,7 +428,7 @@ $LogoSvg = @'
 
 # 7. Write user-facing README.md inside plugin bundle
 $PluginReadme = @'
-# LibreDB cognitive memory plugin (v2.0.0)
+# LibreDB cognitive memory plugin (v__VERSION__)
 
 `LibreDB` gives `Antigravity` persistent project memory, targeted code navigation, and automated release workflows in a single 100% pure-Rust binary:
 
@@ -436,7 +439,7 @@ $PluginReadme = @'
 - **Token-savings reports and verification (`libredb savings`, `libredb bench`)**: Tracks real token savings across sessions and workspaces and runs built-in performance and security audit suites.
 - **Workspace security and Git/Gitea releases (`libredb trust`, `libredb guardrail`, `libredb git-sync`)**: Encrypts credentials via OS keystores (`Windows DPAPI` / `ChaCha20-Poly1305`), seals workspace databases against tampering (`HMAC-SHA256`), checks staged commits against project guardrails, and publishes versioned Git/Gitea releases with binary deliverables.
 - **Neutral default profile**: `deploy_plugin.ps1` (`-Profile Neutral`, default) installs the MCP server and security guardrails with zero personal rules and preserves existing Git identities.
-'@
+'@.Replace("__VERSION__", $LibreVersion)
 [System.IO.File]::WriteAllText((Join-Path $PluginDir "README.md"), $PluginReadme, $Utf8NoBom)
 
 # 8. Ensure "libredb": { "enabled": true } in ~/.gemini/config/config.json if present
@@ -458,6 +461,6 @@ if (Test-Path $AgyConfigPath) {
     }
 }
 
-Write-Output "[OK] Deployed LibreDB v2.0.0 standalone binaries to: $BinDir (Profile=$Profile)"
+Write-Output "[OK] Deployed LibreDB v$LibreVersion standalone binaries to: $BinDir (Profile=$Profile)"
 Write-Output "[OK] Hydrated and modernized global store at: $GlobalLdb"
 Write-Output "[OK] Installed complete Antigravity plugin at: $PluginDir"

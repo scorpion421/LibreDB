@@ -116,7 +116,11 @@ mod win_lock {
             if ok != 0 {
                 return Ok(());
             }
+            const ERROR_LOCK_VIOLATION: i32 = 33;
             let err = io::Error::last_os_error();
+            if err.raw_os_error() != Some(ERROR_LOCK_VIOLATION) {
+                return Err(err);
+            }
             if start.elapsed().as_millis() as u64 >= timeout_ms {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
@@ -263,7 +267,10 @@ impl OsFileBackend {
 /// to apply network-safe sync and lock-timeout semantics without misclassifying local paths.
 pub fn detect_network_path(path: &Path) -> bool {
     let raw = path.to_string_lossy();
-    if raw.len() >= 8 && raw[..8].eq_ignore_ascii_case(r"\\?\UNC\") {
+    if raw
+        .get(..8)
+        .is_some_and(|s| s.eq_ignore_ascii_case(r"\\?\UNC\"))
+    {
         return true;
     }
     if raw.starts_with(r"\\?\") {
@@ -280,7 +287,10 @@ pub fn detect_network_path(path: &Path) -> bool {
     if let Some(p) = probe {
         if let Ok(canon) = std::fs::canonicalize(p) {
             let cs = canon.to_string_lossy();
-            if cs.len() >= 8 && cs[..8].eq_ignore_ascii_case(r"\\?\UNC\") {
+            if cs
+                .get(..8)
+                .is_some_and(|s| s.eq_ignore_ascii_case(r"\\?\UNC\"))
+            {
                 return true;
             }
             #[cfg(target_os = "linux")]
@@ -509,6 +519,24 @@ impl Default for FaultInjectingBackend {
     }
 }
 
+fn checked_usize(val: u64) -> Result<usize> {
+    usize::try_from(val).map_err(|_| {
+        LibreDbError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "offset exceeds usize::MAX",
+        ))
+    })
+}
+
+fn checked_usize_end(start: usize, len: usize) -> Result<usize> {
+    start.checked_add(len).ok_or_else(|| {
+        LibreDbError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "range overflows usize",
+        ))
+    })
+}
+
 impl StorageBackend for FaultInjectingBackend {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
         self.read_ops.fetch_add(1, Ordering::Relaxed);
@@ -516,8 +544,8 @@ impl StorageBackend for FaultInjectingBackend {
         if st.crashed {
             return Err(LibreDbError::SimulatedPowerLoss(self.write_ops_count()));
         }
-        let start = offset as usize;
-        let end = start.saturating_add(buf.len());
+        let start = checked_usize(offset)?;
+        let end = checked_usize_end(start, buf.len())?;
         if end > st.working.len() {
             return Err(LibreDbError::Io(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -541,8 +569,8 @@ impl StorageBackend for FaultInjectingBackend {
                 // Only `torn_prefix_bytes` leak directly onto the durable platter; unsynced cache vanishes.
                 let torn = st.torn_prefix_bytes.min(buf.len());
                 if torn > 0 {
-                    let start = offset as usize;
-                    let end = start + torn;
+                    let start = checked_usize(offset)?;
+                    let end = checked_usize_end(start, torn)?;
                     if end > st.synced.len() {
                         st.synced.resize(end, 0);
                     }
@@ -555,8 +583,8 @@ impl StorageBackend for FaultInjectingBackend {
             st.fault_countdown = Some(rem - 1);
         }
 
-        let start = offset as usize;
-        let end = start + buf.len();
+        let start = checked_usize(offset)?;
+        let end = checked_usize_end(start, buf.len())?;
         if end > st.working.len() {
             st.working.resize(end, 0);
         }
@@ -579,7 +607,8 @@ impl StorageBackend for FaultInjectingBackend {
         if st.crashed {
             return Err(LibreDbError::SimulatedPowerLoss(self.write_ops_count()));
         }
-        st.working.resize(len as usize, 0);
+        let target_len = checked_usize(len)?;
+        st.working.resize(target_len, 0);
         Ok(())
     }
 
@@ -613,6 +642,9 @@ mod tests {
         assert!(!detect_network_path(Path::new(
             r"\\?\D:\Antigravity\LibreDB\.agents\memory.ldb"
         )));
+        // Byte index 8 lands inside a multibyte UTF-8 character on both paths; must never panic.
+        assert!(!detect_network_path(Path::new("Ärger_ä/test.ldb")));
+        assert!(!detect_network_path(Path::new("日本語パス/test.ldb")));
 
         let sample_proc_mounts = "\
 /dev/nvme0n1p2 / ext4 rw,relatime 0 0\n\

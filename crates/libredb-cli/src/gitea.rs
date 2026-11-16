@@ -33,6 +33,10 @@ pub struct GiteaConfig {
 
 impl GiteaConfig {
     pub fn load(ldb: &LibreDb) -> Self {
+        Self::load_with_lookup(ldb, |k| env::var(k).ok())
+    }
+
+    fn load_with_lookup(ldb: &LibreDb, lookup: impl Fn(&str) -> Option<String>) -> Self {
         let get_cfg = |k: &str| -> Option<String> {
             ldb.get_by_key(NodeKind::Config, k)
                 .ok()
@@ -40,24 +44,23 @@ impl GiteaConfig {
                 .filter(|s| !s.is_empty())
         };
 
-        let url = env::var("SKILLSDB_GITEA_URL")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
+        let get_env = |primary: &str, legacy: &str| -> Option<String> {
+            lookup(primary)
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| lookup(legacy).filter(|s| !s.trim().is_empty()))
+        };
+
+        let url = get_env("LIBREDB_GITEA_URL", "SKILLSDB_GITEA_URL")
             .or_else(|| get_cfg("gitea_url"))
             .unwrap_or_else(|| "http://127.0.0.1:3000".to_owned())
             .trim_end_matches('/')
             .to_owned();
 
-        let user = env::var("SKILLSDB_GITEA_USER")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
+        let user = get_env("LIBREDB_GITEA_USER", "SKILLSDB_GITEA_USER")
             .or_else(|| get_cfg("gitea_user"))
             .unwrap_or_default();
 
-        let token = if let Some(env_tok) = env::var("SKILLSDB_GITEA_TOKEN")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-        {
+        let token = if let Some(env_tok) = get_env("LIBREDB_GITEA_TOKEN", "SKILLSDB_GITEA_TOKEN") {
             env_tok.trim().to_owned()
         } else if let Some(raw_stored) = get_cfg("gitea_token") {
             match unprotect_secret(&raw_stored) {
@@ -79,21 +82,20 @@ impl GiteaConfig {
             String::new()
         };
 
-        let service_name = env::var("SKILLSDB_GITEA_SERVICE")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
+        let service_name = get_env("LIBREDB_GITEA_SERVICE", "SKILLSDB_GITEA_SERVICE")
             .or_else(|| get_cfg("gitea_service"))
             .unwrap_or_else(|| "gitea".to_owned());
 
-        let allow_insecure_http = env::var("SKILLSDB_GITEA_ALLOW_INSECURE_HTTP")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .or_else(|| get_cfg("gitea_allow_insecure_http"))
-            .map(|v| {
-                let low = v.trim().to_ascii_lowercase();
-                matches!(low.as_str(), "1" | "true" | "yes" | "on")
-            })
-            .unwrap_or(false);
+        let allow_insecure_http = get_env(
+            "LIBREDB_GITEA_ALLOW_INSECURE_HTTP",
+            "SKILLSDB_GITEA_ALLOW_INSECURE_HTTP",
+        )
+        .or_else(|| get_cfg("gitea_allow_insecure_http"))
+        .map(|v| {
+            let low = v.trim().to_ascii_lowercase();
+            matches!(low.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false);
 
         Self {
             url,
@@ -396,17 +398,7 @@ pub fn cmd_gitea_config(
         }
     }
 
-    let masked = if cfg.token.len() > 10 {
-        format!(
-            "{}...{} (OS vault encrypted)",
-            &cfg.token[..4],
-            &cfg.token[cfg.token.len() - 4..]
-        )
-    } else if !cfg.token.is_empty() {
-        "(set, OS vault encrypted)".to_owned()
-    } else {
-        "(not set)".to_owned()
-    };
+    let masked = mask_token_for_status(&cfg.token);
 
     println!("============================================================");
     println!("LibreDB - Gitea & Workspace Configuration");
@@ -418,6 +410,19 @@ pub fn cmd_gitea_config(
     println!("Allow Remote HTTP:  {}", cfg.allow_insecure_http);
     println!("============================================================");
     Ok(())
+}
+
+fn mask_token_for_status(token: &str) -> String {
+    let char_cnt = token.chars().count();
+    if char_cnt > 10 {
+        let head: String = token.chars().take(4).collect();
+        let tail: String = token.chars().skip(char_cnt - 4).collect();
+        format!("{head}...{tail} (OS vault encrypted)")
+    } else if !token.is_empty() {
+        "(set, OS vault encrypted)".to_owned()
+    } else {
+        "(not set)".to_owned()
+    }
 }
 
 pub fn cmd_gitea_status(global_opt: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
@@ -2722,6 +2727,44 @@ mod tests {
             "Latest release fallback may upload unversioned binary while still excluding mismatched versions"
         );
 
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn gitea_env_vars_prefer_libredb_prefix_and_token_mask_is_utf8_safe() {
+        let tmp = std::env::temp_dir().join(format!("libredb_gitea_env_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let db = LibreDb::open(tmp.join("cfg.ldb")).unwrap();
+
+        let cfg = GiteaConfig::load_with_lookup(&db, |k| match k {
+            "LIBREDB_GITEA_URL" => Some("https://gitea.new.example/".to_owned()),
+            "SKILLSDB_GITEA_URL" => Some("https://gitea.old.example/".to_owned()),
+            "SKILLSDB_GITEA_USER" => Some("legacy_user".to_owned()),
+            "LIBREDB_GITEA_TOKEN" => Some("tok_prim_123456".to_owned()),
+            "SKILLSDB_GITEA_TOKEN" => Some("tok_old_999999".to_owned()),
+            "LIBREDB_GITEA_SERVICE" => Some("gitea_custom".to_owned()),
+            "LIBREDB_GITEA_ALLOW_INSECURE_HTTP" => Some("true".to_owned()),
+            _ => None,
+        });
+        assert_eq!(cfg.url, "https://gitea.new.example");
+        assert_eq!(cfg.user, "legacy_user");
+        assert_eq!(cfg.token, "tok_prim_123456");
+        assert_eq!(cfg.service_name, "gitea_custom");
+        assert!(cfg.allow_insecure_http);
+
+        // Multibyte UTF-8 tokens where byte index 4 would fall inside a scalar must never panic.
+        assert_eq!(
+            super::mask_token_for_status("äöü€αβγδεζηθικ"),
+            "äöü€...ηθικ (OS vault encrypted)"
+        );
+        assert_eq!(
+            super::mask_token_for_status("short_ö"),
+            "(set, OS vault encrypted)"
+        );
+        assert_eq!(super::mask_token_for_status(""), "(not set)");
+
+        drop(db);
         let _ = fs::remove_dir_all(&tmp);
     }
 }

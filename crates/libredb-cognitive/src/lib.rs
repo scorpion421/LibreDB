@@ -477,10 +477,8 @@ impl CognitiveEngine {
             if let Some(ref mut sess) = session {
                 if sess.is_already_in_context(cand.node_id, cand.generation) {
                     let stub_tok = 6u32;
-                    if cand.token_count > stub_tok {
-                        sess.record_suppression(cand.token_count, stub_tok);
-                        saved_by_delta += cand.token_count - stub_tok;
-                    }
+                    sess.record_suppression(cand.token_count, stub_tok);
+                    saved_by_delta += cand.token_count.saturating_sub(stub_tok);
                     let k_short = cand.key.as_deref().unwrap_or("-");
                     stubs.push(format!(
                         "#{} {}:{} gen={}",
@@ -528,9 +526,13 @@ impl CognitiveEngine {
         }
         let hydrate_ids: Vec<u64> = to_hydrate.iter().map(|c| c.node_id).collect();
         let (records, io_reads) = self.db.get_many_coalesced(&hydrate_ids)?;
+        let mut rec_map: HashMap<u64, _> = records.into_iter().map(|r| (r.node_id, r)).collect();
 
-        let mut capsules = Vec::with_capacity(records.len());
-        for (rec, cand) in records.into_iter().zip(to_hydrate.into_iter()) {
+        let mut capsules = Vec::with_capacity(to_hydrate.len());
+        for cand in to_hydrate {
+            let Some(rec) = rec_map.remove(&cand.node_id) else {
+                continue;
+            };
             capsules.push(DeliveredCapsule {
                 node_id: rec.node_id,
                 kind: rec.kind,

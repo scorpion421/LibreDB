@@ -960,6 +960,7 @@ fn should_skip_binary_ext(path: &Path) -> bool {
             | "lib"
             | "a"
             | "ldb"
+            // Third-party and legacy binary DB extensions skipped by text guardrail scans
             | "db"
             | "sqlite"
             | "zip"

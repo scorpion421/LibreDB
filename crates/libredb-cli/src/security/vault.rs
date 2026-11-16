@@ -259,8 +259,10 @@ pub(super) fn decode_and_maybe_upgrade_trust_anchor_record(
     global_db: &LibreDb,
     rec: &libredb_core::NodeRecord,
 ) -> Result<[u8; 32], String> {
-    let raw = String::from_utf8_lossy(&rec.payload).into_owned();
-    let (mut hex_str, needs_upgrade) = unprotect_secret(&raw)?;
+    let mut raw = String::from_utf8_lossy(&rec.payload).into_owned();
+    let res = unprotect_secret(&raw);
+    secure_zero(unsafe { raw.as_bytes_mut() });
+    let (mut hex_str, needs_upgrade) = res?;
     let decoded = hex_decode(hex_str.trim());
     if let Some(mut bytes) = decoded {
         if bytes.len() == 32 {

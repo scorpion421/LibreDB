@@ -633,8 +633,8 @@ impl LibreDb {
             .is_ok()
             {
                 let mut guard = self.state.write();
-                if disk_sb.compaction_count >= guard.superblock.compaction_count
-                    && disk_sb.commit_seq > guard.superblock.commit_seq
+                if (disk_sb.compaction_count, disk_sb.commit_seq)
+                    > (guard.superblock.compaction_count, guard.superblock.commit_seq)
                 {
                     *guard = Arc::new(SnapshotState {
                         superblock: disk_sb,
@@ -648,8 +648,14 @@ impl LibreDb {
             }
         }
 
-        let reloaded = Self::recover_existing(&*self.backend, file_len)?;
-        *self.state.write() = Arc::new(reloaded);
+        let cur_len = self.backend.len()?;
+        let reloaded = Self::recover_existing(&*self.backend, cur_len)?;
+        let mut guard = self.state.write();
+        if (reloaded.superblock.compaction_count, reloaded.superblock.commit_seq)
+            > (guard.superblock.compaction_count, guard.superblock.commit_seq)
+        {
+            *guard = Arc::new(reloaded);
+        }
         Ok(true)
     }
 

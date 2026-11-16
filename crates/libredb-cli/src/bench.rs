@@ -3764,7 +3764,7 @@ fn verify_l12_situational_superseding_and_belief_revision(
         .unwrap_or("");
     let idx_m1 = msg_after.find("legacy-line-diff");
     let idx_m2 = msg_after.find("ast-body-hash-diff");
-    if idx_m1.is_none() || idx_m2.is_some_and(|i2| idx_m1.unwrap() > i2) {
+    if idx_m1.is_none_or(|i1| idx_m2.is_some_and(|i2| i1 > i2)) {
         return Err(format!(
             "L12 PreInvocation did not restore M1 ahead of degraded M2:\n{msg_after}"
         ));

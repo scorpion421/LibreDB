@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.1] - 2026-11-16
+
+### Security
+- **Hardened local IPC coordinator (`libredb mcp-serve`)**: Restricted Windows Named Pipe creation with an owner-only protected security descriptor (`SYSTEM`, `Administrators`, and the active user) plus client-side pipe-owner verification, isolated Unix domain sockets inside verified `0700` directories with bounded worker concurrency (`<= 16`), and pinned incoming IPC hook requests to the server's configured `customizations.ldb` path.
+- **POSIX installer ownership validation (`deploy_plugin.sh`)**: Added explicit directory ownership checks (`uid` matching the active user or `root`) alongside permission-bit verification before registering hook executables, and aligned rule wording with the Windows installer.
+- **Vault plaintext scrubbing**: Cleared decoded UTF-8 intermediate buffers cleanly during legacy trust-anchor secret upgrades.
+
+### Fixed
+- **Multibyte UTF-8 UNC path handling and Windows lock error propagation**: Prevented byte-boundary panics when inspecting non-ASCII workspace paths on storage open, propagated non-contention `LockFileEx` OS errors immediately instead of masking them as timeouts, and guarded against stale snapshot regression during concurrent recovery or compaction.
+- **Concurrent federated hydration and suppression accounting**: Matched coalesced node reads by `NodeID` rather than positional slice indexing to prevent out-of-bounds panics during concurrent compaction, counted small suppressed duplicates accurately, and removed remaining reachable `.unwrap()` calls across MCP server and benchmark verification paths.
+- **`LIBREDB_GITEA_*` environment variables and installer version sync**: Added primary `LIBREDB_GITEA_*` environment variable support (with `SKILLSDB_GITEA_*` fallback), UTF-8-safe API token masking in `gitea-config`, and dynamic `VERSION` resolution inside both deployment scripts.
+
 ## [2.0.0] - 2026-11-16
 
 ### Added

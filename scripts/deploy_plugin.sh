@@ -32,6 +32,10 @@ done
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PROJECT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+LIBRE_VERSION=$(tr -d ' \t\r\n' < "$PROJECT_ROOT/VERSION" 2>/dev/null || echo "2.0.1")
+case "$LIBRE_VERSION" in
+    ""|*[!0-9A-Za-z._+-]*) LIBRE_VERSION="2.0.1" ;;
+esac
 USER_HOME="${HOME:-$(pwd)}"
 GEMINI_DIR="$USER_HOME/.gemini"
 LIBRE_HOME="$GEMINI_DIR/libredb"
@@ -61,10 +65,22 @@ install_binary_hot_safe() {
     mv -f "$tmp_dst" "$dst"
 }
 
-# Verify that a candidate hook directory is not world-writable without sticky bit (mirrors Test-SafeBinaryAcl).
+# Verify that a candidate hook directory is owned by current user/root and not world-writable without sticky bit.
 test_safe_binary_dir() {
     check_dir="$1"
     [ -d "$check_dir" ] || return 1
+    dir_uid=""
+    if stat -c '%u' "$check_dir" >/dev/null 2>&1; then
+        dir_uid=$(stat -c '%u' "$check_dir")
+    elif stat -f '%u' "$check_dir" >/dev/null 2>&1; then
+        dir_uid=$(stat -f '%u' "$check_dir")
+    fi
+    if [ -n "$dir_uid" ]; then
+        current_uid=$(id -u)
+        if [ "$dir_uid" -ne "$current_uid" ] && [ "$dir_uid" -ne 0 ]; then
+            return 1
+        fi
+    fi
     perm_oct=""
     if stat -c '%a' "$check_dir" >/dev/null 2>&1; then
         perm_oct=$(stat -c '%a' "$check_dir")
@@ -120,11 +136,11 @@ EXE_JSON=$(escape_json_str "$TARGET_EXE")
 GLOBAL_JSON=$(escape_json_str "$GLOBAL_LDB")
 
 # 1. Write plugin.json
-cat > "$PLUGIN_DIR/plugin.json" <<'EOF'
+cat > "$PLUGIN_DIR/plugin.json" <<EOF
 {
   "name": "libredb",
   "displayName": "LibreDB Cognitive Memory",
-  "version": "2.0.0",
+  "version": "$LIBRE_VERSION",
   "description": "Persistent project memory, fast code-graph search, and token-savings engine for Antigravity. Routes sub-millisecond lifecycle hooks via an in-memory MCP IPC coordinator with O(1) tail-sync, locates functions and call dependencies without reading whole files, enforces workspace guardrails, and automates Git/Gitea releases.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
@@ -256,7 +272,7 @@ All system rules, coding standards, administrative credentials, and skills live 
    - Elevate directly, via DPAPI (`~/.gemini/config/credentials/*.credential.xml`), or `Start-Process -Verb RunAs`. Never stage in `C:\Windows\Temp`, use `cmd.exe /c` wrappers, create remote services (`sc.exe \\`), or hardcode identities. After approval, log `[1/4 PRE-CHECK]`, `[2/4..3/4 ACTION]`, `[4/4 POST-CHECK]`, `[CLEANUP]` to `AuditLog_<Target>_<Date>_<hh_mm_ss>.log`.
 
 5. **Turn-economy, diagnostics, and built-in benchmarks**:
-   - **Anti-salami-slicing**: Read files `<= 800 lines` in one `read_file` call; for `> 800 lines` use `libredb_code` (`skeleton`, `fim`, `impact`) and batch parallel reads.
+   - **Anti-salami-slicing**: Read files `<= 800 lines` in one `read_file` call; for `> 800 lines` use `libredb_code` (`skeleton`, `locate`, `fim`, `impact` with batched `files`/`symbols`/`slices`) and batch parallel reads.
    - **Subagent firewall**: Run 1-3 file edits and WMI/CIM commands in main context; delegate `>= 4` searches or `> 5` files to `research` (`Model="flash"`).
    - **Batching & verification**: Fix entire bug classes before rebuilding, chain `build && test && verify`, commit memory via `libredb_memorize`, check `libredb guardrail check --path "<dir>" --staged --strict`, inspect savings/benchmarks natively via `libredb savings` and `libredb bench` (zero ad-hoc scripts), and use `WaitMsBeforeAsync=10000` without polling. Note any internal tool workarounds briefly at the end.
 
@@ -392,8 +408,8 @@ cat > "$ASSETS_DIR/logo.svg" <<'EOF'
 EOF
 
 # 7. Write user-facing README.md inside plugin bundle
-cat > "$PLUGIN_DIR/README.md" <<'EOF'
-# LibreDB cognitive memory plugin (v2.0.0)
+cat <<'EOF' | sed "s/__VERSION__/${LIBRE_VERSION}/g" > "$PLUGIN_DIR/README.md"
+# LibreDB cognitive memory plugin (v__VERSION__)
 
 `LibreDB` gives `Antigravity` persistent project memory, targeted code navigation, and automated release workflows in a single 100% pure-Rust binary:
 
@@ -438,6 +454,6 @@ PYEOF
     fi
 fi
 
-echo "[OK] Deployed LibreDB v2.0.0 standalone binary to: $BIN_DIR (profile=$PROFILE)"
+echo "[OK] Deployed LibreDB v${LIBRE_VERSION} standalone binary to: $BIN_DIR (profile=$PROFILE)"
 echo "[OK] Hydrated and modernized global store at: $GLOBAL_LDB"
 echo "[OK] Installed complete Antigravity plugin at: $PLUGIN_DIR"

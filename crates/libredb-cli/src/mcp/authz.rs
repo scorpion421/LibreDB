@@ -90,7 +90,10 @@ impl McpServerState {
             self.ephemeral_dir = Some(dir);
             self.ephemeral_lock = Some(lock_backend);
         }
-        let dir = self.ephemeral_dir.as_ref().unwrap();
+        let dir = self
+            .ephemeral_dir
+            .as_ref()
+            .ok_or_else(|| "ephemeral directory initialization failed".to_owned())?;
         Ok(dir.join(crate::security::ephemeral_workspace_ldb_filename(ws_root)))
     }
 
@@ -529,7 +532,10 @@ impl McpServerState {
                 .map_err(|e| e.to_string())?;
             insert_brain_bounded(&mut self.brains, q_key.clone(), q_brain);
         }
-        let brain = self.brains.get_mut(&q_key).unwrap();
+        let brain = self
+            .brains
+            .get_mut(&q_key)
+            .ok_or_else(|| "quarantined brain cache entry missing after insert".to_owned())?;
         brain.refresh_if_needed().map_err(|e| e.to_string())?;
         Ok(brain)
     }
@@ -738,7 +744,10 @@ impl McpServerState {
             insert_brain_bounded(&mut self.brains, cache_key.clone(), brain);
         }
 
-        let brain = self.brains.get_mut(&cache_key).unwrap();
+        let brain = self
+            .brains
+            .get_mut(&cache_key)
+            .ok_or_else(|| "workspace brain cache entry missing after insert".to_owned())?;
         brain.refresh_if_needed().map_err(|e| e.to_string())?;
         Ok((ws_write_lock, ws_root_to_seal, brain))
     }

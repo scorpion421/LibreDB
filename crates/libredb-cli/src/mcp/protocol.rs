@@ -264,7 +264,7 @@ fn dispatch_jsonrpc_line<W: Write>(
     let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
 
     // Handle JSON-RPC notifications (no `id` member):
-    if id.is_none() {
+    let Some(req_id) = id else {
         match method {
             "notifications/roots/list_changed" => {
                 state.client_supports_roots = true;
@@ -297,8 +297,7 @@ fn dispatch_jsonrpc_line<W: Write>(
             _ => {}
         }
         return Ok(());
-    }
-    let req_id = id.unwrap();
+    };
 
     let response = match handle_rpc_method(method, &params, state) {
         Ok(result_val) => json!({

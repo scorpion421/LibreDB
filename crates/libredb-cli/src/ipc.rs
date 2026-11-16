@@ -1,9 +1,11 @@
 //! Cross-platform local in-memory IPC coordinator bridging short-lived lifecycle hooks
 //! (`hook-pre-tool`, `hook-pre-invocation`) directly into the running `libredb mcp-serve` process.
 //!
-//! - Windows: local Named Pipe (`\\.\pipe\libredb-ipc-v1-<24hex>`) with `PIPE_REJECT_REMOTE_CLIENTS`
-//!   and default user DACL (no drivers, no admin elevation, and no SMB/network I/O).
-//! - Unix (Linux/macOS): `0600` Unix Domain Socket guarded by an advisory file lock.
+//! - Windows: local Named Pipe (`\\.\pipe\libredb-ipc-v1-<24hex>`) with `PIPE_REJECT_REMOTE_CLIENTS`,
+//!   `FILE_FLAG_FIRST_PIPE_INSTANCE`, protected owner/SYSTEM/Administrators SDDL DACL, and client
+//!   pipe-owner SID verification (no drivers, no admin elevation, and no SMB/network I/O).
+//! - Unix (Linux/macOS): `0600` Unix Domain Socket inside a verified `0700` user-owned directory
+//!   guarded by an advisory file lock.
 
 use crate::hooks::{
     default_global_ldb_path, evaluate_pre_invocation_payload_with_ram_state,
@@ -13,14 +15,40 @@ use crate::mcp::{read_bounded_jsonrpc_line, BoundedLineRead, McpServerState, MAX
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use std::fs;
 use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 const LOCK_TRY_TIMEOUT_MS: u64 = 400;
+const MAX_CONCURRENT_IPC_WORKERS: usize = 16;
+
+struct WorkerSlotGuard(Arc<AtomicUsize>);
+
+impl Drop for WorkerSlotGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn try_acquire_worker_slot(counter: &Arc<AtomicUsize>) -> Option<WorkerSlotGuard> {
+    loop {
+        let cur = counter.load(Ordering::Acquire);
+        if cur >= MAX_CONCURRENT_IPC_WORKERS {
+            return None;
+        }
+        if counter
+            .compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return Some(WorkerSlotGuard(Arc::clone(counter)));
+        }
+    }
+}
 
 fn hex_encode_lower(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -61,16 +89,68 @@ fn endpoint_address(global_ldb_opt: Option<&Path>) -> String {
 }
 
 #[cfg(unix)]
+fn current_euid() -> u32 {
+    extern "C" {
+        fn geteuid() -> u32;
+    }
+    unsafe { geteuid() }
+}
+
+#[cfg(unix)]
 fn endpoint_address(global_ldb_opt: Option<&Path>) -> PathBuf {
     let id = control_plane_endpoint_id(global_ldb_opt);
     let abs = effective_global_ldb_path(global_ldb_opt);
     if let Some(parent) = abs.parent().filter(|p| !p.as_os_str().is_empty()) {
-        let cand = parent.join(format!(".ipc_{id}.sock"));
+        let cand = parent.join(".ipc").join(format!("ipc_{id}.sock"));
         if cand.as_os_str().len() <= 96 {
             return cand;
         }
     }
-    std::env::temp_dir().join(format!("libredb-ipc-{id}.sock"))
+    std::env::temp_dir()
+        .join(format!("libredb-ipc-{}", current_euid()))
+        .join(format!("ipc_{id}.sock"))
+}
+
+#[cfg(unix)]
+fn verify_or_create_private_ipc_dir(dir: &Path, create: bool) -> io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    if create && fs::symlink_metadata(dir).is_err() {
+        fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    }
+    let meta = fs::symlink_metadata(dir)?;
+    if !meta.is_dir() || meta.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "IPC directory is not a regular directory",
+        ));
+    }
+    if meta.uid() != current_euid() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "IPC directory is not owned by the current user",
+        ));
+    }
+    if (meta.mode() & 0o077) != 0 {
+        if !create {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "IPC directory permissions are too permissive",
+            ));
+        }
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        let recheck = fs::symlink_metadata(dir)?;
+        if !recheck.is_dir()
+            || recheck.file_type().is_symlink()
+            || recheck.uid() != current_euid()
+            || (recheck.mode() & 0o077) != 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Failed to enforce 0700 permissions on IPC directory",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn handle_ipc_line(
@@ -89,7 +169,17 @@ fn handle_ipc_line(
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);
-    let eff_gdb = req_gdb.as_deref().or(global_ldb_default.as_deref());
+    if let Some(ref p) = req_gdb {
+        let expected = crate::security::normalize_workspace_key(&effective_global_ldb_path(
+            global_ldb_default.as_deref(),
+        ));
+        let requested =
+            crate::security::normalize_workspace_key(&effective_global_ldb_path(Some(p)));
+        if requested != expected {
+            return json!({ "ok": false, "fallback": true });
+        }
+    }
+    let eff_gdb = global_ldb_default.as_deref();
 
     let Some(mut st) = state.try_lock_for(Duration::from_millis(LOCK_TRY_TIMEOUT_MS)) else {
         return json!({ "ok": false, "fallback": true });
@@ -162,9 +252,10 @@ mod win_pipe {
     use std::fs::{File, OpenOptions};
     use std::io;
     use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -179,6 +270,20 @@ mod win_pipe {
     const ERROR_PIPE_BUSY: i32 = 231;
     const ERROR_PIPE_CONNECTED: i32 = 535;
     const PIPE_BUF_BYTES: u32 = 65_536;
+    const TOKEN_QUERY: u32 = 0x0008;
+    const TOKEN_USER_INFO_CLASS: u32 = 1;
+    const SDDL_REVISION_1: u32 = 1;
+    const SE_KERNEL_OBJECT: u32 = 6;
+    const OWNER_SECURITY_INFORMATION: u32 = 0x0000_0001;
+    const SECURITY_SQOS_PRESENT: u32 = 0x0010_0000;
+    const SECURITY_ANONYMOUS: u32 = 0x0000_0000;
+
+    #[repr(C)]
+    struct SecurityAttributes {
+        n_length: u32,
+        lp_security_descriptor: *mut c_void,
+        b_inherit_handle: i32,
+    }
 
     #[link(name = "kernel32")]
     extern "system" {
@@ -196,6 +301,70 @@ mod win_pipe {
         fn ConnectNamedPipe(h_named_pipe: RawHandle, lp_overlapped: *mut c_void) -> i32;
         fn WaitNamedPipeW(lp_named_pipe_name: *const u16, n_time_out: u32) -> i32;
         fn GetLastError() -> u32;
+        fn GetCurrentProcess() -> RawHandle;
+        fn CloseHandle(h_object: RawHandle) -> i32;
+        fn LocalFree(h_mem: *mut c_void) -> *mut c_void;
+    }
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn OpenProcessToken(
+            process_handle: RawHandle,
+            desired_access: u32,
+            token_handle: *mut RawHandle,
+        ) -> i32;
+
+        fn GetTokenInformation(
+            token_handle: RawHandle,
+            token_information_class: u32,
+            token_information: *mut c_void,
+            token_information_length: u32,
+            return_length: *mut u32,
+        ) -> i32;
+
+        fn ConvertSidToStringSidW(sid: *const c_void, string_sid: *mut *mut u16) -> i32;
+
+        fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            string_security_descriptor: *const u16,
+            string_sd_revision: u32,
+            security_descriptor: *mut *mut c_void,
+            security_descriptor_size: *mut u32,
+        ) -> i32;
+
+        fn GetSecurityInfo(
+            handle: RawHandle,
+            object_type: u32,
+            security_info: u32,
+            ppsid_owner: *mut *mut c_void,
+            ppsid_group: *mut *mut c_void,
+            pp_dacl: *mut *mut c_void,
+            pp_sacl: *mut *mut c_void,
+            pp_security_descriptor: *mut *mut c_void,
+        ) -> u32;
+    }
+
+    struct WinHandle(RawHandle);
+
+    impl Drop for WinHandle {
+        fn drop(&mut self) {
+            if !self.0.is_null() && (self.0 as isize) != -1 {
+                unsafe {
+                    CloseHandle(self.0);
+                }
+            }
+        }
+    }
+
+    struct LocalMem(*mut c_void);
+
+    impl Drop for LocalMem {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    LocalFree(self.0);
+                }
+            }
+        }
     }
 
     pub(super) fn to_wide_null(s: &str) -> Vec<u16> {
@@ -205,7 +374,120 @@ mod win_pipe {
             .collect()
     }
 
+    fn sid_ptr_to_string(sid: *const c_void) -> io::Result<String> {
+        if sid.is_null() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "null SID"));
+        }
+        let mut wide_sid: *mut u16 = core::ptr::null_mut();
+        let ok = unsafe { ConvertSidToStringSidW(sid, &mut wide_sid) };
+        if ok == 0 || wide_sid.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let _mem = LocalMem(wide_sid as *mut c_void);
+        let mut len = 0usize;
+        while len < 256 && unsafe { *wide_sid.add(len) } != 0 {
+            len += 1;
+        }
+        let slice = unsafe { core::slice::from_raw_parts(wide_sid, len) };
+        Ok(String::from_utf16_lossy(slice))
+    }
+
+    fn current_user_sid_string() -> io::Result<String> {
+        let mut tok: RawHandle = core::ptr::null_mut();
+        let ok = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut tok) };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let _tok_guard = WinHandle(tok);
+
+        let mut needed: u32 = 0;
+        unsafe {
+            GetTokenInformation(
+                tok,
+                TOKEN_USER_INFO_CLASS,
+                core::ptr::null_mut(),
+                0,
+                &mut needed,
+            );
+        }
+        if needed < core::mem::size_of::<*const c_void>() as u32 {
+            return Err(io::Error::last_os_error());
+        }
+        // 8-byte aligned storage matching `TOKEN_USER` ABI on both 32-bit and 64-bit Windows.
+        let word_count = (needed as usize).div_ceil(core::mem::size_of::<u64>());
+        let mut aligned_buf = vec![0u64; word_count];
+        let buf_bytes = (aligned_buf.len() * core::mem::size_of::<u64>()) as u32;
+        let ok2 = unsafe {
+            GetTokenInformation(
+                tok,
+                TOKEN_USER_INFO_CLASS,
+                aligned_buf.as_mut_ptr() as *mut c_void,
+                buf_bytes,
+                &mut needed,
+            )
+        };
+        if ok2 == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let user_sid_ptr = unsafe { *(aligned_buf.as_ptr() as *const *const c_void) };
+        sid_ptr_to_string(user_sid_ptr)
+    }
+
+    fn build_owner_only_sd() -> io::Result<LocalMem> {
+        let user_sid = current_user_sid_string()?;
+        // Protected DACL granting full pipe access only to current user, LocalSystem, and Administrators.
+        let sddl = format!("D:P(A;;GA;;;{user_sid})(A;;GA;;;SY)(A;;GA;;;BA)");
+        let wide_sddl = to_wide_null(&sddl);
+        let mut sd_ptr: *mut c_void = core::ptr::null_mut();
+        let ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide_sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut sd_ptr,
+                core::ptr::null_mut(),
+            )
+        };
+        if ok == 0 || sd_ptr.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(LocalMem(sd_ptr))
+    }
+
+    fn verify_pipe_owner(pipe_file: &File, expected_user_sid: &str) -> bool {
+        let mut owner_sid: *mut c_void = core::ptr::null_mut();
+        let mut sd_ptr: *mut c_void = core::ptr::null_mut();
+        let rc = unsafe {
+            GetSecurityInfo(
+                pipe_file.as_raw_handle(),
+                SE_KERNEL_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                &mut owner_sid,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                &mut sd_ptr,
+            )
+        };
+        if rc != 0 || sd_ptr.is_null() {
+            if !sd_ptr.is_null() {
+                drop(LocalMem(sd_ptr));
+            }
+            return false;
+        }
+        let _sd_guard = LocalMem(sd_ptr);
+        let Ok(owner) = sid_ptr_to_string(owner_sid) else {
+            return false;
+        };
+        owner == expected_user_sid || owner == "S-1-5-32-544" || owner == "S-1-5-18"
+    }
+
     pub(super) fn create_pipe_instance(wide_name: &[u16], first_instance: bool) -> io::Result<File> {
+        let sd = build_owner_only_sd()?;
+        let mut sa = SecurityAttributes {
+            n_length: core::mem::size_of::<SecurityAttributes>() as u32,
+            lp_security_descriptor: sd.0,
+            b_inherit_handle: 0,
+        };
         let mut open_mode = PIPE_ACCESS_DUPLEX;
         if first_instance {
             open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
@@ -221,7 +503,7 @@ mod win_pipe {
                 PIPE_BUF_BYTES,
                 PIPE_BUF_BYTES,
                 0,
-                core::ptr::null_mut(),
+                &mut sa as *mut SecurityAttributes as *mut c_void,
             )
         };
         if raw.is_null() || (raw as isize) == -1 {
@@ -237,6 +519,7 @@ mod win_pipe {
         global_ldb_default: Option<PathBuf>,
         state: Arc<parking_lot::Mutex<crate::mcp::McpServerState>>,
         served_count: Arc<AtomicU64>,
+        active_workers: Arc<AtomicUsize>,
     ) {
         while !stop.load(Ordering::Acquire) {
             let ok = unsafe { ConnectNamedPipe(cur_pipe.as_raw_handle(), core::ptr::null_mut()) };
@@ -263,14 +546,19 @@ mod win_pipe {
             }
 
             let next_opt = create_pipe_instance(&wide_name, false).ok();
-            let g = global_ldb_default.clone();
-            let s = Arc::clone(&state);
-            let c = Arc::clone(&served_count);
             let connected_pipe = cur_pipe;
-            std::thread::spawn(move || {
-                super::serve_connected_stream(&connected_pipe, &connected_pipe, &g, &s, &c);
+            if let Some(slot) = super::try_acquire_worker_slot(&active_workers) {
+                let g = global_ldb_default.clone();
+                let s = Arc::clone(&state);
+                let c = Arc::clone(&served_count);
+                std::thread::spawn(move || {
+                    let _slot = slot;
+                    super::serve_connected_stream(&connected_pipe, &connected_pipe, &g, &s, &c);
+                    drop(connected_pipe);
+                });
+            } else {
                 drop(connected_pipe);
-            });
+            }
 
             match next_opt {
                 Some(next) => cur_pipe = next,
@@ -280,11 +568,22 @@ mod win_pipe {
     }
 
     pub(super) fn connect_client(pipe_name: &str, max_wait: Duration) -> Option<File> {
+        let expected_sid = current_user_sid_string().ok()?;
         let wide = to_wide_null(pipe_name);
         let deadline = Instant::now() + max_wait;
         loop {
-            match OpenOptions::new().read(true).write(true).open(pipe_name) {
-                Ok(f) => return Some(f),
+            match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .security_qos_flags(SECURITY_SQOS_PRESENT | SECURITY_ANONYMOUS)
+                .open(pipe_name)
+            {
+                Ok(f) => {
+                    if verify_pipe_owner(&f, &expected_sid) {
+                        return Some(f);
+                    }
+                    return None;
+                }
                 Err(e) => {
                     let code = e.raw_os_error().unwrap_or(0);
                     if e.kind() == io::ErrorKind::NotFound || code == ERROR_FILE_NOT_FOUND {
@@ -336,6 +635,7 @@ impl McpIpcServer {
         let global_ldb_default = global_ldb_opt.map(Path::to_path_buf);
         let stop = Arc::new(AtomicBool::new(false));
         let served_count = Arc::new(AtomicU64::new(0));
+        let active_workers = Arc::new(AtomicUsize::new(0));
 
         #[cfg(windows)]
         {
@@ -344,6 +644,7 @@ impl McpIpcServer {
             let first_pipe = win_pipe::create_pipe_instance(&wide, true).ok()?;
             let stop_bg = Arc::clone(&stop);
             let served_bg = Arc::clone(&served_count);
+            let workers_bg = Arc::clone(&active_workers);
             let listener = std::thread::spawn(move || {
                 win_pipe::accept_loop(
                     wide,
@@ -352,6 +653,7 @@ impl McpIpcServer {
                     global_ldb_default,
                     state,
                     served_bg,
+                    workers_bg,
                 );
             });
             Some(Self {
@@ -368,12 +670,15 @@ impl McpIpcServer {
             use std::os::unix::net::UnixListener;
 
             let endpoint = endpoint_address(global_ldb_opt);
-            if let Some(parent) = endpoint.parent() {
-                if !parent.as_os_str().is_empty() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-            }
+            let parent = endpoint
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())?;
+            verify_or_create_private_ipc_dir(parent, true).ok()?;
+
             let lock_path = endpoint.with_extension("lock");
+            if fs::symlink_metadata(&lock_path).is_ok_and(|m| m.file_type().is_symlink()) {
+                return None;
+            }
             let lock_guard = libredb_core::OsFileBackend::open(&lock_path).ok()?;
             if lock_guard.try_lock_write_region().ok() != Some(true) {
                 return None;
@@ -384,6 +689,7 @@ impl McpIpcServer {
 
             let stop_bg = Arc::clone(&stop);
             let served_bg = Arc::clone(&served_count);
+            let workers_bg = Arc::clone(&active_workers);
             let listener = std::thread::spawn(move || {
                 for incoming in listener_sock.incoming() {
                     if stop_bg.load(Ordering::Acquire) {
@@ -392,12 +698,17 @@ impl McpIpcServer {
                     let Ok(stream) = incoming else {
                         break;
                     };
+                    let Some(slot) = try_acquire_worker_slot(&workers_bg) else {
+                        drop(stream);
+                        continue;
+                    };
                     let _ = stream.set_read_timeout(Some(Duration::from_millis(2_000)));
                     let _ = stream.set_write_timeout(Some(Duration::from_millis(2_000)));
                     let g = global_ldb_default.clone();
                     let s = Arc::clone(&state);
                     let c = Arc::clone(&served_bg);
                     std::thread::spawn(move || {
+                        let _slot = slot;
                         serve_connected_stream(&stream, &stream, &g, &s, &c);
                     });
                 }
@@ -470,9 +781,74 @@ pub fn try_invoke_ipc_hook(op: &str, global_ldb_opt: Option<&Path>, payload: &Va
     {
         use std::os::unix::net::UnixStream;
         let endpoint = endpoint_address(global_ldb_opt);
+        let parent = endpoint.parent()?;
+        verify_or_create_private_ipc_dir(parent, false).ok()?;
         let stream = UnixStream::connect(&endpoint).ok()?;
         let _ = stream.set_read_timeout(Some(Duration::from_millis(2_000)));
         let _ = stream.set_write_timeout(Some(Duration::from_millis(2_000)));
         exchange_client_line(&stream, &stream, &req_line)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use libredb_core::LibreDb;
+
+    #[test]
+    fn ipc_server_serves_pinned_hook_and_rejects_mismatched_global_db_path() {
+        let base_target = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join(format!("test_ipc_hardening_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base_target);
+        let ws = base_target.join("ws");
+        std::fs::create_dir_all(ws.join(".agents")).unwrap();
+        let gdb_path = base_target.join("customizations.ldb");
+        let pdb_path = ws.join(".agents").join("memory.ldb");
+        {
+            let gdb = LibreDb::open(&gdb_path).unwrap();
+            let pdb = LibreDb::open(&pdb_path).unwrap();
+            crate::security::seal_workspace_memory(&gdb, &pdb, &ws).unwrap();
+        }
+
+        let state = Arc::new(Mutex::new(
+            McpServerState::new(Some(&pdb_path), Some(&gdb_path)).unwrap(),
+        ));
+        let srv = McpIpcServer::start(Some(&gdb_path), Arc::clone(&state))
+            .expect("IPC server must bind with protected ACL/directory");
+
+        let payload = json!({
+            "conversationId": "ipc-test-cid",
+            "cwd": ws.to_string_lossy(),
+            "prompt": "inspect status"
+        });
+
+        let ok_resp = try_invoke_ipc_hook("pre_invocation", Some(&gdb_path), &payload)
+            .expect("IPC client should communicate over owner-verified endpoint");
+        assert!(ok_resp.get("injectSteps").is_some());
+        assert_eq!(srv.served_count(), 1);
+
+        // Passing a foreign global_ldb path on the wire must fail closed without invoking hooks.
+        let spoofed_gdb = base_target.join("evil_customizations.ldb");
+        let rejected = handle_ipc_line(
+            &serde_json::to_string(&json!({
+                "op": "pre_invocation",
+                "global_ldb": spoofed_gdb.to_string_lossy(),
+                "payload": payload,
+            }))
+            .unwrap(),
+            &Some(gdb_path),
+            &state,
+            &srv.served_count,
+        );
+        assert_eq!(rejected.get("ok").and_then(Value::as_bool), Some(false));
+        assert_eq!(rejected.get("fallback").and_then(Value::as_bool), Some(true));
+        assert_eq!(srv.served_count(), 1);
+
+        drop(srv);
+        drop(state);
+        let _ = std::fs::remove_dir_all(&base_target);
     }
 }
