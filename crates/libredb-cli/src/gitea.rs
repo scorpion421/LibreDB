@@ -727,6 +727,42 @@ pub fn cmd_gitea_sync(
         }
     }
 
+    let repo_name = resolve_repo_name_from_git_or_dir(&clean_root);
+    validate_safe_git_identifier(&repo_name, "repository name")?;
+    let mut remotes = list_git_remotes(&clean_root);
+    if remotes.is_empty() && !cfg.user.is_empty() && !cfg.token.is_empty() {
+        if let Ok(clone_url) = ensure_remote_repo_created(&cfg, &repo_name) {
+            let _ = Command::new("git")
+                .args(["remote", "add", "--", "origin", &clone_url])
+                .current_dir(&clean_root)
+                .output();
+            remotes = list_git_remotes(&clean_root);
+        }
+    }
+
+    let target_remotes = select_target_remotes(
+        &remotes,
+        target_remote_opt,
+        push_all_remotes,
+        push_github,
+    );
+    if target_remotes.is_empty() {
+        return Err("No Git remotes configured for workspace. Run 'libredb gitea-init' or 'git remote add origin <url>'.".into());
+    }
+
+    let branch = current_git_branch(&clean_root);
+    validate_safe_git_identifier(&branch, "branch name")?;
+
+    for (rem_name, rem_url) in &target_remotes {
+        validate_safe_git_identifier(rem_name, "remote name")?;
+        if cfg.is_gitea_remote_url(rem_url) && !cfg.user.is_empty() && !cfg.token.is_empty() {
+            let _ = ensure_remote_repo_created(&cfg, &repo_name);
+        }
+    }
+    // Atomic preflight across ALL target remotes BEFORE creating a local commit or pushing any
+    // mirror, so a diverged secondary remote (e.g. `github` behind `origin`) never leaves mirrors skewed.
+    preflight_verify_remotes_fast_forward(&clean_root, &cfg, &target_remotes, &branch)?;
+
     if changed_cnt > 0 {
         let cfg_author_name = crate::security::load_string_config(
             Some(&ldb),
@@ -773,39 +809,10 @@ pub fn cmd_gitea_sync(
         .output()?;
     let short_hash = String::from_utf8_lossy(&rev_out.stdout).trim().to_owned();
 
-    let repo_name = resolve_repo_name_from_git_or_dir(&clean_root);
-    validate_safe_git_identifier(&repo_name, "repository name")?;
-    let mut remotes = list_git_remotes(&clean_root);
-    if remotes.is_empty() && !cfg.user.is_empty() && !cfg.token.is_empty() {
-        if let Ok(clone_url) = ensure_remote_repo_created(&cfg, &repo_name) {
-            let _ = Command::new("git")
-                .args(["remote", "add", "--", "origin", &clone_url])
-                .current_dir(&clean_root)
-                .output();
-            remotes = list_git_remotes(&clean_root);
-        }
-    }
-
-    let target_remotes = select_target_remotes(
-        &remotes,
-        target_remote_opt,
-        push_all_remotes,
-        push_github,
-    );
-    if target_remotes.is_empty() {
-        return Err("No Git remotes configured for workspace. Run 'libredb gitea-init' or 'git remote add origin <url>'.".into());
-    }
-
-    let branch = current_git_branch(&clean_root);
-    validate_safe_git_identifier(&branch, "branch name")?;
     println!("Synchronizing workspace: {} ({})", repo_name, clean_root.display());
     println!("  [OK] HEAD commit:    {short_hash} ({changed_cnt} files committed)");
 
     for (rem_name, rem_url) in &target_remotes {
-        validate_safe_git_identifier(rem_name, "remote name")?;
-        if cfg.is_gitea_remote_url(rem_url) && !cfg.user.is_empty() && !cfg.token.is_empty() {
-            let _ = ensure_remote_repo_created(&cfg, &repo_name);
-        }
         let mut push_cmd = Command::new("git");
         cfg.configure_git_command_for_remote(&mut push_cmd, rem_url);
         let p_out = push_cmd
@@ -1594,7 +1601,7 @@ fn workspace_has_semver_metadata(root: &Path) -> bool {
 }
 
 fn current_git_branch(root: &Path) -> String {
-    Command::new("git")
+    if let Some(b) = Command::new("git")
         .args(["-c", "core.fsmonitor=false", "rev-parse", "--abbrev-ref", "HEAD"])
         .current_dir(root)
         .output()
@@ -1602,7 +1609,124 @@ fn current_git_branch(root: &Path) -> String {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
         .filter(|b| !b.is_empty() && b != "HEAD")
-        .unwrap_or_else(|| "main".to_owned())
+    {
+        return b;
+    }
+    if let Some(b) = Command::new("git")
+        .args(["-c", "core.fsmonitor=false", "symbolic-ref", "--short", "HEAD"])
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .filter(|b| !b.is_empty())
+    {
+        return b;
+    }
+    "main".to_owned()
+}
+
+/// Fetches `branch` from EVERY target remote BEFORE `cmd_gitea_sync` creates a commit or pushes
+/// any mirror, rejecting diverged/unpulled remote history or unreachable remotes atomically.
+fn preflight_verify_remotes_fast_forward(
+    clean_root: &Path,
+    cfg: &GiteaConfig,
+    target_remotes: &[(String, String)],
+    branch: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    validate_safe_git_identifier(branch, "branch name")?;
+    let local_head_opt = Command::new("git")
+        .args(["-c", "core.fsmonitor=false", "rev-parse", "--verify", "-q", "HEAD"])
+        .current_dir(clean_root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .filter(|s| !s.is_empty());
+
+    for (rem_name, rem_url) in target_remotes {
+        validate_safe_git_identifier(rem_name, "remote name")?;
+        let mut fetch_cmd = Command::new("git");
+        cfg.configure_git_command_for_remote(&mut fetch_cmd, rem_url);
+        let f_out = fetch_cmd
+            .args([
+                "-c",
+                "core.fsmonitor=false",
+                "fetch",
+                "--no-tags",
+                "--quiet",
+                "--",
+                rem_name,
+                branch,
+            ])
+            .current_dir(clean_root)
+            .output()?;
+        if !f_out.status.success() {
+            let err_msg = String::from_utf8_lossy(&f_out.stderr);
+            let err_low = err_msg.to_ascii_lowercase();
+            // Brand new remote repository / branch has no remote ref yet; fast-forward push is safe.
+            if err_low.contains("couldn't find remote ref")
+                || err_low.contains("remote ref does not exist")
+            {
+                continue;
+            }
+            return Err(format!(
+                "[PREFLIGHT FETCH FAILED]: Could not inspect remote '{rem_name}' ({rem_url}) for branch '{branch}' before committing/pushing: {}",
+                err_msg.trim()
+            )
+            .into());
+        }
+
+        let remote_head_opt = Command::new("git")
+            .args([
+                "-c",
+                "core.fsmonitor=false",
+                "rev-parse",
+                "--verify",
+                "-q",
+                "FETCH_HEAD",
+            ])
+            .current_dir(clean_root)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+            .filter(|s| !s.is_empty());
+
+        let Some(ref remote_head) = remote_head_opt else {
+            continue;
+        };
+        let Some(ref local_head) = local_head_opt else {
+            return Err(format!(
+                "[PREFLIGHT SYNC CONFLICT]: Local branch '{branch}' has no commits while remote '{rem_name}' ({rem_url}) already points to {}.",
+                &remote_head[..remote_head.len().min(7)]
+            )
+            .into());
+        };
+        if local_head == remote_head {
+            continue;
+        }
+        let anc_out = Command::new("git")
+            .args([
+                "-c",
+                "core.fsmonitor=false",
+                "merge-base",
+                "--is-ancestor",
+                remote_head,
+                "HEAD",
+            ])
+            .current_dir(clean_root)
+            .output()?;
+        if !anc_out.status.success() {
+            return Err(format!(
+                "[PREFLIGHT SYNC CONFLICT]: Remote '{rem_name}' ({rem_url}) has unpulled commits on branch '{branch}' (remote {} is not an ancestor of local {}). Pull or rebase before running 'git-sync' so multi-remote mirrors stay atomic.",
+                &remote_head[..remote_head.len().min(7)],
+                &local_head[..local_head.len().min(7)]
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 fn parse_owner_and_repo_from_remote_url(raw_url: &str) -> Option<(String, String)> {
@@ -2765,6 +2889,121 @@ mod tests {
         assert_eq!(super::mask_token_for_status(""), "(not set)");
 
         drop(db);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn preflight_detects_unpulled_remote_commits_before_partial_multi_remote_push() {
+        let tmp = std::env::temp_dir().join(format!(
+            "libredb_preflight_git_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        let bare_origin = tmp.join("origin.git");
+        let bare_github = tmp.join("github.git");
+        let bare_empty = tmp.join("empty_mirror.git");
+        let work_a = tmp.join("work_a");
+        let work_b = tmp.join("work_b");
+
+        for bare in [&bare_origin, &bare_github, &bare_empty] {
+            let st = Command::new("git")
+                .args(["init", "--bare"])
+                .arg(bare)
+                .status()
+                .unwrap();
+            assert!(st.success());
+        }
+
+        // Seed work_a -> initial commit pushed to both origin & github on branch `master`.
+        assert!(Command::new("git").arg("init").arg(&work_a).status().unwrap().success());
+        for args in [
+            vec!["config", "user.name", "Test"],
+            vec!["config", "user.email", "test@local.dev"],
+            vec!["checkout", "-b", "master"],
+        ] {
+            assert!(Command::new("git").args(&args).current_dir(&work_a).status().unwrap().success());
+        }
+        fs::write(work_a.join("README.md"), "# Seed\n").unwrap();
+        assert!(Command::new("git").args(["add", "README.md"]).current_dir(&work_a).status().unwrap().success());
+        assert!(Command::new("git").args(["commit", "-m", "initial seed"]).current_dir(&work_a).status().unwrap().success());
+        assert!(Command::new("git").args(["remote", "add", "origin"]).arg(&bare_origin).current_dir(&work_a).status().unwrap().success());
+        assert!(Command::new("git").args(["remote", "add", "github"]).arg(&bare_github).current_dir(&work_a).status().unwrap().success());
+        assert!(Command::new("git").args(["remote", "add", "empty"]).arg(&bare_empty).current_dir(&work_a).status().unwrap().success());
+        assert!(Command::new("git").args(["push", "-u", "origin", "master"]).current_dir(&work_a).status().unwrap().success());
+        assert!(Command::new("git").args(["push", "-u", "github", "master"]).current_dir(&work_a).status().unwrap().success());
+
+        let base_sha = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&work_a)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+
+        // Clone `bare_github` into `work_b` and push a new upstream commit ONLY to `bare_github`.
+        assert!(Command::new("git").arg("clone").arg(&bare_github).arg(&work_b).status().unwrap().success());
+        assert!(Command::new("git").args(["config", "user.name", "Other"]).current_dir(&work_b).status().unwrap().success());
+        assert!(Command::new("git").args(["config", "user.email", "other@local.dev"]).current_dir(&work_b).status().unwrap().success());
+        fs::write(work_b.join("UPSTREAM.txt"), "upstream commit\n").unwrap();
+        assert!(Command::new("git").args(["add", "UPSTREAM.txt"]).current_dir(&work_b).status().unwrap().success());
+        assert!(Command::new("git").args(["commit", "-m", "upstream commit"]).current_dir(&work_b).status().unwrap().success());
+        assert!(Command::new("git").args(["push", "origin", "master"]).current_dir(&work_b).status().unwrap().success());
+
+        // Add local commit in `work_a` (now diverged relative to `github`, fast-forward relative to `origin`).
+        fs::write(work_a.join("LOCAL.txt"), "local work\n").unwrap();
+        assert!(Command::new("git").args(["add", "LOCAL.txt"]).current_dir(&work_a).status().unwrap().success());
+        assert!(Command::new("git").args(["commit", "-m", "local commit"]).current_dir(&work_a).status().unwrap().success());
+
+        let cfg = GiteaConfig {
+            url: "http://127.0.0.1:3000".to_owned(),
+            user: String::new(),
+            token: String::new(),
+            service_name: "gitea".to_owned(),
+            allow_insecure_http: true,
+        };
+        let remotes = vec![
+            ("origin".to_owned(), bare_origin.to_string_lossy().into_owned()),
+            ("github".to_owned(), bare_github.to_string_lossy().into_owned()),
+        ];
+
+        // Preflight MUST fail on `github` BEFORE pushing anything to `origin`!
+        let err = super::preflight_verify_remotes_fast_forward(&work_a, &cfg, &remotes, "master")
+            .expect_err("Diverged secondary remote must abort atomic multi-remote sync");
+        let err_s = err.to_string();
+        assert!(
+            err_s.contains("PREFLIGHT SYNC CONFLICT") && err_s.contains("github"),
+            "Unexpected preflight conflict message: {err_s}"
+        );
+
+        let origin_ref = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "refs/heads/master"])
+                .current_dir(&bare_origin)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        assert_eq!(origin_ref, base_sha, "Primary remote must remain untouched on preflight failure");
+
+        // An empty brand-new mirror (without remote branch ref) alongside an up-to-date remote passes preflight cleanly.
+        let clean_remotes = vec![
+            ("origin".to_owned(), bare_origin.to_string_lossy().into_owned()),
+            ("empty".to_owned(), bare_empty.to_string_lossy().into_owned()),
+        ];
+        super::preflight_verify_remotes_fast_forward(&work_a, &cfg, &clean_remotes, "master").unwrap();
+
         let _ = fs::remove_dir_all(&tmp);
     }
 }

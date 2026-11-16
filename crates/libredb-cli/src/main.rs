@@ -12,12 +12,15 @@ mod telemetry;
 
 use cli_args::CliSpec;
 
+use libredb_cognitive::skeleton::read_bounded_source_file;
 use libredb_cognitive::{
     audit_workspace_guardrails_with_prefixes, create_subagent_handoff, execute_atomic_batch,
-    extract_fim_slice, format_impact_batch_compact, format_locate_compact,
+    extract_fim_slice, format_fim_batch_compact, format_grep_report_compact,
+    format_impact_batch_compact, format_locate_compact, grep_workspace, has_project_root_marker,
     index_workspace_with_exclusions, locate_symbols, query_symbol_impact,
     query_symbols_impact_batch, sync_transcript_epoch, AtomicBatchSpec, CognitiveEngine,
-    FileSkeleton, OverlayBrain, PulseRequest, ReflexEngine, ReflexRule,
+    FileSkeleton, OverlayBrain, PulseRequest, ReflexEngine, ReflexRule, SessionState,
+    WorkspaceGrepOptions,
 };
 use libredb_core::{EdgeKind, LibreDb, NodeKind, WriteRequest};
 use std::env;
@@ -40,10 +43,11 @@ fn print_usage() {
 Antigravity Cognitive & Code-Graph Commands:
   libredb pulse [<db.ldb>] <query> [--global <g.ldb>] [--cid <id>] [--transcript <t.jsonl>] [--epoch <n>] [--budget <tok>] [--cwd <dir> | --project <dir>] [--err <msg>]
   libredb index-workspace <db.ldb> <workspace_dir> [--force]
-  libredb skeleton <db.ldb> <source_file> [--filter <substr>]
+  libredb skeleton [<db.ldb>] <source_file...> [--filter <substr>] [--cwd <dir> | --project <dir>] [--db <db.ldb>] [--cid <id>] [--force] [--json]
   libredb locate [<db.ldb>] <symbol_query...> [--cwd <dir> | --project <dir>] [--json]
   libredb impact [<db.ldb>] <symbol_query...> [--cwd <dir> | --project <dir>] [--json]
-  libredb fim <db.ldb> <source_file> [--symbol <name> | --line <n>] [--pad <lines>]
+  libredb fim [<db.ldb>] [<source_file[:line]>] [--symbol <name> | --line <n>] [--pad <lines>] [--cwd <dir> | --project <dir>] [--db <db.ldb>] [--json]
+  libredb grep | search <pattern> [<path>] [--cwd <dir> | --project <dir>] [--db <db.ldb>] [-i] [-F] [-w] [-n] [-C <lines>] [--ext <e1,e2>] [-m <max>] [--no-symbols] [--json]
   libredb batch <db.ldb> [--fact k=v]... [--decision Title::Body]... [--task key::title::status::prio]... [--snapshot <summary>]
   libredb handoff <db.ldb> <handoff_id> <task_key> <role> [--notes <text>]
   libredb learn-assoc <db.ldb> <cue_phrase> <target_id_1,target_id_2>
@@ -1021,29 +1025,168 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "skeleton" => {
             let cli = CliSpec::new(
                 "skeleton",
-                "libredb skeleton <db.ldb> <source_file> [--filter <substr>] [--global <customizations.ldb>]",
+                "libredb skeleton [<db.ldb>] <source_file...> [--filter <substr>] [--cwd <dir> | --project <dir>] [--db <db.ldb>] [--cid <id>] [--force] [--json] [--global <customizations.ldb>]",
             )
-            .positionals(2, Some(2))
+            .positionals(1, None)
             .allow_global()
-            .values(&["--filter"])
+            .switches(&["--force", "--json"])
+            .values(&["--filter", "--cwd", "--db", "--cid"])
+            .alias("--project", "--cwd")
             .parse(sub_args)?;
             let filter = cli.value("--filter");
+            let force = cli.has_switch("--force");
+            let want_json = cli.has_switch("--json");
             let t0 = Instant::now();
-            let db =
-                open_cli_verified_project_db(cli.global_deref(), Path::new(&cli.positionals[0]))?;
-            let src_path = Path::new(&cli.positionals[1]);
-            let (skel, cache_hit) = FileSkeleton::index_or_get_cached(&db, src_path, None)?;
-            let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-            print!("{}", skel.render_compact(filter, filter.is_some()));
-            println!(
-                "[Skeleton {} in {:.2} ms]",
-                if cache_hit {
+            let (explicit_db_opt, file_args) =
+                split_cli_db_and_file_args(&cli.positionals, cli.path_value("--db"));
+            if file_args.is_empty() {
+                return Err(
+                    "Usage: libredb skeleton [<db.ldb>] <source_file...> [--filter <substr>] [--cwd <dir>]"
+                        .into(),
+                );
+            }
+            let ws_hint = cli
+                .path_value("--cwd")
+                .or_else(|| {
+                    Path::new(&file_args[0])
+                        .parent()
+                        .filter(|p| !p.as_os_str().is_empty())
+                        .map(Path::to_path_buf)
+                })
+                .or_else(|| env::current_dir().ok());
+            let db_opt = if let Some(ref db_p) = explicit_db_opt {
+                Some(open_cli_verified_project_db(cli.global_deref(), db_p)?)
+            } else if let Some(found_db) = find_existing_cli_project_db(ws_hint.as_deref()) {
+                Some(open_cli_verified_project_db(cli.global_deref(), &found_db)?)
+            } else {
+                None
+            };
+            let ws_root_opt = infer_ws_root_for_cli(
+                cli.path_value("--cwd"),
+                Some(Path::new(&file_args[0])),
+                db_opt.as_ref().and_then(|d| d.path()),
+            );
+
+            let mut resolved_paths = Vec::with_capacity(file_args.len());
+            for raw_f in &file_args {
+                let p = Path::new(raw_f);
+                let resolved = if p.is_relative() && !p.exists() {
+                    ws_root_opt
+                        .as_ref()
+                        .map(|ws| ws.join(p))
+                        .filter(|cand| cand.exists())
+                        .unwrap_or_else(|| p.to_path_buf())
+                } else {
+                    p.to_path_buf()
+                };
+                resolved_paths.push(resolved);
+            }
+
+            let mut session_opt: Option<(String, SessionState)> = if let (Some(db), Some(cid)) = (
+                db_opt.as_ref(),
+                cli.value("--cid").map(str::trim).filter(|s| !s.is_empty()),
+            ) {
+                let epoch = crate::mcp::infer_antigravity_transcript_path(cid)
+                    .filter(|tp| tp.exists())
+                    .and_then(|tp| sync_transcript_epoch(db, cid, &tp).ok())
+                    .unwrap_or(1);
+                Some((cid.to_owned(), SessionState::load_or_init(db, cid, epoch)?))
+            } else {
+                None
+            };
+
+            let mut skeletons: Vec<(FileSkeleton, bool)> = Vec::with_capacity(resolved_paths.len());
+            for src_path in &resolved_paths {
+                let pair = if let Some(ref db) = db_opt {
+                    FileSkeleton::index_or_get_cached(db, src_path, None)?
+                } else {
+                    let raw_bytes = read_bounded_source_file(src_path)?;
+                    let label = src_path.to_string_lossy().replace('\\', "/");
+                    (FileSkeleton::extract_from_bytes(label, &raw_bytes), false)
+                };
+                skeletons.push(pair);
+            }
+
+            let mut session_dirty = false;
+            let mut zr_hits = 0u64;
+            let mut baseline_raw_tok = 0u64;
+            let mut emitted_tok = 0u64;
+
+            if want_json {
+                let just_skels: Vec<&FileSkeleton> = skeletons.iter().map(|(s, _)| s).collect();
+                let rendered = if just_skels.len() == 1 {
+                    serde_json::to_string_pretty(just_skels[0])?
+                } else {
+                    serde_json::to_string_pretty(&just_skels)?
+                };
+                for (s, _) in &skeletons {
+                    baseline_raw_tok = baseline_raw_tok.saturating_add(s.raw_tokens as u64);
+                }
+                emitted_tok = ((rendered.len() + 3) / 4) as u64;
+                println!("{rendered}");
+            } else {
+                let mut any_cache_hit = false;
+                let mut out_blocks = Vec::with_capacity(skeletons.len());
+                for (skel, hit) in &skeletons {
+                    any_cache_hit |= *hit;
+                    baseline_raw_tok = baseline_raw_tok.saturating_add(skel.raw_tokens as u64);
+                    if !force && filter.is_none() {
+                        if let Some((_, ref mut sess)) = session_opt {
+                            if sess.is_skeleton_in_context(&skel.file_label, skel.content_hash) {
+                                sess.record_suppression(skel.raw_tokens, 16);
+                                session_dirty = true;
+                                zr_hits += 1;
+                                emitted_tok = emitted_tok.saturating_add(16);
+                                out_blocks.push(format!(
+                                    "=== [Zero-Repeat Skeleton]: {} (unchanged in session, hash={:016x}, L1-L{}, {} contracts, saved ~{} tok) ===\n",
+                                    skel.file_label,
+                                    skel.content_hash,
+                                    skel.total_lines,
+                                    skel.symbols.len(),
+                                    skel.raw_tokens.saturating_sub(16)
+                                ));
+                                continue;
+                            }
+                            sess.mark_skeleton_delivered(
+                                skel.file_label.clone(),
+                                skel.content_hash,
+                            );
+                            session_dirty = true;
+                        }
+                    }
+                    let rendered = skel.render_compact(filter, filter.is_some());
+                    emitted_tok = emitted_tok.saturating_add(((rendered.len() + 3) / 4) as u64);
+                    out_blocks.push(rendered);
+                }
+                let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                print!("{}", out_blocks.join("\n"));
+                let mode_lbl = if db_opt.is_none() {
+                    "extracted in-memory"
+                } else if zr_hits > 0 && zr_hits as usize == skeletons.len() {
+                    "suppressed via Zero-Repeat cache"
+                } else if any_cache_hit {
                     "served from hash-verified cache"
                 } else {
                     "extracted & cached"
-                },
-                elapsed_ms
-            );
+                };
+                println!("[Skeleton {mode_lbl} in {elapsed_ms:.2} ms]");
+            }
+
+            if session_dirty {
+                if let (Some(db), Some((_, sess))) = (db_opt.as_ref(), session_opt) {
+                    let _ = sess.save(db);
+                }
+            }
+            if let Some(ref ws_root) = ws_root_opt {
+                telemetry::record_workspace_event(
+                    ws_root,
+                    telemetry::TelemetryEvent::Skeleton {
+                        zero_repeat_hits: zr_hits,
+                        baseline_tokens: baseline_raw_tok.max(emitted_tok),
+                        emitted_tokens: emitted_tok,
+                    },
+                );
+            }
         }
         "locate" => {
             let cli = CliSpec::new(
@@ -1180,24 +1323,269 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "fim" => {
             let cli = CliSpec::new(
                 "fim",
-                "libredb fim <db.ldb> <source_file> [--symbol <name> | --line <n>] [--pad <lines>] [--global <customizations.ldb>]",
+                "libredb fim [<db.ldb>] [<source_file[:line]>] [--symbol <name> | --line <n>] [--pad <lines>] [--cwd <dir> | --project <dir>] [--db <db.ldb>] [--json] [--global <customizations.ldb>]",
             )
-            .positionals(2, Some(2))
+            .positionals(0, Some(2))
             .allow_global()
-            .values(&["--symbol", "--line", "--pad"])
+            .switches(&["--json"])
+            .values(&["--symbol", "--line", "--pad", "--cwd", "--db"])
+            .alias("--project", "--cwd")
             .parse(sub_args)?;
-            let line = cli.parse_value::<usize>("--line")?;
+            let cli_line = cli.parse_value::<usize>("--line")?;
             let pad = cli.parse_value::<usize>("--pad")?.unwrap_or(12);
-            let db =
-                open_cli_verified_project_db(cli.global_deref(), Path::new(&cli.positionals[0]))?;
-            let bundle = extract_fim_slice(
-                &db,
-                Path::new(&cli.positionals[1]),
-                cli.value("--symbol"),
-                line,
-                pad,
+            let sym_opt = cli.value("--symbol");
+            let want_json = cli.has_switch("--json");
+
+            let (explicit_db_opt, rest) =
+                split_cli_db_and_file_args(&cli.positionals, cli.path_value("--db"));
+            if rest.len() > 1 {
+                return Err(format!(
+                    "Unexpected positional argument '{}' in 'fim'",
+                    rest[1]
+                )
+                .into());
+            }
+            if rest.is_empty() && sym_opt.is_none() {
+                return Err(
+                    "Usage: libredb fim [<db.ldb>] [<source_file[:line]>] [--symbol <name> | --line <n>] [--cwd <dir>]"
+                        .into(),
+                );
+            }
+
+            let target_hint_path = rest.first().map(|s| {
+                let (stripped, _) = split_path_and_line_suffix(s);
+                PathBuf::from(stripped)
+            });
+            let ws_dir_opt = infer_ws_root_for_cli(
+                cli.path_value("--cwd"),
+                target_hint_path.as_deref(),
+                explicit_db_opt.as_deref(),
+            );
+            let glob_db = match cli.global_deref() {
+                Some(gp) => Some(hooks::open_global_ldb(Some(gp))?),
+                None => hooks::open_global_ldb_checked(None)?,
+            };
+            let db = if let Some(ref db_p) = explicit_db_opt {
+                open_cli_verified_project_db(cli.global_deref(), db_p)?
+            } else {
+                resolve_default_cli_project_db(
+                    cli.global_deref(),
+                    glob_db.as_ref(),
+                    ws_dir_opt.as_deref(),
+                )?
+            };
+            let db_ws_root = db
+                .path()
+                .and_then(|p| p.parent())
+                .filter(|p| p.file_name().is_some_and(|n| n.eq_ignore_ascii_case(".agents")))
+                .and_then(|p| p.parent())
+                .map(Path::to_path_buf)
+                .or_else(|| ws_dir_opt.clone());
+
+            let mut bundles = Vec::new();
+            let mut baseline_raw_tok = 0u64;
+            let mut unique_files = std::collections::HashSet::new();
+
+            if let Some(raw_target) = rest.first() {
+                let mut src_str = raw_target.as_str();
+                let mut suffix_line = None;
+                let direct_cand = Path::new(raw_target);
+                let direct_ws_cand = ws_dir_opt.as_ref().map(|ws| ws.join(raw_target));
+                if !direct_cand.exists()
+                    && direct_ws_cand.as_ref().is_none_or(|c| !c.exists())
+                {
+                    let (stripped, parsed_ln) = split_path_and_line_suffix(raw_target);
+                    src_str = stripped;
+                    suffix_line = parsed_ln;
+                }
+                let final_line = match (cli_line, suffix_line) {
+                    (Some(a), Some(b)) if a != b => {
+                        return Err(format!(
+                            "Conflicting line numbers in 'fim': target suffix :{b} vs --line {a}"
+                        )
+                        .into());
+                    }
+                    (Some(a), _) | (_, Some(a)) => Some(a),
+                    (None, None) => None,
+                };
+                let p = Path::new(src_str);
+                let resolved_path = if p.is_relative() && !p.exists() {
+                    db_ws_root
+                        .as_ref()
+                        .map(|ws| ws.join(p))
+                        .filter(|c| c.exists())
+                        .unwrap_or_else(|| p.to_path_buf())
+                } else {
+                    p.to_path_buf()
+                };
+                if unique_files.insert(resolved_path.clone()) {
+                    let ft = std::fs::metadata(&resolved_path)
+                        .map(|m| (m.len().saturating_add(3)) / 4)
+                        .unwrap_or(0);
+                    baseline_raw_tok = baseline_raw_tok.saturating_add(ft);
+                }
+                bundles.push(extract_fim_slice(
+                    &db,
+                    &resolved_path,
+                    sym_opt,
+                    final_line,
+                    pad,
+                )?);
+            } else {
+                // File-less `libredb fim --symbol <name>`: auto-index if empty and locate target file(s).
+                let sym = sym_opt.unwrap_or_default();
+                if db
+                    .get_by_key(NodeKind::Generic, "sys::workspace_graph_state")
+                    .is_err()
+                {
+                    if let Some(ref ws_root) = db_ws_root {
+                        let _ = libredb_cognitive::index_workspace(&db, ws_root, false);
+                    }
+                }
+                let located = locate_symbols(&db, &[sym.to_owned()])?;
+                if located.is_empty() {
+                    return Err(format!("No symbol matched '{sym}' in workspace index").into());
+                }
+                let exact: Vec<_> = located
+                    .iter()
+                    .filter(|m| {
+                        m.symbol_name.eq_ignore_ascii_case(sym)
+                            || m.qualified_name.eq_ignore_ascii_case(sym)
+                    })
+                    .cloned()
+                    .collect();
+                let candidates = if !exact.is_empty() { exact } else { located };
+                let mut seen = std::collections::HashSet::new();
+                for m in candidates {
+                    if bundles.len() >= 4 {
+                        break;
+                    }
+                    let mp = Path::new(&m.file_path);
+                    let rp = if mp.is_relative() {
+                        db_ws_root
+                            .as_ref()
+                            .map(|ws| ws.join(mp))
+                            .unwrap_or_else(|| mp.to_path_buf())
+                    } else {
+                        mp.to_path_buf()
+                    };
+                    if !seen.insert((rp.clone(), m.qualified_name.clone())) {
+                        continue;
+                    }
+                    if unique_files.insert(rp.clone()) {
+                        let ft = std::fs::metadata(&rp)
+                            .map(|meta| (meta.len().saturating_add(3)) / 4)
+                            .unwrap_or(0);
+                        baseline_raw_tok = baseline_raw_tok.saturating_add(ft);
+                    }
+                    bundles.push(extract_fim_slice(
+                        &db,
+                        &rp,
+                        Some(&m.qualified_name),
+                        None,
+                        pad,
+                    )?);
+                }
+            }
+
+            let rendered = if want_json {
+                if bundles.len() == 1 {
+                    serde_json::to_string_pretty(&bundles[0])?
+                } else {
+                    serde_json::to_string_pretty(&bundles)?
+                }
+            } else {
+                format_fim_batch_compact(&bundles)
+            };
+            if let Some(ref ws_root) = db_ws_root {
+                let emitted_tok = ((rendered.len() + 3) / 4) as u64;
+                telemetry::record_workspace_event(
+                    ws_root,
+                    telemetry::TelemetryEvent::Fim {
+                        baseline_tokens: baseline_raw_tok.max(emitted_tok),
+                        emitted_tokens: emitted_tok,
+                    },
+                );
+            }
+            if want_json {
+                println!("{rendered}");
+            } else {
+                print!("{rendered}");
+            }
+        }
+        "grep" | "search" => {
+            let cli = CliSpec::new(
+                "grep",
+                "libredb grep | search <pattern> [<path>] [--cwd <dir> | --project <dir>] [--db <db.ldb>] [-i] [-F] [-w] [-n] [-C <lines>] [--ext <e1,e2>] [-m <max>] [--no-symbols] [--json] [--global <customizations.ldb>]",
+            )
+            .positionals(1, Some(2))
+            .raw_value_slots(&[0, 1])
+            .allow_global()
+            .switches(&[
+                "--ignore-case",
+                "--fixed-strings",
+                "--word-regexp",
+                "--line-number",
+                "--no-symbols",
+                "--json",
+            ])
+            .values(&["--context", "--ext", "--max-count", "--cwd", "--db"])
+            .alias("-i", "--ignore-case")
+            .alias("-F", "--fixed-strings")
+            .alias("-w", "--word-regexp")
+            .alias("-n", "--line-number")
+            .alias("-C", "--context")
+            .alias("-m", "--max-count")
+            .alias("--project", "--cwd")
+            .parse(sub_args)?;
+            let t0 = Instant::now();
+            let pattern = &cli.positionals[0];
+            let explicit_cwd = cli.path_value("--cwd");
+            let raw_sub = cli.positionals.get(1).map(PathBuf::from);
+            let (ws_root, sub_opt) = match (&explicit_cwd, &raw_sub) {
+                (None, Some(p)) if p.is_dir() => (p.clone(), None),
+                _ => {
+                    let root = explicit_cwd
+                        .or_else(|| env::current_dir().ok())
+                        .ok_or("Unable to determine working directory for grep")?;
+                    (root, raw_sub)
+                }
+            };
+            let db_opt = if cli.has_switch("--no-symbols") {
+                None
+            } else if let Some(db_p) = cli.path_value("--db") {
+                Some(open_cli_verified_project_db(cli.global_deref(), &db_p)?)
+            } else if let Some(found_db) = find_existing_cli_project_db(Some(&ws_root)) {
+                open_cli_verified_project_db(cli.global_deref(), &found_db).ok()
+            } else {
+                None
+            };
+            let opts = WorkspaceGrepOptions {
+                fixed_strings: cli.has_switch("--fixed-strings"),
+                ignore_case: cli.has_switch("--ignore-case"),
+                word_boundary: cli.has_switch("--word-regexp"),
+                max_matches: cli.parse_value::<usize>("--max-count")?.unwrap_or(80),
+                context_lines: cli.parse_value::<usize>("--context")?.unwrap_or(0),
+                extensions: cli
+                    .value("--ext")
+                    .map(parse_cli_extensions)
+                    .unwrap_or_default(),
+                include_symbols: !cli.has_switch("--no-symbols"),
+            };
+            let report = grep_workspace(
+                &ws_root,
+                sub_opt.as_deref(),
+                pattern,
+                db_opt.as_deref(),
+                &opts,
             )?;
-            print!("{}", bundle.format_compact());
+            let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            if cli.has_switch("--json") {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", format_grep_report_compact(&report));
+                println!("[Grep completed in {elapsed_ms:.2} ms]");
+            }
         }
         "batch" => {
             let cli = CliSpec::new(
@@ -2624,6 +3012,93 @@ fn open_cli_verified_project_db(
     Ok(Arc::new(LibreDb::open(&resolved_db)?))
 }
 
+pub(crate) fn split_path_and_line_suffix(raw: &str) -> (&str, Option<usize>) {
+    if let Some((left, right)) = raw.rsplit_once(':') {
+        if !left.is_empty() && !right.is_empty() && right.chars().all(|c| c.is_ascii_digit()) {
+            let is_drive_prefix =
+                left.len() == 1 && left.chars().next().is_some_and(|c| c.is_ascii_alphabetic());
+            if !is_drive_prefix {
+                if let Ok(ln) = right.parse::<usize>() {
+                    return (left, Some(ln.max(1)));
+                }
+            }
+        }
+    }
+    (raw, None)
+}
+
+fn split_cli_db_and_file_args(
+    positionals: &[String],
+    explicit_db_flag: Option<PathBuf>,
+) -> (Option<PathBuf>, Vec<String>) {
+    if explicit_db_flag.is_some() {
+        return (explicit_db_flag, positionals.to_vec());
+    }
+    if positionals.len() >= 2 {
+        let low = positionals[0].to_ascii_lowercase();
+        if low.ends_with(".ldb") || low.ends_with(".db") {
+            return (Some(PathBuf::from(&positionals[0])), positionals[1..].to_vec());
+        }
+    }
+    (None, positionals.to_vec())
+}
+
+fn find_existing_cli_project_db(ws_dir_opt: Option<&Path>) -> Option<PathBuf> {
+    let ws = ws_dir_opt?;
+    let mut curr: Option<&Path> = Some(ws);
+    while let Some(dir) = curr {
+        let ldb_cand = dir.join(".agents").join("memory.ldb");
+        if ldb_cand.is_file() {
+            return Some(ldb_cand);
+        }
+        curr = dir.parent();
+    }
+    None
+}
+
+fn infer_ws_root_for_cli(
+    explicit_cwd: Option<PathBuf>,
+    first_file_opt: Option<&Path>,
+    db_path_opt: Option<&Path>,
+) -> Option<PathBuf> {
+    if explicit_cwd.is_some() {
+        return explicit_cwd;
+    }
+    if let Some(db_p) = db_path_opt {
+        if let Some(parent) = db_p.parent() {
+            if parent
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.eq_ignore_ascii_case(".agents"))
+            {
+                if let Some(root) = parent.parent() {
+                    return Some(root.to_path_buf());
+                }
+            }
+        }
+    }
+    let start_dir = first_file_opt
+        .and_then(|p| if p.is_dir() { Some(p) } else { p.parent() })
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .or_else(|| env::current_dir().ok())?;
+    let mut curr: Option<&Path> = Some(&start_dir);
+    while let Some(dir) = curr {
+        if has_project_root_marker(dir) {
+            return Some(dir.to_path_buf());
+        }
+        curr = dir.parent();
+    }
+    env::current_dir().ok()
+}
+
+fn parse_cli_extensions(raw: &str) -> Vec<String> {
+    raw.split([',', ';', ' '])
+        .map(|s| s.trim().trim_start_matches('.').to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 fn split_cli_db_and_symbol_queries(
     positionals: &[String],
     explicit_db_flag: Option<PathBuf>,
@@ -2674,15 +3149,8 @@ fn resolve_default_cli_project_db(
     glob_db_opt: Option<&Arc<LibreDb>>,
     ws_dir_opt: Option<&Path>,
 ) -> Result<Arc<LibreDb>, Box<dyn std::error::Error>> {
-    if let Some(ws) = ws_dir_opt {
-        let mut curr: Option<&Path> = Some(ws);
-        while let Some(dir) = curr {
-            let ldb_cand = dir.join(".agents").join("memory.ldb");
-            if ldb_cand.is_file() {
-                return open_cli_verified_project_db(global_path_opt, &ldb_cand);
-            }
-            curr = dir.parent();
-        }
+    if let Some(ldb_cand) = find_existing_cli_project_db(ws_dir_opt) {
+        return open_cli_verified_project_db(global_path_opt, &ldb_cand);
     }
     if let Some(gdb) = glob_db_opt {
         return Ok(Arc::clone(gdb));
@@ -3016,5 +3484,101 @@ mod tests {
                 "Expected CLI rejection for malformed args {bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn cli_skeleton_fim_symbol_and_grep_ergonomics_work_end_to_end() {
+        let dir = env::temp_dir().join(format!(
+            "libredb_cli_ergo_{}_{}",
+            process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let ws = dir.join("repo");
+        let libre_home = dir.join("libre_home");
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::create_dir_all(&libre_home).unwrap();
+        std::fs::write(ws.join("Cargo.toml"), "[package]\nname = \"ergo\"\nversion = \"0.1.0\"\n").unwrap();
+        let src_a = ws.join("src").join("alpha.rs");
+        let src_b = ws.join("src").join("beta.rs");
+        std::fs::write(
+            &src_a,
+            "pub fn alpha_calc(x: i32) -> i32 {\n    let doubled = x * 2;\n    doubled + 1\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &src_b,
+            "pub fn beta_caller() -> i32 {\n    crate::alpha_calc(7)\n}\n",
+        )
+        .unwrap();
+
+        let gdb_path = libre_home.join("customizations.ldb");
+        let gdb = LibreDb::open(&gdb_path).unwrap();
+        let proj_ldb = ws.join(".agents").join("memory.ldb");
+        let pdb = Arc::new(LibreDb::open(&proj_ldb).unwrap());
+        libredb_cognitive::index_workspace(&pdb, &ws, false).unwrap();
+        security::seal_workspace_memory(&gdb, &pdb, &ws).unwrap();
+        drop(pdb);
+        drop(gdb);
+
+        let ws_s = ws.to_string_lossy().into_owned();
+        let gdb_s = gdb_path.to_string_lossy().into_owned();
+        let src_a_s = src_a.to_string_lossy().into_owned();
+        let src_b_s = src_b.to_string_lossy().into_owned();
+
+        // 1. Multi-file DB-less/project-inferred `skeleton` without `<db.ldb>`
+        run_with_args(&[
+            "skeleton".to_owned(),
+            src_a_s.clone(),
+            src_b_s.clone(),
+            "--cwd".to_owned(),
+            ws_s.clone(),
+            "--global".to_owned(),
+            gdb_s.clone(),
+            "--cid".to_owned(),
+            "conv-ergo".to_owned(),
+        ])
+        .unwrap();
+
+        // 2. File-less `fim --symbol alpha_calc`
+        run_with_args(&[
+            "fim".to_owned(),
+            "--symbol".to_owned(),
+            "alpha_calc".to_owned(),
+            "--cwd".to_owned(),
+            ws_s.clone(),
+            "--global".to_owned(),
+            gdb_s.clone(),
+        ])
+        .unwrap();
+
+        // 3. Inline `<path>:<line>` `fim`
+        run_with_args(&[
+            "fim".to_owned(),
+            format!("{src_b_s}:2"),
+            "--pad".to_owned(),
+            "1".to_owned(),
+            "--cwd".to_owned(),
+            ws_s.clone(),
+            "--global".to_owned(),
+            gdb_s.clone(),
+        ])
+        .unwrap();
+
+        // 4. Pure-Rust symbol-annotated `grep`
+        run_with_args(&[
+            "grep".to_owned(),
+            "doubled".to_owned(),
+            "--cwd".to_owned(),
+            ws_s,
+            "--global".to_owned(),
+            gdb_s,
+            "-w".to_owned(),
+            "--json".to_owned(),
+        ])
+        .unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

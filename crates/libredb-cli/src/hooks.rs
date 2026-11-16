@@ -963,7 +963,60 @@ fn build_project_memory_hydration(
         naive_baseline_bytes += g.len() + 1;
     }
 
-    // Tier 1 (with Git): learned situational reflexes matching the current prompt or newly
+    let inodes = proj_db.list_inodes(None, false);
+    let mut task_ids: Vec<u64> = Vec::new();
+    let mut handoff_ids: Vec<u64> = Vec::new();
+    let mut decision_ids: Vec<u64> = Vec::new();
+    let mut fact_ids: Vec<(u64, u64)> = Vec::new();
+    let mut active_symbol_count: usize = 0;
+
+    for (ino, _, _) in &inodes {
+        if !ino.flags.is_live_active() {
+            continue;
+        }
+        match ino.kind {
+            NodeKind::Task => {
+                naive_baseline_bytes += (ino.token_count as usize) * 4;
+                task_ids.push(ino.node_id);
+            }
+            NodeKind::Handoff => {
+                naive_baseline_bytes += (ino.token_count as usize) * 4;
+                handoff_ids.push(ino.node_id);
+            }
+            NodeKind::Decision => {
+                naive_baseline_bytes += (ino.token_count as usize) * 4;
+                decision_ids.push(ino.node_id);
+            }
+            NodeKind::Fact => {
+                naive_baseline_bytes += (ino.token_count as usize) * 4;
+                fact_ids.push((ino.updated_ns, ino.node_id));
+            }
+            // Security invariant: NEVER hydrate WorkingSet, Symbol, Generic, or TranscriptCursor payloads;
+            // only surface a compact integer readiness summary for live Symbol inodes when > 0.
+            NodeKind::Symbol => {
+                active_symbol_count += 1;
+            }
+            _ => {}
+        }
+    }
+
+    if active_symbol_count > 0 {
+        let sym_word = if active_symbol_count == 1 {
+            "symbol"
+        } else {
+            "symbols"
+        };
+        let graph_line = format!(
+            "Code Graph: {active_symbol_count} {sym_word} indexed (use 'libredb locate <sym>', 'libredb fim --symbol <sym>', 'libredb grep <pat>')"
+        );
+        naive_baseline_bytes += graph_line.len() + 1;
+        git_line_opt = Some(match git_line_opt {
+            Some(g) => format!("{g}\n{graph_line}"),
+            None => graph_line,
+        });
+    }
+
+    // Tier 1 (with Git/Code Graph): learned situational reflexes matching the current prompt or newly
     // harvested error diagnostic. `load_sealed_only` loads exclusively `NodeKind::Rule` capsules
     // covered by the `hmac-sha256:v4` workspace seal, so unsealed `NodeKind::Generic` text can
     // never enter `<SYSTEM_MESSAGE>`.
@@ -1002,38 +1055,6 @@ fn build_project_memory_hydration(
                     None => reflex_block,
                 });
             }
-        }
-    }
-
-    let inodes = proj_db.list_inodes(None, false);
-    let mut task_ids: Vec<u64> = Vec::new();
-    let mut handoff_ids: Vec<u64> = Vec::new();
-    let mut decision_ids: Vec<u64> = Vec::new();
-    let mut fact_ids: Vec<(u64, u64)> = Vec::new();
-
-    for (ino, _, _) in &inodes {
-        if !ino.flags.is_live_active() {
-            continue;
-        }
-        match ino.kind {
-            NodeKind::Task => {
-                naive_baseline_bytes += (ino.token_count as usize) * 4;
-                task_ids.push(ino.node_id);
-            }
-            NodeKind::Handoff => {
-                naive_baseline_bytes += (ino.token_count as usize) * 4;
-                handoff_ids.push(ino.node_id);
-            }
-            NodeKind::Decision => {
-                naive_baseline_bytes += (ino.token_count as usize) * 4;
-                decision_ids.push(ino.node_id);
-            }
-            NodeKind::Fact => {
-                naive_baseline_bytes += (ino.token_count as usize) * 4;
-                fact_ids.push((ino.updated_ns, ino.node_id));
-            }
-            // Security invariant: NEVER hydrate WorkingSet, Symbol, Generic, or TranscriptCursor.
-            _ => {}
         }
     }
 
@@ -3511,6 +3532,86 @@ src/app.ts(18,7): error TS2345: Argument of type 'string' is not assignable.\n";
             injected.len() <= 2100,
             "Injected PreInvocation block exceeded compact ceiling ({} bytes)",
             injected.len()
+        );
+
+        let _ = fs::remove_dir_all(&base_dir);
+    }
+
+    #[test]
+    fn pre_invocation_surfaces_code_graph_readiness_when_symbols_indexed() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join(format!("libredb_cg_hint_{}_{}", std::process::id(), nanos));
+        let ws_repo = base_dir.join("repo");
+        fs::create_dir_all(ws_repo.join("src")).unwrap();
+        fs::write(
+            ws_repo.join("Cargo.toml"),
+            "[package]\nname = \"cg_hint\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            ws_repo.join("src").join("lib.rs"),
+            "pub fn alpha_fn() -> u32 { 1 }\npub fn beta_fn() -> u32 { alpha_fn() + 1 }\n",
+        )
+        .unwrap();
+
+        let global_path = base_dir.join("customizations.ldb");
+        let proj_ldb = ws_repo.join(".agents").join("memory.ldb");
+        let empty_repo = base_dir.join("empty_repo");
+        fs::create_dir_all(&empty_repo).unwrap();
+        let empty_ldb = empty_repo.join(".agents").join("memory.ldb");
+        {
+            let gdb = libredb_core::LibreDb::open(&global_path).unwrap();
+
+            let pdb = std::sync::Arc::new(libredb_core::LibreDb::open(&proj_ldb).unwrap());
+            libredb_cognitive::index_workspace(&pdb, &ws_repo, false).unwrap();
+            crate::security::seal_workspace_memory(&gdb, &pdb, &ws_repo).unwrap();
+
+            let epdb = std::sync::Arc::new(libredb_core::LibreDb::open(&empty_ldb).unwrap());
+            epdb.put(
+                libredb_core::WriteRequest::new(libredb_core::NodeKind::Fact, b"empty".to_vec())
+                    .with_key("k"),
+            )
+            .unwrap();
+            crate::security::seal_workspace_memory(&gdb, &epdb, &empty_repo).unwrap();
+        }
+
+        let res_sym = super::evaluate_pre_invocation_payload(
+            &json!({
+                "conversationId": "conv-cg-sym",
+                "workspacePaths": [ws_repo.to_string_lossy().to_string()],
+                "prompt": "Check alpha_fn"
+            }),
+            Some(&global_path),
+        )
+        .unwrap();
+        let ser_sym = res_sym.to_string();
+        assert!(
+            ser_sym.contains("Code Graph: 2 symbols indexed")
+                && ser_sym.contains("libredb locate")
+                && ser_sym.contains("libredb fim --symbol")
+                && ser_sym.contains("libredb grep"),
+            "Expected compact Code Graph readiness line when Symbol inodes > 0: {ser_sym}"
+        );
+
+        let res_empty = super::evaluate_pre_invocation_payload(
+            &json!({
+                "conversationId": "conv-cg-empty",
+                "workspacePaths": [empty_repo.to_string_lossy().to_string()],
+                "prompt": "Check empty"
+            }),
+            Some(&global_path),
+        )
+        .unwrap();
+        assert!(
+            !res_empty.to_string().contains("Code Graph:"),
+            "Must omit Code Graph line when 0 Symbol inodes exist: {res_empty}"
         );
 
         let _ = fs::remove_dir_all(&base_dir);

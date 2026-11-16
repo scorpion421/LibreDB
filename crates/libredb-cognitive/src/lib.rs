@@ -46,13 +46,14 @@ pub use transcript::{
     sync_transcript_epoch, AtomicBatchReport, AtomicBatchSpec, TaskCapsule, TranscriptEpochState,
 };
 pub use workspace::{
-    extract_fim_slice, format_fim_batch_compact, format_impact_batch_compact,
-    format_impact_compact, format_locate_compact, has_project_root_marker, index_workspace,
-    index_workspace_with_exclusions, locate_symbols, query_symbol_impact,
-    query_symbols_impact_batch, reconcile_tentative_edits, record_search_miss_cue,
-    stage_tentative_file_edit, sync_single_file_symbols, CoChangePartner, FimSliceBundle,
-    FimSliceRequest, PendingMissCue, SymbolCueBridgeBook, SymbolImpactReport, SymbolLocationMatch,
-    TentativeFileEdit, WorkspaceIndexReport, MAX_BATCH_FIM_SLICES, MAX_BATCH_SYMBOL_QUERIES,
+    extract_fim_slice, format_fim_batch_compact, format_grep_report_compact,
+    format_impact_batch_compact, format_impact_compact, format_locate_compact, grep_workspace,
+    has_project_root_marker, index_workspace, index_workspace_with_exclusions, locate_symbols,
+    query_symbol_impact, query_symbols_impact_batch, reconcile_tentative_edits,
+    record_search_miss_cue, stage_tentative_file_edit, sync_single_file_symbols, CoChangePartner,
+    FimSliceBundle, FimSliceRequest, GrepMatchItem, PendingMissCue, SymbolCueBridgeBook,
+    SymbolImpactReport, SymbolLocationMatch, TentativeFileEdit, WorkspaceGrepOptions,
+    WorkspaceGrepReport, WorkspaceIndexReport, MAX_BATCH_FIM_SLICES, MAX_BATCH_SYMBOL_QUERIES,
     MAX_LOCATE_MATCHES_PER_QUERY, PENDING_MISS_CUES_KEY, SYMBOL_CUE_BRIDGES_KEY,
     TENTATIVE_EDIT_PREFIX,
 };

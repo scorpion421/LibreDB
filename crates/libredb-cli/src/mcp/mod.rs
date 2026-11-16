@@ -17,6 +17,7 @@ mod tests;
 
 #[cfg(test)]
 pub use protocol::process_mcp_stream;
+pub(crate) use authz::infer_antigravity_transcript_path;
 pub(crate) use protocol::handle_rpc_method;
 
 use crate::hooks::{default_global_ldb_path, open_global_ldb_checked};

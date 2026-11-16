@@ -1783,3 +1783,115 @@ use super::{canonical_brain_cache_key, handle_rpc_method, process_mcp_stream, Mc
         drop(state);
         let _ = fs::remove_dir_all(&tmp);
     }
+
+    #[test]
+    fn mcp_code_fileless_fim_and_grep_respect_workspace_boundaries() {
+        use serde_json::json;
+        let tmp = std::env::temp_dir().join(format!(
+            "libredb_mcp_fim_grep_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let ws = tmp.join("pinned_ws");
+        fs::create_dir_all(ws.join("src")).unwrap();
+        fs::write(
+            ws.join("Cargo.toml"),
+            "[package]\nname = \"pinned_ws\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            ws.join("src").join("pinned.rs"),
+            "pub fn pinned_target(x: i32) -> i32 {\n    x + 41\n}\n",
+        )
+        .unwrap();
+        fs::write(ws.join(".env"), "TOKEN=pinned_target_secret\n").unwrap();
+
+        let missing_global = tmp.join("missing_global.ldb");
+        let mut state =
+            McpServerState::new_with_workspace_root(None, Some(&missing_global), Some(&ws))
+                .unwrap();
+
+        // 1. File-less `fim` via `symbol` (no `target`)
+        let fim_sym = handle_rpc_method(
+            "tools/call",
+            &json!({
+                "name": "libredb_code",
+                "arguments": {
+                    "action": "fim",
+                    "symbol": "pinned_target"
+                }
+            }),
+            &mut state,
+        )
+        .expect("File-less MCP action='fim' with symbol must succeed");
+        let fim_sym_s = fim_sym.to_string();
+        assert!(
+            fim_sym_s.contains("pub fn pinned_target"),
+            "Expected pinned_target slice in file-less MCP fim output: {fim_sym_s}"
+        );
+
+        // 2. `<path>:<line>` target in `fim`
+        let fim_line = handle_rpc_method(
+            "tools/call",
+            &json!({
+                "name": "libredb_code",
+                "arguments": {
+                    "action": "fim",
+                    "target": "src/pinned.rs:2",
+                    "pad": 1
+                }
+            }),
+            &mut state,
+        )
+        .expect("MCP action='fim' with target:line suffix must succeed");
+        assert!(
+            fim_line.to_string().contains("x + 41"),
+            "Expected line 2 slice in <path>:<line> MCP fim output: {fim_line}"
+        );
+
+        // 3. Symbol-annotated `grep` skips `.env` secrets and annotates enclosing symbol contract
+        let grep_res = handle_rpc_method(
+            "tools/call",
+            &json!({
+                "name": "libredb_code",
+                "arguments": {
+                    "action": "grep",
+                    "target": "pinned_target"
+                }
+            }),
+            &mut state,
+        )
+        .expect("MCP action='grep' must succeed");
+        let grep_s = grep_res.to_string();
+        assert!(
+            grep_s.contains("src/pinned.rs") && grep_s.contains("[fn pinned_target L1-L3]"),
+            "Expected enclosing [fn pinned_target L1-L3] annotation: {grep_s}"
+        );
+        assert!(
+            !grep_s.contains(".env") && !grep_s.contains("pinned_target_secret"),
+            "Sensitive .env file must never appear in MCP grep results: {grep_s}"
+        );
+
+        // 4. `subpath` traversal escaping workspace must fail closed
+        assert!(
+            handle_rpc_method(
+                "tools/call",
+                &json!({
+                    "name": "libredb_code",
+                    "arguments": {
+                        "action": "grep",
+                        "target": "pinned_target",
+                        "subpath": ".."
+                    }
+                }),
+                &mut state,
+            )
+            .is_err(),
+            "Escaping subpath in MCP grep must fail closed"
+        );
+
+        drop(state);
+        let _ = fs::remove_dir_all(&tmp);
+    }

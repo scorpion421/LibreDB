@@ -808,7 +808,7 @@ pub(super) fn infer_chat_memory_ldb_path(cid: &str) -> Option<PathBuf> {
     }
 }
 
-pub(super) fn infer_antigravity_transcript_path(cid: &str) -> Option<PathBuf> {
+pub(crate) fn infer_antigravity_transcript_path(cid: &str) -> Option<PathBuf> {
     if cid.trim().is_empty() || cid.contains('/') || cid.contains('\\') {
         return None;
     }

@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] - 2026-11-16
+
+### Added
+- **Zero-boilerplate `skeleton` and file-less `fim` code-graph ergonomics (`CLI` and `MCP`)**: `libredb skeleton` now infers the active workspace database automatically (falling back to in-memory extraction when no database exists) and accepts multiple files, `--cid` Zero-Repeat deduplication, `--cwd`, and `--json`. Both `libredb fim` and `libredb_code` (`action="fim"`) also support file-less `--symbol` / `symbols` workspace resolution as well as compact `<file>:<line>` target paths.
+- **Symbol-annotated pure-Rust workspace search (`libredb grep` / `search`, `libredb_code` `action="grep"`)**: Added a `.gitignore`-aware, binary- and credential-safe pure-Rust pattern search across workspaces and subpaths without external regex crates. Matching lines in source files are automatically annotated with their enclosing structural contract (`[kind name Lstart-Lend]`).
+- **`PreInvocation` code-graph readiness summary**: Hydrated project prompts now surface a single compact line showing the active indexed symbol count and quick commands when the workspace code graph is populated, without loading raw symbol payloads.
+- **Atomic multi-remote sync preflight (`libredb git-sync`)**: Multi-remote synchronization now fetches and verifies fast-forward compatibility across every configured target remote (including Gitea and GitHub mirrors) before creating a local commit or pushing to any remote.
+- **Automatic `ripgrep` (`rg`) `PATH` provisioning (`deploy_plugin.ps1`, `deploy_plugin.sh`)**: Both installers automatically discover or link native `rg` binaries (including AppLocker/SRP-safe staging on Windows and Homebrew bridging on macOS) and skip redundant `config.json` rewrites when the plugin is already active.
+
 ## [2.0.1] - 2026-11-16
 
 ### Security

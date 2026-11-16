@@ -393,14 +393,14 @@ pub fn handle_rpc_method(
                 },
                 {
                     "name": "libredb_code",
-                    "description": "Zero-bloat source code graph: 'skeleton' (-95% file map, supports single 'target' or batch 'files'), 'locate' (<0.5ms 1-line [Lstart-Lend] symbol lookup, supports single 'target' or batch 'symbols'), 'impact' (compact caller/callee blast radius + governing decisions, supports single 'target' or batch 'symbols'), 'fim' (surgical edit slice + callers + decisions, supports single 'target' or batch 'slices'/'symbols'), 'index' (scan workspace), or 'savings' (authorized workspace token-economy report).",
+                    "description": "Zero-bloat source code graph: 'skeleton' (-95% file map, supports single 'target' or batch 'files'), 'locate' (<0.5ms 1-line [Lstart-Lend] symbol lookup, supports single 'target' or batch 'symbols'), 'impact' (compact caller/callee blast radius + governing decisions, supports single 'target' or batch 'symbols'), 'fim' (surgical edit slice + callers + decisions, supports file 'target', file-less 'symbol'/'symbols', or batch 'slices'), 'grep' (symbol-annotated pure-Rust .gitignore-aware search with enclosing [kind name Lstart-Lend] contracts), 'index' (scan workspace), or 'savings' (authorized workspace token-economy report).",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "action": { "type": "string", "enum": ["skeleton", "locate", "impact", "fim", "index", "savings"] },
-                            "target": { "type": "string", "description": "File path, workspace directory, or symbol query" },
-                            "files": { "type": "array", "items": { "type": "string" }, "description": "Optional batch of file paths for action='skeleton' (single fsync)" },
-                            "symbols": { "type": "array", "items": { "type": "string" }, "description": "Optional batch of symbol names/descriptors for action='locate', action='impact', or multi-symbol action='fim' on 'target' (max 64)" },
+                            "action": { "type": "string", "enum": ["skeleton", "locate", "impact", "fim", "grep", "index", "savings"] },
+                            "target": { "type": "string", "description": "File path, workspace directory, symbol query, or pattern (for action='grep')" },
+                            "files": { "type": "array", "items": { "type": "string" }, "description": "Optional batch of file paths for action='skeleton' (single fsync), or subpath filter for action='grep'" },
+                            "symbols": { "type": "array", "items": { "type": "string" }, "description": "Optional batch of symbol names/descriptors for action='locate', 'impact', or file/file-less action='fim' (max 64)" },
                             "slices": {
                                 "type": "array",
                                 "description": "Optional batch of slice requests for action='fim' across one or multiple files (max 32)",
@@ -416,12 +416,19 @@ pub fn handle_rpc_method(
                                 }
                             },
                             "cwd": { "type": "string" },
+                            "subpath": { "type": "string", "description": "Optional relative directory or file restriction for action='grep'" },
                             "cid": { "type": "string", "description": "Optional conversation ID for Zero-Repeat Skeleton deduplication or savings filtering" },
                             "force": { "type": "boolean", "description": "Force full skeleton emission even if unchanged in session" },
-                            "symbol": { "type": "string", "description": "Symbol filter or FIM target" },
+                            "symbol": { "type": "string", "description": "Symbol filter or file-less FIM target" },
                             "line": { "type": "integer" },
                             "pad": { "type": "integer", "default": 12 },
-                            "format": { "type": "string", "enum": ["compact", "json"], "description": "Output format for action='locate', 'impact', 'fim', or 'savings' (default: 'compact')" },
+                            "ignore_case": { "type": "boolean", "description": "Case-insensitive matching for action='grep'" },
+                            "fixed_strings": { "type": "boolean", "description": "Literal fixed-string matching for action='grep'" },
+                            "word_boundary": { "type": "boolean", "description": "Whole-word matching for action='grep'" },
+                            "context": { "type": "integer", "description": "Optional +/- context lines around matches for action='grep' (max 10)" },
+                            "max_matches": { "type": "integer", "description": "Maximum matches to return for action='grep' (default: 80)" },
+                            "extensions": { "type": "array", "items": { "type": "string" }, "description": "Optional file extension filter list for action='grep' (e.g. ['rs', 'toml'])" },
+                            "format": { "type": "string", "enum": ["compact", "json"], "description": "Output format for action='locate', 'impact', 'fim', 'grep', or 'savings' (default: 'compact')" },
                             "days": { "type": "integer", "description": "Optional lookback window in days for action='savings' (0 = today, max 3660)" }
                         },
                         "required": ["action"]

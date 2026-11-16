@@ -13,11 +13,11 @@ use libredb_cognitive::skeleton::{
 };
 use libredb_cognitive::{
     create_subagent_handoff, execute_atomic_batch, extract_fim_slice, format_fim_batch_compact,
-    format_impact_batch_compact, format_impact_compact, format_locate_compact, locate_symbols,
-    query_symbol_impact, query_symbols_impact_batch, reconcile_tentative_edits,
-    sync_transcript_epoch, AtomicBatchSpec, CognitiveEngine, FileSkeleton, FimSliceRequest,
-    PulseRequest, ReflexEngine, ReflexRule, SessionState, MAX_BATCH_FIM_SLICES,
-    MAX_BATCH_SYMBOL_QUERIES,
+    format_grep_report_compact, format_impact_batch_compact, format_impact_compact,
+    format_locate_compact, grep_workspace, locate_symbols, query_symbol_impact,
+    query_symbols_impact_batch, reconcile_tentative_edits, sync_transcript_epoch, AtomicBatchSpec,
+    CognitiveEngine, FileSkeleton, FimSliceRequest, PulseRequest, ReflexEngine, ReflexRule,
+    SessionState, WorkspaceGrepOptions, MAX_BATCH_FIM_SLICES, MAX_BATCH_SYMBOL_QUERIES,
 };
 use libredb_core::crc::hash_key;
 use libredb_core::{LibreDb, LibreDbError, NodeKind, PreparedWrite, WriteRequest};
@@ -422,9 +422,15 @@ pub(super) fn dispatch_tool(
                 }
                 Some(_) => return Err("Invalid 'slices' parameter: expected array of slice objects".into()),
             };
-            let first_file_hint = target_opt
-                .or_else(|| files_arr.first().map(String::as_str))
-                .or_else(|| slices_arr.first().map(|s| s.target.as_str()));
+            let first_file_hint = if action == "grep" {
+                args.get("subpath")
+                    .and_then(Value::as_str)
+                    .or_else(|| files_arr.first().map(String::as_str))
+            } else {
+                target_opt
+                    .or_else(|| files_arr.first().map(String::as_str))
+                    .or_else(|| slices_arr.first().map(|s| s.target.as_str()))
+            };
             let sym = args.get("symbol").and_then(Value::as_str);
             let line = args.get("line").and_then(Value::as_u64).map(|n| n as usize);
             let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
@@ -433,10 +439,14 @@ pub(super) fn dispatch_tool(
                 .and_then(Value::as_str)
                 .is_some_and(|f| f.eq_ignore_ascii_case("json"));
 
+            let allow_ws_infer = matches!(action, "impact" | "locate" | "grep")
+                || (action == "fim"
+                    && first_file_hint.is_none()
+                    && (sym.is_some() || !symbols_arr.is_empty()));
             let (ws_root, containment_root) = state.resolve_authorized_code_workspace(
                 raw_cwd_arg,
                 first_file_hint,
-                matches!(action, "impact" | "locate"),
+                allow_ws_infer,
             )?;
             let ws_root_str = ws_root.to_string_lossy().into_owned();
             let proj_db = {
@@ -628,62 +638,143 @@ pub(super) fn dispatch_tool(
                     Ok(rendered)
                 }
                 "fim" => {
+                    check_target_access(&ws_root)?;
                     let mut requests: Vec<FimSliceRequest> = Vec::new();
+                    let resolved_explicit: Vec<(PathBuf, FimSliceRequest)>;
+
                     if !slices_arr.is_empty() {
                         requests.extend(slices_arr);
                     } else if !symbols_arr.is_empty() {
-                        let target = target_opt
-                            .or_else(|| files_arr.first().map(String::as_str))
-                            .ok_or("Missing 'target' file path for batched 'symbols' in action='fim'")?;
-                        for s in &symbols_arr {
-                            requests.push(FimSliceRequest {
-                                target: target.to_owned(),
-                                symbol: Some(s.clone()),
-                                line: None,
-                                pad,
-                            });
+                        if let Some(target) = target_opt.or_else(|| files_arr.first().map(String::as_str)) {
+                            for s in &symbols_arr {
+                                requests.push(FimSliceRequest {
+                                    target: target.to_owned(),
+                                    symbol: Some(s.clone()),
+                                    line: None,
+                                    pad,
+                                });
+                            }
                         }
-                    } else {
-                        let target = target_opt.ok_or("Missing target")?;
+                    } else if let Some(target) = target_opt {
+                        let mut final_target = target.to_owned();
+                        let mut final_line = line;
+                        if final_line.is_none() && sym.is_none() {
+                            let (stripped, line_suffix) = crate::split_path_and_line_suffix(target);
+                            if let Some(ln) = line_suffix {
+                                if !resolve_rel(target).exists() {
+                                    final_target = stripped.to_owned();
+                                    final_line = Some(ln);
+                                }
+                            }
+                        }
                         requests.push(FimSliceRequest {
-                            target: target.to_owned(),
+                            target: final_target,
                             symbol: sym.map(ToOwned::to_owned),
-                            line,
+                            line: final_line,
                             pad,
                         });
-                    }
-                    if requests.len() > MAX_BATCH_FIM_SLICES {
-                        return Err(format!(
-                            "Requested FIM slice batch ({}) exceeds maximum allowed ({MAX_BATCH_FIM_SLICES})",
-                            requests.len()
-                        )
-                        .into());
+                    } else if sym.is_none() {
+                        return Err("Missing 'target' file path or 'symbol'/'symbols' query for action='fim'".into());
                     }
 
-                    check_target_access(&ws_root)?;
-                    let mut resolved_requests: Vec<(PathBuf, FimSliceRequest)> =
-                        Vec::with_capacity(requests.len());
-                    for req in requests {
-                        let rp = resolve_rel(&req.target);
-                        check_target_access(&rp)?;
-                        state.verify_target_belongs_to_workspace(&rp, &ws_root)?;
-                        resolved_requests.push((rp, req));
+                    if requests.is_empty() {
+                        // File-less symbol resolution across workspace code graph
+                        state.run_locked_workspace_index(
+                            &proj_db,
+                            &ws_root,
+                            &ws_root,
+                            Some(&ws_root_str),
+                            cid_arg,
+                        )?;
+                        let queries: Vec<String> = if !symbols_arr.is_empty() {
+                            symbols_arr.clone()
+                        } else if let Some(s) = sym {
+                            vec![s.to_owned()]
+                        } else {
+                            Vec::new()
+                        };
+                        if queries.len() > MAX_BATCH_SYMBOL_QUERIES {
+                            return Err(format!(
+                                "Requested FIM symbol batch ({}) exceeds maximum allowed ({MAX_BATCH_SYMBOL_QUERIES})",
+                                queries.len()
+                            )
+                            .into());
+                        }
+                        let located = locate_symbols(&proj_db, &queries)?;
+                        if located.is_empty() {
+                            return Err(format!(
+                                "No symbol matched {:?} in workspace '{}'",
+                                queries,
+                                ws_root.display()
+                            )
+                            .into());
+                        }
+                        let cap = if queries.len() == 1 { 4 } else { MAX_BATCH_FIM_SLICES };
+                        let mut seen_keys: std::collections::HashSet<(PathBuf, String)> =
+                            std::collections::HashSet::new();
+                        let mut auto_resolved: Vec<(PathBuf, FimSliceRequest)> = Vec::new();
+                        for m in &located {
+                            if auto_resolved.len() >= cap {
+                                break;
+                            }
+                            let rp = resolve_rel(&m.file_path);
+                            check_target_access(&rp)?;
+                            state.verify_target_belongs_to_workspace(&rp, &ws_root)?;
+                            if seen_keys.insert((rp.clone(), m.qualified_name.clone())) {
+                                auto_resolved.push((
+                                    rp,
+                                    FimSliceRequest {
+                                        target: m.file_path.clone(),
+                                        symbol: Some(m.qualified_name.clone()),
+                                        line: None,
+                                        pad,
+                                    },
+                                ));
+                            }
+                        }
+                        resolved_explicit = auto_resolved;
+                    } else {
+                        if requests.len() > MAX_BATCH_FIM_SLICES {
+                            return Err(format!(
+                                "Requested FIM slice batch ({}) exceeds maximum allowed ({MAX_BATCH_FIM_SLICES})",
+                                requests.len()
+                            )
+                            .into());
+                        }
+                        let mut manual_resolved: Vec<(PathBuf, FimSliceRequest)> =
+                            Vec::with_capacity(requests.len());
+                        for mut req in requests {
+                            if req.line.is_none() && req.symbol.is_none() {
+                                let (stripped, line_suffix) =
+                                    crate::split_path_and_line_suffix(&req.target);
+                                if let Some(ln) = line_suffix {
+                                    if !resolve_rel(&req.target).exists() {
+                                        req.target = stripped.to_owned();
+                                        req.line = Some(ln);
+                                    }
+                                }
+                            }
+                            let rp = resolve_rel(&req.target);
+                            check_target_access(&rp)?;
+                            state.verify_target_belongs_to_workspace(&rp, &ws_root)?;
+                            manual_resolved.push((rp, req));
+                        }
+                        state.run_locked_workspace_index(
+                            &proj_db,
+                            &ws_root,
+                            &ws_root,
+                            Some(&ws_root_str),
+                            cid_arg,
+                        )?;
+                        resolved_explicit = manual_resolved;
                     }
 
-                    state.run_locked_workspace_index(
-                        &proj_db,
-                        &ws_root,
-                        &ws_root,
-                        Some(&ws_root_str),
-                        cid_arg,
-                    )?;
-
-                    let mut bundles = Vec::with_capacity(resolved_requests.len());
+                    let mut bundles = Vec::with_capacity(resolved_explicit.len());
                     let mut unique_files: std::collections::HashSet<PathBuf> =
                         std::collections::HashSet::new();
                     let mut raw_file_tok_sum = 0u64;
 
-                    for (rp, req) in &resolved_requests {
+                    for (rp, req) in &resolved_explicit {
                         let bundle = extract_fim_slice(
                             &proj_db,
                             rp,
@@ -718,6 +809,85 @@ pub(super) fn dispatch_tool(
                         },
                     );
                     Ok(rendered)
+                }
+                "grep" => {
+                    check_target_access(&ws_root)?;
+                    let pattern = target_opt
+                        .or(sym)
+                        .ok_or("Missing 'target' search pattern for action='grep'")?;
+                    let sub_rp = if let Some(sub) = args
+                        .get("subpath")
+                        .and_then(Value::as_str)
+                        .or_else(|| files_arr.first().map(String::as_str))
+                    {
+                        let rp = resolve_rel(sub);
+                        check_target_access(&rp)?;
+                        state.verify_target_belongs_to_workspace(&rp, &ws_root)?;
+                        Some(rp)
+                    } else {
+                        None
+                    };
+                    let ext_list: Vec<String> = args
+                        .get("extensions")
+                        .and_then(Value::as_array)
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(Value::as_str)
+                                .map(ToOwned::to_owned)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let opts = WorkspaceGrepOptions {
+                        fixed_strings: args
+                            .get("fixed_strings")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                        ignore_case: args
+                            .get("ignore_case")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                        word_boundary: args
+                            .get("word_boundary")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                        max_matches: args
+                            .get("max_matches")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(80) as usize,
+                        context_lines: args
+                            .get("context")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0) as usize,
+                        extensions: ext_list,
+                        include_symbols: true,
+                    };
+                    let mut report = grep_workspace(
+                        &ws_root,
+                        sub_rp.as_deref(),
+                        pattern,
+                        Some(&proj_db),
+                        &opts,
+                    )?;
+                    let prev_len = report.matches.len();
+                    report.matches.retain(|m| {
+                        let rp = resolve_rel(&m.file_path);
+                        check_target_access(&rp).is_ok()
+                            && state.verify_target_belongs_to_workspace(&rp, &ws_root).is_ok()
+                    });
+                    if report.matches.len() != prev_len {
+                        let uniq: std::collections::HashSet<&str> = report
+                            .matches
+                            .iter()
+                            .map(|m| m.file_path.as_str())
+                            .collect();
+                        report.files_matched = uniq.len();
+                        report.total_matches = report.matches.len();
+                    }
+                    if want_json {
+                        Ok(serde_json::to_string_pretty(&report)?)
+                    } else {
+                        Ok(format_grep_report_compact(&report))
+                    }
                 }
                 "index" => {
                     let target = target_opt.ok_or("Missing target")?;

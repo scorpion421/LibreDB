@@ -2716,6 +2716,14 @@ fn normalize_scan_boundary_key(p: &Path) -> String {
 
 impl WorkspaceScanConfig {
     fn from_db_and_root(db: &LibreDb, root: &Path, excluded_paths: &[PathBuf]) -> Self {
+        Self::from_db_and_root_opt(Some(db), root, excluded_paths)
+    }
+
+    fn from_db_and_root_opt(
+        db_opt: Option<&LibreDb>,
+        root: &Path,
+        excluded_paths: &[PathBuf],
+    ) -> Self {
         let root_key = normalize_scan_boundary_key(root);
         let excluded_subroots: HashSet<String> = excluded_paths
             .iter()
@@ -2749,36 +2757,51 @@ impl WorkspaceScanConfig {
                     continue;
                 }
                 let clean = t.trim_matches('/');
-                if !clean.is_empty() && !clean.contains('/') && (t.ends_with('/') || root.join(clean).is_dir()) {
+                if !clean.is_empty()
+                    && !clean.contains('/')
+                    && (t.ends_with('/') || root.join(clean).is_dir())
+                {
                     ignore_dirs.insert(clean.to_ascii_lowercase());
                 }
             }
         }
 
         // Apply runtime-configurable overrides from `NodeKind::Config` (`index:ignore_dirs`, `index:extra_extensions`, `index:max_file_bytes`).
-        if let Ok(rec) = db.get_by_key(NodeKind::Config, "index:ignore_dirs") {
-            for item in String::from_utf8_lossy(&rec.payload).split([',', ';', '\n']) {
-                let d = item.trim().trim_matches('/').to_ascii_lowercase();
-                if !d.is_empty() {
-                    ignore_dirs.insert(d);
+        if let Some(db) = db_opt {
+            if let Ok(rec) = db.get_by_key(NodeKind::Config, "index:ignore_dirs") {
+                for item in String::from_utf8_lossy(&rec.payload).split([',', ';', '\n']) {
+                    let d = item.trim().trim_matches('/').to_ascii_lowercase();
+                    if !d.is_empty() {
+                        ignore_dirs.insert(d);
+                    }
                 }
             }
         }
 
         let mut extra_extensions = Vec::new();
-        if let Ok(rec) = db.get_by_key(NodeKind::Config, "index:extra_extensions") {
-            for item in String::from_utf8_lossy(&rec.payload).split([',', ';', ' ', '\n']) {
-                let e = item.trim().to_ascii_lowercase();
-                if !e.is_empty() {
-                    extra_extensions.push(if e.starts_with('.') { e } else { format!(".{e}") });
+        if let Some(db) = db_opt {
+            if let Ok(rec) = db.get_by_key(NodeKind::Config, "index:extra_extensions") {
+                for item in String::from_utf8_lossy(&rec.payload).split([',', ';', ' ', '\n']) {
+                    let e = item.trim().to_ascii_lowercase();
+                    if !e.is_empty() {
+                        extra_extensions.push(if e.starts_with('.') {
+                            e
+                        } else {
+                            format!(".{e}")
+                        });
+                    }
                 }
             }
         }
 
-        let max_file_bytes = db
-            .get_by_key(NodeKind::Config, "index:max_file_bytes")
-            .ok()
-            .and_then(|r| String::from_utf8_lossy(&r.payload).trim().parse::<usize>().ok())
+        let max_file_bytes = db_opt
+            .and_then(|db| db.get_by_key(NodeKind::Config, "index:max_file_bytes").ok())
+            .and_then(|r| {
+                String::from_utf8_lossy(&r.payload)
+                    .trim()
+                    .parse::<usize>()
+                    .ok()
+            })
             .unwrap_or(4 * 1024 * 1024)
             .min(crate::skeleton::MAX_SKELETON_FILE_BYTES as usize);
 
@@ -2791,10 +2814,45 @@ impl WorkspaceScanConfig {
     }
 }
 
-fn collect_source_files(
+enum ScanFileFilter<'a> {
+    SourceOnly,
+    AllText { ext_filters: &'a [String] },
+}
+
+fn should_skip_dir_entry(
+    root: &Path,
+    entry_path: &Path,
+    low_name: &str,
+    cfg: &WorkspaceScanConfig,
+) -> bool {
+    if cfg.ignore_dirs.contains(low_name)
+        || matches!(low_name, ".ssh" | ".gnupg" | ".aws" | ".azure" | ".kube")
+    {
+        return true;
+    }
+    // Never cross into nested child cognitive workspaces during a parent scan:
+    // any subdirectory strictly below `root` with its own `.agents` directory or an
+    // explicit server-registered workspace boundary owns an isolated cognitive brain.
+    if entry_path != root {
+        if entry_path.join(".agents").is_dir() {
+            return true;
+        }
+        if !cfg.excluded_subroots.is_empty()
+            && cfg
+                .excluded_subroots
+                .contains(&normalize_scan_boundary_key(entry_path))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn collect_workspace_files_internal(
     root: &Path,
     curr: &Path,
     cfg: &WorkspaceScanConfig,
+    filter: &ScanFileFilter<'_>,
     out: &mut Vec<(PathBuf, String)>,
     binary_skipped: &mut usize,
 ) -> Result<()> {
@@ -2807,8 +2865,8 @@ fn collect_source_files(
         let Ok(ft) = entry.file_type() else {
             continue;
         };
-        // Never follow file or directory symlinks during workspace indexing so repository symlinks
-        // cannot escape the workspace boundary or ingest external credential/dotenv files.
+        // Never follow file or directory symlinks during workspace indexing or grep so repository
+        // symlinks cannot escape the workspace boundary or ingest external credential/dotenv files.
         if ft.is_symlink() {
             continue;
         }
@@ -2817,32 +2875,30 @@ fn collect_source_files(
         let low = name.to_ascii_lowercase();
 
         if ft.is_dir() {
-            if cfg.ignore_dirs.contains(&low)
-                || matches!(low.as_str(), ".ssh" | ".gnupg" | ".aws" | ".azure" | ".kube")
-            {
+            if should_skip_dir_entry(root, &p, &low, cfg) {
                 continue;
             }
-            // Never cross into nested child cognitive workspaces during a parent scan:
-            // any subdirectory strictly below `root` with its own `.agents` directory or an
-            // explicit server-registered workspace boundary owns an isolated cognitive brain.
-            if p != root {
-                if p.join(".agents").is_dir() {
-                    continue;
-                }
-                if !cfg.excluded_subroots.is_empty()
-                    && cfg.excluded_subroots.contains(&normalize_scan_boundary_key(&p))
-                {
-                    continue;
-                }
-            }
-            collect_source_files(root, &p, cfg, out, binary_skipped)?;
+            collect_workspace_files_internal(root, &p, cfg, filter, out, binary_skipped)?;
         } else if ft.is_file() {
             if is_sensitive_filename(&low) {
                 continue;
             }
-            if is_known_source_extension(&low)
-                || cfg.extra_extensions.iter().any(|ext| low.ends_with(ext))
-            {
+            let accepted = match filter {
+                ScanFileFilter::SourceOnly => {
+                    is_known_source_extension(&low)
+                        || cfg.extra_extensions.iter().any(|ext| low.ends_with(ext))
+                }
+                ScanFileFilter::AllText { ext_filters } => {
+                    if is_known_binary_extension(&low) {
+                        false
+                    } else if ext_filters.is_empty() {
+                        true
+                    } else {
+                        ext_filters.iter().any(|ext| low.ends_with(ext))
+                    }
+                }
+            };
+            if accepted {
                 let rel = p
                     .strip_prefix(root)
                     .unwrap_or(&p)
@@ -2855,6 +2911,16 @@ fn collect_source_files(
         }
     }
     Ok(())
+}
+
+fn collect_source_files(
+    root: &Path,
+    curr: &Path,
+    cfg: &WorkspaceScanConfig,
+    out: &mut Vec<(PathBuf, String)>,
+    binary_skipped: &mut usize,
+) -> Result<()> {
+    collect_workspace_files_internal(root, curr, cfg, &ScanFileFilter::SourceOnly, out, binary_skipped)
 }
 
 fn is_sensitive_filename(low: &str) -> bool {
@@ -2908,6 +2974,534 @@ fn is_known_binary_extension(low: &str) -> bool {
     ]
     .iter()
     .any(|ext| low.ends_with(ext))
+}
+
+/// Configuration options for pure-Rust symbol-annotated workspace grep (`grep_workspace`).
+#[derive(Debug, Clone)]
+pub struct WorkspaceGrepOptions {
+    pub fixed_strings: bool,
+    pub ignore_case: bool,
+    pub word_boundary: bool,
+    pub max_matches: usize,
+    pub context_lines: usize,
+    pub extensions: Vec<String>,
+    pub include_symbols: bool,
+}
+
+impl Default for WorkspaceGrepOptions {
+    fn default() -> Self {
+        Self {
+            fixed_strings: false,
+            ignore_case: false,
+            word_boundary: false,
+            max_matches: 80,
+            context_lines: 0,
+            extensions: Vec::new(),
+            include_symbols: true,
+        }
+    }
+}
+
+/// Single grep hit optionally annotated with its enclosing `FileSkeleton` symbol contract.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GrepMatchItem {
+    pub file_path: String,
+    pub line_number: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enclosing_symbol: Option<String>,
+    pub line_text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_before: Vec<(usize, String)>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_after: Vec<(usize, String)>,
+}
+
+/// Aggregate result bundle from `grep_workspace`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceGrepReport {
+    pub pattern: String,
+    pub files_searched: usize,
+    pub files_matched: usize,
+    pub total_matches: usize,
+    pub truncated: bool,
+    pub matches: Vec<GrepMatchItem>,
+}
+
+struct PureGrepMatcher {
+    branches: Vec<Vec<String>>,
+    ignore_case: bool,
+    word_boundary: bool,
+}
+
+impl PureGrepMatcher {
+    fn compile(
+        pattern: &str,
+        fixed_strings: bool,
+        ignore_case: bool,
+        word_boundary: bool,
+    ) -> Result<Self> {
+        if pattern.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "grep pattern must not be empty",
+            )
+            .into());
+        }
+        let norm = |s: String| if ignore_case { s.to_lowercase() } else { s };
+        if fixed_strings {
+            return Ok(Self {
+                branches: vec![vec![norm(pattern.to_owned())]],
+                ignore_case,
+                word_boundary,
+            });
+        }
+
+        // Parse alternation branches (`|`) and wildcard sequences (`.*`) linearly with `\` escapes
+        // so untrusted search patterns can never trigger catastrophic regex backtracking.
+        let mut branches: Vec<Vec<String>> = Vec::new();
+        let mut cur_branch: Vec<String> = Vec::new();
+        let mut cur_seg = String::new();
+        let chars: Vec<char> = pattern.chars().collect();
+        let mut i = 0usize;
+        while i < chars.len() {
+            let c = chars[i];
+            if c == '\\' && i + 1 < chars.len() {
+                let nxt = chars[i + 1];
+                if matches!(nxt, '|' | '.' | '*' | '\\') {
+                    cur_seg.push(nxt);
+                } else {
+                    cur_seg.push('\\');
+                    cur_seg.push(nxt);
+                }
+                i += 2;
+                continue;
+            }
+            if c == '|' {
+                if !cur_seg.is_empty() {
+                    cur_branch.push(norm(std::mem::take(&mut cur_seg)));
+                }
+                if cur_branch.is_empty() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "grep pattern contains an empty alternation branch",
+                    )
+                    .into());
+                }
+                branches.push(std::mem::take(&mut cur_branch));
+                i += 1;
+                continue;
+            }
+            if c == '.' && i + 1 < chars.len() && chars[i + 1] == '*' {
+                if !cur_seg.is_empty() {
+                    cur_branch.push(norm(std::mem::take(&mut cur_seg)));
+                }
+                i += 2;
+                continue;
+            }
+            cur_seg.push(c);
+            i += 1;
+        }
+        if !cur_seg.is_empty() {
+            cur_branch.push(norm(cur_seg));
+        }
+        if cur_branch.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "grep pattern must contain at least one non-empty literal term",
+            )
+            .into());
+        }
+        branches.push(cur_branch);
+
+        Ok(Self {
+            branches,
+            ignore_case,
+            word_boundary,
+        })
+    }
+
+    fn is_word_char(c: char) -> bool {
+        c.is_alphanumeric() || c == '_'
+    }
+
+    fn is_word_start(hay: &str, byte_idx: usize) -> bool {
+        hay[..byte_idx]
+            .chars()
+            .next_back()
+            .map_or(true, |c| !Self::is_word_char(c))
+    }
+
+    fn is_word_end(hay: &str, byte_idx: usize) -> bool {
+        hay[byte_idx..]
+            .chars()
+            .next()
+            .map_or(true, |c| !Self::is_word_char(c))
+    }
+
+    fn branch_matches(&self, hay: &str, segs: &[String]) -> bool {
+        let Some(first) = segs.first() else {
+            return false;
+        };
+        let mut offset = 0usize;
+        while offset <= hay.len() {
+            let Some(rel) = hay[offset..].find(first.as_str()) else {
+                return false;
+            };
+            let s0 = offset + rel;
+            let e0 = s0 + first.len();
+            let next_step = s0 + hay[s0..].chars().next().map_or(1, char::len_utf8);
+
+            if self.word_boundary && !Self::is_word_start(hay, s0) {
+                offset = next_step;
+                continue;
+            }
+            if segs.len() == 1 {
+                if !self.word_boundary || Self::is_word_end(hay, e0) {
+                    return true;
+                }
+                offset = next_step;
+                continue;
+            }
+
+            let mut cur = e0;
+            let mut mid_ok = true;
+            for mid in &segs[1..segs.len() - 1] {
+                let Some(mrel) = hay[cur..].find(mid.as_str()) else {
+                    mid_ok = false;
+                    break;
+                };
+                cur += mrel + mid.len();
+            }
+            if !mid_ok {
+                return false;
+            }
+            let last = &segs[segs.len() - 1];
+            if !self.word_boundary {
+                return hay[cur..].contains(last.as_str());
+            }
+            let mut last_off = cur;
+            while last_off <= hay.len() {
+                let Some(lrel) = hay[last_off..].find(last.as_str()) else {
+                    break;
+                };
+                let ls = last_off + lrel;
+                let le = ls + last.len();
+                if Self::is_word_end(hay, le) {
+                    return true;
+                }
+                last_off = ls + hay[ls..].chars().next().map_or(1, char::len_utf8);
+            }
+            offset = next_step;
+        }
+        false
+    }
+
+    fn matches_line(&self, line: &str) -> bool {
+        let folded;
+        let hay = if self.ignore_case {
+            folded = line.to_lowercase();
+            folded.as_str()
+        } else {
+            line
+        };
+        self.branches.iter().any(|b| self.branch_matches(hay, b))
+    }
+}
+
+fn clamp_grep_snippet(raw: &str, max_chars: usize) -> String {
+    let clean = raw.trim_end_matches(&['\r', '\n'][..]);
+    let mut chars = clean.chars();
+    let collected: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{collected}...")
+    } else {
+        collected
+    }
+}
+
+fn load_cached_or_extract_skeleton(
+    db_opt: Option<&LibreDb>,
+    abs_path: &Path,
+    rel_path: &str,
+    raw_bytes: &[u8],
+) -> FileSkeleton {
+    if let Some(db) = db_opt {
+        let current_hash = hash_key(SKELETON_HASH_SEED, raw_bytes);
+        let abs_label = abs_path.to_string_lossy().replace('\\', "/");
+        for label_cand in [rel_path, abs_label.as_str()] {
+            let key = format!("{SKELETON_KEY_PREFIX}{label_cand}");
+            if let Ok(rec) = db.get_by_key(NodeKind::WorkingSet, &key) {
+                if let Ok(cached) = serde_json::from_slice::<FileSkeleton>(&rec.payload) {
+                    if cached.content_hash == current_hash {
+                        return cached;
+                    }
+                }
+            }
+        }
+    }
+    FileSkeleton::extract_from_bytes(rel_path.to_owned(), raw_bytes)
+}
+
+fn find_enclosing_symbol_label(skel: &FileSkeleton, line_no: usize) -> Option<String> {
+    if let Some(s) = skel
+        .symbols
+        .iter()
+        .filter(|s| s.start_line <= line_no && line_no <= s.end_line)
+        .min_by_key(|s| {
+            (
+                s.end_line.saturating_sub(s.start_line),
+                usize::from(matches!(s.kind.as_str(), "impl" | "mod" | "namespace" | "section")),
+            )
+        })
+    {
+        return Some(format!(
+            "{} {} L{}-L{}",
+            s.kind,
+            s.qualified_name(),
+            s.start_line,
+            s.end_line
+        ));
+    }
+    skel.sections
+        .iter()
+        .filter(|sec| sec.start_line <= line_no && line_no <= sec.end_line)
+        .min_by_key(|sec| sec.end_line.saturating_sub(sec.start_line))
+        .map(|sec| format!("section {} L{}-L{}", sec.title, sec.start_line, sec.end_line))
+}
+
+/// Pure-Rust `.gitignore`-aware workspace search with zero-cost `FileSkeleton` enclosing symbol
+/// contract annotation (`[fn Name Lstart-Lend]`) computed lazily ONLY on files that match.
+pub fn grep_workspace(
+    root: &Path,
+    sub_target: Option<&Path>,
+    pattern: &str,
+    db_opt: Option<&LibreDb>,
+    opts: &WorkspaceGrepOptions,
+) -> Result<WorkspaceGrepReport> {
+    let matcher = PureGrepMatcher::compile(
+        pattern,
+        opts.fixed_strings,
+        opts.ignore_case,
+        opts.word_boundary,
+    )?;
+    let canon_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let cfg = WorkspaceScanConfig::from_db_and_root_opt(db_opt, &canon_root, &[]);
+    let ext_filters: Vec<String> = opts
+        .extensions
+        .iter()
+        .filter_map(|raw| {
+            let clean = raw.trim().trim_start_matches('.').to_ascii_lowercase();
+            if clean.is_empty() {
+                None
+            } else {
+                Some(format!(".{clean}"))
+            }
+        })
+        .collect();
+
+    let scan_target = match sub_target {
+        Some(sub) => {
+            let joined = if sub.is_absolute() {
+                sub.to_path_buf()
+            } else {
+                canon_root.join(sub)
+            };
+            let sym_meta = std::fs::symlink_metadata(&joined)?;
+            if sym_meta.file_type().is_symlink() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "grep refused to follow symlink target",
+                )
+                .into());
+            }
+            let canon_sub = std::fs::canonicalize(&joined)?;
+            if !canon_sub.starts_with(&canon_root) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "grep target escaped workspace boundary",
+                )
+                .into());
+            }
+            canon_sub
+        }
+        None => canon_root.clone(),
+    };
+
+    let mut candidate_files: Vec<(PathBuf, String)> = Vec::new();
+    let mut binary_skipped = 0usize;
+    if scan_target.is_file() {
+        let low = scan_target
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !is_sensitive_filename(&low)
+            && !is_known_binary_extension(&low)
+            && (ext_filters.is_empty() || ext_filters.iter().any(|e| low.ends_with(e)))
+        {
+            let rel = scan_target
+                .strip_prefix(&canon_root)
+                .unwrap_or(&scan_target)
+                .to_string_lossy()
+                .replace('\\', "/");
+            candidate_files.push((scan_target, rel));
+        }
+    } else {
+        let filter = ScanFileFilter::AllText {
+            ext_filters: &ext_filters,
+        };
+        collect_workspace_files_internal(
+            &canon_root,
+            &scan_target,
+            &cfg,
+            &filter,
+            &mut candidate_files,
+            &mut binary_skipped,
+        )?;
+        candidate_files.sort_by(|a, b| a.1.cmp(&b.1));
+    }
+
+    let max_matches = opts.max_matches.clamp(1, 2000);
+    let ctx_radius = opts.context_lines.min(10);
+    let mut matches: Vec<GrepMatchItem> = Vec::new();
+    let mut files_searched = 0usize;
+    let mut matched_files: HashSet<String> = HashSet::new();
+    let mut truncated = false;
+
+    for (abs_path, rel_path) in candidate_files {
+        if matches.len() >= max_matches {
+            truncated = true;
+            break;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(&abs_path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() || !meta.is_file() || meta.len() > cfg.max_file_bytes as u64
+        {
+            continue;
+        }
+        let Ok(raw_bytes) = std::fs::read(&abs_path) else {
+            continue;
+        };
+        if raw_bytes[..raw_bytes.len().min(4096)].contains(&0) {
+            continue;
+        }
+        files_searched += 1;
+
+        let text = String::from_utf8_lossy(&raw_bytes);
+        let lines: Vec<&str> = text.lines().collect();
+        let mut hit_indices: Vec<usize> = Vec::new();
+        for (idx, line) in lines.iter().enumerate() {
+            if matcher.matches_line(line) {
+                hit_indices.push(idx);
+            }
+        }
+        if hit_indices.is_empty() {
+            continue;
+        }
+
+        matched_files.insert(rel_path.clone());
+        let low_rel = rel_path.to_ascii_lowercase();
+        let skel_opt = if opts.include_symbols && is_known_source_extension(&low_rel) {
+            Some(load_cached_or_extract_skeleton(
+                db_opt,
+                &abs_path,
+                &rel_path,
+                &raw_bytes,
+            ))
+        } else {
+            None
+        };
+
+        for idx in hit_indices {
+            if matches.len() >= max_matches {
+                truncated = true;
+                break;
+            }
+            let line_no = idx + 1;
+            let enclosing_symbol = skel_opt
+                .as_ref()
+                .and_then(|sk| find_enclosing_symbol_label(sk, line_no));
+            let context_before = if ctx_radius > 0 {
+                (idx.saturating_sub(ctx_radius)..idx)
+                    .map(|j| (j + 1, clamp_grep_snippet(lines[j], 240)))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let context_after = if ctx_radius > 0 {
+                ((idx + 1)..(idx + 1 + ctx_radius).min(lines.len()))
+                    .map(|j| (j + 1, clamp_grep_snippet(lines[j], 240)))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            matches.push(GrepMatchItem {
+                file_path: rel_path.clone(),
+                line_number: line_no,
+                enclosing_symbol,
+                line_text: clamp_grep_snippet(lines[idx], 400),
+                context_before,
+                context_after,
+            });
+        }
+        if truncated {
+            break;
+        }
+    }
+
+    Ok(WorkspaceGrepReport {
+        pattern: pattern.to_owned(),
+        files_searched,
+        files_matched: matched_files.len(),
+        total_matches: matches.len(),
+        truncated,
+        matches,
+    })
+}
+
+/// Formats a `WorkspaceGrepReport` into dense, token-minimal grouped matches.
+pub fn format_grep_report_compact(report: &WorkspaceGrepReport) -> String {
+    let mut out = format!(
+        "=== GREP: {} ({} match{} across {}/{} files) ===\n",
+        report.pattern,
+        report.total_matches,
+        if report.total_matches == 1 { "" } else { "es" },
+        report.files_matched,
+        report.files_searched
+    );
+    if report.matches.is_empty() {
+        out.push_str("(no matches)\n");
+        return out;
+    }
+
+    let mut cur_file: Option<&str> = None;
+    for m in &report.matches {
+        if cur_file != Some(m.file_path.as_str()) {
+            cur_file = Some(m.file_path.as_str());
+            out.push_str(&format!("* {}:\n", m.file_path));
+        }
+        for (ln, txt) in &m.context_before {
+            out.push_str(&format!("  L{ln}- {}\n", clamp_grep_snippet(txt, 200)));
+        }
+        let snippet = clamp_grep_snippet(&m.line_text, 220);
+        if let Some(ref sym) = m.enclosing_symbol {
+            out.push_str(&format!("  L{} [{sym}]: {snippet}\n", m.line_number));
+        } else {
+            out.push_str(&format!("  L{}: {snippet}\n", m.line_number));
+        }
+        for (ln, txt) in &m.context_after {
+            out.push_str(&format!("  L{ln}+ {}\n", clamp_grep_snippet(txt, 200)));
+        }
+    }
+    if report.truncated {
+        out.push_str(&format!(
+            "[Truncated at {} matches; pass narrower subpath, --ext, or --max-count]\n",
+            report.total_matches
+        ));
+    }
+    out
 }
 
 /// Centralized check for whether `dir` contains a recognized project or decompiled workspace marker.
@@ -3815,6 +4409,70 @@ public sealed class SqlOrderRepository(IDbConnection db) : BaseRepository, IOrde
         );
 
         drop(db);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn grep_workspace_annotates_enclosing_symbols_and_skips_sensitive_or_ignored_files() {
+        let tmp = std::env::temp_dir().join(format!("libredb_grep_ws_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("src")).unwrap();
+        std::fs::create_dir_all(tmp.join("ignored_build")).unwrap();
+
+        std::fs::write(tmp.join(".gitignore"), "ignored_build/\n").unwrap();
+        std::fs::write(tmp.join(".env"), "API_KEY=secret_token_should_not_leak\n").unwrap();
+        std::fs::write(tmp.join("ignored_build").join("gen.rs"), "pub fn verify_token() { /* secret_token */ }\n").unwrap();
+        std::fs::write(tmp.join("src").join("blob.txt"), b"verify_token\0\x01\x02binary").unwrap();
+        std::fs::write(
+            tmp.join("src").join("auth.rs"),
+            "pub fn unrelated() -> bool { true }\n\npub fn verify_token(tok: &str) -> bool {\n    let verify_token_extra = false;\n    tok.starts_with(\"tok_.*\") && !verify_token_extra\n}\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.join("README.md"), "# Auth Docs\nCall Verify_Token in setup.\n").unwrap();
+
+        let opts = WorkspaceGrepOptions {
+            word_boundary: true,
+            context_lines: 1,
+            ..Default::default()
+        };
+        let rep = grep_workspace(&tmp, None, "verify_token", None, &opts).unwrap();
+        assert_eq!(rep.total_matches, 1, "Expected only exact word match in src/auth.rs: {rep:?}");
+        assert_eq!(rep.matches[0].file_path, "src/auth.rs");
+        assert_eq!(rep.matches[0].line_number, 3);
+        assert!(
+            rep.matches[0]
+                .enclosing_symbol
+                .as_deref()
+                .is_some_and(|s| s.contains("verify_token") && s.contains("L3-L6")),
+            "Expected enclosing FileSkeleton span L3-L6, got: {:?}",
+            rep.matches[0].enclosing_symbol
+        );
+        assert_eq!(rep.matches[0].context_before.len(), 1);
+        assert_eq!(rep.matches[0].context_after.len(), 1);
+
+        // Case-insensitive + alternation search hits both src/auth.rs and README.md, still never .env/ignored_build/NUL binary
+        let ci_opts = WorkspaceGrepOptions {
+            ignore_case: true,
+            ..Default::default()
+        };
+        let ci_rep = grep_workspace(&tmp, None, "verify_token|unreachable_pat", None, &ci_opts).unwrap();
+        assert!(ci_rep.matches.iter().any(|m| m.file_path == "README.md"));
+        assert!(ci_rep.matches.iter().all(|m| !m.file_path.contains(".env") && !m.file_path.contains("ignored_build") && !m.file_path.contains("blob.txt")));
+
+        // Fixed-strings matches literal `tok_.*` without interpreting `.*` as wildcard
+        let fx_opts = WorkspaceGrepOptions {
+            fixed_strings: true,
+            extensions: vec!["rs".to_owned()],
+            ..Default::default()
+        };
+        let fx_rep = grep_workspace(&tmp, Some(Path::new("src")), "tok_.*", None, &fx_opts).unwrap();
+        assert_eq!(fx_rep.total_matches, 1);
+        assert_eq!(fx_rep.matches[0].line_number, 5);
+        assert!(fx_rep.matches[0].enclosing_symbol.is_some());
+
+        // Path traversal outside workspace MUST fail closed
+        assert!(grep_workspace(&tmp, Some(Path::new("..")), "verify_token", None, &WorkspaceGrepOptions::default()).is_err());
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

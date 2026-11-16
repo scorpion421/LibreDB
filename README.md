@@ -1,7 +1,7 @@
 # LibreDB
 
-[![Version](https://img.shields.io/badge/version-2.0.1-blue.svg)](CHANGELOG.md)
-[![Tests](https://img.shields.io/badge/tests-passing%20(143%20tests%20%2B%2012%20audits%20%2B%2015%20learning%20checks%20%2B%2010k%20crash%20sims)-brightgreen.svg)](crates/libredb-cli/tests/)
+[![Version](https://img.shields.io/badge/version-2.1.0-blue.svg)](CHANGELOG.md)
+[![Tests](https://img.shields.io/badge/tests-passing%20(148%20tests%20%2B%2012%20audits%20%2B%2015%20learning%20checks%20%2B%2010k%20crash%20sims)-brightgreen.svg)](crates/libredb-cli/tests/)
 [![Tech Stack](https://img.shields.io/badge/pure%20rust-1.89%2B%20%7C%20zero%20C%20%7C%20MCP-orange.svg)](Cargo.toml)
 [![License](https://img.shields.io/badge/license-Apache%202.0%20%2B%20Commons%20Clause-purple.svg)](LICENSE)
 
@@ -17,12 +17,12 @@
 
 ## Executive summary and impact
 
-| Dimension | Legacy Python + `SQLite` (`SkillsDB`) | `LibreDB v2.0.1` (100% Pure `Rust` + `MCP` + `PyO3`) |
+| Dimension | Legacy Python + `SQLite` (`SkillsDB`) | `LibreDB v2.1.0` (100% Pure `Rust` + `MCP` + `PyO3`) |
 | :--- | :--- | :--- |
 | **Hook response latency** | `350-500 ms` Python startup + `SQLite` WAL per edit or turn | **`< 0.5 ms` via the in-memory `MCP` `IPC` coordinator (`< 2 ms` direct fallback), loading matching rules and project memory without disk polling** |
 | **Multi-turn recall & I/O** | Repeated subprocess spawns and full-file re-reads | **RAM-cached session delta and `O(1)` incremental tail-sync (`2` reads total on external updates), keeping turn 2+ recall instant even over network shares** |
 | **Security & credential storage** | Plaintext tokens and unverified local memory files | **OS keystores (`Windows DPAPI` / `ChaCha20-Poly1305`), monotonic `HMAC-SHA256` database seals, and symlink/junction path containment** |
-| **Code navigation & learning** | Blind file reads without call-graph awareness | **Symbol index across 25+ languages (`locate`, `skeleton`, `impact`, `fim`) with self-correcting fix learning, task-switch shielding, and outcome verification** |
+| **Code navigation & learning** | Blind file reads without call-graph awareness | **Symbol index across 25+ languages (`locate`, `skeleton`, `impact`, file-less `fim --symbol`, symbol-annotated `grep`) with self-correcting fix learning and outcome verification** |
 | **Diagnostics & releases** | External ad-hoc scripts for metrics and release uploads | **Built-in token-savings reports (`savings`), verification benchmarks (`bench`, `L1..L15` learning suite), and Git/Gitea release automation** |
 
 ## Installation and quickstart
@@ -56,13 +56,13 @@ pwsh -ExecutionPolicy Bypass -File .\scripts\deploy_plugin.ps1 -Profile Personal
 | Command / MCP tool | Description |
 | :--- | :--- |
 | `libredb_pulse` / `libredb pulse "<query>"` | Recalls relevant rules, skills, decisions, and tasks for the current workspace while suppressing duplicates already shown in the session |
-| `libredb_code` / `locate`, `skeleton`, `impact`, `fim` | Searches symbol definitions, shows compact file outlines, traces affected callers, and reads surgical line ranges across 25+ languages |
+| `libredb_code` / `locate`, `skeleton`, `impact`, `fim`, `grep` | Searches symbols and patterns with enclosing contracts, shows compact file outlines, traces callers, and reads surgical symbol or `<file>:<line>` ranges |
 | `libredb slice-skill` / `get-skill` / `sync-skill` | Syncs external `SKILL.md` guides and retrieves relevant sections on demand instead of loading full manuals |
 | `libredb learning [--verify]` / `savings` / `bench` | Inspects learned search bridges and error pitfalls, runs `L1..L15` learning verification, measures transcript token savings, and runs built-in benchmarks |
 | `libredb_memorize` / `learn-reflex`, `learn-error` | Saves project facts, architectural decisions, tasks, snapshots, and verified bug-fix rules atomically |
 | `libredb mcp-serve` / `guardrail check` | Starts the workspace-scoped MCP server with in-memory hook IPC coordinator or checks staged commits against formatting, style, and security rules |
 | `libredb trust` / `libredb config` / `status` | Seals and verifies workspace memory databases (`HMAC-SHA256`), manages global or per-project settings, and inspects database statistics |
-| `libredb git-init` / `git-sync` / `git-release` | Optional `git-automation` feature (enabled by default): pushes commits cleanly, creates Keep a Changelog releases on Gitea/GitHub, and attaches matching binary assets |
+| `libredb git-init` / `git-sync` / `git-release` | Optional `git-automation` feature (enabled by default): pushes commits cleanly with multi-remote preflight checks, creates Keep a Changelog releases on Gitea/GitHub, and attaches matching binary assets |
 
 ## Architecture and project structure
 
@@ -70,7 +70,7 @@ pwsh -ExecutionPolicy Bypass -File .\scripts\deploy_plugin.ps1 -Profile Personal
 LibreDB/
 |-- Cargo.toml                                     # Pure-Rust workspace (4 default CLI/MCP crates + optional PyO3 crate)
 |-- Makefile                                       # Zero-dependency POSIX/Linux/macOS source build & installer
-|-- VERSION                                        # Semantic Version (2.0.1)
+|-- VERSION                                        # Semantic Version (2.1.0)
 |-- CHANGELOG.md                                   # Keep a Changelog 1.1.0 release history
 |-- LICENSE                                        # Commons Clause v1.0 + full verbatim Apache License 2.0 text
 |-- README.md                                      # 9-block standardized documentation

@@ -122,6 +122,18 @@ for path_dir in "$GEMINI_DIR/antigravity/bin" "$USER_HOME/.local/bin"; do
     fi
 done
 
+# Bridge ripgrep (rg) into Antigravity's GUI PATH dir if absent from standard /usr/bin:/bin (e.g. macOS launchd GUI sessions)
+RG_AGY_BIN="$GEMINI_DIR/antigravity/bin/rg"
+if [ ! -x "$RG_AGY_BIN" ] && ! PATH="/usr/bin:/bin:$GEMINI_DIR/antigravity/bin:$USER_HOME/.local/bin" command -v rg >/dev/null 2>&1; then
+    for rg_cand in /opt/homebrew/bin/rg /usr/local/bin/rg "$USER_HOME/.cargo/bin/rg" /usr/bin/rg; do
+        if [ -x "$rg_cand" ] && "$rg_cand" --version 2>/dev/null | grep -q '^ripgrep '; then
+            install_binary_hot_safe "$rg_cand" "$RG_AGY_BIN"
+            echo "[OK] Provisioned native ripgrep (rg) into Antigravity PATH at: $RG_AGY_BIN"
+            break
+        fi
+    done
+fi
+
 GLOBAL_LDB="$LIBRE_HOME/customizations.ldb"
 if [ ! -f "$GLOBAL_LDB" ]; then
     "$TARGET_EXE" init "$GLOBAL_LDB" >/dev/null
@@ -327,12 +339,13 @@ description: >-
 1. **`libredb_pulse`** (`query`, `cwd`, `cid`, `budget`, `error`):
    - Retrieves relevant rules, micro-skills, decisions, facts, tasks, snapshots, and symbols across global + workspace layers within `budget` tokens.
    - Always pass `cid` (Conversation ID) and `cwd` so RAM-first `Zero-Repeat Delta` suppresses already-delivered items (`0` disk I/O reads on Turn 2+) and automatically re-hydrates after `/compact`.
-2. **`libredb_code`** (`action`: `"index"` | `"skeleton"` | `"locate"` | `"impact"` | `"fim"` | `"savings"`, `target`, `files`, `symbols`, `slices`, `cwd`, `cid`, `force`, `symbol`, `line`, `pad`, `format`, `days`):
+2. **`libredb_code`** (`action`: `"index"` | `"skeleton"` | `"locate"` | `"impact"` | `"fim"` | `"grep"` | `"savings"`, `target`, `files`, `symbols`, `slices`, `cwd`, `subpath`, `cid`, `force`, `symbol`, `line`, `pad`, `ignore_case`, `fixed_strings`, `word_boundary`, `context`, `max_matches`, `extensions`, `format`, `days`):
    - `"index"`: Incrementally scans non-binary source files in `target` (`< 3 ms` warm stat+hash fast path), wiring `Calls` (including Dalvik/Smali descriptors & `1..2`-char R8 methods) and `Decision -> Governs -> Symbol` synapses.
    - `"skeleton"`: Returns a `92-99%` compressed `[Lstart-Lend]` contract map of a single `target` file or multi-file batch (`files: [...]`) across 25+ languages and `< 5 us` topology-inferred extensionless files with session-aware `[Zero-Repeat Skeleton]` deduplication (`cid`).
    - `"locate"`: Returns `< 0.5 ms` 1-line `[Lstart-Lend]` symbol locations for a single `target` or batched `symbols: [...]` (`<= 64`) without full caller/callee edge traversal.
    - `"impact"`: Returns compact (`-70%` token) bidirectional callers, DI/interface implementors, callees, and governing architectural decisions for a single `target` or batched `symbols: [...]` (`<= 64`, `format="json"` for raw JSON).
-   - `"fim"`: Returns surgical `[Lstart-Lend]` edit slices with blast-radius callers, implementors, and governing decisions attached for a single `target` or batched `slices: [{"target": "...", "symbol": "...", "line": 42, "pad": 12}]` / `symbols: [...]` (`<= 32` slices, deduplicating file baseline tokens).
+   - `"fim"`: Returns surgical `[Lstart-Lend]` edit slices with blast-radius callers, implementors, and governing decisions attached for a file `target` (including `<path>:<line>` syntax), file-less workspace `symbol`/`symbols` lookup, or batched `slices` (`<= 32`).
+   - `"grep"`: Pure-Rust `.gitignore`-aware, credential/binary-safe workspace text and pattern search annotated with enclosing `[kind name Lstart-Lend]` contracts (optional `subpath`, `ignore_case`, `fixed_strings`, `word_boundary`, `context`, `max_matches`, `extensions`).
    - `"savings"`: Returns an authorized workspace 3-tier token-consumption and savings report (`days=0` for today, `days <= 3660`).
 3. **`libredb_memorize`** (`cwd`, `cid`, `facts`, `decisions`, `tasks`, `snapshot`, `learn_assoc`, `learn_reflex`, `learn_error`):
    - Atomically commits workspace/chat facts, architectural decisions (auto-linked to symbols), tasks, milestone snapshots, language-agnostic Hebbian concept bridges, situational pitfall reflexes, or error-recovery directives.
@@ -341,8 +354,11 @@ description: >-
 
 - **Zero-boilerplate cognitive & code-graph queries:**
   - `libredb pulse [<db.ldb>] "<query>" [--cwd "<dir>" | --project "<dir>"] [--cid <id>] [--budget <tok>] [--err <msg>]`
+  - `libredb skeleton [<db.ldb>] <source_file...> [--filter <substr>] [--cwd "<dir>" | --project "<dir>"] [--cid <id>] [--force] [--json]`
   - `libredb locate [<db.ldb>] <symbol...> [--cwd "<dir>" | --project "<dir>"] [--json]`
   - `libredb impact [<db.ldb>] <symbol...> [--cwd "<dir>" | --project "<dir>"] [--json]`
+  - `libredb fim [<db.ldb>] [<source_file[:line]>] [--symbol <name> | --line <n>] [--pad <lines>] [--cwd "<dir>" | --project "<dir>"] [--json]`
+  - `libredb grep | search "<pattern>" [<path>] [--cwd "<dir>" | --project "<dir>"] [-i] [-F] [-w] [-C <lines>] [--ext <e1,e2>] [-m <max>] [--no-symbols] [--json]`
   - `libredb slice-skill "<query>" [--skill <skill_name>] [--top <k>] [--json]`
   - `libredb get-skill [<skill_name>] [--section "<Section Title>" | --query "<query>" [--top <k>]] [--json]`
 - **Learning observability & verification:** `libredb learning [<db.ldb>] [--verify] [--cwd "<dir>" | --project "<dir>"] [--db <db.ldb>] [--top <n>] [--json]`
@@ -435,6 +451,8 @@ if stat.S_ISLNK(st.st_mode):
 with open(p, "r", encoding="utf-8") as f:
     cfg = json.load(f)
 if isinstance(cfg.get("plugins"), dict):
+    if cfg.get("plugins", {}).get("libredb", {}).get("enabled") is True:
+        sys.exit(0)
     cfg["plugins"].setdefault("libredb", {})["enabled"] = True
     d = os.path.dirname(os.path.abspath(p))
     fd, tmp_p = tempfile.mkstemp(prefix=".config.json.tmp.", dir=d)

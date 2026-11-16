@@ -81,6 +81,84 @@ foreach ($PathDir in $TargetPathDirs) {
     }
 }
 
+function Find-LocalRipgrep {
+    param([string]$HostArch)
+    $StaticPatterns = @(
+        (Join-Path $UserHome ".cargo\bin\rg.exe"),
+        (Join-Path $UserHome "scoop\apps\ripgrep\current\rg.exe"),
+        (Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Packages\BurntSushi.ripgrep*\*\rg.exe"),
+        (Join-Path $env:ProgramFiles "ripgrep*\rg.exe"),
+        (Join-Path $env:ProgramFiles "Git\usr\bin\rg.exe"),
+        (Join-Path $env:LOCALAPPDATA "Programs\Microsoft VS Code*\resources\app\node_modules*\@vscode\ripgrep\bin\rg.exe"),
+        (Join-Path $env:ProgramFiles "Microsoft VS Code*\resources\app\node_modules*\@vscode\ripgrep\bin\rg.exe"),
+        (Join-Path $env:LOCALAPPDATA "Programs\antigravity*\resources\app\node_modules*\@vscode\ripgrep\bin\rg.exe")
+    )
+    $Candidates = [System.Collections.Generic.List[string]]::new()
+    foreach ($Pat in $StaticPatterns) {
+        if (-not $Pat) { continue }
+        Get-Item -Path $Pat -ErrorAction SilentlyContinue | ForEach-Object { [void]$Candidates.Add($_.FullName) }
+    }
+    $VsRoot = Join-Path $env:ProgramFiles "Microsoft Visual Studio"
+    if (Test-Path $VsRoot) {
+        Get-ChildItem -Path $VsRoot -Filter "rg.exe" -Recurse -ErrorAction SilentlyContinue |
+            Sort-Object { if ($_.FullName -match $HostArch) { 0 } else { 1 } } |
+            ForEach-Object { [void]$Candidates.Add($_.FullName) }
+    }
+    foreach ($Cand in $Candidates) {
+        if ($HostArch -eq "x64" -and $Cand -match '(^|[\\/])(win32-)?arm64([\\/]|$)') { continue }
+        if ($HostArch -eq "arm64" -and $Cand -match '(^|[\\/])(win32-)?(x64|x86|amd64|ia32)([\\/]|$)') { continue }
+        try {
+            $Ver = (& $Cand --version 2>$null | Select-Object -First 1)
+            if ($LASTEXITCODE -eq 0 -and $Ver -match '^ripgrep\s') {
+                return $Cand
+            }
+        } catch {
+        }
+    }
+    return $null
+}
+
+$script:ProvisionedRg = $null
+
+function Ensure-RipgrepOnPath {
+    param([string]$DefaultBinDir)
+    $ExistingRg = Get-Command rg -ErrorAction SilentlyContinue
+    if ($ExistingRg -and $ExistingRg.Source) {
+        try {
+            $Ver = (& $ExistingRg.Source --version 2>$null | Select-Object -First 1)
+            if ($LASTEXITCODE -eq 0 -and $Ver -match '^ripgrep\s') {
+                $script:ProvisionedRg = $ExistingRg.Source
+                Write-Output "[OK] Native ripgrep (rg) available on PATH: $($ExistingRg.Source)"
+                return
+            }
+        } catch {
+        }
+    }
+    $ArchRaw = if ($env:PROCESSOR_ARCHITECTURE) { $env:PROCESSOR_ARCHITECTURE.ToUpperInvariant() } else { "AMD64" }
+    $HostArch = if ($ArchRaw -eq "ARM64") { "arm64" } else { "x64" }
+    $FoundRg = Find-LocalRipgrep -HostArch $HostArch
+    if ((-not $FoundRg) -and (Get-Command winget -ErrorAction SilentlyContinue)) {
+        Write-Output "[INFO] ripgrep (rg.exe) not found locally; trying winget user install..."
+        try {
+            & winget install --id BurntSushi.ripgrep.MSVC --exact --silent --accept-package-agreements --accept-source-agreements --scope user --disable-interactivity 2>$null | Out-Null
+            $FoundRg = Find-LocalRipgrep -HostArch $HostArch
+        } catch {
+        }
+    }
+    if ($FoundRg) {
+        $DstRg = Join-Path $DefaultBinDir "rg.exe"
+        if (-not $FoundRg.Equals($DstRg, [System.StringComparison]::OrdinalIgnoreCase)) {
+            Install-BinaryHotSafe -Src $FoundRg -Dst $DstRg
+        }
+        $script:ProvisionedRg = $DstRg
+        Write-Output "[OK] Provisioned native ripgrep (rg.exe) into PATH at: $DstRg"
+        return
+    }
+    Write-Output "[INFO] ripgrep (rg.exe) not found locally and winget install unavailable."
+}
+
+Ensure-RipgrepOnPath -DefaultBinDir $DefaultAgyBin
+
 # Seed ~/.gemini/libredb/customizations.ldb cleanly when absent.
 $GlobalLdb = Join-Path $LibreHome "customizations.ldb"
 if (-not (Test-Path $GlobalLdb)) {
@@ -180,6 +258,9 @@ if ($null -eq $VerifiedHookCmd) {
                 if (Test-SafeBinaryAcl -CheckPath $DriveHookDir) {
                     $DriveHookExe = Join-Path $DriveHookDir "libredb.exe"
                     Install-BinaryHotSafe -Src $ReleaseExe -Dst $DriveHookExe
+                    if ($ProvisionedRg -and (Test-Path $ProvisionedRg)) {
+                        Install-BinaryHotSafe -Src $ProvisionedRg -Dst (Join-Path $DriveHookDir "rg.exe")
+                    }
                     $FormattedCmd = if ($DriveHookExe.Contains(' ')) { '"' + $DriveHookExe + '"' } else { $DriveHookExe }
                     $ProbeOut = "{}" | & $env:ComSpec /c "$FormattedCmd hook-pre-invocation" 2>$null
                     if ($LASTEXITCODE -eq 0 -and ($ProbeOut -join "") -match "injectSteps") {
@@ -344,12 +425,13 @@ description: >-
 1. **`libredb_pulse`** (`query`, `cwd`, `cid`, `budget`, `error`):
    - Retrieves relevant rules, micro-skills, decisions, facts, tasks, snapshots, and symbols across global + workspace layers within `budget` tokens.
    - Always pass `cid` (Conversation ID) and `cwd` so RAM-first `Zero-Repeat Delta` suppresses already-delivered items (`0` disk I/O reads on Turn 2+) and automatically re-hydrates after `/compact`.
-2. **`libredb_code`** (`action`: `"index"` | `"skeleton"` | `"locate"` | `"impact"` | `"fim"` | `"savings"`, `target`, `files`, `symbols`, `slices`, `cwd`, `cid`, `force`, `symbol`, `line`, `pad`, `format`, `days`):
+2. **`libredb_code`** (`action`: `"index"` | `"skeleton"` | `"locate"` | `"impact"` | `"fim"` | `"grep"` | `"savings"`, `target`, `files`, `symbols`, `slices`, `cwd`, `subpath`, `cid`, `force`, `symbol`, `line`, `pad`, `ignore_case`, `fixed_strings`, `word_boundary`, `context`, `max_matches`, `extensions`, `format`, `days`):
    - `"index"`: Incrementally scans non-binary source files in `target` (`< 3 ms` warm stat+hash fast path), wiring `Calls` (including Dalvik/Smali descriptors & `1..2`-char R8 methods) and `Decision -> Governs -> Symbol` synapses.
    - `"skeleton"`: Returns a `92-99%` compressed `[Lstart-Lend]` contract map of a single `target` file or multi-file batch (`files: [...]`) across 25+ languages and `< 5 us` topology-inferred extensionless files with session-aware `[Zero-Repeat Skeleton]` deduplication (`cid`).
    - `"locate"`: Returns `< 0.5 ms` 1-line `[Lstart-Lend]` symbol locations for a single `target` or batched `symbols: [...]` (`<= 64`) without full caller/callee edge traversal.
    - `"impact"`: Returns compact (`-70%` token) bidirectional callers, DI/interface implementors, callees, and governing architectural decisions for a single `target` or batched `symbols: [...]` (`<= 64`, `format="json"` for raw JSON).
-   - `"fim"`: Returns surgical `[Lstart-Lend]` edit slices with blast-radius callers, implementors, and governing decisions attached for a single `target` or batched `slices: [{"target": "...", "symbol": "...", "line": 42, "pad": 12}]` / `symbols: [...]` (`<= 32` slices, deduplicating file baseline tokens).
+   - `"fim"`: Returns surgical `[Lstart-Lend]` edit slices with blast-radius callers, implementors, and governing decisions attached for a file `target` (including `<path>:<line>` syntax), file-less workspace `symbol`/`symbols` lookup, or batched `slices` (`<= 32`).
+   - `"grep"`: Pure-Rust `.gitignore`-aware, credential/binary-safe workspace text and pattern search annotated with enclosing `[kind name Lstart-Lend]` contracts (optional `subpath`, `ignore_case`, `fixed_strings`, `word_boundary`, `context`, `max_matches`, `extensions`).
    - `"savings"`: Returns an authorized workspace 3-tier token-consumption and savings report (`days=0` for today, `days <= 3660`).
 3. **`libredb_memorize`** (`cwd`, `cid`, `facts`, `decisions`, `tasks`, `snapshot`, `learn_assoc`, `learn_reflex`, `learn_error`):
    - Atomically commits workspace/chat facts, architectural decisions (auto-linked to symbols), tasks, milestone snapshots, language-agnostic Hebbian concept bridges, situational pitfall reflexes, or error-recovery directives.
@@ -358,8 +440,11 @@ description: >-
 
 - **Zero-boilerplate cognitive & code-graph queries:**
   - `libredb pulse [<db.ldb>] "<query>" [--cwd "<dir>" | --project "<dir>"] [--cid <id>] [--budget <tok>] [--err <msg>]`
+  - `libredb skeleton [<db.ldb>] <source_file...> [--filter <substr>] [--cwd "<dir>" | --project "<dir>"] [--cid <id>] [--force] [--json]`
   - `libredb locate [<db.ldb>] <symbol...> [--cwd "<dir>" | --project "<dir>"] [--json]`
   - `libredb impact [<db.ldb>] <symbol...> [--cwd "<dir>" | --project "<dir>"] [--json]`
+  - `libredb fim [<db.ldb>] [<source_file[:line]>] [--symbol <name> | --line <n>] [--pad <lines>] [--cwd "<dir>" | --project "<dir>"] [--json]`
+  - `libredb grep | search "<pattern>" [<path>] [--cwd "<dir>" | --project "<dir>"] [-i] [-F] [-w] [-C <lines>] [--ext <e1,e2>] [-m <max>] [--no-symbols] [--json]`
   - `libredb slice-skill "<query>" [--skill <skill_name>] [--top <k>] [--json]`
   - `libredb get-skill [<skill_name>] [--section "<Section Title>" | --query "<query>" [--top <k>]] [--json]`
 - **Learning observability & verification:** `libredb learning [<db.ldb>] [--verify] [--cwd "<dir>" | --project "<dir>"] [--db <db.ldb>] [--top <n>] [--json]`
@@ -454,13 +539,19 @@ if (Test-Path $AgyConfigPath) {
     try {
         $CfgObj = Get-Content $AgyConfigPath -Raw | ConvertFrom-Json
         if ($null -ne $CfgObj.plugins) {
-            if ($null -eq $CfgObj.plugins.PSObject.Properties["libredb"]) {
-                $CfgObj.plugins | Add-Member -NotePropertyName "libredb" -NotePropertyValue ([PSCustomObject]@{ enabled = $true })
-            } else {
-                $CfgObj.plugins.libredb.enabled = $true
+            $AlreadyEnabled = $false
+            if ($null -ne $CfgObj.plugins.PSObject.Properties["libredb"]) {
+                $AlreadyEnabled = ($CfgObj.plugins.libredb.enabled -eq $true)
             }
-            $CfgJson = $CfgObj | ConvertTo-Json -Depth 20
-            [System.IO.File]::WriteAllText($AgyConfigPath, $CfgJson, $Utf8NoBom)
+            if (-not $AlreadyEnabled) {
+                if ($null -eq $CfgObj.plugins.PSObject.Properties["libredb"]) {
+                    $CfgObj.plugins | Add-Member -NotePropertyName "libredb" -NotePropertyValue ([PSCustomObject]@{ enabled = $true })
+                } else {
+                    $CfgObj.plugins.libredb.enabled = $true
+                }
+                $CfgJson = $CfgObj | ConvertTo-Json -Depth 20
+                [System.IO.File]::WriteAllText($AgyConfigPath, $CfgJson, $Utf8NoBom)
+            }
         }
     } catch {
         Write-Output "[WARN] Could not auto-update config.json plugin state: $_"
