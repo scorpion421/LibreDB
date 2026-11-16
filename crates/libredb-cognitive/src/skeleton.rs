@@ -10,9 +10,9 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 pub const SKELETON_KEY_PREFIX: &str = "skeleton::";
-/// Content-hash seed bumped whenever `FileSkeleton` extraction semantics upgrade (full Dalvik
-/// package/class paths and member descriptors in v1.1.1).
-pub const SKELETON_HASH_SEED: u8 = 111;
+/// Content-hash seed bumped whenever `FileSkeleton` extraction semantics upgrade (inline `mod`
+/// container and test-attribute tracking in v2.2.0).
+pub const SKELETON_HASH_SEED: u8 = 112;
 /// Hard safety cap (`16 MiB`) for individual source files read by `skeleton` and `fim` so oversized
 /// or special files cannot trigger unbounded memory allocations.
 pub const MAX_SKELETON_FILE_BYTES: u64 = 16 * 1024 * 1024;
@@ -1850,6 +1850,7 @@ fn extract_shell_symbols(lines: &[&str], total_lines: usize) -> Vec<SymbolContra
 fn extract_brace_symbols(lines: &[&str], total_lines: usize, lang: &str) -> Vec<SymbolContract> {
     let mut out: Vec<SymbolContract> = Vec::new();
     let mut pending_doc = String::new();
+    let mut pending_test_attr = false;
     // Active container stack: `(container_type_name, container_kind, end_line, indent)`
     let mut container_stack: Vec<(String, String, usize, usize)> = Vec::new();
     let mut active_callable_end: usize = 0;
@@ -1865,6 +1866,21 @@ fn extract_brace_symbols(lines: &[&str], total_lines: usize, lang: &str) -> Vec<
             }
             continue;
         }
+        if matches!(trimmed, "[Fact]" | "[Theory]" | "[Test]" | "[TestMethod]") {
+            pending_test_attr = true;
+            continue;
+        }
+        if trimmed == "#[test]"
+            || trimmed.ends_with("::test]")
+            || trimmed.starts_with("#[test_case(")
+            || trimmed == "#[rstest]"
+            || trimmed == "@Test"
+            || trimmed.starts_with("@Test(")
+            || trimmed == "@ParameterizedTest"
+        {
+            pending_test_attr = true;
+            continue;
+        }
         if trimmed.starts_with("#[")
             || trimmed.starts_with("#!")
             || trimmed.starts_with("//")
@@ -1878,6 +1894,7 @@ fn extract_brace_symbols(lines: &[&str], total_lines: usize, lang: &str) -> Vec<
         }
         if trimmed.is_empty() {
             pending_doc.clear();
+            pending_test_attr = false;
             continue;
         }
 
@@ -1912,6 +1929,7 @@ fn extract_brace_symbols(lines: &[&str], total_lines: usize, lang: &str) -> Vec<
             )
         {
             pending_doc.clear();
+            pending_test_attr = false;
             continue;
         }
 
@@ -2023,8 +2041,11 @@ fn extract_brace_symbols(lines: &[&str], total_lines: usize, lang: &str) -> Vec<
                             | "extension"
                             | "protocol"
                             | "record"
+                            | "mod"
                     ) {
-                        supertypes = extract_brace_supertypes(sig_head, &name);
+                        if kind != "mod" {
+                            supertypes = extract_brace_supertypes(sig_head, &name);
+                        }
                         if end_line > start_line {
                             container_stack.push((
                                 name.clone(),
@@ -2041,6 +2062,16 @@ fn extract_brace_symbols(lines: &[&str], total_lines: usize, lang: &str) -> Vec<
                         active_callable_end = end_line;
                     }
 
+                    if pending_test_attr
+                        && container.is_none()
+                        && matches!(
+                            kind.as_str(),
+                            "fn" | "fun" | "func" | "function" | "method"
+                        )
+                    {
+                        container = Some("tests".to_owned());
+                    }
+
                     out.push(SymbolContract {
                         kind,
                         name,
@@ -2055,11 +2086,13 @@ fn extract_brace_symbols(lines: &[&str], total_lines: usize, lang: &str) -> Vec<
                         body_tokens: Vec::new(),
                     });
                     pending_doc.clear();
+                    pending_test_attr = false;
                     continue;
                 }
             }
         }
         pending_doc.clear();
+        pending_test_attr = false;
     }
 
     out
@@ -2082,6 +2115,7 @@ fn starts_with_decl_keyword(trimmed: &str) -> bool {
             | "struct"
             | "enum"
             | "trait"
+            | "mod"
             | "impl"
             | "class"
             | "interface"
@@ -2486,6 +2520,7 @@ fn match_brace_declaration(
         "struct ",
         "enum ",
         "trait ",
+        "mod ",
         "impl ",
         "impl<",
         "class ",
@@ -2498,6 +2533,9 @@ fn match_brace_declaration(
         "type ",
     ] {
         if let Some(rest) = s.strip_prefix(kw) {
+            if kw == "mod " && !full_sig.contains('{') {
+                continue;
+            }
             let clean_kw = kw.trim_end_matches('<').trim().to_owned();
             let mut explicit_container: Option<String> = None;
             let target = if kw == "impl<" {

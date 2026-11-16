@@ -146,11 +146,17 @@ pub struct SymbolImpactReport {
     pub node_id: u64,
     pub symbol_key: String,
     pub contract: String,
-    /// Total incoming caller count before output bounding.
+    /// Total incoming production caller count before output bounding.
     #[serde(default)]
     pub total_callers: usize,
-    /// Symbols in the workspace that call or reference this symbol (bounded for context hygiene).
+    /// Symbols in production code that call or reference this symbol (bounded for context hygiene).
     pub callers: Vec<String>,
+    /// Total incoming test caller / co-changed test file count before output bounding.
+    #[serde(default)]
+    pub total_related_tests: usize,
+    /// Test symbols or co-changed test files covering this symbol so callers never drown tests.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub related_tests: Vec<String>,
     /// Concrete types or methods that implement, extend, or override this interface/trait/method.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub implementors: Vec<String>,
@@ -179,6 +185,9 @@ pub struct FimSliceBundle {
     pub total_file_lines: usize,
     pub slice_text: String,
     pub callers: Vec<String>,
+    /// Test symbols or co-changed test files covering the target symbol.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub related_tests: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub implementors: Vec<String>,
     pub governing_decisions: Vec<String>,
@@ -220,6 +229,12 @@ impl FimSliceBundle {
             out.push_str(&format!("Blast-Radius Callers ({}):\n", self.callers.len()));
             for c in self.callers.iter().take(10) {
                 out.push_str(&format!("  <- {c}\n"));
+            }
+        }
+        if !self.related_tests.is_empty() {
+            out.push_str(&format!("Related tests ({}):\n", self.related_tests.len()));
+            for t in self.related_tests.iter().take(6) {
+                out.push_str(&format!("  [test] {}\n", compact_contract_ref(t)));
             }
         }
         out.push_str("--- Code Window ---\n");
@@ -1274,7 +1289,7 @@ pub fn index_workspace_with_exclusions(
                     .filter_map(|(offset, &ln)| {
                         let line_no = start_i + offset + 1;
                         let in_child = skel.symbols.iter().any(|other| {
-                            other.kind != "impl"
+                            !matches!(other.kind.as_str(), "impl" | "mod")
                                 && other.start_line > sym.start_line
                                 && other.end_line <= sym.end_line
                                 && line_no >= other.start_line
@@ -2267,6 +2282,18 @@ pub fn format_impact_compact(symbol_query: &str, reports: &[SymbolImpactReport])
                 out.push_str(&format!("    -> {}\n", compact_contract_ref(c)));
             }
         }
+        if !rep.related_tests.is_empty() {
+            let shown = rep.related_tests.len().min(6);
+            let total_t = rep.total_related_tests.max(rep.related_tests.len());
+            if total_t > shown {
+                out.push_str(&format!("  Related tests ({total_t} total, top {shown}):\n"));
+            } else {
+                out.push_str(&format!("  Related tests ({total_t}):\n"));
+            }
+            for t in rep.related_tests.iter().take(shown) {
+                out.push_str(&format!("    [test] {}\n", compact_contract_ref(t)));
+            }
+        }
         if !rep.co_changed_files.is_empty() {
             out.push_str(&format!(
                 "  Co-changed files (git Lift) ({}):\n",
@@ -2450,10 +2477,26 @@ pub fn query_symbol_impact(db: &LibreDb, symbol_query: &str) -> Result<Vec<Symbo
             }
         }
 
-        let total_callers = caller_ids.len();
-        caller_ids.truncate(MAX_SERIALIZED_CALLERS);
-        let (caller_recs, _) = db.get_many_coalesced(&caller_ids)?;
+        let (prod_ids, test_ids): (Vec<u64>, Vec<u64>) = caller_ids
+            .into_iter()
+            .partition(|cid| {
+                !full_key_by_id
+                    .get(cid)
+                    .is_some_and(|k| is_test_symbol_key(k))
+            });
+
+        let total_callers = prod_ids.len();
+        let bounded_prod: Vec<u64> = prod_ids.into_iter().take(MAX_SERIALIZED_CALLERS).collect();
+        let (caller_recs, _) = db.get_many_coalesced(&bounded_prod)?;
         let callers: Vec<String> = caller_recs
+            .into_iter()
+            .map(|r| String::from_utf8_lossy(&r.payload).into_owned())
+            .collect();
+
+        let mut total_related_tests = test_ids.len();
+        let bounded_tests: Vec<u64> = test_ids.into_iter().take(8).collect();
+        let (test_recs, _) = db.get_many_coalesced(&bounded_tests)?;
+        let mut related_tests: Vec<String> = test_recs
             .into_iter()
             .map(|r| String::from_utf8_lossy(&r.payload).into_owned())
             .collect();
@@ -2503,13 +2546,24 @@ pub fn query_symbol_impact(db: &LibreDb, symbol_query: &str) -> Result<Vec<Symbo
                 for p in partners.iter().take(3) {
                     let p_prefix = format!("{} ::", p.rel_path);
                     let already_linked = callers.iter().any(|c| c.starts_with(&p_prefix))
+                        || related_tests.iter().any(|t| t.starts_with(&p_prefix))
                         || callees.iter().any(|c| c.starts_with(&p_prefix))
                         || implementors.iter().any(|c| c.starts_with(&p_prefix));
                     if !already_linked {
-                        co_changed_files.push(format!(
-                            "{} ({}%, {}/{} commits)",
-                            p.rel_path, p.confidence_pct, p.shared_commits, p.source_commits
-                        ));
+                        if is_test_file_path(&p.rel_path) {
+                            total_related_tests += 1;
+                            if related_tests.len() < 8 {
+                                related_tests.push(format!(
+                                    "{} (co-changed {}%, {}/{} commits)",
+                                    p.rel_path, p.confidence_pct, p.shared_commits, p.source_commits
+                                ));
+                            }
+                        } else {
+                            co_changed_files.push(format!(
+                                "{} ({}%, {}/{} commits)",
+                                p.rel_path, p.confidence_pct, p.shared_commits, p.source_commits
+                            ));
+                        }
                     }
                 }
             }
@@ -2523,6 +2577,8 @@ pub fn query_symbol_impact(db: &LibreDb, symbol_query: &str) -> Result<Vec<Symbo
             contract,
             total_callers,
             callers,
+            total_related_tests,
+            related_tests,
             implementors,
             total_callees,
             callees,
@@ -2533,6 +2589,53 @@ pub fn query_symbol_impact(db: &LibreDb, symbol_query: &str) -> Result<Vec<Symbo
     }
 
     Ok(reports)
+}
+
+fn is_test_file_path(file_part: &str) -> bool {
+    let low = file_part.replace('\\', "/").to_ascii_lowercase();
+    let fname = low.rsplit('/').next().unwrap_or(low.as_str());
+    low.starts_with("tests/")
+        || low.starts_with("test/")
+        || low.contains("/tests/")
+        || low.contains("/test/")
+        || low.contains("/__tests__/")
+        || fname == "tests.rs"
+        || fname == "test.rs"
+        || fname.ends_with("_test.rs")
+        || fname.ends_with("_tests.rs")
+        || fname.ends_with("_test.go")
+        || fname.ends_with("_test.py")
+        || (fname.starts_with("test_") && fname.ends_with(".py"))
+        || fname.ends_with(".test.ts")
+        || fname.ends_with(".test.tsx")
+        || fname.ends_with(".test.js")
+        || fname.ends_with(".test.jsx")
+        || fname.ends_with(".spec.ts")
+        || fname.ends_with(".spec.tsx")
+        || fname.ends_with(".spec.js")
+        || fname.ends_with("test.java")
+        || fname.ends_with("tests.java")
+        || fname.ends_with("tests.cs")
+        || fname.ends_with("test.kt")
+        || fname.ends_with("tests.kt")
+}
+
+fn is_test_symbol_key(full_key: &str) -> bool {
+    let Some((file_part, raw_sym_part)) = full_key.split_once("::") else {
+        return is_test_file_path(full_key);
+    };
+    if is_test_file_path(file_part) {
+        return true;
+    }
+    let sym_low = raw_sym_part.to_ascii_lowercase();
+    sym_low.starts_with("tests::")
+        || sym_low.starts_with("test::")
+        || sym_low.contains("::tests::")
+        || sym_low.contains("::test::")
+        || sym_low
+            .rsplit("::")
+            .next()
+            .is_some_and(|leaf| leaf.starts_with("test_"))
 }
 
 fn clean_sym_key_ref(s: &str) -> &str {
@@ -2655,6 +2758,7 @@ pub fn extract_fim_slice(
     }
 
     let mut callers = Vec::new();
+    let mut related_tests = Vec::new();
     let mut implementors = Vec::new();
     let mut governing = Vec::new();
     let mut known_pitfalls = Vec::new();
@@ -2667,6 +2771,7 @@ pub fn extract_fim_slice(
                 .or_else(|| impacts.into_iter().next());
             if let Some(first) = best {
                 callers = first.callers;
+                related_tests = first.related_tests;
                 implementors = first.implementors;
                 governing = first.governing_decisions;
                 known_pitfalls = first.known_pitfalls;
@@ -2715,6 +2820,7 @@ pub fn extract_fim_slice(
         total_file_lines: total_lines,
         slice_text: numbered,
         callers,
+        related_tests,
         implementors,
         governing_decisions: governing,
         known_pitfalls,
@@ -3730,7 +3836,7 @@ pub(crate) fn compute_file_symbol_keys(rel_path: &str, skel: &FileSkeleton) -> V
     let mut out = Vec::with_capacity(skel.symbols.len());
     let mut seen_keys: HashSet<String> = HashSet::with_capacity(skel.symbols.len());
     for (idx, sym) in skel.symbols.iter().enumerate() {
-        if sym.kind == "impl" {
+        if matches!(sym.kind.as_str(), "impl" | "mod") {
             continue;
         }
         let qname = sym.qualified_name();
@@ -4639,6 +4745,88 @@ public sealed class SqlOrderRepository(IDbConnection db) : BaseRepository, IOrde
         // Path traversal outside workspace MUST fail closed
         assert!(grep_workspace(&tmp, Some(Path::new("..")), "verify_token", None, &WorkspaceGrepOptions::default()).is_err());
 
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn impact_and_fim_separate_related_tests_even_when_production_callers_exceed_cap() {
+        let tmp = std::env::temp_dir().join(format!(
+            "libredb_rel_tests_{}_{}",
+            std::process::id(),
+            current_unix_ns()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("src")).unwrap();
+        std::fs::create_dir_all(tmp.join("tests")).unwrap();
+        std::fs::create_dir_all(tmp.join(".agents")).unwrap();
+
+        std::fs::write(
+            tmp.join("src").join("target.rs"),
+            "pub fn core_gate() -> bool {\n    true\n}\n",
+        )
+        .unwrap();
+        let mut prod_src = String::new();
+        for idx in 0..25 {
+            prod_src.push_str(&format!(
+                "pub fn prod_caller_{idx:02}() -> bool {{\n    core_gate()\n}}\n"
+            ));
+        }
+        std::fs::write(tmp.join("src").join("prod.rs"), prod_src).unwrap();
+        std::fs::write(
+            tmp.join("src").join("inline_unit.rs"),
+            "#[cfg(test)]\nmod tests {\n    #[test]\n    fn inline_gate_behaves_properly() {\n        assert!(core_gate());\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.join("src").join("top_attr.rs"),
+            "#[test]\nfn standalone_attr_smoke() {\n    assert!(core_gate());\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.join("tests").join("e2e_auth.rs"),
+            "#[test]\nfn e2e_gate_smoke() {\n    assert!(core_gate());\n}\n",
+        )
+        .unwrap();
+
+        let db = LibreDb::open(tmp.join(".agents").join("memory.ldb")).unwrap();
+        index_workspace(&db, &tmp, false).unwrap();
+
+        let impacts = query_symbol_impact(&db, "core_gate").unwrap();
+        assert_eq!(impacts.len(), 1);
+        let rep = &impacts[0];
+        assert_eq!(rep.total_callers, 25);
+        assert_eq!(rep.callers.len(), 20);
+        assert_eq!(rep.total_related_tests, 3);
+        assert_eq!(rep.related_tests.len(), 3);
+        let rt_joined = rep.related_tests.join("\n");
+        assert!(
+            rt_joined.contains("tests/e2e_auth.rs")
+                && rt_joined.contains("tests::inline_gate_behaves_properly")
+                && rt_joined.contains("tests::standalone_attr_smoke"),
+            "Integration, inline mod tests, and #[test]-attributed callers must all surface in related_tests: {rt_joined}"
+        );
+        let imp_compact = format_impact_compact("core_gate", &impacts);
+        assert!(
+            imp_compact.contains("Related tests (3):") && imp_compact.contains("[test] "),
+            "Compact impact output must include Related tests block: {imp_compact}"
+        );
+
+        let bundle = extract_fim_slice(
+            &db,
+            &tmp.join("src").join("target.rs"),
+            Some("core_gate"),
+            None,
+            1,
+        )
+        .unwrap();
+        assert_eq!(bundle.related_tests.len(), 3);
+        assert!(
+            bundle.format_compact().contains("Related tests (3):"),
+            "FIM bundle must surface separated related_tests: {}",
+            bundle.format_compact()
+        );
+
+        drop(db);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] - 2026-11-16
+
+### Added
+- **Separated `related_tests` reporting in `impact` and `fim`**: Blast-radius lookups now split test callers and co-changed test files out from production callers before applying output caps, keeping affected integration and unit tests visible even for heavily called core functions.
+- **`PreToolUse` ambiguous multi-edit duplication guard**: File edits that would expand new function or test declarations (or large brace-closing blocks) across multiple matching anchors in one file are now blocked before writing, reporting the exact colliding line numbers while still allowing benign multi-site renames.
+- **Version-pinned `IPC` hook endpoints and handshake (`libredb mcp-serve`)**: Lifecycle hook `IPC` endpoints and wire messages are now bound to the exact binary version, isolating newly deployed hooks from older `mcp-serve` processes still running in memory so upgrades fall back cleanly to disk without cross-version side effects.
+
 ## [2.1.1] - 2026-11-16
 
 ### Added

@@ -1164,7 +1164,7 @@ pub(crate) fn diff_symbol_bodies(
 
     let mut old_groups: HashMap<String, Vec<&SymbolContract>> = HashMap::new();
     for s in &old_skel.symbols {
-        if s.kind == "impl" {
+        if matches!(s.kind.as_str(), "impl" | "mod") {
             continue;
         }
         old_groups.entry(s.qualified_name()).or_default().push(s);

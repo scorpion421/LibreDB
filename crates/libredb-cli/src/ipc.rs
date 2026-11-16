@@ -71,15 +71,21 @@ fn effective_global_ldb_path(global_ldb_opt: Option<&Path>) -> PathBuf {
     }
 }
 
-/// Computes the deterministic 24-hex endpoint identifier bound to `customizations.ldb`.
-pub fn control_plane_endpoint_id(global_ldb_opt: Option<&Path>) -> String {
+fn control_plane_endpoint_id_for_version(global_ldb_opt: Option<&Path>, pkg_version: &str) -> String {
     let abs = effective_global_ldb_path(global_ldb_opt);
     let norm = crate::security::normalize_workspace_key(&abs);
     let mut h = Sha256::new();
-    h.update(b"LibreDB::ControlPlaneIpc::v1\0");
+    h.update(b"LibreDB::ControlPlaneIpc::v2\0");
+    h.update(pkg_version.as_bytes());
+    h.update(b"\0");
     h.update(norm.as_bytes());
     let digest = h.finalize();
     hex_encode_lower(&digest[..12])
+}
+
+/// Computes the deterministic version-bound 24-hex endpoint identifier tied to `customizations.ldb`.
+pub fn control_plane_endpoint_id(global_ldb_opt: Option<&Path>) -> String {
+    control_plane_endpoint_id_for_version(global_ldb_opt, env!("CARGO_PKG_VERSION"))
 }
 
 #[cfg(windows)]
@@ -162,6 +168,10 @@ fn handle_ipc_line(
     let Ok(req) = serde_json::from_str::<Value>(raw_line.trim()) else {
         return json!({ "ok": false, "fallback": true });
     };
+    // Pin live in-RAM IPC responses to the exact binary version so hooks fall back cleanly during upgrades.
+    if req.get("ver").and_then(Value::as_str) != Some(env!("CARGO_PKG_VERSION")) {
+        return json!({ "ok": false, "fallback": true });
+    }
     let op = req.get("op").and_then(Value::as_str).unwrap_or("");
     let payload = req.get("payload").unwrap_or(&Value::Null);
     let req_gdb = req
@@ -189,13 +199,13 @@ fn handle_ipc_line(
         "pre_tool" => {
             let response = evaluate_pre_tool_payload_with_ram_state(payload, eff_gdb, &mut st);
             served_count.fetch_add(1, Ordering::AcqRel);
-            json!({ "ok": true, "response": response })
+            json!({ "ok": true, "ver": env!("CARGO_PKG_VERSION"), "response": response })
         }
         "pre_invocation" => {
             match evaluate_pre_invocation_payload_with_ram_state(payload, eff_gdb, &mut st) {
                 Ok(response) => {
                     served_count.fetch_add(1, Ordering::AcqRel);
-                    json!({ "ok": true, "response": response })
+                    json!({ "ok": true, "ver": env!("CARGO_PKG_VERSION"), "response": response })
                 }
                 Err(_) => json!({ "ok": false, "fallback": true }),
             }
@@ -239,7 +249,9 @@ fn exchange_client_line<R: io::Read, W: io::Write>(
         BoundedLineRead::Oversized | BoundedLineRead::Eof => return None,
     };
     let resp: Value = serde_json::from_str(line.trim()).ok()?;
-    if resp.get("ok").and_then(Value::as_bool) == Some(true) {
+    if resp.get("ok").and_then(Value::as_bool) == Some(true)
+        && resp.get("ver").and_then(Value::as_str) == Some(env!("CARGO_PKG_VERSION"))
+    {
         resp.get("response").cloned()
     } else {
         None
@@ -760,6 +772,7 @@ impl Drop for McpIpcServer {
 /// back seamlessly to direct in-process `.ldb` evaluation.
 pub fn try_invoke_ipc_hook(op: &str, global_ldb_opt: Option<&Path>, payload: &Value) -> Option<Value> {
     let req = json!({
+        "ver": env!("CARGO_PKG_VERSION"),
         "op": op,
         "global_ldb": global_ldb_opt.map(|p| p.to_string_lossy().into_owned()),
         "payload": payload,
@@ -830,22 +843,42 @@ mod tests {
         assert!(ok_resp.get("injectSteps").is_some());
         assert_eq!(srv.served_count(), 1);
 
-        // Passing a foreign global_ldb path on the wire must fail closed without invoking hooks.
+        // Passing a foreign global_ldb path or mismatched binary version on the wire must fail closed.
         let spoofed_gdb = base_target.join("evil_customizations.ldb");
         let rejected = handle_ipc_line(
             &serde_json::to_string(&json!({
+                "ver": env!("CARGO_PKG_VERSION"),
                 "op": "pre_invocation",
                 "global_ldb": spoofed_gdb.to_string_lossy(),
                 "payload": payload,
             }))
             .unwrap(),
-            &Some(gdb_path),
+            &Some(gdb_path.clone()),
             &state,
             &srv.served_count,
         );
         assert_eq!(rejected.get("ok").and_then(Value::as_bool), Some(false));
         assert_eq!(rejected.get("fallback").and_then(Value::as_bool), Some(true));
+
+        let stale_ver = handle_ipc_line(
+            &serde_json::to_string(&json!({
+                "ver": "0.0.0-stale",
+                "op": "pre_invocation",
+                "global_ldb": gdb_path.to_string_lossy(),
+                "payload": payload,
+            }))
+            .unwrap(),
+            &Some(gdb_path.clone()),
+            &state,
+            &srv.served_count,
+        );
+        assert_eq!(stale_ver.get("ok").and_then(Value::as_bool), Some(false));
+        assert_eq!(stale_ver.get("fallback").and_then(Value::as_bool), Some(true));
         assert_eq!(srv.served_count(), 1);
+        assert_ne!(
+            control_plane_endpoint_id_for_version(Some(&gdb_path), "2.1.1"),
+            control_plane_endpoint_id(Some(&gdb_path))
+        );
 
         drop(srv);
         drop(state);

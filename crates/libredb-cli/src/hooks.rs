@@ -390,6 +390,24 @@ fn evaluate_pre_tool_payload_inner(
                     "reason": format!("LibreDB Control-Plane Guardrail Blocked Write: {reason}")
                 });
             }
+            if crate::security::load_bool_config(
+                global_db_ro.as_deref(),
+                proj_db_ro,
+                "guardrail:multi_edit_guard",
+                true,
+            ) {
+                if let Some(reason) = check_ambiguous_multi_edit_hazard(
+                    Path::new(target_file),
+                    target_file,
+                    tool_name,
+                    &args,
+                ) {
+                    return json!({
+                        "decision": "deny",
+                        "reason": reason
+                    });
+                }
+            }
         }
 
         if !is_test_or_scratch_path(target_file) {
@@ -1560,6 +1578,272 @@ fn collect_git_telemetry_line(root: &Path) -> Option<String> {
 
 const MAX_SIMULATED_SOURCE_BYTES: u64 = 4 * 1024 * 1024;
 
+fn align_replacement_line_endings(
+    cur: &str,
+    file_uses_crlf: bool,
+    target_raw: &str,
+    repl_raw: &str,
+) -> Option<(String, String)> {
+    if target_raw.is_empty() {
+        return None;
+    }
+    if cur.contains(target_raw) {
+        Some((target_raw.to_owned(), repl_raw.to_owned()))
+    } else if file_uses_crlf && !target_raw.contains("\r\n") && target_raw.contains('\n') {
+        let t = target_raw.replace('\n', "\r\n");
+        let r = if repl_raw.contains("\r\n") {
+            repl_raw.to_owned()
+        } else {
+            repl_raw.replace('\n', "\r\n")
+        };
+        Some((t, r))
+    } else if !file_uses_crlf && target_raw.contains("\r\n") {
+        Some((
+            target_raw.replace("\r\n", "\n"),
+            repl_raw.replace("\r\n", "\n"),
+        ))
+    } else {
+        None
+    }
+}
+
+fn line_window_byte_range(
+    cur: &str,
+    start_line: Option<usize>,
+    end_line: Option<usize>,
+) -> Option<(usize, usize)> {
+    let (Some(sl), Some(el)) = (start_line, end_line) else {
+        return None;
+    };
+    if sl < 1 || el < sl {
+        return None;
+    }
+    let mut cur_line = 1usize;
+    let mut span_start: Option<usize> = if sl == 1 { Some(0) } else { None };
+    let mut span_end: Option<usize> = None;
+    for (idx, b) in cur.bytes().enumerate() {
+        if b == b'\n' {
+            if cur_line == el && span_end.is_none() {
+                span_end = Some(idx + 1);
+                break;
+            }
+            cur_line += 1;
+            if cur_line == sl && span_start.is_none() {
+                span_start = Some(idx + 1);
+            }
+        }
+    }
+    let s_idx = span_start.unwrap_or(0);
+    let e_idx = span_end.unwrap_or(cur.len()).max(s_idx);
+    Some((s_idx, e_idx))
+}
+
+fn is_symbol_or_test_decl_line(line: &str) -> bool {
+    let t = line.trim_start();
+    if t.is_empty() || t.starts_with("//") || t.starts_with("/*") || t.starts_with("# ") {
+        return false;
+    }
+    if t.starts_with("#[test]")
+        || t.starts_with("#[tokio::test")
+        || t.starts_with("#[rstest")
+    {
+        return true;
+    }
+    const DECL_PREFIXES: &[&str] = &[
+        "fn ",
+        "pub fn ",
+        "pub(crate) fn ",
+        "pub(super) fn ",
+        "async fn ",
+        "pub async fn ",
+        "struct ",
+        "pub struct ",
+        "pub(crate) struct ",
+        "enum ",
+        "pub enum ",
+        "trait ",
+        "pub trait ",
+        "impl ",
+        "impl<",
+        "mod ",
+        "pub mod ",
+        "def ",
+        "async def ",
+        "class ",
+        "function ",
+        "async function ",
+        "export function ",
+        "export async function ",
+        "export class ",
+        "func ",
+    ];
+    DECL_PREFIXES.iter().any(|p| t.starts_with(p))
+}
+
+fn check_multi_edit_pair(
+    cur: &str,
+    file_uses_crlf: bool,
+    display_file: &str,
+    target_raw: &str,
+    repl_raw: &str,
+    start_line: Option<usize>,
+    end_line: Option<usize>,
+) -> Option<String> {
+    let (target_eff, _) = align_replacement_line_endings(cur, file_uses_crlf, target_raw, repl_raw)?;
+    let (base_off, win_end) = line_window_byte_range(cur, start_line, end_line).unwrap_or((0, cur.len()));
+    let window = &cur[base_off..win_end];
+    let hit_offsets: Vec<usize> = window
+        .match_indices(&target_eff)
+        .map(|(rel, _)| base_off + rel)
+        .collect();
+    if hit_offsets.len() <= 1 {
+        return None;
+    }
+
+    let target_decls = target_raw
+        .lines()
+        .filter(|l| is_symbol_or_test_decl_line(l))
+        .count();
+    let repl_decls = repl_raw
+        .lines()
+        .filter(|l| is_symbol_or_test_decl_line(l))
+        .count();
+    let target_lines = target_raw.lines().count().max(1);
+    let repl_lines = repl_raw.lines().count();
+    let large_brace_append = repl_lines >= target_lines + 8
+        && target_lines <= 4
+        && target_raw.trim_end().ends_with('}');
+
+    if repl_decls > target_decls || large_brace_append {
+        let mut line_labels: Vec<String> = hit_offsets
+            .iter()
+            .take(8)
+            .map(|&off| {
+                let ln = cur[..off].bytes().filter(|&b| b == b'\n').count() + 1;
+                format!("L{ln}")
+            })
+            .collect();
+        if hit_offsets.len() > 8 {
+            line_labels.push("...".to_owned());
+        }
+        return Some(format!(
+            "LibreDB Ambiguous Multi-Edit Guard Blocked Write: Target matched {} locations in '{}' ({}) while Replacement introduces new symbol/test declarations or appends a large block onto a non-unique closing-brace anchor, which would duplicate code {} times. Include 1-2 unique surrounding lines in Target so the edit modifies only the intended site.",
+            hit_offsets.len(),
+            display_file,
+            line_labels.join(", "),
+            hit_offsets.len()
+        ));
+    }
+    None
+}
+
+fn check_ambiguous_multi_edit_hazard(
+    target_file: &Path,
+    display_file: &str,
+    tool_name: &str,
+    args: &Value,
+) -> Option<String> {
+    if !matches!(
+        tool_name,
+        "edit_file" | "replace_file_content" | "multi_replace_file_content"
+    ) {
+        return None;
+    }
+    let meta = std::fs::symlink_metadata(target_file).ok()?;
+    if meta.file_type().is_symlink() || !meta.is_file() || meta.len() > MAX_SIMULATED_SOURCE_BYTES
+    {
+        return None;
+    }
+    let raw_bytes = std::fs::read(target_file).ok()?;
+    let cur = std::str::from_utf8(&raw_bytes).ok()?;
+    let file_uses_crlf = cur.contains("\r\n");
+
+    if tool_name == "multi_replace_file_content" {
+        let chunks = args.get("ReplacementChunks")?.as_array()?;
+        for ch in chunks {
+            let allow_mult = ch
+                .get("AllowMultiple")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if !allow_mult {
+                continue;
+            }
+            let Some(target_str) = ch
+                .get("TargetContent")
+                .or_else(|| ch.get("Target"))
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            let Some(repl_str) = ch
+                .get("ReplacementContent")
+                .or_else(|| ch.get("Replacement"))
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            let sl = ch
+                .get("StartLine")
+                .and_then(Value::as_u64)
+                .map(|n| n as usize);
+            let el = ch
+                .get("EndLine")
+                .and_then(Value::as_u64)
+                .map(|n| n as usize);
+            if let Some(reason) = check_multi_edit_pair(
+                cur,
+                file_uses_crlf,
+                display_file,
+                target_str,
+                repl_str,
+                sl,
+                el,
+            ) {
+                return Some(reason);
+            }
+        }
+        return None;
+    }
+
+    let replace_all = tool_name == "edit_file"
+        || args
+            .get("AllowMultiple")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    if !replace_all {
+        return None;
+    }
+    let target_str = args
+        .get("Target")
+        .or_else(|| args.get("TargetContent"))
+        .or_else(|| args.get("old_string"))
+        .or_else(|| args.get("target"))
+        .and_then(Value::as_str)?;
+    let repl_str = args
+        .get("Replacement")
+        .or_else(|| args.get("ReplacementContent"))
+        .or_else(|| args.get("new_string"))
+        .or_else(|| args.get("replacement"))
+        .and_then(Value::as_str)?;
+    let sl = args
+        .get("StartLine")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize);
+    let el = args
+        .get("EndLine")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize);
+    check_multi_edit_pair(
+        cur,
+        file_uses_crlf,
+        display_file,
+        target_str,
+        repl_str,
+        sl,
+        el,
+    )
+}
+
 fn apply_in_ram_replacement(
     cur: &str,
     file_uses_crlf: bool,
@@ -1569,65 +1853,26 @@ fn apply_in_ram_replacement(
     start_line: Option<usize>,
     end_line: Option<usize>,
 ) -> Option<String> {
-    if target_raw.is_empty() {
-        return None;
-    }
-    let (target_eff, repl_eff) = if cur.contains(target_raw) {
-        (target_raw.to_owned(), repl_raw.to_owned())
-    } else if file_uses_crlf && !target_raw.contains("\r\n") && target_raw.contains('\n') {
-        let t = target_raw.replace('\n', "\r\n");
-        let r = if repl_raw.contains("\r\n") {
-            repl_raw.to_owned()
-        } else {
-            repl_raw.replace('\n', "\r\n")
-        };
-        (t, r)
-    } else if !file_uses_crlf && target_raw.contains("\r\n") {
-        (
-            target_raw.replace("\r\n", "\n"),
-            repl_raw.replace("\r\n", "\n"),
-        )
-    } else {
-        return None;
-    };
+    let (target_eff, repl_eff) =
+        align_replacement_line_endings(cur, file_uses_crlf, target_raw, repl_raw)?;
 
-    if let (Some(sl), Some(el)) = (start_line, end_line) {
-        if sl >= 1 && el >= sl {
-            let mut cur_line = 1usize;
-            let mut span_start: Option<usize> = if sl == 1 { Some(0) } else { None };
-            let mut span_end: Option<usize> = None;
-            for (idx, b) in cur.bytes().enumerate() {
-                if b == b'\n' {
-                    if cur_line == el && span_end.is_none() {
-                        span_end = Some(idx + 1);
-                        break;
-                    }
-                    cur_line += 1;
-                    if cur_line == sl && span_start.is_none() {
-                        span_start = Some(idx + 1);
-                    }
+    if let Some((s_idx, e_idx)) = line_window_byte_range(cur, start_line, end_line) {
+        let window = &cur[s_idx..e_idx];
+        if window.contains(&target_eff) {
+            let updated_win = if replace_all {
+                window.replace(&target_eff, &repl_eff)
+            } else {
+                if window.matches(&target_eff).count() != 1 {
+                    return None;
                 }
-            }
-            let s_idx = span_start.unwrap_or(0);
-            let e_idx = span_end.unwrap_or(cur.len()).max(s_idx);
-            let window = &cur[s_idx..e_idx];
-            if window.contains(&target_eff) {
-                let updated_win = if replace_all {
-                    window.replace(&target_eff, &repl_eff)
-                } else {
-                    if window.matches(&target_eff).count() != 1 {
-                        return None;
-                    }
-                    window.replacen(&target_eff, &repl_eff, 1)
-                };
-                let mut rebuilt = String::with_capacity(
-                    cur.len().saturating_sub(window.len()) + updated_win.len(),
-                );
-                rebuilt.push_str(&cur[..s_idx]);
-                rebuilt.push_str(&updated_win);
-                rebuilt.push_str(&cur[e_idx..]);
-                return Some(rebuilt);
-            }
+                window.replacen(&target_eff, &repl_eff, 1)
+            };
+            let mut rebuilt =
+                String::with_capacity(cur.len().saturating_sub(window.len()) + updated_win.len());
+            rebuilt.push_str(&cur[..s_idx]);
+            rebuilt.push_str(&updated_win);
+            rebuilt.push_str(&cur[e_idx..]);
+            return Some(rebuilt);
         }
     }
 
@@ -3613,6 +3858,102 @@ src/app.ts(18,7): error TS2345: Argument of type 'string' is not assignable.\n";
             !res_empty.to_string().contains("Code Graph:"),
             "Must omit Code Graph line when 0 Symbol inodes exist: {res_empty}"
         );
+
+        let _ = fs::remove_dir_all(&base_dir);
+    }
+
+    #[test]
+    fn pre_tool_use_blocks_ambiguous_multi_match_symbol_duplication_and_allows_benign_renames() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join(format!("libredb_multi_edit_{}_{}", std::process::id(), nanos));
+        fs::create_dir_all(&base_dir).unwrap();
+        let global_path = base_dir.join("customizations.ldb");
+        {
+            let _gdb = libredb_core::LibreDb::open(&global_path).unwrap();
+        }
+        let target_rs = base_dir.join("tests.rs");
+        let sample = "\
+#[test]
+fn case_one() {
+    drop(state);
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn case_two() {
+    drop(state);
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn case_three() {
+    drop(state);
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn unique_end() {
+    let sentinel = 999;
+}
+";
+        fs::write(&target_rs, sample).unwrap();
+
+        // 1. Ambiguous 3-site anchor appending a new #[test] MUST be blocked with exact line numbers!
+        let dup_deny = super::evaluate_pre_tool_payload(
+            &json!({
+                "toolName": "edit_file",
+                "toolInput": {
+                    "Path": target_rs.to_string_lossy(),
+                    "Target": "    drop(state);\n    let _ = fs::remove_dir_all(&tmp);\n}",
+                    "Replacement": "    drop(state);\n    let _ = fs::remove_dir_all(&tmp);\n}\n\n#[test]\nfn dup_case() {\n    assert!(true);\n}"
+                }
+            }),
+            Some(&global_path),
+        );
+        assert_eq!(dup_deny["decision"], "deny", "Multi-site test insertion must be blocked: {dup_deny}");
+        let reason = dup_deny["reason"].as_str().unwrap_or("");
+        assert!(
+            reason.contains("3 locations")
+                && reason.contains("L3")
+                && reason.contains("L9")
+                && reason.contains("L15"),
+            "Deny message should report exact duplicate anchor lines: {reason}"
+        );
+
+        // 2. Benign multi-site identifier/text replacement (0 new declarations) MUST remain allowed!
+        let rename_allow = super::evaluate_pre_tool_payload(
+            &json!({
+                "toolName": "edit_file",
+                "toolInput": {
+                    "Path": target_rs.to_string_lossy(),
+                    "Target": "remove_dir_all(&tmp)",
+                    "Replacement": "remove_dir_all(&work_dir)"
+                }
+            }),
+            Some(&global_path),
+        );
+        assert_eq!(rename_allow["decision"], "allow", "Benign rename across multiple sites must be allowed: {rename_allow}");
+
+        // 3. Single-site unique anchor appending a new #[test] MUST remain allowed!
+        let unique_allow = super::evaluate_pre_tool_payload(
+            &json!({
+                "toolName": "edit_file",
+                "toolInput": {
+                    "Path": target_rs.to_string_lossy(),
+                    "Target": "fn unique_end() {\n    let sentinel = 999;\n}",
+                    "Replacement": "fn unique_end() {\n    let sentinel = 999;\n}\n\n#[test]\nfn next_unique_test() {\n    assert_eq!(1, 1);\n}"
+                }
+            }),
+            Some(&global_path),
+        );
+        assert_eq!(unique_allow["decision"], "allow", "Unique anchor test append must be allowed: {unique_allow}");
 
         let _ = fs::remove_dir_all(&base_dir);
     }
