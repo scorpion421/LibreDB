@@ -4,12 +4,10 @@
 
 use super::authz::{default_libredb_home, infer_antigravity_transcript_path};
 use super::{canonical_brain_cache_key, McpServerState};
-use crate::hooks::{open_global_ldb, user_home_dir};
 use crate::telemetry::{
     build_savings_report, format_savings_report, record_event, record_workspace_event,
     SavingsQueryOptions, TelemetryEvent, MAX_SAVINGS_DAYS,
 };
-use libredb_bridge::import_sqlite_readonly;
 use libredb_cognitive::skeleton::{
     read_bounded_source_file, SKELETON_HASH_SEED, SKELETON_KEY_PREFIX,
 };
@@ -740,39 +738,6 @@ pub(super) fn dispatch_tool(
         }
         "libredb_memorize" | "libredb_batch" => {
             let mut outputs: Vec<String> = Vec::new();
-
-            if args.get("sync_central_sqlite").and_then(Value::as_bool) == Some(true) {
-                state.sync_global_db_or_purge()?;
-                let allow_sync = crate::security::load_bool_config(
-                    state.global_db.as_deref(),
-                    None,
-                    "mcp:allow_central_sqlite_sync",
-                    false,
-                );
-                if !allow_sync {
-                    return Err(
-                        "Refusing unapproved MCP import of legacy customizations.db into global customizations.ldb ('sync_central_sqlite' is disabled by default). Run 'libredb modernize-global --migrate-legacy' in a terminal, or explicitly enable 'libredb config set mcp:allow_central_sqlite_sync true'."
-                            .into(),
-                    );
-                }
-                let central_sqlite = user_home_dir()
-                    .join(".gemini")
-                    .join("database")
-                    .join("customizations.db");
-                if let Some(ref gp) = state.global_path.clone() {
-                    if central_sqlite.exists() {
-                        let gdb = open_global_ldb(Some(gp))?;
-                        let sum = import_sqlite_readonly(&central_sqlite, &gdb, "central")?;
-                        let mut cog = CognitiveEngine::open_db(gdb)?;
-                        cog.save_index_snapshot()?;
-                        state.reload_global_db()?;
-                        outputs.push(format!(
-                            "Synced {} central capsules + {} synapses from customizations.db",
-                            sum.cognitive_capsules_created, sum.synapses_wired
-                        ));
-                    }
-                }
-            }
 
             let (ws_write_lock, ws_root_to_seal, proj_db) = {
                 let (lock_opt, ws_opt, brain) =

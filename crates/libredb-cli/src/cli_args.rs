@@ -86,6 +86,7 @@ impl<'a> CliSpec<'a> {
         self
     }
 
+    #[cfg(any(feature = "git-automation", test))]
     pub fn optional_bools(mut self, flags: &[&'a str]) -> Self {
         self.optional_bools.extend(flags.iter().copied());
         self
@@ -236,6 +237,7 @@ impl ParsedCli {
             .unwrap_or(&[])
     }
 
+    #[cfg(any(feature = "git-automation", test))]
     pub fn optional_bool(&self, flag: &str) -> Option<bool> {
         self.optional_bools.get(flag).copied()
     }

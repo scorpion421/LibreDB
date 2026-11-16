@@ -1,13 +1,13 @@
 //! Standards-compliant OS secret vault, revision-monotonic `HMAC-SHA256` workspace trust seals
 //! (`hmac-sha256:v4:r<rev>:`), ephemeral `0700` `MCP` directory management, and canonical path policies.
 //!
-//! Modular architecture (`v1.0.0`):
+//! Modular architecture (`v2.0.0`):
 //! - `mod.rs`: Shared domain-separation constants, config loaders, workspace key canonicalization,
 //!   and constant-time / encoding primitives.
 //! - `ephemeral.rs`: CSPRNG `0700` ephemeral directory creation and `.owner.lock` crash reaping.
 //! - `vault.rs`: Windows `DPAPI` and POSIX `ChaCha20-Poly1305` AEAD secret vault & trust anchor init.
 //! - `seals.rs`: `WorkspaceTrustLockGuard`, `hmac-sha256:v4:r<rev>:` seals, rollback/loss ratchets,
-//!   `PreMutationSealGuard`, and `v2`/`v3` -> `v4` migrations.
+//!   and `PreMutationSealGuard`.
 //! - `path_policy.rs`: Symlink/NTFS-ADS/Win32-dot path policy, `MCP` containment, and `CVE-2022-24765`.
 
 mod ephemeral;
@@ -23,9 +23,11 @@ pub(crate) use ephemeral::{
 pub(crate) use path_policy::canonicalize_with_missing_tail;
 pub use path_policy::{
     check_mcp_read_path_policy, check_mcp_workspace_containment,
-    check_tool_write_path_policy_with_base, is_forbidden_mcp_workspace_root, is_safe_auto_git_dir,
-    sanitize_git_ref_for_prompt,
+    check_tool_write_path_policy_with_base, is_forbidden_mcp_workspace_root,
+    sanitize_git_ref_for_prompt, strip_verbatim_prefix,
 };
+#[cfg(any(feature = "git-automation", test))]
+pub use path_policy::is_safe_auto_git_dir;
 
 pub(crate) use seals::{
     has_config_key_fail_closed, is_mcp_untrusted_workspaces_allowed,
@@ -37,14 +39,14 @@ pub(crate) use seals::{
 };
 pub use seals::{
     check_global_trust_sync, compute_cognitive_content_digest, detect_workspace_seal_rollback,
-    has_prior_workspace_seal_marker,
-    has_valid_legacy_v3_content_seal, is_unsealed_replacement_of_sealed_workspace,
-    is_workspace_memory_trusted, list_trusted_workspaces, migrate_workspace_seal_v2_to_v3,
-    migrate_workspace_seal_v3_to_v4, revoke_workspace_trust, seal_workspace_memory,
-    PreMutationSealGuard, WorkspaceTrustLockGuard,
+    has_prior_workspace_seal_marker, is_unsealed_replacement_of_sealed_workspace,
+    is_workspace_memory_trusted, list_trusted_workspaces, revoke_workspace_trust,
+    seal_workspace_memory, PreMutationSealGuard, WorkspaceTrustLockGuard,
 };
 
-pub use vault::{is_ciphertext_envelope, protect_secret, unprotect_secret};
+pub use vault::{is_ciphertext_envelope, protect_secret};
+#[cfg(any(feature = "git-automation", test))]
+pub use vault::unprotect_secret;
 
 use crate::hooks::user_home_dir;
 use hmac::Hmac;
@@ -59,10 +61,7 @@ pub(super) const DPAPI_PREFIX: &str = "dpapi:v1:";
 pub(super) const VAULT_V1_PREFIX: &str = "vault:v1:";
 pub(super) const VAULT_V2_PREFIX: &str = "vault:v2:";
 pub(super) const VAULT_AEAD_AAD: &[u8] = b"LibreDB::CredentialVault::v2";
-pub(super) const CONTENT_DIGEST_V3_DOMAIN: &[u8] = b"LibreDB::CognitiveContent::v3\0";
 pub(super) const CONTENT_DIGEST_DOMAIN: &[u8] = b"LibreDB::CognitiveContent::v4\0";
-pub(super) const SEAL_V2_DOMAIN_SEP: &[u8] = b"LibreDB::WorkspaceTrustSeal::v2\0";
-pub(super) const SEAL_V3_DOMAIN_SEP: &[u8] = b"LibreDB::WorkspaceTrustSeal::v3\0";
 pub(super) const SEAL_V4_DOMAIN_SEP: &[u8] = b"LibreDB::WorkspaceTrustSeal::v4\0";
 pub(super) const SEAL_V4_REV_DOMAIN_SEP: &[u8] = b"LibreDB::WorkspaceTrustSeal::v4r\0";
 pub(super) const TRUST_SECRET_KEY: &str = "sys::trust_anchor_secret";
@@ -114,6 +113,7 @@ pub fn load_bool_config(
 }
 
 /// Resolves a string configuration value (`proj_db` overrides `global_db`).
+#[cfg(feature = "git-automation")]
 pub fn load_string_config(
     global_db: Option<&LibreDb>,
     proj_db: Option<&LibreDb>,
@@ -156,7 +156,7 @@ pub fn is_git_index_tracking_agents_db(ws_root: &Path) -> bool {
 /// Normalizes a workspace path into a canonical lookup key across verbatim UNC, mapped drives, and slashes.
 pub fn normalize_workspace_key(path: &Path) -> String {
     let resolved = canonicalize_with_missing_tail(path).unwrap_or_else(|| path.to_path_buf());
-    let cleaned = crate::gitea::strip_verbatim_prefix(&resolved);
+    let cleaned = strip_verbatim_prefix(&resolved);
     let mut s = cleaned.to_string_lossy().replace('\\', "/");
     while s.len() > 3 && s.ends_with('/') {
         s.pop();
@@ -168,18 +168,17 @@ pub fn normalize_workspace_key(path: &Path) -> String {
     }
 }
 
-
 /// Returns true if `key` addresses a security-critical internal configuration namespace
 /// (`sys::*`, `trust:*`, `workspace:*`, `workspace_id::*`) that must never be mutated via
-/// generic `libredb config set/unset`, `libredb put`, `libredb deprecate`, or SQLite imports.
+/// generic `libredb config set/unset`, `libredb put`, or `libredb deprecate`.
 pub fn is_reserved_security_config_key(key: &str) -> bool {
     libredb_core::is_reserved_security_config_key(key)
 }
 
 /// Returns true if `key` addresses either a reserved internal trust/system namespace or a
 /// privileged host/MCP/guardrail policy switch (`mcp:*`, `gitea_allow_insecure_http`,
-/// `guardrail:allow_staged_files`) that must never be imported from SQLite or mutated via
-/// low-level `libredb put` / `libredb deprecate`.
+/// `guardrail:allow_staged_files`) that must never be mutated via low-level `libredb put`
+/// or `libredb deprecate`.
 pub fn is_admin_only_security_config_key(key: &str) -> bool {
     libredb_core::is_admin_only_security_config_key(key)
 }

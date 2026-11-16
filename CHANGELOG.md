@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0] - 2026-11-16
+
+### Added
+- **External data-driven design skills (`skills/`, `--skills-dir`)**: Moved the native platform UI guidelines (`windows-app-design`, `android-app-design`, `apple-hig-design`, `linux-desktop-hig-design`) out of compiled Rust source into editable `SKILL.md` files under `skills/` and added `--skills-dir` to `libredb modernize-global` so style updates apply without recompiling the binary.
+- **Optional `git-automation` Cargo feature (`crates/libredb-cli/Cargo.toml`)**: Placed the Git/Gitea release automation module behind a default `git-automation` feature flag (`--no-default-features` builds a lean pure-memory and guardrail binary without HTTP/credential tooling) and moved Windows path prefix normalization into the core path-policy module.
+
+### Changed
+- **100% pure-Rust build with zero C dependencies (`Cargo.toml`, `Makefile`)**: Removed `libredb-bridge` and bundled `SQLite` (`rusqlite` / `sqlite3.c`) across the workspace and Python bindings, eliminating roughly 250,000 lines of C compilation and allowing clean builds with just `cargo` and `rustc`. Note: legacy `.db` SQLite migration remains supported on `<= v1.7.0` releases before upgrading to `v2.0.0`.
+- **Contradiction-free `Apache-2.0` + `Commons Clause` license (`LICENSE`, `README.md`)**: Replaced the `AGPL-3.0` base text under the `Commons Clause v1.0` with `Apache License, Version 2.0`, removing the `AGPL-3.0` Section 7 "further restriction" clause that conflicted with the `Commons Clause`.
+
+### Removed
+- **Legacy SQLite bridge and pre-1.0 trust-seal migrations (`crates/libredb-bridge`, `libredb trust`)**: Removed `import-sqlite`, `export-sqlite`, `verify-roundtrip`, `--migrate-legacy`, `sync_central_sqlite`, legacy `tempfile` linkage in `libredb-py`, and pre-1.0 `--migrate-v2` / `--migrate-v3` workspace seal handlers so workspace verification enforces modern revision-bound `v4` seals cleanly.
+
+### Fixed
+- **Language-independent Windows ACL safety check (`deploy_plugin.ps1`)**: Translated ACL identity references to canonical Windows security identifiers (`S-1-1-0`, `S-1-2-0`, `S-1-5-11`, `S-1-5-32-545`, `S-1-5-32-546`, `-513`, `-515`) so world-writable folder checks work reliably on non-English Windows installations.
+- **Repeated live-upgrade hot-swap (`deploy_plugin.ps1`)**: Replaced the static `.old` backup filename with a unique per-upgrade suffix (`<pid>.<ticks>.old`) while sweeping unlocked `.old` leftovers first, preventing failures when upgrading twice while an older `mcp-serve` process is still running.
+- **Installer build guidance and `SKILL.md` command parity (`deploy_plugin.ps1`, `deploy_plugin.sh`)**: Updated the missing-binary error hint from `cargo build --release --workspace` to `cargo build --release` (respecting `default-members`) and added missing `--project`, `--verify`, `status`, `--skills-dir`, and `--suite learning` options to the installed `SKILL.md`.
+
 ## [1.7.0] - 2026-11-16
 
 ### Added

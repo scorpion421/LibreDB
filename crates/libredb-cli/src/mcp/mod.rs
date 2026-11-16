@@ -298,29 +298,6 @@ impl McpServerState {
         Ok(())
     }
 
-    pub(super) fn reload_global_db(&mut self) -> Result<(), String> {
-        if let Some(ref gp) = self.global_path {
-            match open_global_ldb_checked(Some(gp)) {
-                Ok(Some(gdb)) => {
-                    self.global_db = Some(gdb);
-                    self.brains.clear();
-                    self.ram_session_fallback.clear();
-                }
-                Ok(None) => {
-                    self.global_db = None;
-                    self.brains.clear();
-                    self.ram_session_fallback.clear();
-                }
-                Err(err) => {
-                    self.brains.clear();
-                    self.ram_session_fallback.clear();
-                    return Err(err);
-                }
-            }
-        }
-        Ok(())
-    }
-
     pub(super) fn custom_protected_paths(&self, proj_db: Option<&LibreDb>) -> Vec<String> {
         crate::security::load_config_list(
             self.global_db.as_deref(),

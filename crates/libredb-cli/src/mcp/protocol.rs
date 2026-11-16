@@ -484,8 +484,7 @@ pub fn handle_rpc_method(
                                     "supersedes": { "type": "array", "items": { "type": "string" } }
                                 },
                                 "required": ["error_text", "fix_directive"]
-                            },
-                            "sync_central_sqlite": { "type": "boolean" }
+                            }
                         }
                     }
                 }

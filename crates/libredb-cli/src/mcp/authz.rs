@@ -524,7 +524,7 @@ impl McpServerState {
         let q_path = default_libredb_home().join("quarantined_workspace.ldb");
         let q_key = canonical_brain_cache_key(&q_path);
         if !self.brains.contains_key(&q_key) {
-            let (q_db, _) = open_project_ldb_silent(&q_path)?;
+            let q_db = open_project_ldb_silent(&q_path)?;
             let q_brain = OverlayBrain::open(self.global_db.clone(), q_db)
                 .map_err(|e| e.to_string())?;
             insert_brain_bounded(&mut self.brains, q_key.clone(), q_brain);
@@ -604,7 +604,7 @@ impl McpServerState {
 
         let mut ws_write_lock: Option<crate::security::WorkspaceTrustLockGuard> = None;
         let mut ws_root_to_seal: Option<PathBuf> = None;
-        let (mut db_path, mut cache_key) =
+        let (db_path, cache_key) =
             if let Some(ws_root) = workspace_root_from_agents_ldb(&candidate_path) {
                 if crate::security::is_private_brain_workspace(&ws_root) {
                     (candidate_path, candidate_cache_key)
@@ -640,11 +640,8 @@ impl McpServerState {
                                     (q_path, q_key)
                                 }
                             } else {
-                                let has_disk_memory =
-                                    auth_ldb.is_file() || auth_ldb.with_extension("db").exists();
-                                let needs_mig_lock =
-                                    !auth_ldb.is_file() && auth_ldb.with_extension("db").exists();
-                                if is_explicit_memorize || needs_mig_lock {
+                                let has_disk_memory = auth_ldb.is_file();
+                                if is_explicit_memorize {
                                     if let Some(ref gdb) = self.global_db {
                                         ws_write_lock = Some(
                                             crate::security::WorkspaceTrustLockGuard::acquire(
@@ -653,23 +650,10 @@ impl McpServerState {
                                         );
                                     }
                                 }
-                                let allow_readonly_sqlite_mig = !needs_mig_lock
-                                    || is_explicit_memorize
-                                    || self.global_db.as_deref().is_some_and(|gdb| {
-                                        let norm =
-                                            crate::security::normalize_workspace_key(&auth_root);
-                                        gdb.get_by_key(
-                                            libredb_core::NodeKind::Config,
-                                            &format!("trust:allowed::{norm}"),
-                                        )
-                                        .is_ok()
-                                    });
-                                if allow_readonly_sqlite_mig
-                                    && crate::security::is_workspace_memory_trusted(
-                                        self.global_db.as_deref(),
-                                        &auth_root,
-                                    )
-                                {
+                                if crate::security::is_workspace_memory_trusted(
+                                    self.global_db.as_deref(),
+                                    &auth_root,
+                                ) {
                                     if !is_explicit_memorize && !has_disk_memory {
                                         let eph_path =
                                             self.ephemeral_workspace_ldb_path(&auth_root)?;
@@ -748,49 +732,10 @@ impl McpServerState {
             };
 
         if !self.brains.contains_key(&cache_key) {
-            let (proj_db, did_migrate) = open_project_ldb_silent(&db_path)?;
-            let mut ready_db = Some(proj_db);
-            if did_migrate {
-                if let Some(mig_ws) = workspace_root_from_agents_ldb(&db_path) {
-                    if !crate::security::is_private_brain_workspace(&mig_ws) {
-                        let seal_res =
-                            if crate::security::is_forbidden_mcp_workspace_root(&mig_ws) {
-                                Err("workspace resolves to a forbidden root or control-plane directory".to_owned())
-                            } else if let Some(ref gdb) = self.global_db {
-                                crate::security::seal_workspace_memory(
-                                    gdb,
-                                    ready_db.as_ref().unwrap(),
-                                    &mig_ws,
-                                )
-                            } else {
-                                Err("global customizations.ldb is unavailable".to_owned())
-                            };
-                        if let Err(err) = seal_res {
-                            ready_db = None;
-                            if is_explicit_memorize {
-                                return Err(format!(
-                                    "Post-migration hmac-sha256:v4 workspace seal failed for '{}': {err}",
-                                    mig_ws.display()
-                                ));
-                            }
-                            ws_root_to_seal = None;
-                            db_path = default_libredb_home().join("quarantined_workspace.ldb");
-                            cache_key = canonical_brain_cache_key(&db_path);
-                            if !self.brains.contains_key(&cache_key) {
-                                let (q_db, _) = open_project_ldb_silent(&db_path)?;
-                                let q_brain = OverlayBrain::open(self.global_db.clone(), q_db)
-                                    .map_err(|e| e.to_string())?;
-                                insert_brain_bounded(&mut self.brains, cache_key.clone(), q_brain);
-                            }
-                        }
-                    }
-                }
-            }
-            if let Some(valid_db) = ready_db {
-                let brain = OverlayBrain::open(self.global_db.clone(), valid_db)
-                    .map_err(|e| e.to_string())?;
-                insert_brain_bounded(&mut self.brains, cache_key.clone(), brain);
-            }
+            let proj_db = open_project_ldb_silent(&db_path)?;
+            let brain = OverlayBrain::open(self.global_db.clone(), proj_db)
+                .map_err(|e| e.to_string())?;
+            insert_brain_bounded(&mut self.brains, cache_key.clone(), brain);
         }
 
         let brain = self.brains.get_mut(&cache_key).unwrap();

@@ -5,16 +5,19 @@ edition.workspace = true
 authors.workspace = true
 license-file.workspace = true
 repository.workspace = true
-description = "Command-line utility, cognitive pulse engine, and lossless SQLite bridge for LibreDB"
+description = "Command-line interface, MCP cognitive server, lifecycle hooks, and security engine for LibreDB"
 
 [[bin]]
 name = "libredb"
 path = "src/main.rs"
 
+[features]
+default = ["git-automation"]
+git-automation = []
+
 [dependencies]
 chacha20poly1305.workspace = true
 hmac.workspace = true
-libredb-bridge = { path = "../libredb-bridge" }
 libredb-cognitive = { path = "../libredb-cognitive" }
 libredb-core = { path = "../libredb-core" }
 libredb-index = { path = "../libredb-index" }
@@ -22,6 +25,3 @@ parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-
-[dev-dependencies]
-rusqlite.workspace = true

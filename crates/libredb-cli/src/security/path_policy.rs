@@ -1,6 +1,7 @@
 //! Symlink-canonicalized, NTFS-ADS-stripped, and trailing-dot-normalized control-plane, credential,
 //! `MCP` workspace containment, and `CVE-2022-24765` `safe.directory` path policies.
 
+#[cfg(any(feature = "git-automation", test))]
 use super::seals::{
     check_global_trust_sync, has_config_key_fail_closed, is_workspace_memory_trusted,
 };
@@ -254,7 +255,7 @@ pub(super) fn resolve_policy_candidate_paths(raw_path: &Path, base_dir: Option<&
             continue;
         }
         if let Some(canon) = canonicalize_with_missing_tail(cand_path) {
-            let clean = crate::gitea::strip_verbatim_prefix(&canon);
+            let clean = strip_verbatim_prefix(&canon);
             push_unique(sanitize_policy_path_str(&clean.to_string_lossy()));
         }
     }
@@ -268,7 +269,7 @@ pub(super) fn resolve_policy_candidate_paths(raw_path: &Path, base_dir: Option<&
                 let joined = base.join(rel_p);
                 push_unique(lexical_normalize_lower(&joined));
                 if let Some(canon) = canonicalize_with_missing_tail(&joined) {
-                    let clean = crate::gitea::strip_verbatim_prefix(&canon);
+                    let clean = strip_verbatim_prefix(&canon);
                     push_unique(sanitize_policy_path_str(&clean.to_string_lossy()));
                 }
             }
@@ -323,6 +324,19 @@ pub(super) fn lexical_normalize_lower(path: &Path) -> String {
         format!("/{joined}")
     } else {
         joined
+    }
+}
+
+/// Strips Windows verbatim (`\\?\` / `\\?\UNC\`) path prefixes cleanly while preserving UNC shares.
+pub fn strip_verbatim_prefix(p: &Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    if s.len() >= 8 && s[..8].eq_ignore_ascii_case(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{}", &s[8..]));
+    }
+    if let Some(stripped) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(stripped)
+    } else {
+        p.to_path_buf()
     }
 }
 
@@ -415,7 +429,7 @@ pub(super) fn check_credential_store_path(low_norm: &str, custom_protected: &[St
         let mut c_variants = vec![sanitize_policy_path_str(raw_c)];
         if let Some(canon_c) = canonicalize_with_missing_tail(Path::new(raw_c)) {
             let clean_c =
-                sanitize_policy_path_str(&crate::gitea::strip_verbatim_prefix(&canon_c).to_string_lossy());
+                sanitize_policy_path_str(&strip_verbatim_prefix(&canon_c).to_string_lossy());
             if !c_variants.contains(&clean_c) {
                 c_variants.push(clean_c);
             }
@@ -459,6 +473,7 @@ pub fn sanitize_git_ref_for_prompt(raw_ref: &str) -> String {
 /// authorized in `global_db` (`trust:allowed::<ws>`) AND passes `is_workspace_memory_trusted`
 /// (`CVE-2022-24765`). Never trusts spoofable `USERNAME`/`USER` path substrings or unapproved
 /// directories outside `$HOME` that merely lack `.agents/`.
+#[cfg(any(feature = "git-automation", test))]
 pub fn is_safe_auto_git_dir(global_db: Option<&LibreDb>, project_root: &Path) -> bool {
     let Some(canon_root) = canonicalize_with_missing_tail(project_root) else {
         return false;

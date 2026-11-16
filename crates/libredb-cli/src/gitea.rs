@@ -6,7 +6,7 @@
 //! and strict SemVer 2.0.0 + Keep a Changelog 1.1.0 + `[GITEA REPOSITORY COLLISION]` guardrails.
 
 use crate::hooks::open_global_ldb;
-use crate::security::{base64_encode, protect_secret, unprotect_secret};
+use crate::security::{base64_encode, protect_secret, strip_verbatim_prefix, unprotect_secret};
 use libredb_cognitive::{
     audit_workspace_guardrails_with_prefixes, index_workspace, is_sensitive_staged_file,
     CognitiveEngine,
@@ -1899,14 +1899,13 @@ fn record_learned_workspace(ldb: &LibreDb, clean_root: &Path) {
         return;
     }
     let has_existing_or_prior_memory = clean_root.join(".agents").join("memory.ldb").exists()
-        || clean_root.join(".agents").join("memory.db").exists()
         || crate::security::has_prior_workspace_seal_marker(ldb, clean_root)
         || crate::security::is_git_index_tracking_agents_db(clean_root);
     if has_existing_or_prior_memory
         && !crate::security::is_workspace_memory_trusted(Some(ldb), clean_root)
     {
         // Never grant `trust:allowed::<norm>` to a repository containing an untrusted, unsealed,
-        // tampered, or Git-tracked `.agents/memory.*` database!
+        // tampered, or Git-tracked `.agents/memory.ldb` database!
         return;
     }
 
@@ -1922,18 +1921,6 @@ fn record_learned_workspace(ldb: &LibreDb, clean_root: &Path) {
             .with_key(format!("trust:allowed::{norm}"))
             .with_importance(185),
     );
-}
-
-pub fn strip_verbatim_prefix(p: &Path) -> PathBuf {
-    let s = p.to_string_lossy();
-    if s.len() >= 8 && s[..8].eq_ignore_ascii_case(r"\\?\UNC\") {
-        return PathBuf::from(format!(r"\\{}", &s[8..]));
-    }
-    if let Some(stripped) = s.strip_prefix(r"\\?\") {
-        PathBuf::from(stripped)
-    } else {
-        p.to_path_buf()
-    }
 }
 
 fn query_service_state(service_name: &str) -> String {
@@ -2442,12 +2429,12 @@ fn percent_encode(s: &str) -> String {
 mod tests {
     use super::{
         ensure_no_http_header_chars, http_request, parse_http_response, record_learned_workspace,
-        resolve_gitea_owner_and_repo, should_supply_git_credentials, strip_verbatim_prefix,
-        validate_safe_git_identifier, GiteaConfig,
+        resolve_gitea_owner_and_repo, should_supply_git_credentials, validate_safe_git_identifier,
+        GiteaConfig,
     };
     use libredb_core::{LibreDb, NodeKind, WriteRequest};
     use std::fs;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::process::Command;
 
     /// S19 (v1.4.0): release binaries under `dist/` and `releases/` never enter the Git tree,
@@ -2463,29 +2450,6 @@ mod tests {
         assert!(!is_release_deliverable_path("releases/README.md"));
         assert!(!is_release_deliverable_path("tests/fixtures/sample.zip"));
         assert!(!is_release_deliverable_path("src/dist/notes.zipper"));
-    }
-    #[test]
-    fn strip_verbatim_prefix_preserves_unc_and_drive_paths() {
-        assert_eq!(
-            strip_verbatim_prefix(Path::new(
-                r"\\?\UNC\fileserver.corp.example\home$\user\Antigravity\LibreDB"
-            )),
-            PathBuf::from(r"\\fileserver.corp.example\home$\user\Antigravity\LibreDB")
-        );
-        assert_eq!(
-            strip_verbatim_prefix(Path::new(
-                r"\\?\unc\fileserver.corp.example\share\workspace"
-            )),
-            PathBuf::from(r"\\fileserver.corp.example\share\workspace")
-        );
-        assert_eq!(
-            strip_verbatim_prefix(Path::new(r"\\?\D:\Antigravity\LibreDB")),
-            PathBuf::from(r"D:\Antigravity\LibreDB")
-        );
-        assert_eq!(
-            strip_verbatim_prefix(Path::new(r"Q:\Antigravity\LibreDB")),
-            PathBuf::from(r"Q:\Antigravity\LibreDB")
-        );
     }
 
     #[test]

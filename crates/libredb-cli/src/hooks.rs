@@ -1,10 +1,9 @@
 //! Native sub-millisecond Antigravity lifecycle hooks (`PreInvocation` and `PreToolUse`)
-//! with silent background `SQLite -> LibreDB` auto-migration on first workspace/chat touch.
+//! powered by single-file pure-Rust `LibreDB` storage and optional in-memory `MCP` coordination.
 
-use libredb_bridge::open_or_auto_migrate;
 use libredb_cognitive::{
     check_command_guardrails, check_text_guardrails_with_options, has_project_root_marker,
-    is_compaction_checkpoint_line, is_test_or_scratch_path, sync_transcript_epoch, CognitiveEngine,
+    is_compaction_checkpoint_line, is_test_or_scratch_path, sync_transcript_epoch,
 };
 use libredb_core::{LibreDb, NodeKind, WriteRequest};
 use serde_json::{json, Value};
@@ -18,13 +17,6 @@ pub fn default_global_ldb_path() -> PathBuf {
         .join(".gemini")
         .join("libredb")
         .join("customizations.ldb")
-}
-
-pub fn default_central_sqlite_path() -> PathBuf {
-    user_home_dir()
-        .join(".gemini")
-        .join("database")
-        .join("customizations.db")
 }
 
 const MIN_VALID_LDB_BYTES: u64 = 8192;
@@ -77,9 +69,7 @@ pub fn open_global_ldb(override_path: Option<&Path>) -> Result<Arc<LibreDb>, Str
             ));
         }
     }
-    // Never implicitly import legacy `~/.gemini/database/customizations.db` on cold CLI opens;
-    // legacy SQLite migration requires explicit `--migrate-legacy` or `libredb import-sqlite`.
-    let (db, _) = open_or_auto_migrate(&target, None, "central").map_err(|e| e.to_string())?;
+    let db = Arc::new(LibreDb::open(&target).map_err(|e| e.to_string())?);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -128,16 +118,8 @@ pub fn open_global_ldb_checked(override_path: Option<&Path>) -> Result<Option<Ar
     }
 }
 
-pub fn open_project_ldb_silent(ldb_path: &Path) -> Result<(Arc<LibreDb>, bool), String> {
-    let (db, migrated) =
-        open_or_auto_migrate(ldb_path, None, "project").map_err(|e| e.to_string())?;
-    let did_migrate = migrated.is_some();
-    if did_migrate {
-        if let Ok(mut cog) = CognitiveEngine::open_db(Arc::clone(&db)) {
-            let _ = cog.save_index_snapshot();
-        }
-    }
-    Ok((db, did_migrate))
+pub fn open_project_ldb_silent(ldb_path: &Path) -> Result<Arc<LibreDb>, String> {
+    LibreDb::open(ldb_path).map(Arc::new).map_err(|e| e.to_string())
 }
 
 /// Handles Antigravity `PreToolUse` JSON hook from `stdin` (`< 1.5 ms`).
@@ -505,7 +487,7 @@ fn evaluate_pre_tool_payload_inner(
     json!({ "decision": "allow" })
 }
 
-/// Handles Antigravity `PreInvocation` JSON hook from `stdin` (`< 2.5 ms` warm, `< 30 ms` on first-time SQLite auto-port).
+/// Handles Antigravity `PreInvocation` JSON hook from `stdin` (`< 2 ms` warm, `< 0.5 ms` via IPC).
 pub fn run_pre_invocation_hook(
     global_ldb_opt: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -530,7 +512,7 @@ pub fn run_pre_invocation_hook(
 }
 
 /// Pure, directly unit-testable `PreInvocation` evaluator enforcing fail-closed workspace trust
-/// both before opening `.agents/memory.*` and immediately after any legacy SQLite `.db -> .ldb` migration.
+/// before opening `.agents/memory.ldb`.
 pub(crate) fn evaluate_pre_invocation_payload(
     payload: &Value,
     global_ldb_opt: Option<&Path>,
@@ -562,14 +544,8 @@ fn evaluate_pre_invocation_payload_inner(
     let target_ldb: Option<PathBuf> = if let Some(ref root) = ws_root {
         Some(root.join(".agents").join("memory.ldb"))
     } else if let Some(ref cid) = cid_opt {
-        let brain_agents = resolve_brain_conv_dir(cid).join(".agents");
-        let cand_ldb = brain_agents.join("memory.ldb");
-        let cand_db = brain_agents.join("memory.db");
-        if cand_ldb.exists() || cand_db.exists() {
-            Some(cand_ldb)
-        } else {
-            None
-        }
+        let cand_ldb = resolve_brain_conv_dir(cid).join(".agents").join("memory.ldb");
+        cand_ldb.exists().then_some(cand_ldb)
     } else {
         None
     };
@@ -578,10 +554,9 @@ fn evaluate_pre_invocation_payload_inner(
         return Ok(json!({ "injectSteps": [] }));
     };
 
-    // If neither `.agents/memory.ldb` nor `.agents/memory.db` exists yet in this folder, wait until
-    // the agent or workspace actually creates project memory rather than polluting random folders.
-    let mem_db_sibling = mem_ldb_path.with_extension("db");
-    if !mem_ldb_path.exists() && !mem_db_sibling.exists() {
+    // If `.agents/memory.ldb` does not exist yet in this folder, wait until the agent or
+    // workspace actually creates project memory rather than polluting random folders.
+    if !mem_ldb_path.is_file() {
         return Ok(json!({ "injectSteps": [] }));
     }
 
@@ -602,16 +577,16 @@ fn evaluate_pre_invocation_payload_inner(
         Ok(opened)
     };
 
-    // Cryptographic workspace trust check BEFORE opening `.ldb` or migrating any C SQLite `.db` file!
-    // Prevents cloned repositories carrying poisoned `.agents/memory.*` payloads from injecting
-    // `<SYSTEM_MESSAGE>` prompt overrides or triggering untrusted SQLite deserialization, and fails
-    // closed immediately if an existing `customizations.ldb` is corrupted/unreadable on disk.
-    let (proj_db, did_migrate): (Arc<LibreDb>, bool) = if mem_ldb_path.is_file() {
+    // Cryptographic workspace trust check BEFORE opening `.agents/memory.ldb`!
+    // Prevents cloned repositories carrying poisoned `.agents/memory.ldb` payloads from injecting
+    // `<SYSTEM_MESSAGE>` prompt overrides, and fails closed immediately if an existing
+    // `customizations.ldb` is corrupted/unreadable on disk.
+    let proj_db: Arc<LibreDb> =
         if let (Some(ref mut st), Some(ref root)) = (ram_state.as_deref_mut(), &ws_root) {
             let Some(pdb) = st.lookup_or_cache_trusted_workspace_db(root) else {
                 return Ok(json!({ "injectSteps": [] }));
             };
-            (pdb, false)
+            pdb
         } else {
             if let Some(ref root) = ws_root {
                 let Ok(global_db_ro) = ensure_global_db() else {
@@ -621,81 +596,11 @@ fn evaluate_pre_invocation_payload_inner(
                     return Ok(json!({ "injectSteps": [] }));
                 }
             }
-            let Ok(pair) = open_project_ldb_silent(&mem_ldb_path) else {
+            let Ok(pdb) = open_project_ldb_silent(&mem_ldb_path) else {
                 return Ok(json!({ "injectSteps": [] }));
             };
-            pair
-        }
-    } else {
-        if let Some(ref root) = ws_root {
-            let Ok(global_db_ro) = ensure_global_db() else {
-                return Ok(json!({ "injectSteps": [] }));
-            };
-            if !crate::security::is_workspace_memory_trusted(global_db_ro.as_deref(), root) {
-                return Ok(json!({ "injectSteps": [] }));
-            }
-        }
-        let Ok(pair) = open_project_ldb_silent(&mem_ldb_path) else {
-            return Ok(json!({ "injectSteps": [] }));
+            pdb
         };
-        pair
-    };
-
-    // Strict fail-closed post-migration sealing: if an authorized legacy `.agents/memory.db` was just
-    // migrated into `.agents/memory.ldb`, it MUST be cryptographically sealed with `hmac-sha256:v4:r<rev>:`
-    // BEFORE recording any dedup cursor or reading/injecting a single capsule from `proj_db`.
-    // If sealing fails for any reason, emit ONLY the quarantine diagnostic and zero project content.
-    if did_migrate {
-        if let Some(ref root) = ws_root {
-            if !crate::security::is_private_brain_workspace(root) {
-                let seal_outcome: Result<(), String> = if is_protected_profile_dir(root) {
-                    Err("workspace resolves to a protected profile directory".to_owned())
-                } else {
-                    match ensure_global_db() {
-                        Ok(Some(global_db)) => crate::security::seal_workspace_memory(
-                            &global_db, &proj_db, root,
-                        )
-                        .map(|()| {
-                            let norm = crate::security::normalize_workspace_key(root);
-                            let ws_cfg_key = crate::security::workspace_id_config_key(&norm);
-                            let root_str = root.to_string_lossy().into_owned();
-                            let already_same = global_db
-                                .get_by_key(NodeKind::Config, &ws_cfg_key)
-                                .map(|r| r.payload == root_str.as_bytes())
-                                .unwrap_or(false);
-                            if !already_same {
-                                let _ = global_db.put(
-                                    WriteRequest::new(NodeKind::Config, root_str.into_bytes())
-                                        .with_key(ws_cfg_key)
-                                        .with_importance(170),
-                                );
-                            }
-                        }),
-                        Ok(None) => Err("global customizations.ldb is unavailable".to_owned()),
-                        Err(e) => Err(e),
-                    }
-                };
-
-                if let Err(err) = seal_outcome {
-                    eprintln!(
-                        "[WARN] LibreDB post-migration seal failed for '{}': {err}",
-                        root.display()
-                    );
-                    let diag = format!(
-                        "[WARN] Quarantined migrated workspace '{}': post-migration hmac-sha256:v4 workspace seal failed ({err}); project memory context suppressed.",
-                        root.display()
-                    );
-                    return Ok(json!({
-                        "injectSteps": [{
-                            "systemMessage": {
-                                "systemMessage": diag
-                            }
-                        }]
-                    }));
-                }
-            }
-        }
-    }
 
     if let Some(ref root) = ws_root {
         if let Ok((promoted, saved_tok)) =
@@ -790,7 +695,7 @@ fn evaluate_pre_invocation_payload_inner(
 
     // Record workspace discovery metadata in `customizations.ldb` on first session touch without
     // ever re-sealing an existing `.ldb` file automatically.
-    if !did_migrate && (!had_prior_cursor || global_ldb_opt.is_some()) {
+    if !had_prior_cursor || global_ldb_opt.is_some() {
         if let Some(ref root) = ws_root {
             if !is_protected_profile_dir(root) {
                 if let Ok(Some(global_db)) = ensure_global_db() {
@@ -1927,19 +1832,13 @@ fn record_working_set_edit(
         }
         None => None,
     };
-    let (proj_db, did_migrate) = match preopened_db {
+    let proj_db = match preopened_db {
         Some(db) => {
             let _ = db.sync_from_disk_if_changed();
-            (db, false)
+            db
         }
         None => open_project_ldb_silent(&ldb_path)?,
     };
-    if did_migrate && !crate::security::is_private_brain_workspace(ws_root) {
-        let gdb = global_db.ok_or_else(|| {
-            "global customizations.ldb is required to seal migrated workspace".to_owned()
-        })?;
-        crate::security::seal_workspace_memory(gdb, &proj_db, ws_root)?;
-    }
 
     let _deferred = proj_db
         .is_network_share()
@@ -2417,9 +2316,7 @@ pub fn find_workspace_root(start: &Path) -> Option<PathBuf> {
         }
         // Prefer an initialized `.agents` memory database first, then the `.git`
         // repository boundary, so nested workspace sub-crates resolve to the repo root.
-        if c.join(".agents").join("memory.ldb").exists()
-            || c.join(".agents").join("memory.db").exists()
-        {
+        if c.join(".agents").join("memory.ldb").exists() {
             return Some(c.to_path_buf());
         }
         if c.join(".git").exists() {
@@ -2706,102 +2603,6 @@ mod tests {
         let (name_f, args_f) = extract_pre_tool_name_and_args(&flat);
         assert_eq!(name_f, "run_command");
         assert_eq!(args_f.get("WaitMsBeforeAsync").and_then(|v| v.as_i64()), Some(5000));
-    }
-
-    #[test]
-    fn failed_post_migration_seal_fails_closed_and_injects_zero_project_memory() {
-        use super::evaluate_pre_invocation_payload;
-        use libredb_core::{LibreDb, NodeKind, WriteRequest};
-        use std::fs;
-
-        let base_target = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("target")
-            .join(format!(
-                "test_pre_inv_mig_{}_{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .subsec_nanos()
-            ));
-        let _ = fs::remove_dir_all(&base_target);
-        let ws_repo = base_target.join("legacy_mig_repo");
-        fs::create_dir_all(ws_repo.join(".agents")).unwrap();
-        fs::write(ws_repo.join("Cargo.toml"), b"[package]\nname = \"demo\"\n").unwrap();
-
-        // 1. Seed a real legacy `.agents/memory.db` SQLite store containing sensitive project memory:
-        let legacy_sqlite = ws_repo.join(".agents").join("memory.db");
-        {
-            let conn = rusqlite::Connection::open(&legacy_sqlite).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE fact_history (id INTEGER PRIMARY KEY, key TEXT NOT NULL, old_value TEXT, new_value TEXT NOT NULL);
-                 INSERT INTO fact_history (key, old_value, new_value) VALUES ('secret_key', NULL, 'SECRET_MIGRATED_FACT_MUST_NOT_LEAK');
-                 CREATE TABLE project_decisions (id INTEGER PRIMARY KEY, title TEXT NOT NULL, content TEXT NOT NULL, category TEXT, is_active INTEGER NOT NULL DEFAULT 1);
-                 INSERT INTO project_decisions (title, content, category, is_active) VALUES ('secret_arch', 'SECRET_MIGRATED_DECISION_MUST_NOT_LEAK', 'security', 1);",
-            )
-            .unwrap();
-        }
-        assert!(!ws_repo.join(".agents").join("memory.ldb").exists());
-
-        // 2. Authorize `ws_repo` in an isolated `customizations.ldb`, then corrupt `sys::trust_anchor_secret`
-        //    so pre-migration path authorization succeeds (`!ldb_path.is_file() && path_authorized`),
-        //    SQLite -> `.ldb` migration succeeds (`did_migrate == true`), and `seal_workspace_memory` FAILS!
-        let global_ldb_path = base_target.join("customizations.ldb");
-        {
-            let gdb = LibreDb::open(&global_ldb_path).unwrap();
-            gdb.put(
-                WriteRequest::new(
-                    NodeKind::Config,
-                    ws_repo.to_string_lossy().as_bytes().to_vec(),
-                )
-                .with_key("workspace:legacy_mig_repo"),
-            )
-            .unwrap();
-            gdb.put(
-                WriteRequest::new(NodeKind::Config, b"corrupt-non-hex-secret".to_vec())
-                    .with_key("sys::trust_anchor_secret"),
-            )
-            .unwrap();
-        }
-
-        let payload = json!({
-            "conversationId": "conv-mig-fail-closed-test",
-            "workspacePaths": [ws_repo.to_string_lossy().to_string()]
-        });
-
-        let out1 = evaluate_pre_invocation_payload(&payload, Some(&global_ldb_path)).unwrap();
-        let out1_str = serde_json::to_string(&out1).unwrap();
-
-        // Migration ran (`.agents/memory.ldb` now exists and holds the ported capsules on disk),
-        // `[WARN]` diagnostic WAS emitted, and ZERO project memory capsules or headers were injected!
-        let ported_ldb = LibreDb::open(ws_repo.join(".agents").join("memory.ldb")).unwrap();
-        assert!(ported_ldb.get_by_key(NodeKind::Fact, "secret_key").is_ok());
-        drop(ported_ldb);
-
-        assert!(
-            out1_str.contains("[WARN] Quarantined migrated workspace"),
-            "Expected fail-closed diagnostic warning, got: {out1_str}"
-        );
-        assert!(
-            !out1_str.contains("SECRET_MIGRATED_FACT_MUST_NOT_LEAK"),
-            "Migrated Fact leaked despite post-migration seal failure: {out1_str}"
-        );
-        assert!(
-            !out1_str.contains("SECRET_MIGRATED_DECISION_MUST_NOT_LEAK"),
-            "Migrated Decision leaked despite post-migration seal failure: {out1_str}"
-        );
-        assert!(
-            !out1_str.contains("PROJECT MEMORY CONTEXT"),
-            "Project memory context header must not be emitted on seal failure: {out1_str}"
-        );
-
-        // Subsequent invocation sees unsealed `.agents/memory.ldb` and fails closed before opening:
-        let out2 = evaluate_pre_invocation_payload(&payload, Some(&global_ldb_path)).unwrap();
-        assert_eq!(out2, json!({ "injectSteps": [] }));
-
-        let _ = fs::remove_dir_all(&base_target);
     }
 
     #[test]

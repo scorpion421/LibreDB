@@ -1,8 +1,8 @@
-//! Command-line interface, lifecycle hooks, Gitea automation, and native MCP server for `LibreDB`.
+//! Command-line interface, lifecycle hooks, optional Git/Gitea automation, and native MCP server for `LibreDB`.
 
 mod bench;
 mod cli_args;
-mod design_skills;
+#[cfg(feature = "git-automation")]
 mod gitea;
 mod hooks;
 mod ipc;
@@ -12,9 +12,6 @@ mod telemetry;
 
 use cli_args::CliSpec;
 
-use libredb_bridge::{
-    export_sqlite_database, import_sqlite_readonly, open_or_auto_migrate, verify_sqlite_equivalence,
-};
 use libredb_cognitive::{
     audit_workspace_guardrails_with_prefixes, create_subagent_handoff, execute_atomic_batch,
     extract_fim_slice, format_impact_batch_compact, format_locate_compact,
@@ -24,11 +21,17 @@ use libredb_cognitive::{
 };
 use libredb_core::{EdgeKind, LibreDb, NodeKind, WriteRequest};
 use std::env;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
 use std::time::Instant;
+
+const PERSONAL_DESIGN_SKILL_NAMES: [&str; 4] = [
+    "windows-app-design",
+    "android-app-design",
+    "apple-hig-design",
+    "linux-desktop-hig-design",
+];
 
 fn print_usage() {
     println!(
@@ -53,12 +56,12 @@ Antigravity Cognitive & Code-Graph Commands:
   libredb list-rules [--global <customizations.ldb>]
   libredb list-skills [--global <customizations.ldb>]
   libredb list-reflexes [--global <customizations.ldb>]
-  libredb modernize-global [--global <customizations.ldb>] [--skill-md <SKILL.md>] [--profile neutral|personal] [--migrate-legacy]
+  libredb modernize-global [--global <customizations.ldb>] [--skill-md <SKILL.md>] [--skills-dir <dir>] [--profile neutral|personal]
   libredb mcp-serve [<default_project.ldb>] [--global <customizations.ldb>] [--workspace-root <dir>]
   libredb savings | report [--today] [--days <n>] [--cid <id>] [--project <dir> | --cwd <dir>] [--json]
 
 Security, Trust & Universal Configuration Commands:
-  libredb trust [<dir>] [--revoke] [--list] [--reinit-lost] [--accept-rollback] [--migrate-v3 [--confirm-metadata]] [--migrate-v2] [--if-clean] [--global <customizations.ldb>]
+  libredb trust [<dir>] [--revoke] [--list] [--reinit-lost] [--accept-rollback] [--if-clean] [--global <customizations.ldb>]
   libredb config <get|set|unset|list> [<key>] [<value>] [--project <dir> | --cwd <dir>] [--global <customizations.ldb>]
   libredb guardrail check [--path <dir>] [--staged] [--strict]
   libredb hook-pre-tool [--global <customizations.ldb>]
@@ -68,11 +71,6 @@ Security, Trust & Universal Configuration Commands:
   libredb git-init | gitea-init [<dir>] [--project <dir>] [--name <repo>] [--use-existing] [--overwrite]
   libredb git-sync | gitea-sync [-m <msg>] [--project <dir> | --cwd <dir>] [--remote <r>] [--all-remotes] [--github] [--releases] [--allow-unversioned]
   libredb git-release | gitea-release [vX.Y.Z] [--project <dir> | --cwd <dir>] [--remote <r>] [--all-remotes] [--github]
-
-Lossless 1:1 SQLite Bridge Commands:
-  libredb import-sqlite <db.ldb> <source.db> [--scope central|project]
-  libredb export-sqlite <db.ldb> <reconstructed.db> [--scope central|project]
-  libredb verify-roundtrip <source.db> [--scope central|project]
 
 Core Storage & Graph Commands:
   libredb init <db.ldb>
@@ -86,7 +84,7 @@ Core Storage & Graph Commands:
   libredb compact <db.ldb> [--prune]
   libredb stats | status [<db.ldb>] [--project <dir> | --cwd <dir>] [--json] [--global <customizations.ldb>]
   libredb verify <db.ldb>
-  libredb bench [--suite kernel|full|audit] [--workspace <dir> | --project <dir> | --cwd <dir>] [--filter <p1,p2>] [--ext <e1,e2>] [--max-files <n>] [--nodes <n>] [--threads <t>] [--json]",
+  libredb bench [--suite kernel|full|audit|learning] [--workspace <dir> | --project <dir> | --cwd <dir>] [--filter <p1,p2>] [--ext <e1,e2>] [--max-files <n>] [--nodes <n>] [--threads <t>] [--json]",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -220,16 +218,13 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "trust" => {
             let cli = CliSpec::new(
                 "trust",
-                "libredb trust [<dir>] [--revoke] [--list] [--reinit-lost] [--accept-rollback] [--migrate-v3 [--confirm-metadata]] [--migrate-v2] [--if-clean] [--global <customizations.ldb>]",
+                "libredb trust [<dir>] [--revoke] [--list] [--reinit-lost] [--accept-rollback] [--if-clean] [--global <customizations.ldb>]",
             )
             .positionals(0, Some(1))
             .allow_global()
             .switches(&[
                 "--revoke",
                 "--list",
-                "--migrate-v2",
-                "--migrate-v3",
-                "--confirm-metadata",
                 "--reinit-lost",
                 "--accept-rollback",
                 "--if-clean",
@@ -238,9 +233,6 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let dir_opt = cli.positionals.first().map(PathBuf::from);
             let revoke = cli.has_switch("--revoke");
             let list = cli.has_switch("--list");
-            let migrate_v2 = cli.has_switch("--migrate-v2");
-            let migrate_v3 = cli.has_switch("--migrate-v3");
-            let confirm_metadata = cli.has_switch("--confirm-metadata");
             let reinit_lost = cli.has_switch("--reinit-lost");
             let accept_rollback = cli.has_switch("--accept-rollback");
             let if_clean = cli.has_switch("--if-clean");
@@ -251,114 +243,18 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 for (_, display_path) in items {
                     println!("  * {display_path}");
                 }
-            } else if migrate_v3 {
-                if let Some(target_dir) = dir_opt {
-                    let abs = std::fs::canonicalize(&target_dir).unwrap_or(target_dir);
-                    let clean = gitea::strip_verbatim_prefix(&abs);
-                    if security::migrate_workspace_seal_v3_to_v4(&gdb, &clean, confirm_metadata)? {
-                        println!(
-                            "[OK] Verified legacy v0.9.3 HMAC + Inode invariants and upgraded workspace '{}' to v4 metadata-bound seal",
-                            clean.display()
-                        );
-                    } else {
-                        println!(
-                            "[OK] Workspace '{}' already carries a valid v4 metadata-bound trust seal",
-                            clean.display()
-                        );
-                    }
-                } else {
-                    let mut migrated = 0usize;
-                    let mut already_valid = 0usize;
-                    let mut rejected = 0usize;
-                    for (_, raw_ws) in security::list_trusted_workspaces(&gdb)? {
-                        let ws_path = PathBuf::from(raw_ws.trim());
-                        if !ws_path.is_dir()
-                            || (!ws_path.join(".agents").join("memory.ldb").is_file()
-                                && !security::has_prior_workspace_seal_marker(&gdb, &ws_path))
-                        {
-                            continue;
-                        }
-                        match security::migrate_workspace_seal_v3_to_v4(
-                            &gdb,
-                            &ws_path,
-                            confirm_metadata,
-                        ) {
-                            Ok(true) => migrated += 1,
-                            Ok(false) => already_valid += 1,
-                            Err(msg) => {
-                                rejected += 1;
-                                eprintln!(
-                                    "[WARN] Refused v3->v4 seal migration for '{}': {msg}",
-                                    ws_path.display()
-                                );
-                            }
-                        }
-                    }
-                    println!(
-                        "[OK] Workspace v3->v4 seal migration summary: {migrated} upgraded, {already_valid} already v4, {rejected} rejected"
-                    );
-                    if rejected > 0 {
-                        return Err(format!(
-                            "{rejected} workspace(s) require inspection / '--confirm-metadata' or failed v3 HMAC verification and remain quarantined"
-                        )
-                        .into());
-                    }
-                }
-            } else if migrate_v2 {
-                if let Some(target_dir) = dir_opt {
-                    let abs = std::fs::canonicalize(&target_dir).unwrap_or(target_dir);
-                    let clean = gitea::strip_verbatim_prefix(&abs);
-                    if security::migrate_workspace_seal_v2_to_v3(&gdb, &clean)? {
-                        println!(
-                            "[OK] Verified legacy v2 HMAC and upgraded workspace '{}' to content-bound v4 seal",
-                            clean.display()
-                        );
-                    } else {
-                        println!(
-                            "[OK] Workspace '{}' already carries a valid content-bound v4 trust seal",
-                            clean.display()
-                        );
-                    }
-                } else {
-                    let mut migrated = 0usize;
-                    let mut already_valid = 0usize;
-                    let mut rejected = 0usize;
-                    for (_, raw_ws) in security::list_trusted_workspaces(&gdb)? {
-                        let ws_path = PathBuf::from(raw_ws.trim());
-                        if !ws_path.is_dir()
-                            || (!ws_path.join(".agents").join("memory.ldb").is_file()
-                                && !security::has_prior_workspace_seal_marker(&gdb, &ws_path))
-                        {
-                            continue;
-                        }
-                        match security::migrate_workspace_seal_v2_to_v3(&gdb, &ws_path) {
-                            Ok(true) => migrated += 1,
-                            Ok(false) => already_valid += 1,
-                            Err(msg) => {
-                                rejected += 1;
-                                eprintln!("[WARN] Refused v2->v3 seal migration for '{}': {msg}", ws_path.display());
-                            }
-                        }
-                    }
-                    println!(
-                        "[OK] Workspace v2->v4 seal migration summary: {migrated} upgraded, {already_valid} already v4, {rejected} rejected"
-                    );
-                    if rejected > 0 {
-                        return Err(format!("{rejected} workspace(s) failed v2 HMAC verification and remain quarantined").into());
-                    }
-                }
             } else {
                 security::check_global_trust_sync(&gdb)?;
                 let target_dir = dir_opt.unwrap_or(env::current_dir()?);
                 let abs = std::fs::canonicalize(&target_dir).unwrap_or(target_dir);
-                let clean = gitea::strip_verbatim_prefix(&abs);
+                let clean = security::strip_verbatim_prefix(&abs);
                 if revoke {
                     security::revoke_workspace_trust(&gdb, &clean)?;
                     println!("[OK] Revoked workspace trust for '{}'", clean.display());
                 } else if if_clean {
                     if security::is_workspace_memory_trusted(Some(&gdb), &clean) {
                         let ldb_path = clean.join(".agents").join("memory.ldb");
-                        let (pdb, _) = hooks::open_project_ldb_silent(&ldb_path)?;
+                        let pdb = hooks::open_project_ldb_silent(&ldb_path)?;
                         security::seal_workspace_memory(&gdb, &pdb, &clean)?;
                         println!(
                             "[OK] Trusted and cryptographically sealed clean workspace '{}'",
@@ -406,7 +302,7 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         .into());
                     }
                     let ldb_path = clean.join(".agents").join("memory.ldb");
-                    let (pdb, _) = hooks::open_project_ldb_silent(&ldb_path)?;
+                    let pdb = hooks::open_project_ldb_silent(&ldb_path)?;
                     security::seal_workspace_memory(&gdb, &pdb, &clean)?;
                     println!(
                         "[OK] Trusted and cryptographically sealed workspace '{}'",
@@ -414,7 +310,7 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     );
                 } else {
                     let ldb_path = clean.join(".agents").join("memory.ldb");
-                    let (pdb, _) = hooks::open_project_ldb_silent(&ldb_path)?;
+                    let pdb = hooks::open_project_ldb_silent(&ldb_path)?;
                     security::seal_workspace_memory(&gdb, &pdb, &clean)?;
                     if reinit_lost {
                         println!(
@@ -461,7 +357,7 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let mut proj_seal_guard: Option<security::PreMutationSealGuard> = None;
             let db: Arc<LibreDb> = if let Some(ref pdir) = proj_dir {
                 let abs = std::fs::canonicalize(pdir).unwrap_or_else(|_| pdir.clone());
-                let clean = gitea::strip_verbatim_prefix(&abs);
+                let clean = security::strip_verbatim_prefix(&abs);
                 let ldb_p = clean.join(".agents").join("memory.ldb");
                 if matches!(action, "set" | "unset") {
                     proj_seal_guard = Some(security::PreMutationSealGuard::verify_before_write(
@@ -469,8 +365,7 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         &ldb_p,
                     )?);
                 }
-                let (pdb, _) = hooks::open_project_ldb_silent(&ldb_p)?;
-                pdb
+                hooks::open_project_ldb_silent(&ldb_p)?
             } else {
                 hooks::open_global_ldb(cli.global_deref())?
             };
@@ -834,13 +729,13 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "modernize-global" => {
             let cli = CliSpec::new(
                 "modernize-global",
-                "libredb modernize-global [--global <customizations.ldb>] [--skill-md <SKILL.md>] [--profile neutral|personal] [--migrate-legacy]",
+                "libredb modernize-global [--global <customizations.ldb>] [--skill-md <SKILL.md>] [--skills-dir <dir>] [--profile neutral|personal]",
             )
             .positionals(0, Some(0))
             .allow_global()
-            .switches(&["--personal", "--migrate-legacy"])
+            .switches(&["--personal"])
             .alias("--personal-rules", "--personal")
-            .values(&["--skill-md", "--profile"])
+            .values(&["--skill-md", "--skills-dir", "--profile"])
             .parse(sub_args)?;
             let mut personal = cli.has_switch("--personal");
             if let Some(prof) = cli.value("--profile") {
@@ -856,7 +751,7 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             let skill_md = cli.path_value("--skill-md");
-            let migrate_legacy = cli.has_switch("--migrate-legacy");
+            let skills_dir = cli.path_value("--skills-dir");
             let target_global = cli
                 .global_path
                 .clone()
@@ -866,22 +761,19 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     std::fs::create_dir_all(parent)?;
                 }
             }
-            let gdb = if migrate_legacy {
-                let central_sql = hooks::default_central_sqlite_path();
-                if !target_global.exists() && central_sql.is_file() {
-                    open_or_auto_migrate(&target_global, Some(central_sql.as_path()), "central")?.0
-                } else {
-                    let existing_gdb = hooks::open_global_ldb(Some(&target_global))?;
-                    if central_sql.is_file() {
-                        import_sqlite_readonly(&central_sql, &existing_gdb, "central")?;
-                    }
-                    existing_gdb
-                }
-            } else {
-                hooks::open_global_ldb(Some(&target_global))?
-            };
-            modernize_global_db(&gdb, skill_md.as_deref(), personal)?;
+            let gdb = hooks::open_global_ldb(Some(&target_global))?;
+            modernize_global_db(&gdb, skill_md.as_deref(), skills_dir.as_deref(), personal)?;
         }
+        #[cfg(not(feature = "git-automation"))]
+        "gitea-credential-helper" | "gitea-status" | "git-status" | "gitea-config"
+        | "gitea-init" | "git-init" | "gitea-sync" | "git-sync" | "gitea-release"
+        | "git-release" => {
+            return Err(
+                "Git/Gitea automation commands require building libredb-cli with the 'git-automation' feature enabled."
+                    .into(),
+            );
+        }
+        #[cfg(feature = "git-automation")]
         "gitea-credential-helper" => {
             let cli = CliSpec::new(
                 "gitea-credential-helper",
@@ -893,6 +785,7 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let action = cli.positionals.first().map(String::as_str).unwrap_or("get");
             gitea::cmd_gitea_credential_helper(action, cli.global_deref())?;
         }
+        #[cfg(feature = "git-automation")]
         cmd @ ("gitea-status" | "git-status") => {
             let cli = CliSpec::new(
                 cmd,
@@ -905,7 +798,9 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .parse(sub_args)?;
             gitea::cmd_gitea_status(cli.global_deref())?;
         }
+        #[cfg(feature = "git-automation")]
         "gitea-config" => {
+            use std::io::Read;
             let cli = CliSpec::new(
                 "gitea-config",
                 "libredb gitea-config [--url <u>] [--user <usr>] [--token <tok> | --token-stdin] [--allow-insecure-http <bool>] [--register-helper] [--global <customizations.ldb>]",
@@ -931,6 +826,7 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 cli.has_switch("--register-helper"),
             )?;
         }
+        #[cfg(feature = "git-automation")]
         cmd @ ("gitea-init" | "git-init") => {
             let cli = CliSpec::new(
                 cmd,
@@ -957,6 +853,7 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 cli.global_deref(),
             )?;
         }
+        #[cfg(feature = "git-automation")]
         cmd @ ("gitea-sync" | "git-sync") => {
             let cli = CliSpec::new(
                 cmd,
@@ -990,6 +887,7 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 cli.global_deref(),
             )?;
         }
+        #[cfg(feature = "git-automation")]
         cmd @ ("gitea-release" | "git-release") => {
             let cli = CliSpec::new(
                 cmd,
@@ -1591,129 +1489,6 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     println!("{}", libredb_cognitive::format_learning_report(&rep));
                 }
             }
-        }
-        "import-sqlite" => {
-            let cli = CliSpec::new(
-                "import-sqlite",
-                "libredb import-sqlite <db.ldb> <source.db> [--scope central|project] [--global <customizations.ldb>]",
-            )
-            .positionals(2, Some(2))
-            .allow_global()
-            .values(&["--scope"])
-            .parse(sub_args)?;
-            let scope = cli.value("--scope").unwrap_or("central");
-            let t0 = Instant::now();
-            let db_path = Path::new(&cli.positionals[0]);
-            let gdb_opt = hooks::open_global_ldb_checked(cli.global_deref())?;
-            let seal_guard = if scope == "central" {
-                security::PreMutationSealGuard::verify_before_write_allow_fresh_global_import(
-                    gdb_opt.as_deref(),
-                    db_path,
-                )?
-            } else {
-                security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?
-            };
-            let db = Arc::new(LibreDb::open(db_path)?);
-            let sum = import_sqlite_readonly(Path::new(&cli.positionals[1]), &db, scope)?;
-            // Pre-build and persist the inverted index snapshot BEFORE sealing so cold CLI `pulse` runs in <10 ms!
-            let mut cog = CognitiveEngine::open_db(Arc::clone(&db))?;
-            cog.save_index_snapshot()?;
-            seal_guard.reseal_after_write(gdb_opt.as_deref(), &db)?;
-            println!(
-                "[OK] Imported SQLite '{}' + saved persistent index snapshot in {:.2} ms: {} tables ({} rows) -> {} cognitive capsules + {} synapses",
-                cli.positionals[1],
-                t0.elapsed().as_secs_f64() * 1000.0,
-                sum.tables_mirrored,
-                sum.total_sqlite_rows,
-                sum.cognitive_capsules_created,
-                sum.synapses_wired
-            );
-        }
-        "export-sqlite" => {
-            let cli = CliSpec::new(
-                "export-sqlite",
-                "libredb export-sqlite <db.ldb> <reconstructed.db> [--scope central|project] [--global <customizations.ldb>]",
-            )
-            .positionals(2, Some(2))
-            .allow_global()
-            .values(&["--scope"])
-            .parse(sub_args)?;
-            let scope = cli.value("--scope").unwrap_or("central");
-            let t0 = Instant::now();
-            let db =
-                open_cli_verified_project_db(cli.global_deref(), Path::new(&cli.positionals[0]))?;
-            let rows = export_sqlite_database(&db, scope, Path::new(&cli.positionals[1]))?;
-            println!(
-                "[OK] Reconstructed SQLite '{}' (scope={}, {} rows + FTS5 indexes) in {:.2} ms",
-                cli.positionals[1],
-                scope,
-                rows,
-                t0.elapsed().as_secs_f64() * 1000.0
-            );
-        }
-        "verify-roundtrip" => {
-            let cli = CliSpec::new(
-                "verify-roundtrip",
-                "libredb verify-roundtrip <source.db> [--scope central|project]",
-            )
-            .positionals(1, Some(1))
-            .values(&["--scope"])
-            .parse(sub_args)?;
-            let scope = cli.value("--scope").unwrap_or("central");
-            let src_path = Path::new(&cli.positionals[0]);
-            let src_meta = std::fs::symlink_metadata(src_path)?;
-            if src_meta.file_type().is_symlink() || !src_meta.file_type().is_file() {
-                return Err(format!(
-                    "Refusing symlink or non-regular source SQLite file '{}'",
-                    src_path.display()
-                )
-                .into());
-            }
-            let stamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos());
-            let tmp_dir = env::temp_dir().join(format!(
-                "libredb_roundtrip_{}_{stamp}",
-                process::id()
-            ));
-            std::fs::create_dir(&tmp_dir)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&tmp_dir, std::fs::Permissions::from_mode(0o700));
-            }
-
-            let copy_src = tmp_dir.join("source_snapshot.db");
-            let temp_ldb = tmp_dir.join("bridge.tmp.ldb");
-            let recon_db = tmp_dir.join("reconstructed.db");
-            std::fs::copy(src_path, &copy_src)?;
-
-            let t0 = Instant::now();
-            let imp_sum;
-            {
-                let ldb = LibreDb::open(&temp_ldb)?;
-                imp_sum = import_sqlite_readonly(&copy_src, &ldb, scope)?;
-                ldb.compact_with_gravity()?;
-                ldb.verify_integrity()?;
-                export_sqlite_database(&ldb, scope, &recon_db)?;
-            }
-            let rep = verify_sqlite_equivalence(&copy_src, &recon_db)?;
-            let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-            let _ = std::fs::remove_dir_all(&tmp_dir);
-
-            println!("=== LOSSLESS 1:1 SQLITE <-> LIBREDB BIJECTION VERIFIED ===");
-            println!("  Source snapshot:       {}", src_path.display());
-            println!(
-                "  Tables verified:       {} (including {} FTS5 virtual tables)",
-                rep.tables_verified, rep.fts5_tables_verified
-            );
-            println!("  Exact rows verified:   {} (0 discrepancies)", rep.rows_verified);
-            println!(
-                "  Cognitive graph built: {} capsules + {} synapses",
-                imp_sum.cognitive_capsules_created, imp_sum.synapses_wired
-            );
-            println!("  Canonical digest:      {}", rep.canonical_digest_hex);
-            println!("  Total round-trip time: {:.2} ms", elapsed_ms);
         }
         "init" => {
             let cli = CliSpec::new(
@@ -2353,6 +2128,7 @@ fn deprecate_skill_and_sections(
 fn modernize_global_db(
     gdb: &Arc<LibreDb>,
     skill_md_opt: Option<&Path>,
+    skills_dir_opt: Option<&Path>,
     personal: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let t0 = Instant::now();
@@ -2466,7 +2242,7 @@ fn modernize_global_db(
                 deprecated_legacy += 1;
             }
         }
-        for (skill_name, _) in design_skills::PERSONAL_DESIGN_SKILLS {
+        for skill_name in PERSONAL_DESIGN_SKILL_NAMES {
             deprecated_legacy += deprecate_skill_and_sections(gdb, skill_name)?;
         }
     }
@@ -2684,12 +2460,23 @@ fn modernize_global_db(
         }
         active_reflex_count += personal_reflexes.len();
 
-        let mut design_sections = 0usize;
-        for (skill_name, skill_md) in design_skills::PERSONAL_DESIGN_SKILLS {
-            let (_, cnt) = sync_skill_markdown_str(gdb, skill_md, Some(skill_name), skill_name)?;
-            design_sections += cnt;
+        let effective_skills_dir = skills_dir_opt
+            .map(Path::to_path_buf)
+            .or_else(|| {
+                let cwd_skills = PathBuf::from("skills");
+                cwd_skills.is_dir().then_some(cwd_skills)
+            });
+        if let Some(ref sdir) = effective_skills_dir {
+            let mut design_sections = 0usize;
+            for skill_name in PERSONAL_DESIGN_SKILL_NAMES {
+                let p = sdir.join(skill_name).join("SKILL.md");
+                if p.is_file() {
+                    let (_, cnt) = sync_skill_markdown(gdb, &p, Some(skill_name))?;
+                    design_sections += cnt;
+                }
+            }
+            synced_sections += design_sections;
         }
-        synced_sections += design_sections;
 
         let pushback_rule = "[Rule: candid-architectural-pushback | priority=100 | enforcement=CRITICAL]\nSummary: Candid engineering pushback without false politeness when coding ideas overshoot the target.\nWhenever a user idea or architectural direction shoots past the target, introduces unnecessary complexity, hardcodes a fragile assumption, or heads in the wrong technical direction, state directly and candidly that it is suboptimal and immediately propose the cleaner engineering alternative. Never hold back technical criticism out of personal consideration.";
         gdb.put(
@@ -2718,7 +2505,10 @@ fn modernize_global_db(
 
     // Transparently upgrade any legacy plaintext or POSIX `vault:v1:` `gitea_token` to OS vault (`dpapi:v1:` / `vault:v2:`)
     // BEFORE `--prune` compaction physically purges superseded extents from `customizations.ldb`!
-    let _ = gitea::GiteaConfig::load(gdb);
+    #[cfg(feature = "git-automation")]
+    {
+        let _ = gitea::GiteaConfig::load(gdb);
+    }
 
     // Audit registered workspaces strictly read-only (`is_workspace_memory_trusted`): NEVER re-seal
     // unverified or offline-modified `.agents/memory.ldb` databases during global upgrades!
@@ -2748,16 +2538,9 @@ fn modernize_global_db(
                         ws_path.display(),
                         ws_path.display()
                     );
-                } else if security::has_valid_legacy_v3_content_seal(gdb, &ws_path) {
-                    println!(
-                        "[WARN] Quarantined workspace '{}': .agents/memory.ldb carries a valid legacy v0.9.3 content seal (CognitiveContent::v3) without v4 metadata authentication; run 'libredb trust --migrate-v3 \"{}\"' (adding '--confirm-metadata' after reviewing unauthenticated metadata if prompted).",
-                        ws_path.display(),
-                        ws_path.display()
-                    );
                 } else {
                     println!(
-                        "[WARN] Quarantined workspace '{}': .agents/memory.ldb has an unverified, legacy v2, or modified seal (run 'libredb trust --migrate-v2 \"{}\"' for v0.9.0 upgrades or 'libredb trust \"{}\"' after manual inspection).",
-                        ws_path.display(),
+                        "[WARN] Quarantined workspace '{}': .agents/memory.ldb has an unverified, legacy, or modified seal; inspect the database and run 'libredb trust \"{}\"' to re-seal.",
                         ws_path.display(),
                         ws_path.display()
                     );
@@ -2787,7 +2570,7 @@ fn modernize_global_db(
 }
 
 /// Verifies workspace trust BEFORE read-only CLI commands (`pulse`, `skeleton`, `impact`, `fim`)
-/// open or auto-migrate a project `.agents/memory.ldb` (or legacy `.db`).
+/// open a project `.agents/memory.ldb`.
 fn open_cli_verified_project_db(
     global_path_opt: Option<&Path>,
     db_path: &Path,
@@ -2809,20 +2592,12 @@ fn open_cli_verified_project_db(
         let is_mem = resolved_db
             .file_name()
             .and_then(|n| n.to_str())
-            .is_some_and(|n| {
-                n.eq_ignore_ascii_case("memory.ldb") || n.eq_ignore_ascii_case("memory.db")
-            });
+            .is_some_and(|n| n.eq_ignore_ascii_case("memory.ldb"));
         if is_agents && is_mem {
             if let Some(ws_root) = parent.parent() {
                 if security::is_private_brain_workspace(ws_root) {
                     let ldb_file = ws_root.join(".agents").join("memory.ldb");
-                    let leg_sql = ws_root.join(".agents").join("memory.db");
-                    let sql_opt = if !ldb_file.exists() && leg_sql.is_file() {
-                        Some(leg_sql.as_path())
-                    } else {
-                        None
-                    };
-                    return Ok(open_or_auto_migrate(&ldb_file, sql_opt, "project")?.0);
+                    return Ok(Arc::new(LibreDb::open(&ldb_file)?));
                 }
                 let Some(ref gdb) = gdb_opt else {
                     return Err(format!(
@@ -2834,31 +2609,6 @@ fn open_cli_verified_project_db(
                 };
                 let _ws_lock = security::WorkspaceTrustLockGuard::acquire(gdb, ws_root)?;
                 let ldb_file = ws_root.join(".agents").join("memory.ldb");
-                let leg_sql = ws_root.join(".agents").join("memory.db");
-                if !ldb_file.exists() && leg_sql.is_file() {
-                    let norm = security::normalize_workspace_key(ws_root);
-                    if security::has_config_key_fail_closed(gdb, &format!("trust:revoked::{norm}"))?
-                        || !security::has_config_key_fail_closed(
-                            gdb,
-                            &format!("trust:allowed::{norm}"),
-                        )?
-                        || security::has_prior_workspace_seal_marker(gdb, ws_root)
-                        || security::is_git_index_tracking_agents_db(ws_root)
-                    {
-                        return Err(format!(
-                            "Refusing automatic legacy SQLite migration for untrusted workspace '{}'; inspect .agents/memory.db and run 'libredb trust \"{}\"' if trusted.",
-                            ws_root.display(),
-                            ws_root.display()
-                        )
-                        .into());
-                    }
-                    let (migrated_db, did_mig) =
-                        open_or_auto_migrate(&ldb_file, Some(leg_sql.as_path()), "project")?;
-                    if did_mig.is_some() {
-                        security::seal_workspace_memory(gdb, &migrated_db, ws_root)?;
-                    }
-                    return Ok(migrated_db);
-                }
                 if !security::is_workspace_memory_trusted(Some(gdb), ws_root) {
                     return Err(format!(
                         "Workspace memory at '{}' is untrusted, tampered, or rolled back; inspect the workspace and run 'libredb trust \"{}\"' before querying it.",
@@ -2928,8 +2678,7 @@ fn resolve_default_cli_project_db(
         let mut curr: Option<&Path> = Some(ws);
         while let Some(dir) = curr {
             let ldb_cand = dir.join(".agents").join("memory.ldb");
-            let sql_cand = dir.join(".agents").join("memory.db");
-            if ldb_cand.is_file() || sql_cand.is_file() {
+            if ldb_cand.is_file() {
                 return open_cli_verified_project_db(global_path_opt, &ldb_cand);
             }
             curr = dir.parent();
@@ -3058,9 +2807,10 @@ mod tests {
         .unwrap();
 
         let gdb = Arc::new(LibreDb::open(&ldb_path).unwrap());
+        let test_skills_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../skills");
 
         // 1. Clean neutral install must create 0 active non-reflex rules and only 3 technical reflexes
-        modernize_global_db(&gdb, Some(&dummy_skill), false).unwrap();
+        modernize_global_db(&gdb, Some(&dummy_skill), Some(&test_skills_dir), false).unwrap();
         let count_non_reflex_rules = |db: &LibreDb| -> usize {
             db.list_inodes(Some(NodeKind::Rule), false)
                 .into_iter()
@@ -3077,7 +2827,7 @@ mod tests {
         assert_eq!(count_reflexes(&gdb), 3);
 
         // 2. Switching to personal profile adds personal rules + all 11 reflexes + all 4 platform design skills
-        modernize_global_db(&gdb, Some(&dummy_skill), true).unwrap();
+        modernize_global_db(&gdb, Some(&dummy_skill), Some(&test_skills_dir), true).unwrap();
         assert_eq!(count_non_reflex_rules(&gdb), 3);
         assert_eq!(count_reflexes(&gdb), 11);
         for ds in [
@@ -3115,7 +2865,7 @@ mod tests {
             .with_importance(220),
         )
         .unwrap();
-        modernize_global_db(&gdb, Some(&dummy_skill), false).unwrap();
+        modernize_global_db(&gdb, Some(&dummy_skill), Some(&test_skills_dir), false).unwrap();
         assert_eq!(count_non_reflex_rules(&gdb), 2);
         assert!(gdb
             .get_by_key(NodeKind::Rule, "rule:global::candid-architectural-pushback")
@@ -3176,12 +2926,12 @@ mod tests {
         ));
 
         // Running `modernize_global_db` (both neutral and personal) MUST keep `ws_tampered` quarantined!
-        modernize_global_db(&gdb, Some(&dummy_skill), false).unwrap();
+        modernize_global_db(&gdb, Some(&dummy_skill), Some(&test_skills_dir), false).unwrap();
         assert!(
             !security::is_workspace_memory_trusted(Some(&gdb), &ws_tampered),
             "modernize_global_db must NEVER re-seal an offline-tampered workspace"
         );
-        modernize_global_db(&gdb, Some(&dummy_skill), true).unwrap();
+        modernize_global_db(&gdb, Some(&dummy_skill), Some(&test_skills_dir), true).unwrap();
         assert!(
             !security::is_workspace_memory_trusted(Some(&gdb), &ws_tampered),
             "personal modernize_global_db must NEVER re-seal an offline-tampered workspace"
@@ -3216,7 +2966,7 @@ mod tests {
         let gdb = LibreDb::open(&fresh_global).unwrap();
         assert!(fresh_global.is_file());
 
-        // 2. Once `customizations.ldb` exists on disk, low-level `init` / `put` / `import-sqlite` MUST fail closed:
+        // 2. Once `customizations.ldb` exists on disk, low-level `init` / `put` MUST fail closed:
         assert!(
             security::PreMutationSealGuard::verify_before_write_allow_fresh_global_import(
                 Some(&gdb),

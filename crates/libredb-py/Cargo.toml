@@ -12,10 +12,8 @@ name = "libredb_py"
 crate-type = ["cdylib"]
 
 [dependencies]
-libredb-bridge = { path = "../libredb-bridge" }
 libredb-cognitive = { path = "../libredb-cognitive" }
 libredb-core = { path = "../libredb-core" }
 parking_lot.workspace = true
 pyo3 = { version = "0.24", features = ["extension-module", "abi3-py312"] }
 serde_json.workspace = true
-tempfile.workspace = true

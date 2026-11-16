@@ -12,3 +12,6 @@ libredb-core = { path = "../libredb-core" }
 libredb-index = { path = "../libredb-index" }
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

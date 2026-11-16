@@ -1,8 +1,7 @@
 param(
     [ValidateSet("Neutral", "Personal")]
     [string]$Profile = "Neutral",
-    [switch]$NoHooks,
-    [switch]$MigrateLegacy
+    [switch]$NoHooks
 )
 
 $ErrorActionPreference = "Stop"
@@ -22,22 +21,25 @@ New-Item -ItemType Directory -Force -Path $BinDir, $RulesDir, $SkillDir, $Assets
 $ReleaseExe = Join-Path $ProjectRoot "target\release\libredb.exe"
 $ReleaseDll = Join-Path $ProjectRoot "target\release\libredb_py.dll"
 if (-not (Test-Path $ReleaseExe)) {
-    throw "Release binary not found at $ReleaseExe. Run 'cargo build --release --workspace' first."
+    throw "Release binary not found at $ReleaseExe. Run 'cargo build --release' first."
 }
 
 function Install-BinaryHotSafe {
     param([string]$Src, [string]$Dst)
     Unblock-File -Path $Src -ErrorAction SilentlyContinue
+    # Opportunistically sweep unlocked `.old` binaries deferred from prior live upgrades.
+    Remove-Item "$Dst.old" -Force -ErrorAction SilentlyContinue
+    $DstDir = Split-Path -Parent $Dst
+    $DstLeaf = Split-Path -Leaf $Dst
+    Get-ChildItem -LiteralPath $DstDir -Filter "$DstLeaf.*.old" -ErrorAction SilentlyContinue |
+        Remove-Item -Force -ErrorAction SilentlyContinue
     if (Test-Path $Dst) {
-        $OldPath = "$Dst.old"
-        if (Test-Path $OldPath) {
-            Remove-Item $OldPath -Force -ErrorAction SilentlyContinue
-        }
         try {
             Copy-Item $Src $Dst -Force
             Unblock-File -Path $Dst -ErrorAction SilentlyContinue
             return
         } catch {
+            $OldPath = "$Dst.$PID.$([Environment]::TickCount64).old"
             Move-Item $Dst $OldPath -Force
         }
     }
@@ -76,16 +78,10 @@ foreach ($PathDir in $TargetPathDirs) {
     }
 }
 
-# Seed ~/.gemini/libredb/customizations.ldb cleanly on neutral installs; import legacy customizations.db
-# only when explicitly requested (-MigrateLegacy) or when deploying the maintainer's -Profile Personal.
-$CentralSqlite = Join-Path $GeminiDir "database\customizations.db"
+# Seed ~/.gemini/libredb/customizations.ldb cleanly when absent.
 $GlobalLdb = Join-Path $LibreHome "customizations.ldb"
 if (-not (Test-Path $GlobalLdb)) {
-    if ((($Profile -eq "Personal") -or $MigrateLegacy) -and (Test-Path $CentralSqlite)) {
-        & $TargetExe import-sqlite $GlobalLdb $CentralSqlite --scope central
-    } else {
-        & $TargetExe init $GlobalLdb | Out-Null
-    }
+    & $TargetExe init $GlobalLdb | Out-Null
 }
 
 $ExeForward = $TargetExe.Replace('\', '/')
@@ -97,7 +93,7 @@ $PluginJson = @'
 {
   "name": "libredb",
   "displayName": "LibreDB Cognitive Memory",
-  "version": "1.7.0",
+  "version": "2.0.0",
   "description": "Persistent project memory, fast code-graph search, and token-savings engine for Antigravity. Routes sub-millisecond lifecycle hooks via an in-memory MCP IPC coordinator with O(1) tail-sync, locates functions and call dependencies without reading whole files, enforces workspace guardrails, and automates Git/Gitea releases.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
@@ -138,9 +134,18 @@ function Test-SafeBinaryAcl {
             if ($Rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) {
                 continue
             }
-            $Id = $Rule.IdentityReference.Value
-            $IsBroad = $Id -match '^(Everyone|Jeder|BUILTIN\\Users|BUILTIN\\Benutzer|NT AUTHORITY\\Authenticated Users|NT-AUTORIT.+\\Authentifizierte Benutzer)$' -or
-                       $Id -match '\\(Domain Users|Dom.+nen-Benutzer)$'
+            $Sid = $null
+            try {
+                if ($Rule.IdentityReference -is [System.Security.Principal.SecurityIdentifier]) {
+                    $Sid = $Rule.IdentityReference.Value
+                } else {
+                    $Sid = $Rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+                }
+            } catch {
+                $Sid = $Rule.IdentityReference.Value
+            }
+            $IsBroad = $Sid -match '^(S-1-1-0|S-1-2-0|S-1-5-11|S-1-5-32-545|S-1-5-32-546)$' -or
+                       $Sid -match '^S-1-5-21-\d+-\d+-\d+-(513|515)$'
             if ($IsBroad) {
                 $Rights = [int]$Rule.FileSystemRights
                 # FileSystemRights: WriteData/CreateFiles (2), AppendData (4), Write (278), Modify (197055), FullControl (2032127), GenericWrite (0x40000000), GenericAll (0x10000000)
@@ -252,7 +257,7 @@ if ($Profile -eq "Personal") {
     $AgentsMd = @'
 # Central LibreDB rules directive
 
-All system rules, coding standards, administrative credentials, and skills live in `~/.gemini/libredb/customizations.ldb` (auto-migrating legacy `.db` files 1:1 on first touch). Enforce with HIGHEST PRIORITY:
+All system rules, coding standards, administrative credentials, and skills live in `~/.gemini/libredb/customizations.ldb` (pure Rust single-file `LIBREDB1` storage). Enforce with HIGHEST PRIORITY:
 
 1. **Global output formatting invariant**:
    - **No em-dashes or en-dashes**: Never output U+2014 or U+2013 in chat, markdown, code comments, commits, or artifacts. Use `-`, `:`, or `(...)`.
@@ -268,7 +273,7 @@ All system rules, coding standards, administrative credentials, and skills live 
    - **Language boundary**: 100% grammatically correct ASCII English in all code, comments, logs, UI strings, and commits. Never translate UI strings to German.
    - **SemVer & releases**: Follow https://semver.org/ (`MAJOR.MINOR.PATCH`) and https://keepachangelog.com/en/1.1.0/. Never overwrite published tags; bump version, update `CHANGELOG.md` (`## [X.Y.Z] - YYYY-MM-DD`), place deliverables (`.apk`, `.aab`, `.exe`, `.msi`, `.xpi`, `.vsix`, `.whl`, `.jar`, `.zip`) in `dist/` or `releases/`, and sync via `libredb git-sync -m "<msg>" --project "<dir>" --releases` / `libredb git-release vX.Y.Z --project "<dir>"`.
    - **Human-readable changelogs, release notes & overviews**: Write all `README.md` summaries, plugin overviews, `CHANGELOG.md` entries, and Git/Gitea release descriptions in clear, logical IT prose for human engineers and users. Explain what changed, why it matters, and how to use it in 1-2 concise sentences per bullet - never dump internal helper function names, storage keys, or run-on buzzword chains.
-   - **Authoring & README**: Commit as `Antigravity <antigravity@local.dev>`. Strictly no VBScript (`.vbs`, `cscript`, `wscript`). Follow the 9-block `README.md` blueprint: (1) `# Title`, (2) Shields.io badges (`Version`, `Tests`, stack, `AGPLv3 + Commons Clause`), (3) 1-3 sentence summary, (4) `## Table of contents`, (5) executive summary table, (6) installation & quickstart, (7) usage & commands, (8) architecture & ASCII tree (`|--`), (9) SemVer & license.
+   - **Authoring & README**: Commit as `Antigravity <antigravity@local.dev>`. Strictly no VBScript (`.vbs`, `cscript`, `wscript`). Follow the 9-block `README.md` blueprint: (1) `# Title`, (2) Shields.io badges (`Version`, `Tests`, stack, `Apache 2.0 + Commons Clause`), (3) 1-3 sentence summary, (4) `## Table of contents`, (5) executive summary table, (6) installation & quickstart, (7) usage & commands, (8) architecture & ASCII tree (`|--`), (9) SemVer & license.
 
 4. **Admin elevation and SOC audit standard (`C:\IT_ADMIN_LOGS\<USERNAME>\<TASK>\<TARGET>\<Date>\<hh_mm_ss>\`)**:
    - Elevate directly, via DPAPI (`~/.gemini/config/credentials/*.credential.xml`), or `Start-Process -Verb RunAs`. Never stage in `C:\Windows\Temp`, use `cmd.exe /c` wrappers, create remote services (`sc.exe \\`), or hardcode identities. After approval, log `[1/4 PRE-CHECK]`, `[2/4..3/4 ACTION]`, `[4/4 POST-CHECK]`, `[CLEANUP]` to `AuditLog_<Target>_<Date>_<hh_mm_ss>.log`.
@@ -279,7 +284,7 @@ All system rules, coding standards, administrative credentials, and skills live 
    - **Batching & verification**: Fix entire bug classes before rebuilding, chain `build && test && verify`, commit memory via `libredb_memorize`, check `libredb guardrail check --path "<dir>" --staged --strict`, inspect savings/benchmarks natively via `libredb savings` and `libredb bench` (zero ad-hoc scripts), and use `WaitMsBeforeAsync=10000` without polling. Note any internal tool workarounds briefly at the end.
 
 6. **Autonomous project memory & Git/Gitea sync (pure Pull)**:
-   - Persist/recall via `libredb_memorize`, `libredb_pulse` (`query`, `cwd`, `cid`, `budget`), and `libredb get-skill <name> [--section "<Section>"]` / `libredb slice-skill "<query>"` on `.agents/memory.ldb` (auto-migrating legacy `.agents/memory.db` 1:1).
+   - Persist/recall via `libredb_memorize`, `libredb_pulse` (`query`, `cwd`, `cid`, `budget`), and `libredb get-skill <name> [--section "<Section>"]` / `libredb slice-skill "<query>"` on pure-Rust `.agents/memory.ldb`.
    - Use `libredb git-init`, `git-sync`, `git-release`, and `gitea-status`. Never hijack non-Gitea `origin` remotes or leak Gitea auth headers; ask before `--allow-unversioned` ("Soll ich das wirklich ohne Versionierung hochladen?") and pause on `[GITEA REPOSITORY COLLISION]`. Link URLs as `[Label](url)`.
 
 7. **Model & concurrency catalog**:
@@ -323,7 +328,7 @@ description: >-
 
 # LibreDB cognitive memory, code graph, and Gitea suite
 
-`LibreDB` gives `Antigravity` global customizations (`~/.gemini/libredb/customizations.ldb`) and per-workspace project memory (`.agents/memory.ldb`) with fast lifecycle hooks and built-in Git/Gitea release automation. Existing legacy `.agents/memory.db` SQLite databases are automatically migrated 1:1 into `.agents/memory.ldb` on first access.
+`LibreDB` gives `Antigravity` global customizations (`~/.gemini/libredb/customizations.ldb`) and per-workspace project memory (`.agents/memory.ldb`) with fast lifecycle hooks and built-in Git/Gitea release automation on a pure-Rust single-file `LIBREDB1` storage engine.
 
 ## MCP tools (`libredb-mcp`)
 
@@ -337,32 +342,34 @@ description: >-
    - `"impact"`: Returns compact (`-70%` token) bidirectional callers, DI/interface implementors, callees, and governing architectural decisions for a single `target` or batched `symbols: [...]` (`<= 64`, `format="json"` for raw JSON).
    - `"fim"`: Returns surgical `[Lstart-Lend]` edit slices with blast-radius callers, implementors, and governing decisions attached for a single `target` or batched `slices: [{"target": "...", "symbol": "...", "line": 42, "pad": 12}]` / `symbols: [...]` (`<= 32` slices, deduplicating file baseline tokens).
    - `"savings"`: Returns an authorized workspace 3-tier token-consumption and savings report (`days=0` for today, `days <= 3660`).
-3. **`libredb_memorize`** (`cwd`, `cid`, `facts`, `decisions`, `tasks`, `snapshot`, `learn_assoc`, `learn_reflex`, `sync_central_sqlite`):
-   - Atomically commits workspace/chat facts, architectural decisions (auto-linked to symbols), tasks, milestone snapshots, language-agnostic Hebbian concept bridges, or situational pitfall reflexes.
+3. **`libredb_memorize`** (`cwd`, `cid`, `facts`, `decisions`, `tasks`, `snapshot`, `learn_assoc`, `learn_reflex`, `learn_error`):
+   - Atomically commits workspace/chat facts, architectural decisions (auto-linked to symbols), tasks, milestone snapshots, language-agnostic Hebbian concept bridges, situational pitfall reflexes, or error-recovery directives.
 
 ## CLI commands (`libredb`)
 
 - **Zero-boilerplate cognitive & code-graph queries:**
-  - `libredb pulse [<db.ldb>] "<query>" [--cwd "<dir>"] [--cid <id>] [--budget <tok>]`
-  - `libredb locate [<db.ldb>] <symbol...> [--cwd "<dir>"] [--json]`
-  - `libredb impact [<db.ldb>] <symbol...> [--cwd "<dir>"] [--json]`
+  - `libredb pulse [<db.ldb>] "<query>" [--cwd "<dir>" | --project "<dir>"] [--cid <id>] [--budget <tok>] [--err <msg>]`
+  - `libredb locate [<db.ldb>] <symbol...> [--cwd "<dir>" | --project "<dir>"] [--json]`
+  - `libredb impact [<db.ldb>] <symbol...> [--cwd "<dir>" | --project "<dir>"] [--json]`
   - `libredb slice-skill "<query>" [--skill <skill_name>] [--top <k>] [--json]`
   - `libredb get-skill [<skill_name>] [--section "<Section Title>" | --query "<query>" [--top <k>]] [--json]`
-- **Learning observability:** `libredb learning [<db.ldb>] [--cwd "<dir>"] [--db <db.ldb>] [--top <n>] [--json]`
+- **Learning observability & verification:** `libredb learning [<db.ldb>] [--verify] [--cwd "<dir>" | --project "<dir>"] [--db <db.ldb>] [--top <n>] [--json]`
 - **Token savings & reproducible benchmarks:**
-  - `libredb savings | report [--today] [--days <n>] [--cid <id>] [--project "<dir>"] [--json]`
-  - `libredb bench [--suite kernel|full|audit] [--workspace "<dir>"] [--filter <p1,p2>] [--ext <e1,e2>] [--max-files <n>] [--nodes <n>] [--threads <t>] [--json]`
-- **Guardrails:** `libredb guardrail check --path "<dir>" [--staged] [--strict]`
+  - `libredb savings | report [--today] [--days <n>] [--cid <id>] [--project "<dir>" | --cwd "<dir>"] [--json]`
+  - `libredb bench [--suite kernel|full|audit|learning] [--workspace "<dir>" | --project "<dir>" | --cwd "<dir>"] [--filter <p1,p2>] [--ext <e1,e2>] [--max-files <n>] [--nodes <n>] [--threads <t>] [--json]`
+- **Guardrails & database inspection:**
+  - `libredb guardrail check --path "<dir>" [--staged] [--strict]`
+  - `libredb status | stats [<db.ldb>] [--project "<dir>" | --cwd "<dir>"] [--json]`
 - **Workspace trust & universal config:**
-  - `libredb trust [<dir>] [--revoke] [--list] [--accept-rollback] [--reinit-lost] [--migrate-v3 [--confirm-metadata]] [--migrate-v2] [--if-clean]`
-  - `libredb config <get|set|unset|list> [<key>] [<value>] [--project "<dir>"]`
+  - `libredb trust [<dir>] [--revoke] [--list] [--accept-rollback] [--reinit-lost] [--if-clean]`
+  - `libredb config <get|set|unset|list> [<key>] [<value>] [--project "<dir>" | --cwd "<dir>"]`
 - **Compaction & GC:** `libredb compact <db.ldb> [--prune]`
 - **Rules, skills & reflexes:**
   - `libredb sync-skill <SKILL.md> [--name <skill_name>]`
   - `libredb list-rules`, `libredb list-skills`, `libredb list-reflexes`
-  - `libredb modernize-global`
+  - `libredb modernize-global [--skills-dir "<dir>"] [--profile neutral|personal]`
 - **Dynamic Git & Gitea workflow:**
-  - `libredb gitea-status`
+  - `libredb gitea-status [--project "<dir>" | --cwd "<dir>"]`
   - `libredb git-init "<dir>" [--name <repo>] [--use-existing] [--overwrite]` (alias: `gitea-init`)
   - `libredb git-sync -m "<commit message>" --project "<dir>" [--remote <r>] [--all-remotes] [--github] [--releases] [--allow-unversioned]` (alias: `gitea-sync`)
   - `libredb git-release [vX.Y.Z] --project "<dir>" [--remote <r>] [--all-remotes] [--github]` (alias: `gitea-release`)
@@ -371,11 +378,9 @@ description: >-
 $SkillMdPath = Join-Path $SkillDir "SKILL.md"
 [System.IO.File]::WriteAllText($SkillMdPath, $SkillMd, $Utf8NoBom)
 
-# Modernize global DB in-place via LibreDB IPC writer lock (encrypting plaintext tokens via DPAPI + read-only v3 workspace seal audit)
-$ModernizeArgs = @("modernize-global", "--global", $GlobalLdb, "--skill-md", $SkillMdPath, "--profile", $Profile.ToLowerInvariant())
-if ($MigrateLegacy) {
-    $ModernizeArgs += "--migrate-legacy"
-}
+# Modernize global DB in-place via LibreDB IPC writer lock (encrypting plaintext tokens via DPAPI + read-only v4 workspace seal audit)
+$SkillsRepoDir = Join-Path $ProjectRoot "skills"
+$ModernizeArgs = @("modernize-global", "--global", $GlobalLdb, "--skill-md", $SkillMdPath, "--skills-dir", $SkillsRepoDir, "--profile", $Profile.ToLowerInvariant())
 & $TargetExe @ModernizeArgs
 
 if ($Profile -eq "Personal") {
@@ -420,11 +425,11 @@ $LogoSvg = @'
 
 # 7. Write user-facing README.md inside plugin bundle
 $PluginReadme = @'
-# LibreDB cognitive memory plugin (v1.7.0)
+# LibreDB cognitive memory plugin (v2.0.0)
 
-`LibreDB` gives `Antigravity` persistent project memory, targeted code navigation, and automated release workflows in a single local Rust binary:
+`LibreDB` gives `Antigravity` persistent project memory, targeted code navigation, and automated release workflows in a single 100% pure-Rust binary:
 
-- **Persistent project memory (`libredb_pulse`, `libredb_memorize`)**: Stores architectural decisions, project facts, open tasks, and global rules in a single `.agents/memory.ldb` file (automatically migrating legacy `.db` SQLite databases), synchronizing updates incrementally (`O(1)` tail-sync) and skipping entries already shown in the session.
+- **Persistent project memory (`libredb_pulse`, `libredb_memorize`)**: Stores architectural decisions, project facts, open tasks, and global rules in a single `.agents/memory.ldb` file, synchronizing updates incrementally (`O(1)` tail-sync) and skipping entries already shown in the session.
 - **In-memory hook coordinator (`libredb mcp-serve`)**: Runs `PreInvocation` and `PreToolUse` hooks directly against the live MCP server RAM over a local Named Pipe or Unix socket, avoiding duplicate file locks and timeouts on slow network drives while falling back transparently to disk.
 - **Targeted code navigation (`libredb_code`)**: Indexes functions, classes, and call relationships across 25+ languages so the agent can jump directly to symbol definitions (`locate`), inspect file outlines (`skeleton`), check affected callers (`impact`), and read exact code slices (`fim`) instead of loading entire large files.
 - **Self-correcting learning (`libredb learning --verify`)**: Remembers which code symbol solved a failed search and which fix resolved a compiler or test error, refutes wrong hints automatically across 15 verified stages (`L1..L15`), and surfaces accurate pitfalls when similar code is touched later.
@@ -453,6 +458,6 @@ if (Test-Path $AgyConfigPath) {
     }
 }
 
-Write-Output "[OK] Deployed LibreDB v1.7.0 standalone binaries to: $BinDir (Profile=$Profile)"
+Write-Output "[OK] Deployed LibreDB v2.0.0 standalone binaries to: $BinDir (Profile=$Profile)"
 Write-Output "[OK] Hydrated and modernized global store at: $GlobalLdb"
 Write-Output "[OK] Installed complete Antigravity plugin at: $PluginDir"

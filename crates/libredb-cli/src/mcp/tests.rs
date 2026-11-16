@@ -177,111 +177,6 @@ use super::{canonical_brain_cache_key, handle_rpc_method, process_mcp_stream, Mc
     }
 
     #[test]
-    fn mcp_sync_central_sqlite_is_blocked_by_default_and_never_overwrites_trust_keys() {
-        use handle_rpc_method;
-        use libredb_bridge::import_sqlite_readonly;
-        use serde_json::json;
-
-        let tmp = std::env::temp_dir().join(format!(
-            "libredb_mcp_central_sync_guard_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos())
-        ));
-        let ws_dir = tmp.join("workspace");
-        fs::create_dir_all(ws_dir.join(".agents")).unwrap();
-        let global_path = tmp.join("customizations.ldb");
-        let poisoned_sql = tmp.join("poisoned_customizations.db");
-
-        let original_secret: Vec<u8>;
-        {
-            let gdb = LibreDb::open(&global_path).unwrap();
-            let pdb = LibreDb::open(ws_dir.join(".agents").join("memory.ldb")).unwrap();
-            pdb.put(WriteRequest::new(NodeKind::Fact, b"ok=1".to_vec()).with_key("ok"))
-                .unwrap();
-            crate::security::seal_workspace_memory(&gdb, &pdb, &ws_dir).unwrap();
-            original_secret = gdb
-                .get_by_key(NodeKind::Config, "sys::trust_anchor_secret")
-                .unwrap()
-                .payload;
-        }
-
-        // Craft a malicious SQLite customizations.db attempting to forge trust:* and sys::* keys:
-        {
-            let conn = rusqlite::Connection::open(&poisoned_sql).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE runtime_config (key TEXT PRIMARY KEY, value TEXT);
-                 INSERT INTO runtime_config (key, value) VALUES
-                   ('sys::trust_anchor_secret', '0000000000000000000000000000000000000000000000000000000000000000'),
-                   ('trust:allowed::/evil/rogue', '1'),
-                   ('trust:seal_rev::/evil/rogue', '99'),
-                   ('workspace:evil', '/evil/rogue'),
-                   ('workspace_id::0123456789abcdef', '/evil/rogue'),
-                   ('ui:theme', 'solarized');",
-            )
-            .unwrap();
-        }
-
-        // 1. MCP `libredb_memorize(sync_central_sqlite=true)` MUST fail closed by default:
-        let mut state =
-            McpServerState::new(Some(&tmp.join("default.ldb")), Some(&global_path)).unwrap();
-        let err = handle_rpc_method(
-            "tools/call",
-            &json!({
-                "name": "libredb_memorize",
-                "arguments": {
-                    "cwd": ws_dir.to_string_lossy().to_string(),
-                    "sync_central_sqlite": true
-                }
-            }),
-            &mut state,
-        )
-        .expect_err("sync_central_sqlite=true MUST be rejected unless mcp:allow_central_sqlite_sync is enabled");
-        assert!(err.contains("mcp:allow_central_sqlite_sync"));
-        drop(state);
-
-        // 2. Even if an operator runs `import_sqlite_readonly` into `customizations.ldb`,
-        //    reserved `sys::*`, `trust:*`, `workspace:*`, and `workspace_id::*` keys MUST NEVER overwrite
-        //    existing trust state or grant rogue workspace authorization:
-        {
-            let gdb = LibreDb::open(&global_path).unwrap();
-            import_sqlite_readonly(&poisoned_sql, &gdb, "central").unwrap();
-
-            assert_eq!(
-                gdb.get_by_key(NodeKind::Config, "sys::trust_anchor_secret")
-                    .unwrap()
-                    .payload,
-                original_secret,
-                "SQLite import MUST NEVER overwrite sys::trust_anchor_secret!"
-            );
-            assert!(
-                crate::security::is_workspace_memory_trusted(Some(&gdb), &ws_dir),
-                "Existing sealed workspace MUST remain trusted after SQLite import!"
-            );
-            for forbidden in [
-                "trust:allowed::/evil/rogue",
-                "trust:seal_rev::/evil/rogue",
-                "workspace:evil",
-                "workspace_id::0123456789abcdef",
-            ] {
-                assert!(
-                    gdb.get_by_key(NodeKind::Config, forbidden).is_err(),
-                    "Reserved Config key '{forbidden}' MUST NOT be imported from SQLite!"
-                );
-            }
-            assert_eq!(
-                gdb.get_by_key(NodeKind::Config, "ui:theme")
-                    .unwrap()
-                    .payload,
-                b"solarized"
-            );
-        }
-
-        let _ = fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
     fn mcp_code_indexing_propagates_lock_failures_and_uses_canonical_workspace_lock_for_subdirs() {
         use super::authz::resolve_canonical_workspace_lock_root;
         use serde_json::json;
@@ -691,13 +586,12 @@ use super::{canonical_brain_cache_key, handle_rpc_method, process_mcp_stream, Mc
     }
 
     #[test]
-    fn mcp_sqlite_import_never_activates_security_switches_or_authorizes_untrusted_workspaces() {
+    fn mcp_rejects_untrusted_workspace_tool_calls() {
         use handle_rpc_method;
-        use libredb_bridge::import_sqlite_readonly;
         use serde_json::json;
 
         let tmp = std::env::temp_dir().join(format!(
-            "libredb_mcp_sql_policy_switches_{}_{}",
+            "libredb_mcp_untrusted_ws_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -706,9 +600,7 @@ use super::{canonical_brain_cache_key, handle_rpc_method, process_mcp_stream, Mc
         let trusted_ws = tmp.join("trusted_ws");
         let untrusted_ws = tmp.join("untrusted_ws");
         fs::create_dir_all(trusted_ws.join(".agents")).unwrap();
-        fs::create_dir_all(trusted_ws.join("src")).unwrap();
         fs::create_dir_all(untrusted_ws.join("src")).unwrap();
-        fs::write(trusted_ws.join("src").join("ok.rs"), "pub fn ok_fn() {}\n").unwrap();
         fs::write(
             untrusted_ws.join("src").join("secret.rs"),
             "pub fn hidden_fn() {}\n",
@@ -716,56 +608,19 @@ use super::{canonical_brain_cache_key, handle_rpc_method, process_mcp_stream, Mc
         .unwrap();
 
         let global_path = tmp.join("customizations.ldb");
-        let poisoned_sql = tmp.join("poisoned_switches.db");
         {
             let gdb = LibreDb::open(&global_path).unwrap();
             let pdb = LibreDb::open(trusted_ws.join(".agents").join("memory.ldb")).unwrap();
             crate::security::seal_workspace_memory(&gdb, &pdb, &trusted_ws).unwrap();
-        }
-
-        // Craft a SQLite `runtime_config` attempting to enable `mcp:allow_untrusted_workspaces`,
-        // `mcp:allow_central_sqlite_sync`, `gitea_allow_insecure_http`, and `guardrail:allow_staged_files`:
-        {
-            let conn = rusqlite::Connection::open(&poisoned_sql).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE runtime_config (key TEXT PRIMARY KEY, value TEXT);
-                 INSERT INTO runtime_config (key, value) VALUES
-                   ('mcp:allow_untrusted_workspaces', 'true'),
-                   ('MCP:allow_central_sqlite_sync', 'true'),
-                   ('gitea_allow_insecure_http', 'true'),
-                   ('guardrail:allow_staged_files', '.env,secrets.json'),
-                   ('ui:accent', 'emerald');",
-            )
-            .unwrap();
-        }
-
-        {
-            let gdb = LibreDb::open(&global_path).unwrap();
-            import_sqlite_readonly(&poisoned_sql, &gdb, "central").unwrap();
-
-            for blocked_switch in [
-                "mcp:allow_untrusted_workspaces",
-                "mcp:allow_central_sqlite_sync",
-                "MCP:allow_central_sqlite_sync",
-                "gitea_allow_insecure_http",
-                "guardrail:allow_staged_files",
-            ] {
-                assert!(
-                    gdb.get_by_key(NodeKind::Config, blocked_switch).is_err(),
-                    "Privileged security switch '{blocked_switch}' MUST NOT materialize from SQLite import!"
-                );
-            }
-            assert!(
-                !crate::security::is_mcp_workspace_authorized_in_global(&gdb, &untrusted_ws),
-                "Untrusted workspace MUST NOT become MCP-authorized after importing SQLite runtime_config!"
-            );
+            assert!(!crate::security::is_mcp_workspace_authorized_in_global(
+                &gdb,
+                &untrusted_ws
+            ));
         }
 
         let mut state =
             McpServerState::new(Some(&tmp.join("default.ldb")), Some(&global_path)).unwrap();
 
-        // Untrusted workspace MUST still be rejected across `libredb_code` and `libredb_memorize`,
-        // and `sync_central_sqlite=true` MUST remain disabled:
         for rejected_call in [
             json!({
                 "name": "libredb_code",
@@ -782,17 +637,10 @@ use super::{canonical_brain_cache_key, handle_rpc_method, process_mcp_stream, Mc
                     "facts": { "pwn": "1" }
                 }
             }),
-            json!({
-                "name": "libredb_memorize",
-                "arguments": {
-                    "cwd": trusted_ws.to_string_lossy().to_string(),
-                    "sync_central_sqlite": true
-                }
-            }),
         ] {
             assert!(
                 handle_rpc_method("tools/call", &rejected_call, &mut state).is_err(),
-                "SQLite-imported security switches MUST NOT weaken MCP enforcement: {rejected_call}"
+                "Untrusted workspace MUST be rejected: {rejected_call}"
             );
         }
 

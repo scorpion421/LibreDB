@@ -1,8 +1,5 @@
 //! Native `PyO3` (`abi3-py312` stable ABI) Python extension (`import libredb`) for Python 3.12+.
 
-use libredb_bridge::{
-    export_sqlite_database, import_sqlite_readonly, open_or_auto_migrate, verify_sqlite_equivalence,
-};
 use libredb_cognitive::{
     create_subagent_handoff, execute_atomic_batch, extract_fim_slice, index_workspace,
     query_symbol_impact, sync_transcript_epoch, AtomicBatchSpec, CognitiveEngine, FileSkeleton,
@@ -32,24 +29,9 @@ impl PyBrain {
     #[new]
     #[pyo3(signature = (path, global_path=None))]
     pub fn new(path: &str, global_path: Option<&str>) -> PyResult<Self> {
-        let (project_db, mig_proj) =
-            open_or_auto_migrate(Path::new(path), None, "project").map_err(to_py_err)?;
-        if mig_proj.is_some() {
-            if let Ok(mut cog) = CognitiveEngine::open_db(Arc::clone(&project_db)) {
-                let _ = cog.save_index_snapshot();
-            }
-        }
+        let project_db = Arc::new(LibreDb::open(Path::new(path)).map_err(to_py_err)?);
         let global_db = match global_path {
-            Some(gp) => {
-                let (gdb, mig_glob) =
-                    open_or_auto_migrate(Path::new(gp), None, "central").map_err(to_py_err)?;
-                if mig_glob.is_some() {
-                    if let Ok(mut cog) = CognitiveEngine::open_db(Arc::clone(&gdb)) {
-                        let _ = cog.save_index_snapshot();
-                    }
-                }
-                Some(gdb)
-            }
+            Some(gp) => Some(Arc::new(LibreDb::open(Path::new(gp)).map_err(to_py_err)?)),
             None => None,
         };
         Ok(Self {
@@ -310,33 +292,6 @@ impl PyBrain {
         ReflexEngine::learn_reflex(&self.project_db, &rule).map_err(to_py_err)
     }
 
-    /// Imports an existing SQLite database (`central` or `project`) strictly read-only and saves an index snapshot.
-    #[pyo3(signature = (sqlite_path, scope="central"))]
-    pub fn import_sqlite(&self, py: Python<'_>, sqlite_path: &str, scope: &str) -> PyResult<String> {
-        let sp = PathBuf::from(sqlite_path);
-        let sc = scope.to_owned();
-        py.allow_threads(|| {
-            let sum =
-                import_sqlite_readonly(&sp, &self.project_db, &sc).map_err(to_py_err)?;
-            let mut cog = CognitiveEngine::open_db(Arc::clone(&self.project_db)).map_err(to_py_err)?;
-            cog.save_index_snapshot().map_err(to_py_err)?;
-            serde_json::to_string(&sum).map_err(to_py_err)
-        })
-    }
-
-    /// Exports the lossless SQLite mirror back to `out_sqlite_path`.
-    #[pyo3(signature = (out_sqlite_path, scope="central"))]
-    pub fn export_sqlite(
-        &self,
-        py: Python<'_>,
-        out_sqlite_path: &str,
-        scope: &str,
-    ) -> PyResult<usize> {
-        let op = PathBuf::from(out_sqlite_path);
-        let sc = scope.to_owned();
-        py.allow_threads(|| export_sqlite_database(&self.project_db, &sc, &op).map_err(to_py_err))
-    }
-
     /// Runs Gravity locality compaction, refreshes the persistent index snapshot, and verifies CRC integrity.
     #[pyo3(signature = (prune=false))]
     pub fn compact(&self, py: Python<'_>, prune: bool) -> PyResult<String> {
@@ -358,48 +313,9 @@ impl PyBrain {
     }
 }
 
-/// Verifies lossless `SQLite -> LibreDB -> SQLite` parity on a temporary copy of `sqlite_path`.
-#[pyfunction]
-#[pyo3(signature = (sqlite_path, scope="central"))]
-pub fn verify_sqlite_roundtrip_json(
-    py: Python<'_>,
-    sqlite_path: &str,
-    scope: &str,
-) -> PyResult<String> {
-    let sp = PathBuf::from(sqlite_path);
-    let sc = scope.to_owned();
-    py.allow_threads(move || {
-        let sym_meta = std::fs::symlink_metadata(&sp).map_err(to_py_err)?;
-        if sym_meta.file_type().is_symlink() {
-            return Err(PyRuntimeError::new_err(format!(
-                "refusing symlinked SQLite path '{}'",
-                sp.display()
-            )));
-        }
-        let tmp_dir = tempfile::Builder::new()
-            .prefix("libredb_py_rt_")
-            .tempdir()
-            .map_err(to_py_err)?;
-        let copy_src = tmp_dir.path().join("src.db");
-        let ldb_file = tmp_dir.path().join("mid.ldb");
-        let recon_db = tmp_dir.path().join("recon.db");
-        std::fs::copy(&sp, &copy_src).map_err(to_py_err)?;
-
-        {
-            let ldb = LibreDb::open(&ldb_file).map_err(to_py_err)?;
-            import_sqlite_readonly(&copy_src, &ldb, &sc).map_err(to_py_err)?;
-            ldb.compact_with_gravity().map_err(to_py_err)?;
-            export_sqlite_database(&ldb, &sc, &recon_db).map_err(to_py_err)?;
-        }
-        let rep = verify_sqlite_equivalence(&copy_src, &recon_db).map_err(to_py_err)?;
-        serde_json::to_string(&rep).map_err(to_py_err)
-    })
-}
-
 #[pymodule(name = "libredb")]
 fn libredb_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<PyBrain>()?;
-    m.add_function(wrap_pyfunction!(verify_sqlite_roundtrip_json, m)?)?;
     Ok(())
 }

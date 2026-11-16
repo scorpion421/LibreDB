@@ -171,7 +171,7 @@ use libredb_core::EdgeKind;
     }
 
     #[test]
-    fn workspace_seal_v3_detects_post_seal_database_content_tampering() {
+    fn workspace_seal_v4_detects_post_seal_database_content_tampering() {
         let tmp = std::env::temp_dir().join(format!("libredb_trust_v3_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         let global_ldb_path = tmp.join("global.ldb");
@@ -244,9 +244,9 @@ use libredb_core::EdgeKind;
     }
 
     #[test]
-    fn explicit_v2_to_v3_seal_migration_verifies_v2_hmac_and_blocks_downgrade() {
+    fn legacy_v2_and_v3_seals_are_rejected_and_cannot_downgrade_v4_seals() {
         let tmp = std::env::temp_dir().join(format!(
-            "libredb_v2_mig_test_{}_{}",
+            "libredb_legacy_reject_test_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -254,7 +254,7 @@ use libredb_core::EdgeKind;
                 .subsec_nanos()
         ));
         let _ = fs::remove_dir_all(&tmp);
-        let repo = tmp.join("legacy_v2_repo");
+        let repo = tmp.join("legacy_repo");
         fs::create_dir_all(repo.join(".agents")).unwrap();
 
         let gdb = LibreDb::open(tmp.join("customizations.ldb")).unwrap();
@@ -271,33 +271,25 @@ use libredb_core::EdgeKind;
                 .with_key(format!("trust:allowed::{norm}")),
         )
         .unwrap();
-        let secret = ensure_trust_anchor_secret(&gdb).unwrap();
 
-        // Forged v2 tag must fail migration:
-        pdb.put(
-            WriteRequest::new(
-                NodeKind::Config,
-                b"hmac-sha256:v2:0000000000000000000000000000000000000000000000000000000000000000"
-                    .to_vec(),
+        // Pre-1.0 v2 and v3 seals MUST both fail fail-closed without grant of trust or write access:
+        for legacy_seal in [
+            "hmac-sha256:v2:0000000000000000000000000000000000000000000000000000000000000000",
+            "hmac-sha256:v3:0000000000000000000000000000000000000000000000000000000000000000",
+        ] {
+            pdb.put(
+                WriteRequest::new(NodeKind::Config, legacy_seal.as_bytes().to_vec())
+                    .with_key(TRUST_SEALS_KEY),
             )
-            .with_key(TRUST_SEALS_KEY),
-        )
-        .unwrap();
-        assert!(migrate_workspace_seal_v2_to_v3(&gdb, &repo).is_err());
-        assert!(!is_workspace_memory_trusted(Some(&gdb), &repo));
+            .unwrap();
+            assert!(!is_workspace_memory_trusted(Some(&gdb), &repo));
+            assert!(PreMutationSealGuard::verify_before_write(Some(&gdb), &pdb_path).is_err());
+        }
 
-        // Genuine v2 tag for this host's secret migrates cleanly to v3:
-        let genuine_v2 = compute_legacy_workspace_seal_v2(&secret, &norm);
-        pdb.put(
-            WriteRequest::new(NodeKind::Config, genuine_v2.as_bytes().to_vec())
-                .with_key(TRUST_SEALS_KEY),
-        )
-        .unwrap();
-        assert!(!is_workspace_memory_trusted(Some(&gdb), &repo));
-        assert!(migrate_workspace_seal_v2_to_v3(&gdb, &repo).unwrap());
+        // Valid v4 seal succeeds, and tampering + appending legacy v2/v3 lines fails closed:
+        seal_workspace_memory(&gdb, &pdb, &repo).unwrap();
         assert!(is_workspace_memory_trusted(Some(&gdb), &repo));
 
-        // Appending a genuine v2 line alongside a broken v3 slot must STILL fail (anti-downgrade):
         let existing_seals = String::from_utf8_lossy(
             &pdb.get_by_key(NodeKind::Config, TRUST_SEALS_KEY)
                 .unwrap()
@@ -308,14 +300,16 @@ use libredb_core::EdgeKind;
             WriteRequest::new(NodeKind::Rule, b"tampered".to_vec()).with_key("rule:tampered"),
         )
         .unwrap();
-        let downgrade_attempt = format!("{existing_seals}\n{genuine_v2}");
+        let downgrade_attempt = format!(
+            "{existing_seals}\nhmac-sha256:v2:1111111111111111111111111111111111111111111111111111111111111111\nhmac-sha256:v3:2222222222222222222222222222222222222222222222222222222222222222"
+        );
         pdb.put(
             WriteRequest::new(NodeKind::Config, downgrade_attempt.into_bytes())
                 .with_key(TRUST_SEALS_KEY),
         )
         .unwrap();
         assert!(!is_workspace_memory_trusted(Some(&gdb), &repo));
-        assert!(migrate_workspace_seal_v2_to_v3(&gdb, &repo).is_err());
+        assert!(PreMutationSealGuard::verify_before_write(Some(&gdb), &pdb_path).is_err());
 
         drop(pdb);
         drop(gdb);
@@ -323,7 +317,7 @@ use libredb_core::EdgeKind;
     }
 
     #[test]
-    fn reseal_after_write_updates_v3_seal_and_propagates_seal_errors() {
+    fn reseal_after_write_updates_v4_seal_and_propagates_seal_errors() {
         let tmp = std::env::temp_dir().join(format!(
             "libredb_reseal_err_test_{}_{}",
             std::process::id(),
@@ -482,24 +476,26 @@ use libredb_core::EdgeKind;
     }
 
     #[test]
-    fn hmac_sha256_workspace_seal_v3_binds_path_and_content_digest() {
+    fn hmac_sha256_workspace_seal_v4_binds_path_revision_and_content_digest() {
         let k1 = [0x11u8; 32];
         let k2 = [0x22u8; 32];
         let d1 = [0xAAu8; 32];
         let d2 = [0xBBu8; 32];
-        let s1 = compute_workspace_seal_v3(&k1, "d:/projects/alpha", &d1);
-        let s_diff_path = compute_workspace_seal_v3(&k1, "d:/projects/beta", &d1);
-        let s_diff_content = compute_workspace_seal_v3(&k1, "d:/projects/alpha", &d2);
-        let s_diff_key = compute_workspace_seal_v3(&k2, "d:/projects/alpha", &d1);
-        assert!(s1.starts_with("hmac-sha256:v3:"));
-        assert_eq!(s1.len(), "hmac-sha256:v3:".len() + 64);
+        let s1 = compute_workspace_seal_v4_rev(&k1, "d:/projects/alpha", &d1, 1);
+        let s_diff_path = compute_workspace_seal_v4_rev(&k1, "d:/projects/beta", &d1, 1);
+        let s_diff_content = compute_workspace_seal_v4_rev(&k1, "d:/projects/alpha", &d2, 1);
+        let s_diff_rev = compute_workspace_seal_v4_rev(&k1, "d:/projects/alpha", &d1, 2);
+        let s_diff_key = compute_workspace_seal_v4_rev(&k2, "d:/projects/alpha", &d1, 1);
+        assert!(s1.starts_with("hmac-sha256:v4:r1:"));
+        assert_eq!(s1.len(), "hmac-sha256:v4:r1:".len() + 64);
         assert_ne!(s1, s_diff_path);
         assert_ne!(s1, s_diff_content);
+        assert_ne!(s1, s_diff_rev);
         assert_ne!(s1, s_diff_key);
     }
 
     #[test]
-    fn v3_seal_protects_fact_updated_ns_importance_and_cognitive_synapses_while_allowing_indexing() {
+    fn v4_seal_protects_fact_updated_ns_importance_and_cognitive_synapses_while_allowing_indexing() {
         let tmp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("..")
@@ -771,278 +767,6 @@ use libredb_core::EdgeKind;
         );
 
         drop(pdb);
-        drop(gdb);
-        let _ = fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn legacy_v093_seal_is_quarantined_until_verified_migrate_v3_and_blocks_unconfirmed_metadata_or_downgrades()
-    {
-        let tmp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("target")
-            .join(format!(
-                "test_v093_mig_{}_{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .subsec_nanos()
-            ));
-        let _ = fs::remove_dir_all(&tmp);
-        let gdb = LibreDb::open(tmp.join("customizations.ldb")).unwrap();
-        let secret = ensure_trust_anchor_secret(&gdb).unwrap();
-
-        // Helper that seals `repo` using the EXACT `v0.9.3` wire format (`CognitiveContent::v3` + `trust:v3_upgraded`):
-        let write_authentic_v093_seal = |repo_dir: &Path, pdb_ref: &LibreDb| -> String {
-            let norm = normalize_workspace_key(repo_dir);
-            let (v3_dig, _) = compute_legacy_cognitive_content_digest_v3(pdb_ref).unwrap();
-            let host_tag = compute_host_seal_slot_id(&secret, &norm);
-            let bare_v3 = compute_workspace_seal_v3(&secret, &norm, &v3_dig);
-            let body = format!("{bare_v3}\n{host_tag}={bare_v3}");
-            pdb_ref
-                .put(
-                    WriteRequest::new(NodeKind::Config, body.clone().into_bytes())
-                        .with_key(TRUST_SEALS_KEY)
-                        .with_importance(200),
-                )
-                .unwrap();
-            gdb.put(
-                WriteRequest::new(
-                    NodeKind::Config,
-                    repo_dir.to_string_lossy().into_owned().into_bytes(),
-                )
-                .with_key(format!("trust:allowed::{norm}")),
-            )
-            .unwrap();
-            gdb.put(
-                WriteRequest::new(NodeKind::Config, b"v3".to_vec())
-                    .with_key(format!("trust:v3_upgraded::{norm}")),
-            )
-            .unwrap();
-            body
-        };
-
-        // --- PART 0: Empty `v0.9.3` workspace (`0` cognitive capsules) has zero unauthenticated metadata ---
-        let repo_empty = tmp.join("v093_empty");
-        fs::create_dir_all(repo_empty.join(".agents")).unwrap();
-        let pdb_empty = LibreDb::open(repo_empty.join(".agents").join("memory.ldb")).unwrap();
-        write_authentic_v093_seal(&repo_empty, &pdb_empty);
-        assert!(!is_workspace_memory_trusted(Some(&gdb), &repo_empty));
-        assert!(has_valid_legacy_v3_content_seal(&gdb, &repo_empty));
-        assert!(migrate_workspace_seal_v3_to_v4(&gdb, &repo_empty, false).unwrap());
-        assert!(is_workspace_memory_trusted(Some(&gdb), &repo_empty));
-
-        // --- PART 1: Minimal `v0.9.3` workspace (1 default-importance unlinked Fact) with symmetrically
-        // patched `created_ns == updated_ns` + recomputed Inode/Frame CRC32s MUST NOT auto-upgrade without
-        // explicit `--confirm-metadata` (`confirm_unauthenticated_metadata == true`)! ---
-        let repo_min = tmp.join("v093_minimal");
-        fs::create_dir_all(repo_min.join(".agents")).unwrap();
-        let pdb_min_path = repo_min.join(".agents").join("memory.ldb");
-        let pdb_min = LibreDb::open(&pdb_min_path).unwrap();
-        let f_single = pdb_min
-            .put(
-                WriteRequest::new(NodeKind::Fact, b"single_fact = v093".to_vec())
-                    .with_key("fact:single"),
-            )
-            .unwrap();
-        let captured_v093_seal = write_authentic_v093_seal(&repo_min, &pdb_min);
-        pdb_min.compact_with_options(true).unwrap();
-        drop(pdb_min);
-
-        // Symmetrically patch BOTH `created_ns` (`off + 16..24`) and `updated_ns` (`off + 24..32`) to the
-        // exact same forged timestamp `forged_ts` with valid Inode + Frame CRC32s:
-        let forged_ts: u64 = 4_102_444_800_000_000_000;
-        {
-            let mut raw = fs::read(&pdb_min_path).unwrap();
-            let slot_a: &[u8; 4096] = raw[0..4096].try_into().unwrap();
-            let slot_b: &[u8; 4096] = raw[4096..8192].try_into().unwrap();
-            let sb = match (
-                libredb_core::format::Superblock::decode(slot_a),
-                libredb_core::format::Superblock::decode(slot_b),
-            ) {
-                (Ok(a), Ok(b)) => {
-                    if b.commit_seq >= a.commit_seq {
-                        b
-                    } else {
-                        a
-                    }
-                }
-                (Ok(a), Err(_)) => a,
-                (Err(_), Ok(b)) => b,
-                _ => panic!("expected valid superblock"),
-            };
-            let base_off = sb.base_snapshot_offset as usize;
-            let frame_len =
-                u32::from_le_bytes(raw[base_off + 4..base_off + 8].try_into().unwrap()) as usize;
-            let inode_count =
-                u32::from_le_bytes(raw[base_off + 16..base_off + 20].try_into().unwrap()) as usize;
-            let mut patched = false;
-            for idx in 0..inode_count {
-                let off = base_off + 24 + idx * 128;
-                let nid = u64::from_le_bytes(raw[off..off + 8].try_into().unwrap());
-                if nid == f_single {
-                    raw[off + 16..off + 24].copy_from_slice(&forged_ts.to_le_bytes());
-                    raw[off + 24..off + 32].copy_from_slice(&forged_ts.to_le_bytes());
-                    let ino_crc = libredb_core::crc::crc32(&raw[off..off + 124]);
-                    raw[off + 124..off + 128].copy_from_slice(&ino_crc.to_le_bytes());
-                    patched = true;
-                    break;
-                }
-            }
-            assert!(patched, "Expected f_single Inode in compacted snapshot");
-            let frame_crc_off = base_off + frame_len - 4;
-            let frame_crc = libredb_core::crc::crc32(&raw[base_off..frame_crc_off]);
-            raw[frame_crc_off..base_off + frame_len].copy_from_slice(&frame_crc.to_le_bytes());
-            fs::write(&pdb_min_path, &raw).unwrap();
-        }
-
-        // Unmigrated `v0.9.3` workspace MUST fail closed in `is_workspace_memory_trusted`,
-        // MUST be rejected by `--migrate-v2`, MUST be recognized by `has_valid_legacy_v3_content_seal`,
-        // AND MUST refuse automatic `migrate_workspace_seal_v3_to_v4(..., false)` while surfacing `forged_ts`!
-        assert!(!is_workspace_memory_trusted(Some(&gdb), &repo_min));
-        assert!(migrate_workspace_seal_v2_to_v3(&gdb, &repo_min).is_err());
-        assert!(has_valid_legacy_v3_content_seal(&gdb, &repo_min));
-        let guard_err = PreMutationSealGuard::verify_before_write(Some(&gdb), &pdb_min_path)
-            .err()
-            .expect("unmigrated v0.9.3 DB must block writes until migrated");
-        assert!(guard_err.contains("--migrate-v3"));
-
-        let single_unconfirmed_err = migrate_workspace_seal_v3_to_v4(&gdb, &repo_min, false)
-            .expect_err("1-capsule v0.9.3 DB with unauthenticated timestamps MUST require --confirm-metadata");
-        assert!(single_unconfirmed_err.contains(&format!("{forged_ts}..{forged_ts}")));
-        assert!(single_unconfirmed_err.contains("--confirm-metadata"));
-        assert!(!is_workspace_memory_trusted(Some(&gdb), &repo_min));
-
-        // Explicit human confirmation (`confirm_unauthenticated_metadata == true`) upgrades to `v4`:
-        assert!(migrate_workspace_seal_v3_to_v4(&gdb, &repo_min, true).unwrap());
-        assert!(is_workspace_memory_trusted(Some(&gdb), &repo_min));
-        assert!(!has_valid_legacy_v3_content_seal(&gdb, &repo_min));
-
-        // Monotonic `v4` anti-downgrade ratchet: tampering with `pdb_min` and replaying the captured `v0.9.3` seal
-        // MUST fail BOTH `is_workspace_memory_trusted` AND `migrate_workspace_seal_v3_to_v4(..., true)`!
-        let pdb_min = LibreDb::open(&pdb_min_path).unwrap();
-        pdb_min
-            .put(
-                WriteRequest::new(NodeKind::Fact, b"single_fact = v093".to_vec())
-                    .with_key("fact:single")
-                    .with_importance(250),
-            )
-            .unwrap();
-        pdb_min
-            .put(
-                WriteRequest::new(NodeKind::Config, captured_v093_seal.into_bytes())
-                    .with_key(TRUST_SEALS_KEY),
-            )
-            .unwrap();
-        assert!(!is_workspace_memory_trusted(Some(&gdb), &repo_min));
-        assert!(migrate_workspace_seal_v3_to_v4(&gdb, &repo_min, true).is_err());
-
-        // --- PART 2: Rich `v0.9.3` workspace with metadata/synapses/SynonymCluster NOT covered by `v0.9.3` ---
-        let repo_rich = tmp.join("v093_rich");
-        fs::create_dir_all(repo_rich.join(".agents")).unwrap();
-        let pdb_rich_path = repo_rich.join(".agents").join("memory.ldb");
-        let pdb_rich = LibreDb::open(&pdb_rich_path).unwrap();
-        let f1 = pdb_rich
-            .put(
-                WriteRequest::new(NodeKind::Fact, b"f1 = a".to_vec())
-                    .with_key("fact:1")
-                    .with_importance(210),
-            )
-            .unwrap();
-        let d1 = pdb_rich
-            .put(
-                WriteRequest::new(NodeKind::Decision, b"d1 = arch".to_vec()).with_key("dec:1"),
-            )
-            .unwrap();
-        pdb_rich
-            .put(
-                WriteRequest::new(NodeKind::SynonymCluster, b"[\"vault\",\"dpapi\"]".to_vec())
-                    .with_key("syn:vault"),
-            )
-            .unwrap();
-        pdb_rich.link(d1, EdgeKind::RelatedTo, f1, 200).unwrap();
-        write_authentic_v093_seal(&repo_rich, &pdb_rich);
-
-        // Without `--confirm-metadata`, `--migrate-v3` MUST refuse automatic re-sealing and surface counts:
-        let unconfirmed_err = migrate_workspace_seal_v3_to_v4(&gdb, &repo_rich, false)
-            .expect_err("unauthenticated v0.9.3 metadata/synapses must require --confirm-metadata");
-        assert!(unconfirmed_err.contains("newly_covered_kinds=1"));
-        assert!(unconfirmed_err.contains("cognitive_synapses=1"));
-        assert!(unconfirmed_err.contains("--confirm-metadata"));
-        assert!(!is_workspace_memory_trusted(Some(&gdb), &repo_rich));
-
-        // Payload tampering on `repo_rich` MUST fail even WITH `confirm_unauthenticated_metadata = true`:
-        pdb_rich
-            .put(WriteRequest::new(NodeKind::Fact, b"f1 = tampered".to_vec()).with_key("fact:1"))
-            .unwrap();
-        assert!(migrate_workspace_seal_v3_to_v4(&gdb, &repo_rich, true).is_err());
-
-        // Restore authentic `v0.9.3` seal on `repo_rich`, then confirm `--confirm-metadata` upgrades cleanly:
-        write_authentic_v093_seal(&repo_rich, &pdb_rich);
-        assert!(migrate_workspace_seal_v3_to_v4(&gdb, &repo_rich, true).unwrap());
-        assert!(is_workspace_memory_trusted(Some(&gdb), &repo_rich));
-
-        // --- PART 3: Raw binary `updated_ns` tampering on a `v0.9.3` DB MUST be rejected even with `--confirm-metadata` ---
-        let repo_bin = tmp.join("v093_bin_tamper");
-        fs::create_dir_all(repo_bin.join(".agents")).unwrap();
-        let pdb_bin_path = repo_bin.join(".agents").join("memory.ldb");
-        let pdb_bin = LibreDb::open(&pdb_bin_path).unwrap();
-        let f_bin = pdb_bin
-            .put(WriteRequest::new(NodeKind::Fact, b"bin_fact = 1".to_vec()).with_key("fact:bin"))
-            .unwrap();
-        write_authentic_v093_seal(&repo_bin, &pdb_bin);
-        pdb_bin.compact_with_options(true).unwrap();
-        drop(pdb_bin);
-
-        let mut raw = fs::read(&pdb_bin_path).unwrap();
-        let slot_a: &[u8; 4096] = raw[0..4096].try_into().unwrap();
-        let slot_b: &[u8; 4096] = raw[4096..8192].try_into().unwrap();
-        let sb = match (
-            libredb_core::format::Superblock::decode(slot_a),
-            libredb_core::format::Superblock::decode(slot_b),
-        ) {
-            (Ok(a), Ok(b)) => {
-                if b.commit_seq >= a.commit_seq {
-                    b
-                } else {
-                    a
-                }
-            }
-            (Ok(a), Err(_)) => a,
-            (Err(_), Ok(b)) => b,
-            _ => panic!("expected valid superblock"),
-        };
-        let base_off = sb.base_snapshot_offset as usize;
-        let frame_len = u32::from_le_bytes(raw[base_off + 4..base_off + 8].try_into().unwrap()) as usize;
-        let inode_count = u32::from_le_bytes(raw[base_off + 16..base_off + 20].try_into().unwrap()) as usize;
-        for idx in 0..inode_count {
-            let off = base_off + 24 + idx * 128;
-            let nid = u64::from_le_bytes(raw[off..off + 8].try_into().unwrap());
-            if nid == f_bin {
-                let old_upd = u64::from_le_bytes(raw[off + 24..off + 32].try_into().unwrap());
-                raw[off + 24..off + 32].copy_from_slice(&(old_upd + 500_000).to_le_bytes());
-                let ino_crc = libredb_core::crc::crc32(&raw[off..off + 124]);
-                raw[off + 124..off + 128].copy_from_slice(&ino_crc.to_le_bytes());
-                break;
-            }
-        }
-        let frame_crc_off = base_off + frame_len - 4;
-        let frame_crc = libredb_core::crc::crc32(&raw[base_off..frame_crc_off]);
-        raw[frame_crc_off..base_off + frame_len].copy_from_slice(&frame_crc.to_le_bytes());
-        fs::write(&pdb_bin_path, &raw).unwrap();
-
-        // Even though the `v0.9.3` payload HMAC and storage CRC32 are both valid, `migrate_workspace_seal_v3_to_v4`
-        // catches `updated_ns != created_ns` on the unlinked `Fact` Inode and refuses migration!
-        assert!(has_valid_legacy_v3_content_seal(&gdb, &repo_bin));
-        let bin_err = migrate_workspace_seal_v3_to_v4(&gdb, &repo_bin, true)
-            .expect_err("raw binary updated_ns forgery on v0.9.3 Inode must fail migration");
-        assert!(bin_err.contains("updated_ns != created_ns"));
-
-        drop(pdb_empty);
-        drop(pdb_min);
-        drop(pdb_rich);
         drop(gdb);
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -1780,7 +1504,7 @@ use libredb_core::EdgeKind;
                 &fresh_global
             )
             .is_ok(),
-            "Fresh installer SQLite import into non-existent customizations.ldb must be permitted!"
+            "Fresh installer bootstrap into non-existent customizations.ldb must be permitted!"
         );
 
         // 2. Writing to a non-`memory.ldb` scratch DB inside `.agents/` must NOT advance or clobber
@@ -2052,4 +1776,28 @@ use libredb_core::EdgeKind;
         drop(pdb);
         drop(gdb);
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn strip_verbatim_prefix_preserves_unc_and_drive_paths() {
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(
+                r"\\?\UNC\fileserver.corp.example\home$\user\Antigravity\LibreDB"
+            )),
+            PathBuf::from(r"\\fileserver.corp.example\home$\user\Antigravity\LibreDB")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(
+                r"\\?\unc\fileserver.corp.example\share\workspace"
+            )),
+            PathBuf::from(r"\\fileserver.corp.example\share\workspace")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\D:\Antigravity\LibreDB")),
+            PathBuf::from(r"D:\Antigravity\LibreDB")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"Q:\Antigravity\LibreDB")),
+            PathBuf::from(r"Q:\Antigravity\LibreDB")
+        );
     }
