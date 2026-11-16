@@ -175,7 +175,8 @@ pub fn run_pre_tool_hook(global_ldb_opt: Option<&Path>) -> Result<(), Box<dyn st
         }
     };
 
-    let response = evaluate_pre_tool_payload(&payload, global_ldb_opt);
+    let response = crate::ipc::try_invoke_ipc_hook("pre_tool", global_ldb_opt, &payload)
+        .unwrap_or_else(|| evaluate_pre_tool_payload(&payload, global_ldb_opt));
     emit_json(&response)?;
     Ok(())
 }
@@ -183,8 +184,31 @@ pub fn run_pre_tool_hook(global_ldb_opt: Option<&Path>) -> Result<(), Box<dyn st
 /// Pure, directly unit-testable `PreToolUse` evaluator enforcing fail-closed behavior whenever
 /// `customizations.ldb` exists on disk yet is corrupted, truncated, or symlinked.
 pub(crate) fn evaluate_pre_tool_payload(payload: &Value, global_ldb_opt: Option<&Path>) -> Value {
+    evaluate_pre_tool_payload_inner(payload, global_ldb_opt, None)
+}
+
+/// In-RAM IPC variant of `PreToolUse` reusing `McpServerState`'s open `global_db` and cached
+/// workspace brains without reopening `.ldb` files from disk.
+pub(crate) fn evaluate_pre_tool_payload_with_ram_state(
+    payload: &Value,
+    global_ldb_opt: Option<&Path>,
+    ram_state: &mut crate::mcp::McpServerState,
+) -> Value {
+    evaluate_pre_tool_payload_inner(payload, global_ldb_opt, Some(ram_state))
+}
+
+fn evaluate_pre_tool_payload_inner(
+    payload: &Value,
+    global_ldb_opt: Option<&Path>,
+    mut ram_state: Option<&mut crate::mcp::McpServerState>,
+) -> Value {
     let (tool_name, args) = extract_pre_tool_name_and_args(payload);
-    let mut global_db_cache: Option<Result<Option<Arc<LibreDb>>, String>> = None;
+    let ram_synced_global = ram_state.is_some();
+    let mut global_db_cache: Option<Result<Option<Arc<LibreDb>>, String>> =
+        ram_state.as_deref_mut().map(|st| {
+            st.sync_global_db_or_purge()
+                .map(|()| st.global_db.clone())
+        });
     let mut get_global_db_checked = || -> Result<Option<Arc<LibreDb>>, String> {
         global_db_cache
             .get_or_insert_with(|| open_global_ldb_checked(global_ldb_opt))
@@ -248,14 +272,16 @@ pub(crate) fn evaluate_pre_tool_payload(payload: &Value, global_ldb_opt: Option<
                 });
             }
         };
-        if let Some(ref gdb) = gdb_opt {
-            if let Err(err) = crate::security::check_global_trust_sync(gdb) {
-                return json!({
-                    "decision": "deny",
-                    "reason": format!(
-                        "LibreDB PreToolUse failed closed because global customizations.ldb could not synchronize: {err}"
-                    )
-                });
+        if !ram_synced_global {
+            if let Some(ref gdb) = gdb_opt {
+                if let Err(err) = crate::security::check_global_trust_sync(gdb) {
+                    return json!({
+                        "decision": "deny",
+                        "reason": format!(
+                            "LibreDB PreToolUse failed closed because global customizations.ldb could not synchronize: {err}"
+                        )
+                    });
+                }
             }
         }
 
@@ -330,21 +356,32 @@ pub(crate) fn evaluate_pre_tool_payload(payload: &Value, global_ldb_opt: Option<
                 });
             }
         };
-        if let Some(ref gdb) = global_db_ro {
-            if let Err(err) = crate::security::check_global_trust_sync(gdb) {
-                return json!({
-                    "decision": "deny",
-                    "reason": format!(
-                        "LibreDB Control-Plane Guardrail failed closed because global customizations.ldb could not synchronize: {err}"
-                    )
-                });
+        if !ram_synced_global {
+            if let Some(ref gdb) = global_db_ro {
+                if let Err(err) = crate::security::check_global_trust_sync(gdb) {
+                    return json!({
+                        "decision": "deny",
+                        "reason": format!(
+                            "LibreDB Control-Plane Guardrail failed closed because global customizations.ldb could not synchronize: {err}"
+                        )
+                    });
+                }
             }
         }
-        let proj_db_ro = if target_file != "<tool_input>" {
+        let trusted_ws = if target_file != "<tool_input>" {
             find_workspace_root(Path::new(target_file)).and_then(|root| {
+                if let Some(ref mut st) = ram_state {
+                    if let Some(cached_pdb) = st.lookup_or_cache_trusted_workspace_db(&root) {
+                        return Some((root, Some(cached_pdb)));
+                    }
+                }
                 if crate::security::is_workspace_memory_trusted(global_db_ro.as_deref(), &root) {
                     let ldb_p = root.join(".agents").join("memory.ldb");
-                    ldb_p.is_file().then(|| LibreDb::open(&ldb_p).ok()).flatten()
+                    let opened = ldb_p
+                        .is_file()
+                        .then(|| LibreDb::open(&ldb_p).ok().map(Arc::new))
+                        .flatten();
+                    Some((root, opened))
                 } else {
                     None
                 }
@@ -352,11 +389,12 @@ pub(crate) fn evaluate_pre_tool_payload(payload: &Value, global_ldb_opt: Option<
         } else {
             None
         };
+        let proj_db_ro = trusted_ws.as_ref().and_then(|(_, db_opt)| db_opt.as_deref());
 
         if target_file != "<tool_input>" {
             let custom_protected = crate::security::load_config_list(
                 global_db_ro.as_deref(),
-                proj_db_ro.as_ref(),
+                proj_db_ro,
                 "guardrail:protected_paths",
             );
             let hook_ws = resolve_hook_workspace(payload, None).or_else(|| env::current_dir().ok());
@@ -375,7 +413,7 @@ pub(crate) fn evaluate_pre_tool_payload(payload: &Value, global_ldb_opt: Option<
         if !is_test_or_scratch_path(target_file) {
             let custom_prefixes = crate::security::load_config_list(
                 global_db_ro.as_deref(),
-                proj_db_ro.as_ref(),
+                proj_db_ro,
                 "guardrail:secret_prefixes",
             );
             let mut texts_to_check: Vec<&str> = Vec::new();
@@ -406,7 +444,7 @@ pub(crate) fn evaluate_pre_tool_payload(payload: &Value, global_ldb_opt: Option<
 
             let enforce_style = crate::security::load_bool_config(
                 global_db_ro.as_deref(),
-                proj_db_ro.as_ref(),
+                proj_db_ro,
                 "guardrail:style_rules",
                 false,
             );
@@ -448,15 +486,19 @@ pub(crate) fn evaluate_pre_tool_payload(payload: &Value, global_ldb_opt: Option<
         }
 
         if target_file != "<tool_input>" && !is_test_or_scratch_path(target_file) {
-            let target_path = Path::new(target_file);
-            let cid_transcript = resolve_cid_and_transcript(payload);
-            let _ = record_working_set_edit(
-                target_path,
-                tool_name,
-                &args,
-                global_db_ro.as_deref(),
-                cid_transcript.as_ref().map(|(c, p)| (c.as_str(), p.as_path())),
-            );
+            if let Some((ref ws_root, ref preopened_db)) = trusted_ws {
+                let target_path = Path::new(target_file);
+                let cid_transcript = resolve_cid_and_transcript(payload);
+                let _ = record_working_set_edit(
+                    ws_root,
+                    preopened_db.clone(),
+                    target_path,
+                    tool_name,
+                    &args,
+                    global_db_ro.as_deref(),
+                    cid_transcript.as_ref().map(|(c, p)| (c.as_str(), p.as_path())),
+                );
+            }
         }
     }
 
@@ -476,7 +518,13 @@ pub fn run_pre_invocation_hook(
         return Ok(());
     }
     let payload: Value = serde_json::from_str(raw.trim()).unwrap_or_else(|_| json!({}));
-    let response = evaluate_pre_invocation_payload(&payload, global_ldb_opt)?;
+    let response = if let Some(ipc_resp) =
+        crate::ipc::try_invoke_ipc_hook("pre_invocation", global_ldb_opt, &payload)
+    {
+        ipc_resp
+    } else {
+        evaluate_pre_invocation_payload(&payload, global_ldb_opt)?
+    };
     emit_json(&response)?;
     Ok(())
 }
@@ -486,6 +534,24 @@ pub fn run_pre_invocation_hook(
 pub(crate) fn evaluate_pre_invocation_payload(
     payload: &Value,
     global_ldb_opt: Option<&Path>,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    evaluate_pre_invocation_payload_inner(payload, global_ldb_opt, None)
+}
+
+/// In-RAM IPC variant of `PreInvocation` reusing `McpServerState`'s open `global_db` and cached
+/// workspace brains without reopening `.ldb` files from disk on every turn.
+pub(crate) fn evaluate_pre_invocation_payload_with_ram_state(
+    payload: &Value,
+    global_ldb_opt: Option<&Path>,
+    ram_state: &mut crate::mcp::McpServerState,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    evaluate_pre_invocation_payload_inner(payload, global_ldb_opt, Some(ram_state))
+}
+
+fn evaluate_pre_invocation_payload_inner(
+    payload: &Value,
+    global_ldb_opt: Option<&Path>,
+    mut ram_state: Option<&mut crate::mcp::McpServerState>,
 ) -> Result<Value, Box<dyn std::error::Error>> {
     let (cid_opt, transcript_opt) = match resolve_cid_and_transcript(payload) {
         Some((c, tp)) => (Some(c), Some(tp)),
@@ -519,21 +585,60 @@ pub(crate) fn evaluate_pre_invocation_payload(
         return Ok(json!({ "injectSteps": [] }));
     }
 
+    let mut cached_gdb_opt: Option<Option<Arc<LibreDb>>> = if let Some(ref mut st) = ram_state {
+        if st.sync_global_db_or_purge().is_err() {
+            return Ok(json!({ "injectSteps": [] }));
+        }
+        Some(st.global_db.clone())
+    } else {
+        None
+    };
+    let mut ensure_global_db = || -> Result<Option<Arc<LibreDb>>, String> {
+        if let Some(ref opt) = cached_gdb_opt {
+            return Ok(opt.clone());
+        }
+        let opened = open_global_ldb_checked(global_ldb_opt)?;
+        cached_gdb_opt = Some(opened.clone());
+        Ok(opened)
+    };
+
     // Cryptographic workspace trust check BEFORE opening `.ldb` or migrating any C SQLite `.db` file!
     // Prevents cloned repositories carrying poisoned `.agents/memory.*` payloads from injecting
     // `<SYSTEM_MESSAGE>` prompt overrides or triggering untrusted SQLite deserialization, and fails
     // closed immediately if an existing `customizations.ldb` is corrupted/unreadable on disk.
-    if let Some(ref root) = ws_root {
-        let Ok(global_db_ro) = open_global_ldb_checked(global_ldb_opt) else {
+    let (proj_db, did_migrate): (Arc<LibreDb>, bool) = if mem_ldb_path.is_file() {
+        if let (Some(ref mut st), Some(ref root)) = (ram_state.as_deref_mut(), &ws_root) {
+            let Some(pdb) = st.lookup_or_cache_trusted_workspace_db(root) else {
+                return Ok(json!({ "injectSteps": [] }));
+            };
+            (pdb, false)
+        } else {
+            if let Some(ref root) = ws_root {
+                let Ok(global_db_ro) = ensure_global_db() else {
+                    return Ok(json!({ "injectSteps": [] }));
+                };
+                if !crate::security::is_workspace_memory_trusted(global_db_ro.as_deref(), root) {
+                    return Ok(json!({ "injectSteps": [] }));
+                }
+            }
+            let Ok(pair) = open_project_ldb_silent(&mem_ldb_path) else {
+                return Ok(json!({ "injectSteps": [] }));
+            };
+            pair
+        }
+    } else {
+        if let Some(ref root) = ws_root {
+            let Ok(global_db_ro) = ensure_global_db() else {
+                return Ok(json!({ "injectSteps": [] }));
+            };
+            if !crate::security::is_workspace_memory_trusted(global_db_ro.as_deref(), root) {
+                return Ok(json!({ "injectSteps": [] }));
+            }
+        }
+        let Ok(pair) = open_project_ldb_silent(&mem_ldb_path) else {
             return Ok(json!({ "injectSteps": [] }));
         };
-        if !crate::security::is_workspace_memory_trusted(global_db_ro.as_deref(), root) {
-            return Ok(json!({ "injectSteps": [] }));
-        }
-    }
-
-    let Ok((proj_db, did_migrate)) = open_project_ldb_silent(&mem_ldb_path) else {
-        return Ok(json!({ "injectSteps": [] }));
+        pair
     };
 
     // Strict fail-closed post-migration sealing: if an authorized legacy `.agents/memory.db` was just
@@ -546,7 +651,7 @@ pub(crate) fn evaluate_pre_invocation_payload(
                 let seal_outcome: Result<(), String> = if is_protected_profile_dir(root) {
                     Err("workspace resolves to a protected profile directory".to_owned())
                 } else {
-                    match open_global_ldb_checked(global_ldb_opt) {
+                    match ensure_global_db() {
                         Ok(Some(global_db)) => crate::security::seal_workspace_memory(
                             &global_db, &proj_db, root,
                         )
@@ -609,7 +714,7 @@ pub(crate) fn evaluate_pre_invocation_payload(
 
     let harvested_errors = if let (Some(ref cid), Some(ref tp)) = (&cid_opt, &transcript_opt) {
         if tp.is_file() {
-            harvest_recent_transcript_errors(&proj_db, cid, tp)
+            harvest_recent_transcript_errors(&proj_db, cid, tp, true)
         } else {
             Vec::new()
         }
@@ -688,7 +793,7 @@ pub(crate) fn evaluate_pre_invocation_payload(
     if !did_migrate && (!had_prior_cursor || global_ldb_opt.is_some()) {
         if let Some(ref root) = ws_root {
             if !is_protected_profile_dir(root) {
-                if let Ok(Some(global_db)) = open_global_ldb_checked(global_ldb_opt) {
+                if let Ok(Some(global_db)) = ensure_global_db() {
                     let norm = crate::security::normalize_workspace_key(root);
                     let ws_cfg_key = crate::security::workspace_id_config_key(&norm);
                     let root_str = root.to_string_lossy().into_owned();
@@ -715,7 +820,7 @@ pub(crate) fn evaluate_pre_invocation_payload(
         prompt_hint.as_deref(),
         error_hint,
     );
-    let gdb_opt = open_global_ldb_checked(global_ldb_opt).ok().flatten();
+    let gdb_opt = ensure_global_db().ok().flatten();
     let enforce_style = crate::security::load_bool_config(
         gdb_opt.as_deref(),
         Some(&proj_db),
@@ -1787,42 +1892,65 @@ fn simulate_post_edit_bytes(
 }
 
 fn record_working_set_edit(
+    ws_root: &Path,
+    preopened_db: Option<Arc<LibreDb>>,
     target_file: &Path,
     tool_name: &str,
     args: &Value,
     global_db: Option<&LibreDb>,
     cid_transcript: Option<(&str, &Path)>,
 ) -> Result<(), String> {
-    let Some(root) = find_workspace_root(target_file) else {
-        return Ok(());
-    };
-    let ldb_path = root.join(".agents").join("memory.ldb");
+    let ldb_path = ws_root.join(".agents").join("memory.ldb");
     let db_sibling = ldb_path.with_extension("db");
-    if !ldb_path.exists() && !db_sibling.exists() {
+    if preopened_db.is_none() && !ldb_path.exists() && !db_sibling.exists() {
         return Ok(());
     }
-    if !crate::security::is_workspace_memory_trusted(global_db, &root) {
-        return Ok(());
-    }
-    let _ws_lock = match global_db.filter(|_| !crate::security::is_private_brain_workspace(&root)) {
-        Some(gdb) => Some(crate::security::WorkspaceTrustLockGuard::acquire(
-            gdb, &root,
-        )?),
+    let is_net = preopened_db
+        .as_ref()
+        .is_some_and(|db| db.is_network_share())
+        || libredb_core::io::detect_network_path(&ldb_path);
+    let _ws_lock = match global_db.filter(|_| !crate::security::is_private_brain_workspace(ws_root)) {
+        Some(gdb) => {
+            if is_net {
+                let Some(guard) = crate::security::WorkspaceTrustLockGuard::try_acquire_bounded(
+                    gdb, ws_root, 250,
+                )?
+                else {
+                    return Ok(());
+                };
+                Some(guard)
+            } else {
+                Some(crate::security::WorkspaceTrustLockGuard::acquire(
+                    gdb, ws_root,
+                )?)
+            }
+        }
         None => None,
     };
-    let (proj_db, did_migrate) = open_project_ldb_silent(&ldb_path)?;
-    if did_migrate && !crate::security::is_private_brain_workspace(&root) {
+    let (proj_db, did_migrate) = match preopened_db {
+        Some(db) => {
+            let _ = db.sync_from_disk_if_changed();
+            (db, false)
+        }
+        None => open_project_ldb_silent(&ldb_path)?,
+    };
+    if did_migrate && !crate::security::is_private_brain_workspace(ws_root) {
         let gdb = global_db.ok_or_else(|| {
             "global customizations.ldb is required to seal migrated workspace".to_owned()
         })?;
-        crate::security::seal_workspace_memory(gdb, &proj_db, &root)?;
+        crate::security::seal_workspace_memory(gdb, &proj_db, ws_root)?;
     }
+
+    let _deferred = proj_db
+        .is_network_share()
+        .then(|| proj_db.begin_deferred_sync());
 
     // Harvest any unseen non-banal transcript/task errors BEFORE staging the edit so
     // error cue timestamps causally precede the staged TentativeFileEdit (`edit_ns >= recorded_at_ns`).
     if let Some((cid, tp)) = cid_transcript {
         if tp.is_file() {
-            let _ = harvest_recent_transcript_errors(&proj_db, cid, tp);
+            let _ =
+                harvest_recent_transcript_errors(&proj_db, cid, tp, !proj_db.is_network_share());
         }
     }
 
@@ -1834,7 +1962,7 @@ fn record_working_set_edit(
         if let Ok((_, promoted_prior, saved_prior)) =
             libredb_cognitive::stage_tentative_file_edit(
                 &proj_db,
-                &root,
+                ws_root,
                 target_file,
                 pre_hash,
                 &post_bytes,
@@ -1843,28 +1971,30 @@ fn record_working_set_edit(
         {
             if promoted_prior > 0 {
                 crate::telemetry::record_workspace_event(
-                    &root,
+                    ws_root,
                     crate::telemetry::TelemetryEvent::HookSymbolShift {
                         reread_tokens_avoided: saved_prior,
                     },
                 );
             }
         }
-    } else if let Ok((promoted_prior, saved_prior)) =
-        libredb_cognitive::reconcile_tentative_edits(&proj_db, &root)
-    {
-        if promoted_prior > 0 {
-            crate::telemetry::record_workspace_event(
-                &root,
-                crate::telemetry::TelemetryEvent::HookSymbolShift {
-                    reread_tokens_avoided: saved_prior,
-                },
-            );
+    } else if !proj_db.is_network_share() {
+        if let Ok((promoted_prior, saved_prior)) =
+            libredb_cognitive::reconcile_tentative_edits(&proj_db, ws_root)
+        {
+            if promoted_prior > 0 {
+                crate::telemetry::record_workspace_event(
+                    ws_root,
+                    crate::telemetry::TelemetryEvent::HookSymbolShift {
+                        reread_tokens_avoided: saved_prior,
+                    },
+                );
+            }
         }
     }
 
     let rel_key = target_file
-        .strip_prefix(&root)
+        .strip_prefix(ws_root)
         .unwrap_or(target_file)
         .to_string_lossy()
         .replace('\\', "/");
@@ -1896,7 +2026,9 @@ fn record_working_set_edit(
                 .with_importance(180),
         )
         .map_err(|e| e.to_string())?;
-    let _ = proj_db.maybe_auto_compact();
+    if !proj_db.is_network_share() {
+        let _ = proj_db.maybe_auto_compact();
+    }
     Ok(())
 }
 
@@ -2089,6 +2221,7 @@ fn harvest_recent_transcript_errors(
     proj_db: &LibreDb,
     cid: &str,
     transcript_path: &Path,
+    persist_cursor_when_empty: bool,
 ) -> Vec<String> {
     let Some(lines) = read_file_tail_lines(transcript_path, 65_536) else {
         return Vec::new();
@@ -2186,7 +2319,9 @@ fn harvest_recent_transcript_errors(
             newly_recorded.push(diag);
         }
     }
-    if max_step_index > last_step_index {
+    if max_step_index > last_step_index
+        && (!newly_recorded.is_empty() || persist_cursor_when_empty)
+    {
         let cur_json = json!({ "last_step_index": max_step_index });
         if let Ok(bytes) = serde_json::to_vec(&cur_json) {
             let _ = proj_db.put(

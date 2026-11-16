@@ -215,9 +215,15 @@ impl OsFileBackend {
     /// Attempts to acquire the exclusive inter-process writer lock without blocking (`0 ms`).
     /// Returns `Ok(true)` if acquired, `Ok(false)` if held by another live file handle or process.
     pub fn try_lock_write_region(&self) -> Result<bool> {
+        self.try_lock_write_region_bounded(0)
+    }
+
+    /// Attempts to acquire the exclusive inter-process writer lock within `timeout_ms`.
+    /// Returns `Ok(true)` if acquired, `Ok(false)` on timeout.
+    pub fn try_lock_write_region_bounded(&self, timeout_ms: u64) -> Result<bool> {
         #[cfg(windows)]
         {
-            match win_lock::lock_high_byte(&self.file, 0) {
+            match win_lock::lock_high_byte(&self.file, timeout_ms) {
                 Ok(()) => Ok(true),
                 Err(e) if e.kind() == std::io::ErrorKind::TimedOut => Ok(false),
                 Err(e) => Err(LibreDbError::Io(e)),
@@ -225,14 +231,15 @@ impl OsFileBackend {
         }
         #[cfg(unix)]
         {
-            match self.file.try_lock() {
+            match unix_lock::lock_with_timeout(&self.file, timeout_ms) {
                 Ok(()) => Ok(true),
-                Err(std::fs::TryLockError::WouldBlock) => Ok(false),
-                Err(std::fs::TryLockError::Error(e)) => Err(LibreDbError::Io(e)),
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => Ok(false),
+                Err(e) => Err(LibreDbError::Io(e)),
             }
         }
         #[cfg(not(any(windows, unix)))]
         {
+            let _ = timeout_ms;
             Ok(true)
         }
     }

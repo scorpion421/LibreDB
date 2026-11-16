@@ -5,6 +5,7 @@ mod cli_args;
 mod design_skills;
 mod gitea;
 mod hooks;
+mod ipc;
 mod mcp;
 mod security;
 mod telemetry;

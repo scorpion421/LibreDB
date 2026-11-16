@@ -27,8 +27,9 @@ pub use learning::{
     is_code_learning_eligible_path, is_non_causal_error_noise, learn_explicit_error_resolution,
     learning_state_report, record_error_cue, record_search_miss_cue_with_source,
     sanitize_learning_artifacts, ErrorPitfallBook, LearnedPitfallEntry, LearningCounters,
-    LearningStateReport, MissCueSource, PendingErrorCue, ACTIVE_PITFALL_MIN_CONFIDENCE,
-    ERROR_PITFALL_BOOK_KEY, PENDING_ERROR_CUES_KEY,
+    LearningStateReport, MissCueSource, PendingErrorCue, PendingServedBridge,
+    ACTIVE_PITFALL_MIN_CONFIDENCE, BRIDGE_REFUTE_DECAY, ERROR_PITFALL_BOOK_KEY,
+    PENDING_ERROR_CUES_KEY, PENDING_SERVED_BRIDGES_KEY,
 };
 pub use overlay::OverlayBrain;
 pub use reflex::{
@@ -507,6 +508,24 @@ impl CognitiveEngine {
         }
 
         // 4. Hydrate ONLY the unseen/updated winning capsules in one coalesced extent read!
+        let has_direct_symbol = to_hydrate
+            .iter()
+            .any(|c| c.kind == NodeKind::Symbol && !c.via_bridge);
+        if !has_direct_symbol {
+            let bridged_syms: Vec<(u64, String)> = to_hydrate
+                .iter()
+                .filter(|c| c.kind == NodeKind::Symbol && c.via_bridge)
+                .filter_map(|c| c.key.as_ref().map(|k| (c.node_id, k.clone())))
+                .collect();
+            if !bridged_syms.is_empty() {
+                learning::record_served_bridge_hit(
+                    &self.db,
+                    &req.query,
+                    learning::MissCueSource::Pulse,
+                    &bridged_syms,
+                );
+            }
+        }
         let hydrate_ids: Vec<u64> = to_hydrate.iter().map(|c| c.node_id).collect();
         let (records, io_reads) = self.db.get_many_coalesced(&hydrate_ids)?;
 

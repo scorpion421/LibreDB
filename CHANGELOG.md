@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0] - 2026-11-16
+
+### Added
+- **In-memory MCP-to-hook coordinator (`libredb mcp-serve`)**: Added a local Windows Named Pipe and `0600` Unix Domain Socket bridge backed by the live MCP server state so concurrent `PreToolUse` and `PreInvocation` hooks execute directly in RAM without reopening database files across slow network shares, falling back transparently to disk when no server is running.
+- **Incremental `O(1)` database tail synchronization**: Upgraded the storage engine to read both ping-pong superblock slots in a single `8 KB` read, replay newly appended transaction frames sequentially (`<= 256 KiB` batches), and coalesce rapid hook writes during a single turn into one durable flush.
+- **Task-switch shielding and served-bridge self-correction (`L14`, `L15`)**: Prevents unrelated exact symbol lookups from absorbing earlier unresolved search misses when switching tasks mid-session, automatically decays bridge links when a developer skips a suggested target to edit another file, and extends `libredb learning --verify` from 13 to 15 verification stages.
+
+### Changed
+- **Hook execution headroom (`deploy_plugin.ps1`, `deploy_plugin.sh`)**: Raised default `PreInvocation` and `PreToolUse` command hook timeouts from `5` to `15` seconds to accommodate endpoint security scanners and mapped corporate SMB shares.
+
+### Fixed
+- **Parallel hook timeouts on SMB and network drives**: Reused already-open verified workspace database handles inside fallback hooks, bounded non-blocking SMB lock waits (`250 ms`), and deferred cross-file reconciliation on network shares so concurrent file edits never stall past Antigravity's hook timeout.
+
 ## [1.6.5] - 2026-11-16
 
 ### Added

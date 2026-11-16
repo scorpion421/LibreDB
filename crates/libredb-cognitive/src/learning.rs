@@ -24,6 +24,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 pub const PENDING_MISS_CUES_KEY: &str = "sys::pending_miss_cues";
 /// Internal causal symbol-alias bridge key mapping `cue_token -> Vec<(symbol_key, weight)>`.
 pub const SYMBOL_CUE_BRIDGES_KEY: &str = "sys::symbol_cue_bridges";
+/// Internal ring-buffer key storing recently served bridge hits awaiting edit confirmation or refutation.
+pub const PENDING_SERVED_BRIDGES_KEY: &str = "sys::pending_served_bridges";
+/// Maximum pending served bridge records retained in `sys::pending_served_bridges`.
+pub const MAX_PENDING_SERVED_BRIDGES: usize = 8;
+/// Multiplicative weight decay applied to a served bridge target when the user edits a different file/symbol.
+pub const BRIDGE_REFUTE_DECAY: f64 = 0.55;
 /// Internal ring-buffer key storing non-banal observed errors awaiting a structural fix edit.
 pub const PENDING_ERROR_CUES_KEY: &str = "sys::pending_error_cues";
 /// Internal procedural error-recovery pitfall book (`NodeKind::Generic`, seal-neutral).
@@ -108,6 +114,21 @@ pub struct PendingMissCue {
     pub bound_files: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bound_symbols: Vec<String>,
+    /// Stripped symbol keys resolved via exact Tier-1/Tier-2 lookups with disjoint query tokens after `recorded_at_ns`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shielded_symbols: Vec<String>,
+}
+
+/// Recently served learned bridge awaiting confirmation (edit in served file) or refutation (edit in another file).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingServedBridge {
+    pub raw_query: String,
+    pub tokens: Vec<String>,
+    pub served_at_ns: u128,
+    #[serde(default)]
+    pub source: MissCueSource,
+    pub served_symbols: Vec<String>,
+    pub served_files: Vec<String>,
 }
 
 /// Persisted causal bridge mapping learned query cue tokens to workspace `symbol_key` strings.
@@ -218,6 +239,8 @@ pub struct LearningCounters {
     #[serde(default)]
     pub failed_fixes_refuted: u64,
     #[serde(default)]
+    pub failed_bridges_refuted: u64,
+    #[serde(default)]
     pub method_supersedes_applied: u64,
 }
 
@@ -318,6 +341,7 @@ pub fn record_search_miss_cue_with_source(
                 existing_cue.first_bound_edit_ns = None;
                 existing_cue.bound_files.clear();
                 existing_cue.bound_symbols.clear();
+                existing_cue.shielded_symbols.clear();
                 count_as_miss = true;
             }
             existing_cue.recorded_at_ns = now_ns;
@@ -331,6 +355,7 @@ pub fn record_search_miss_cue_with_source(
                 first_bound_edit_ns: None,
                 bound_files: Vec::new(),
                 bound_symbols: Vec::new(),
+                shielded_symbols: Vec::new(),
             });
             count_as_miss = true;
         }
@@ -342,6 +367,22 @@ pub fn record_search_miss_cue_with_source(
             .map_err(|_| LibreDbError::CorruptFormat("pending miss cues serialize"))?;
         Ok(Some(WriteRequest::new(NodeKind::Generic, bytes).with_importance(32)))
     })?;
+    let _ = db.transact_key(NodeKind::Generic, PENDING_SERVED_BRIDGES_KEY, |existing| {
+        let Some(rec) = existing else {
+            return Ok(None);
+        };
+        let Ok(mut served) = serde_json::from_slice::<Vec<PendingServedBridge>>(&rec.payload) else {
+            return Ok(None);
+        };
+        let before = served.len();
+        served.retain(|s| s.raw_query.eq_ignore_ascii_case(&trimmed));
+        if served.len() == before {
+            return Ok(None);
+        }
+        let bytes = serde_json::to_vec(&served)
+            .map_err(|_| LibreDbError::CorruptFormat("pending served bridges serialize"))?;
+        Ok(Some(WriteRequest::new(NodeKind::Generic, bytes).with_importance(24)))
+    });
     if count_as_miss {
         bump_learning_counters(db, |c| c.misses_recorded += 1);
     }
@@ -1298,6 +1339,120 @@ impl BridgeScorer {
     }
 }
 
+/// Marks exact Tier-1/Tier-2 symbols looked up via disjoint query tokens as shielded on any
+/// currently unbound `PendingMissCue` so switching from topic A to topic B never binds cue A to B.
+pub(crate) fn shield_unrelated_pending_miss_cues(
+    db: &LibreDb,
+    raw_query: &str,
+    direct_hits: &[(u64, String)],
+) {
+    if direct_hits.is_empty() || db.get_by_key(NodeKind::Generic, PENDING_MISS_CUES_KEY).is_err() {
+        return;
+    }
+    let q_tokens = extract_cue_tokens(raw_query);
+    let shielded: Vec<String> = direct_hits
+        .iter()
+        .map(|(_, k)| strip_line_disambiguator(k).to_owned())
+        .collect();
+    if shielded.is_empty() {
+        return;
+    }
+    let _ = db.transact_key(NodeKind::Generic, PENDING_MISS_CUES_KEY, |existing| {
+        let Some(rec) = existing else {
+            return Ok(None);
+        };
+        let Ok(mut cues) = serde_json::from_slice::<Vec<PendingMissCue>>(&rec.payload) else {
+            return Ok(None);
+        };
+        let mut changed = false;
+        for c in &mut cues {
+            if c.first_bound_edit_ns.is_some() {
+                continue;
+            }
+            let overlaps = !q_tokens.is_empty()
+                && c.tokens
+                    .iter()
+                    .any(|ct| q_tokens.iter().any(|qt| ct.eq_ignore_ascii_case(qt)));
+            if overlaps {
+                continue;
+            }
+            for sym_k in &shielded {
+                if !c.shielded_symbols.contains(sym_k) {
+                    c.shielded_symbols.push(sym_k.clone());
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            return Ok(None);
+        }
+        let bytes = serde_json::to_vec(&cues)
+            .map_err(|_| LibreDbError::CorruptFormat("pending miss cues serialize"))?;
+        Ok(Some(WriteRequest::new(NodeKind::Generic, bytes).with_importance(32)))
+    });
+}
+
+/// Records recently served learned bridge hits into `sys::pending_served_bridges` so a follow-up
+/// edit to another file within `CUE_EPISODE_WINDOW_NS` refutes the wrong bridge and re-binds.
+pub(crate) fn record_served_bridge_hit(
+    db: &LibreDb,
+    raw_query: &str,
+    source: MissCueSource,
+    bridged_hits: &[(u64, String)],
+) {
+    let tokens = extract_cue_tokens(raw_query);
+    if tokens.is_empty() || bridged_hits.is_empty() {
+        return;
+    }
+    let now_ns = current_unix_ns();
+    let mut served_symbols = Vec::new();
+    let mut served_files = Vec::new();
+    for (_, full_k) in bridged_hits {
+        let stripped = strip_line_disambiguator(full_k).to_owned();
+        if let Some((fp, _)) = stripped.split_once("::") {
+            let fp_norm = fp.replace('\\', "/");
+            if !served_files.contains(&fp_norm) {
+                served_files.push(fp_norm);
+            }
+        }
+        if !served_symbols.contains(&stripped) {
+            served_symbols.push(stripped);
+        }
+    }
+    if served_symbols.is_empty() {
+        return;
+    }
+    let trimmed = raw_query.trim().to_owned();
+    let _ = db.transact_key(NodeKind::Generic, PENDING_SERVED_BRIDGES_KEY, |existing| {
+        let mut list: Vec<PendingServedBridge> = existing
+            .and_then(|rec| serde_json::from_slice(&rec.payload).ok())
+            .unwrap_or_default();
+        list.retain(|s| now_ns.saturating_sub(s.served_at_ns) <= CUE_EPISODE_WINDOW_NS);
+        if let Some(prev) = list.iter_mut().find(|s| s.raw_query.eq_ignore_ascii_case(&trimmed)) {
+            prev.served_at_ns = now_ns;
+            prev.source = source;
+            prev.served_symbols = served_symbols.clone();
+            prev.served_files = served_files.clone();
+        } else {
+            list.push(PendingServedBridge {
+                raw_query: trimmed.clone(),
+                tokens: tokens.clone(),
+                served_at_ns: now_ns,
+                source,
+                served_symbols: served_symbols.clone(),
+                served_files: served_files.clone(),
+            });
+        }
+        if list.len() > MAX_PENDING_SERVED_BRIDGES {
+            let drop_n = list.len() - MAX_PENDING_SERVED_BRIDGES;
+            list.drain(0..drop_n);
+        }
+        let bytes = serde_json::to_vec(&list)
+            .map_err(|_| LibreDbError::CorruptFormat("pending served bridges serialize"))?;
+        Ok(Some(WriteRequest::new(NodeKind::Generic, bytes).with_importance(24)))
+    });
+}
+
 /// Shared tier resolution for `locate` and `impact`:
 /// exact (tier 1) > case-insensitive (tier 2) > confident learned bridges > substring (tier 3).
 /// Direct Tier-1/Tier-2 hits stay first while non-duplicate confident bridges join slots `2..K`.
@@ -1321,6 +1476,7 @@ pub(crate) fn compose_tiers_with_bridges(
         .collect();
     if !tier1.is_empty() || !tier2.is_empty() {
         let mut out = if !tier1.is_empty() { tier1 } else { tier2 };
+        shield_unrelated_pending_miss_cues(db, raw_query, &out);
         for b in bridged {
             if !out.iter().any(|(id, _)| *id == b.0) {
                 out.push(b);
@@ -1332,6 +1488,7 @@ pub(crate) fn compose_tiers_with_bridges(
         let _ = record_search_miss_cue_with_source(db, raw_query, source);
         return tier3;
     }
+    record_served_bridge_hit(db, raw_query, source, &bridged);
     let mut out = bridged;
     for t in tier3 {
         if !out.iter().any(|(id, _)| *id == t.0) {
@@ -1372,8 +1529,11 @@ pub(crate) fn learn_from_verified_edit(db: &LibreDb, ev: &EditEvidence) -> usize
         return 0;
     }
     let has_miss_cues = db.get_by_key(NodeKind::Generic, PENDING_MISS_CUES_KEY).is_ok();
+    let has_served_bridges = db
+        .get_by_key(NodeKind::Generic, PENDING_SERVED_BRIDGES_KEY)
+        .is_ok();
     let has_error_cues = db.get_by_key(NodeKind::Generic, PENDING_ERROR_CUES_KEY).is_ok();
-    if !has_miss_cues && !has_error_cues {
+    if !has_miss_cues && !has_served_bridges && !has_error_cues {
         return 0;
     }
     if ev.touched.len() > MAX_TOUCHED_PER_EDIT {
@@ -1403,7 +1563,7 @@ pub(crate) fn learn_from_verified_edit(db: &LibreDb, ev: &EditEvidence) -> usize
                 let new_syms: Vec<String> = ev
                     .touched
                     .iter()
-                    .filter(|s| !c.bound_symbols.contains(s))
+                    .filter(|s| !c.bound_symbols.contains(s) && !c.shielded_symbols.contains(s))
                     .cloned()
                     .collect();
                 if new_syms.is_empty() {
@@ -1485,11 +1645,149 @@ pub(crate) fn learn_from_verified_edit(db: &LibreDb, ev: &EditEvidence) -> usize
         }
     }
 
+    if has_served_bridges {
+        total_learned += reconcile_served_bridges_for_edit(db, ev);
+    }
+
     if has_error_cues {
         total_learned += bind_error_cues_for_edit(db, ev);
     }
 
     total_learned
+}
+
+fn reconcile_served_bridges_for_edit(db: &LibreDb, ev: &EditEvidence) -> usize {
+    if !is_code_learning_eligible_path(&ev.rel_path) {
+        return 0;
+    }
+    let mut refuted_list: Vec<PendingServedBridge> = Vec::new();
+    let mut confirmed_list: Vec<PendingServedBridge> = Vec::new();
+    let tx = db.transact_key(NodeKind::Generic, PENDING_SERVED_BRIDGES_KEY, |existing| {
+        let Some(rec) = existing else {
+            return Ok(None);
+        };
+        let Ok(served) = serde_json::from_slice::<Vec<PendingServedBridge>>(&rec.payload) else {
+            return Ok(None);
+        };
+        let now_ns = current_unix_ns();
+        let before = served.len();
+        let mut remaining = Vec::with_capacity(served.len());
+        for s in served {
+            if now_ns.saturating_sub(s.served_at_ns) > CUE_EPISODE_WINDOW_NS
+                || ev.edit_ns.saturating_sub(s.served_at_ns) > CUE_EPISODE_WINDOW_NS
+            {
+                continue;
+            }
+            if s.served_at_ns > ev.edit_ns {
+                remaining.push(s);
+                continue;
+            }
+            let same_file = s
+                .served_files
+                .iter()
+                .any(|f| file_hint_matches(f, &ev.rel_path));
+            let same_sym = ev.touched.iter().any(|t| s.served_symbols.contains(t));
+            if same_file || same_sym {
+                confirmed_list.push(s);
+            } else {
+                refuted_list.push(s);
+            }
+        }
+        if refuted_list.is_empty() && confirmed_list.is_empty() && remaining.len() == before {
+            return Ok(None);
+        }
+        let bytes = serde_json::to_vec(&remaining)
+            .map_err(|_| LibreDbError::CorruptFormat("pending served bridges serialize"))?;
+        Ok(Some(WriteRequest::new(NodeKind::Generic, bytes).with_importance(24)))
+    });
+    if tx.is_err() || (refuted_list.is_empty() && confirmed_list.is_empty()) {
+        return 0;
+    }
+
+    let vocab = SymbolVocabulary::from_db(db);
+    let mut updated_links = 0usize;
+    let mut refuted_count = 0u64;
+    let bridge_tx = db.transact_key(NodeKind::Generic, SYMBOL_CUE_BRIDGES_KEY, |existing| {
+        let mut book: SymbolCueBridgeBook = existing
+            .and_then(|rec| serde_json::from_slice(&rec.payload).ok())
+            .unwrap_or_default();
+
+        for conf in &confirmed_list {
+            for tok in &conf.tokens {
+                if let Some(list) = book.bridges.get_mut(tok) {
+                    for sym_k in &ev.touched {
+                        if let Some(link) = list.iter_mut().find(|(k, _)| k == sym_k) {
+                            link.1 = (1.0 - (1.0 - link.1) * BRIDGE_REINFORCE_RETAIN).clamp(0.10, 0.95);
+                            updated_links += 1;
+                        }
+                    }
+                    list.sort_by(|a, b| {
+                        b.1.partial_cmp(&a.1)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| a.0.cmp(&b.0))
+                    });
+                }
+            }
+        }
+
+        for ref_item in &refuted_list {
+            let whole = whole_identifier(&ref_item.raw_query);
+            let init_w = ref_item.source.initial_weight();
+            let mut item_refuted = false;
+            for tok in &ref_item.tokens {
+                let is_whole = whole.as_deref() == Some(tok.as_str());
+                let fanout = book.bridges.get(tok).map_or(0, |l| l.len() as u32);
+                if !is_whole && vocab.specificity(tok, fanout) < MIN_BIND_TOKEN_SPECIFICITY {
+                    continue;
+                }
+                let list = book.bridges.entry(tok.clone()).or_default();
+                for (sym_k, w) in list.iter_mut() {
+                    if ref_item.served_symbols.contains(sym_k) {
+                        *w = (*w * BRIDGE_REFUTE_DECAY).clamp(0.10, 0.95);
+                        item_refuted = true;
+                    }
+                }
+                for new_sym in &ev.touched {
+                    if let Some(existing_link) = list.iter_mut().find(|(k, _)| k == new_sym) {
+                        existing_link.1 = (1.0 - (1.0 - existing_link.1) * BRIDGE_REINFORCE_RETAIN)
+                            .max(init_w)
+                            .clamp(0.10, 0.95);
+                    } else {
+                        list.push((new_sym.clone(), init_w));
+                    }
+                    updated_links += 1;
+                }
+                list.sort_by(|a, b| {
+                    b.1.partial_cmp(&a.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.0.cmp(&b.0))
+                });
+                list.truncate(MAX_TARGETS_PER_CUE_TOKEN);
+            }
+            if item_refuted {
+                refuted_count += 1;
+            }
+        }
+
+        evict_bridge_book_overflow(&mut book);
+        if updated_links == 0 && refuted_count == 0 {
+            return Ok(None);
+        }
+        let bytes = serde_json::to_vec(&book)
+            .map_err(|_| LibreDbError::CorruptFormat("symbol cue bridges serialize"))?;
+        Ok(Some(WriteRequest::new(NodeKind::Generic, bytes).with_importance(64)))
+    });
+
+    if bridge_tx.is_ok() && (updated_links > 0 || refuted_count > 0) {
+        let re_bound = refuted_list.len() as u64;
+        bump_learning_counters(db, |c| {
+            c.failed_bridges_refuted += refuted_count;
+            c.bindings_learned += re_bound;
+            c.method_supersedes_applied += refuted_count;
+        });
+        return updated_links;
+    }
+    0
 }
 
 fn is_error_code_token(tok: &str, cue_code: Option<&str>) -> bool {
@@ -2306,7 +2604,7 @@ pub fn format_learning_report(rep: &LearningStateReport) -> String {
         ));
     }
     lines.push(format!(
-        "Counters: misses {}, bindings {}, broad edits skipped {}, bulk scans skipped {}, error cues {}, trivial filtered {}, pitfalls {}, refuted {}, supersedes {}",
+        "Counters: misses {}, bindings {}, broad edits skipped {}, bulk scans skipped {}, error cues {}, trivial filtered {}, pitfalls {}, refuted {}, bridges refuted {}, supersedes {}",
         rep.counters.misses_recorded,
         rep.counters.bindings_learned,
         rep.counters.broad_edits_skipped,
@@ -2315,6 +2613,7 @@ pub fn format_learning_report(rep: &LearningStateReport) -> String {
         rep.counters.trivial_errors_filtered,
         rep.counters.pitfalls_learned,
         rep.counters.failed_fixes_refuted,
+        rep.counters.failed_bridges_refuted,
         rep.counters.method_supersedes_applied
     ));
     lines.join("\n")
@@ -2333,6 +2632,7 @@ mod tests {
             first_bound_edit_ns: None,
             bound_files: Vec::new(),
             bound_symbols: Vec::new(),
+            shielded_symbols: Vec::new(),
         }
     }
 

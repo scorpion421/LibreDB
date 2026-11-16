@@ -28,10 +28,31 @@ impl WorkspaceTrustLockGuard {
         Self::acquire_norm(global_db, &norm)
     }
 
+    pub fn try_acquire_bounded(
+        global_db: &LibreDb,
+        ws_root: &Path,
+        timeout_ms: u64,
+    ) -> Result<Option<Self>, String> {
+        let norm = normalize_workspace_key(ws_root);
+        Self::acquire_norm_with_timeout(global_db, &norm, Some(timeout_ms))
+    }
+
     pub(crate) fn acquire_norm(global_db: &LibreDb, norm: &str) -> Result<Self, String> {
+        Self::acquire_norm_with_timeout(global_db, norm, None)?
+            .ok_or_else(|| "Timed out acquiring workspace trust lock".to_owned())
+    }
+
+    pub(crate) fn acquire_norm_with_timeout(
+        global_db: &LibreDb,
+        norm: &str,
+        timeout_ms_opt: Option<u64>,
+    ) -> Result<Option<Self>, String> {
         static REGISTRY: std::sync::OnceLock<
             std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<WsLockPair>>>,
         > = std::sync::OnceLock::new();
+
+        let deadline_opt =
+            timeout_ms_opt.map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
 
         let lock_path = workspace_trust_lock_path(global_db, norm)?;
         let canon_key =
@@ -55,12 +76,21 @@ impl WorkspaceTrustLockGuard {
         let tid = std::thread::current().id();
         let mut st = slot.0.lock().unwrap_or_else(|e| e.into_inner());
         while st.owner.is_some_and(|o| o != tid) {
-            st = slot.1.wait(st).unwrap_or_else(|e| e.into_inner());
+            if let Some(deadline) = deadline_opt {
+                let rem = deadline.saturating_duration_since(std::time::Instant::now());
+                if rem.is_zero() {
+                    return Ok(None);
+                }
+                let (next_st, _) = slot.1.wait_timeout(st, rem).unwrap_or_else(|e| e.into_inner());
+                st = next_st;
+            } else {
+                st = slot.1.wait(st).unwrap_or_else(|e| e.into_inner());
+            }
         }
         if st.depth > 0 {
             st.depth += 1;
             drop(st);
-            return Ok(Self { slot });
+            return Ok(Some(Self { slot }));
         }
 
         // Reserve intra-process ownership while blocking on the OS cross-process file lock;
@@ -108,12 +138,28 @@ impl WorkspaceTrustLockGuard {
             use std::os::unix::fs::PermissionsExt;
             let _ = fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600));
         }
-        backend.lock_write_region().map_err(|e| {
-            format!(
-                "Failed to acquire workspace trust lock '{}': {e}",
-                lock_path.display()
-            )
-        })?;
+        if let Some(deadline) = deadline_opt {
+            let rem_ms = deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64;
+            let acquired = backend.try_lock_write_region_bounded(rem_ms).map_err(|e| {
+                format!(
+                    "Failed to acquire workspace trust lock '{}': {e}",
+                    lock_path.display()
+                )
+            })?;
+            if !acquired {
+                return Ok(None);
+            }
+        } else {
+            backend.lock_write_region().map_err(|e| {
+                format!(
+                    "Failed to acquire workspace trust lock '{}': {e}",
+                    lock_path.display()
+                )
+            })?;
+        }
 
         {
             let mut st = slot.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -122,7 +168,7 @@ impl WorkspaceTrustLockGuard {
         reset_guard.armed = false;
         drop(reset_guard);
 
-        Ok(Self { slot })
+        Ok(Some(Self { slot }))
     }
 }
 

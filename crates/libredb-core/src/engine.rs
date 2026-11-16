@@ -14,7 +14,7 @@ use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -30,6 +30,21 @@ impl<'a> IpcWriteGuard<'a> {
 impl Drop for IpcWriteGuard<'_> {
     fn drop(&mut self) {
         let _ = self.0.unlock_write_region();
+    }
+}
+
+/// RAII guard coalescing intermediate `sync_data()` flushes on `LibreDb` into a single flush
+/// when the outermost guard drops.
+pub struct DeferredSyncGuard<'a> {
+    db: &'a LibreDb,
+}
+
+impl Drop for DeferredSyncGuard<'_> {
+    fn drop(&mut self) {
+        let prev = self.db.deferred_sync_depth.fetch_sub(1, Ordering::AcqRel);
+        if prev == 1 && self.db.dirty_unsynced.swap(false, Ordering::AcqRel) {
+            let _ = self.db.backend.sync_data();
+        }
     }
 }
 
@@ -238,6 +253,8 @@ pub struct LibreDb {
     /// 16 sharded lane counters proving parallel lane distribution under concurrent workloads.
     lane_counters: [AtomicU32; SHARD_WRITE_LANES],
     telemetry: AccessTelemetry,
+    deferred_sync_depth: AtomicU32,
+    dirty_unsynced: AtomicBool,
 }
 
 impl LibreDb {
@@ -253,6 +270,27 @@ impl LibreDb {
     /// Returns the filesystem path when opened via `LibreDb::open`, or `None` for custom backends.
     pub fn path(&self) -> Option<&Path> {
         self.file_path.as_deref()
+    }
+
+    /// Returns true if the backing file resides on a remote SMB/NFS network share.
+    pub fn is_network_share(&self) -> bool {
+        self.backend.is_network_share()
+    }
+
+    /// Defers durable `sync_data()` flushes until the returned RAII guard drops (coalescing
+    /// bursts of small metadata commits into a single `fsync` / `FlushFileBuffers`).
+    pub fn begin_deferred_sync(&self) -> DeferredSyncGuard<'_> {
+        self.deferred_sync_depth.fetch_add(1, Ordering::AcqRel);
+        DeferredSyncGuard { db: self }
+    }
+
+    fn sync_or_defer(&self) -> Result<()> {
+        if self.deferred_sync_depth.load(Ordering::Acquire) > 0 {
+            self.dirty_unsynced.store(true, Ordering::Release);
+            Ok(())
+        } else {
+            self.backend.sync_data()
+        }
     }
 
     /// Opens or initializes a database on any `StorageBackend` while associating a logical
@@ -288,6 +326,8 @@ impl LibreDb {
             commit_lock: Mutex::new(()),
             lane_counters: std::array::from_fn(|_| AtomicU32::new(0)),
             telemetry: AccessTelemetry::default(),
+            deferred_sync_depth: AtomicU32::new(0),
+            dirty_unsynced: AtomicBool::new(false),
         })
     }
 
@@ -311,39 +351,7 @@ impl LibreDb {
     }
 
     fn recover_existing(backend: &dyn StorageBackend, file_len: u64) -> Result<SnapshotState> {
-        if file_len < DATA_REGION_START {
-            return Err(LibreDbError::NoValidSuperblock);
-        }
-
-        let mut buf_a = [0u8; SUPERBLOCK_SLOT_SIZE as usize];
-        let mut buf_b = [0u8; SUPERBLOCK_SLOT_SIZE as usize];
-        let res_a = backend.read_at(0, &mut buf_a).and_then(|_| Superblock::decode(&buf_a));
-        let res_b = backend
-            .read_at(SUPERBLOCK_SLOT_SIZE, &mut buf_b)
-            .and_then(|_| Superblock::decode(&buf_b));
-
-        let sb = match (res_a, res_b) {
-            (Ok(a), Ok(b)) => {
-                // Pick the highest commit_seq whose declared data_tail_offset physically exists in file_len.
-                let a_fits = a.data_tail_offset <= file_len;
-                let b_fits = b.data_tail_offset <= file_len;
-                match (a_fits, b_fits) {
-                    (true, true) => {
-                        if b.commit_seq >= a.commit_seq {
-                            b
-                        } else {
-                            a
-                        }
-                    }
-                    (true, false) => a,
-                    (false, true) => b,
-                    (false, false) => return Err(LibreDbError::NoValidSuperblock),
-                }
-            }
-            (Ok(a), Err(_)) if a.data_tail_offset <= file_len => a,
-            (Err(_), Ok(b)) if b.data_tail_offset <= file_len => b,
-            _ => return Err(LibreDbError::NoValidSuperblock),
-        };
+        let sb = Self::read_disk_superblock(backend, file_len)?;
 
         let mut inodes: HashMap<u64, Inode> = HashMap::new();
         let mut key_dir: HashMap<(NodeKind, String), u64> = HashMap::new();
@@ -381,60 +389,23 @@ impl LibreDb {
         }
 
         // 2. Replay incremental CommitFrames (`LDBC`) in `[delta_start_offset .. data_tail_offset]`.
-        // Note: Within the delta stream, payload/overflow extents precede each `CommitFrame`, so
-        // each record in the delta stream is wrapped in a self-describing `DeltaEnvelope`:
-        // `[env_magic: "LDBE" (4B)][total_env_len: u32 (4B)][extents...][CommitFrame "LDBC"...]`
-        let mut cursor = sb.delta_start_offset;
-        while cursor < sb.data_tail_offset {
-            if cursor
-                .checked_add(12)
-                .is_none_or(|end| end > sb.data_tail_offset || end > file_len)
-            {
-                return Err(LibreDbError::CorruptFormat("truncated delta envelope header"));
-            }
-            let mut hdr = [0u8; 12];
-            backend.read_at(cursor, &mut hdr)?;
-            if &hdr[0..4] != b"LDBE" {
-                return Err(LibreDbError::CorruptFormat("invalid delta envelope magic"));
-            }
-            let total_env_len = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as u64;
-            let meta_rel_offset = u32::from_le_bytes(hdr[8..12].try_into().unwrap()) as u64;
-            let env_end = cursor
-                .checked_add(total_env_len)
-                .ok_or(LibreDbError::CorruptFormat("delta envelope offset overflow"))?;
-            if total_env_len < 12
-                || meta_rel_offset < 12
-                || meta_rel_offset >= total_env_len
-                || env_end > sb.data_tail_offset
-                || env_end > file_len
-            {
-                return Err(LibreDbError::CorruptFormat("invalid delta envelope bounds"));
-            }
-            let meta_len_u64 = total_env_len - meta_rel_offset;
-            if meta_len_u64 > MAX_EXTENT_PAYLOAD_BYTES as u64 {
-                return Err(LibreDbError::PayloadTooLarge {
-                    size: usize::try_from(meta_len_u64).unwrap_or(usize::MAX),
-                    max: MAX_EXTENT_PAYLOAD_BYTES,
-                });
-            }
-
-            let meta_len = meta_len_u64 as usize;
-            let mut meta_buf = vec![0u8; meta_len];
-            backend.read_at(cursor + meta_rel_offset, &mut meta_buf)?;
-            let (_seq, delta_inodes, delta_keys) =
-                decode_metadata_frame(COMMIT_FRAME_MAGIC, &meta_buf)?;
-
-            for inode in delta_inodes {
-                inodes.insert(inode.node_id, inode);
-            }
-            apply_key_mutations(&mut key_dir, &mut reverse_keys, delta_keys);
-
-            cursor = env_end;
-        }
-
-        // 3. Hydrate any overflow synapse extents (`> 4` edges) into RAM for `O(1)` graph traversal.
         let mut overflow_synapses: HashMap<u64, Vec<Synapse>> = HashMap::new();
+        Self::replay_delta_range(
+            backend,
+            file_len,
+            sb.delta_start_offset,
+            sb.data_tail_offset,
+            &mut inodes,
+            &mut key_dir,
+            &mut reverse_keys,
+            &mut overflow_synapses,
+        )?;
+
+        // 3. Hydrate any remaining BaseSnapshot overflow synapse extents (`> 4` edges) into RAM.
         for (&nid, inode) in &inodes {
+            if overflow_synapses.contains_key(&nid) {
+                continue;
+            }
             if let InodeStorage::Extent {
                 edge_extent_offset,
                 edge_overflow_count,
@@ -470,14 +441,17 @@ impl LibreDb {
         if file_len < DATA_REGION_START {
             return Err(LibreDbError::NoValidSuperblock);
         }
-        let mut buf_a = [0u8; SUPERBLOCK_SLOT_SIZE as usize];
-        let mut buf_b = [0u8; SUPERBLOCK_SLOT_SIZE as usize];
-        let res_a = backend
-            .read_at(0, &mut buf_a)
-            .and_then(|_| Superblock::decode(&buf_a));
-        let res_b = backend
-            .read_at(SUPERBLOCK_SLOT_SIZE, &mut buf_b)
-            .and_then(|_| Superblock::decode(&buf_b));
+        let mut buf_ab = [0u8; DATA_REGION_START as usize];
+        backend.read_at(0, &mut buf_ab)?;
+        const SLOT_SZ: usize = SUPERBLOCK_SLOT_SIZE as usize;
+        let slot_a: &[u8; SLOT_SZ] = buf_ab[..SLOT_SZ]
+            .try_into()
+            .map_err(|_| LibreDbError::NoValidSuperblock)?;
+        let slot_b: &[u8; SLOT_SZ] = buf_ab[SLOT_SZ..]
+            .try_into()
+            .map_err(|_| LibreDbError::NoValidSuperblock)?;
+        let res_a = Superblock::decode(slot_a);
+        let res_b = Superblock::decode(slot_b);
         match (res_a, res_b) {
             (Ok(a), Ok(b)) => {
                 let a_fits = a.data_tail_offset <= file_len;
@@ -495,19 +469,185 @@ impl LibreDb {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn replay_delta_range(
+        backend: &dyn StorageBackend,
+        file_len: u64,
+        range_start: u64,
+        range_end: u64,
+        inodes: &mut HashMap<u64, Inode>,
+        key_dir: &mut HashMap<(NodeKind, String), u64>,
+        reverse_keys: &mut HashMap<u64, (NodeKind, String)>,
+        overflow_synapses: &mut HashMap<u64, Vec<Synapse>>,
+    ) -> Result<()> {
+        if range_start >= range_end {
+            return Ok(());
+        }
+        if range_start < DATA_REGION_START || range_end > file_len {
+            return Err(LibreDbError::CorruptFormat("delta replay bounds invalid"));
+        }
+
+        const BUFFERED_DELTA_LIMIT: u64 = 262_144;
+        let mut touched_nids: HashSet<u64> = HashSet::new();
+        let mut apply_frame = |meta_bytes: &[u8]| -> Result<()> {
+            let (_seq, delta_inodes, delta_keys) =
+                decode_metadata_frame(COMMIT_FRAME_MAGIC, meta_bytes)?;
+            for inode in delta_inodes {
+                touched_nids.insert(inode.node_id);
+                inodes.insert(inode.node_id, inode);
+            }
+            apply_key_mutations(key_dir, reverse_keys, delta_keys);
+            Ok(())
+        };
+
+        let range_len = range_end - range_start;
+        if range_len <= BUFFERED_DELTA_LIMIT {
+            let mut buf = vec![0u8; range_len as usize];
+            backend.read_at(range_start, &mut buf)?;
+            let mut rel = 0usize;
+            while rel < buf.len() {
+                if rel + 12 > buf.len() {
+                    return Err(LibreDbError::CorruptFormat("truncated delta envelope header"));
+                }
+                if &buf[rel..rel + 4] != b"LDBE" {
+                    return Err(LibreDbError::CorruptFormat("invalid delta envelope magic"));
+                }
+                let total_env_len =
+                    u32::from_le_bytes(buf[rel + 4..rel + 8].try_into().unwrap()) as usize;
+                let meta_rel_offset =
+                    u32::from_le_bytes(buf[rel + 8..rel + 12].try_into().unwrap()) as usize;
+                if total_env_len < 12
+                    || meta_rel_offset < 12
+                    || meta_rel_offset >= total_env_len
+                    || rel.checked_add(total_env_len).is_none_or(|e| e > buf.len())
+                {
+                    return Err(LibreDbError::CorruptFormat("invalid delta envelope bounds"));
+                }
+                apply_frame(&buf[rel + meta_rel_offset..rel + total_env_len])?;
+                rel += total_env_len;
+            }
+        } else {
+            let mut cursor = range_start;
+            while cursor < range_end {
+                if cursor
+                    .checked_add(12)
+                    .is_none_or(|end| end > range_end || end > file_len)
+                {
+                    return Err(LibreDbError::CorruptFormat("truncated delta envelope header"));
+                }
+                let mut hdr = [0u8; 12];
+                backend.read_at(cursor, &mut hdr)?;
+                if &hdr[0..4] != b"LDBE" {
+                    return Err(LibreDbError::CorruptFormat("invalid delta envelope magic"));
+                }
+                let total_env_len = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as u64;
+                let meta_rel_offset = u32::from_le_bytes(hdr[8..12].try_into().unwrap()) as u64;
+                let env_end = cursor
+                    .checked_add(total_env_len)
+                    .ok_or(LibreDbError::CorruptFormat("delta envelope offset overflow"))?;
+                if total_env_len < 12
+                    || meta_rel_offset < 12
+                    || meta_rel_offset >= total_env_len
+                    || env_end > range_end
+                    || env_end > file_len
+                {
+                    return Err(LibreDbError::CorruptFormat("invalid delta envelope bounds"));
+                }
+                let meta_len_u64 = total_env_len - meta_rel_offset;
+                if meta_len_u64 > MAX_EXTENT_PAYLOAD_BYTES as u64 {
+                    return Err(LibreDbError::PayloadTooLarge {
+                        size: usize::try_from(meta_len_u64).unwrap_or(usize::MAX),
+                        max: MAX_EXTENT_PAYLOAD_BYTES,
+                    });
+                }
+                let mut meta_buf = vec![0u8; meta_len_u64 as usize];
+                backend.read_at(cursor + meta_rel_offset, &mut meta_buf)?;
+                apply_frame(&meta_buf)?;
+                cursor = env_end;
+            }
+        }
+
+        for nid in touched_nids {
+            match inodes.get(&nid).map(|ino| &ino.storage) {
+                Some(InodeStorage::Extent {
+                    edge_extent_offset,
+                    edge_overflow_count,
+                    ..
+                }) if *edge_overflow_count > 0 => {
+                    if *edge_extent_offset < DATA_REGION_START {
+                        return Err(LibreDbError::CorruptFormat(
+                            "overflow synapse offset below DATA_REGION_START",
+                        ));
+                    }
+                    let syns = read_overflow_synapses(
+                        backend,
+                        *edge_extent_offset,
+                        *edge_overflow_count as usize,
+                    )?;
+                    overflow_synapses.insert(nid, syns);
+                }
+                _ => {
+                    overflow_synapses.remove(&nid);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Checks whether another OS process (e.g. a lifecycle hook or CLI command) committed new
-    /// frames to the underlying `.ldb` file (`< 8 microseconds` 8 KB superblock read from OS page
-    /// cache), and transparently reloads `SnapshotState` if `commit_seq` or `compaction_count` advanced.
+    /// frames to the underlying `.ldb` file using a single 8 KB superblock read and, when no
+    /// compaction occurred, incrementally replays ONLY the newly appended tail delta slice.
     pub fn sync_from_disk_if_changed(&self) -> Result<bool> {
         let file_len = self.backend.len()?;
         let disk_sb = Self::read_disk_superblock(&*self.backend, file_len)?;
-        let mem_sb = self.state.read().superblock;
+        let cur_snap = Arc::clone(&self.state.read());
+        let mem_sb = cur_snap.superblock;
         if disk_sb.commit_seq == mem_sb.commit_seq
             && disk_sb.compaction_count == mem_sb.compaction_count
             && disk_sb.data_tail_offset == mem_sb.data_tail_offset
         {
             return Ok(false);
         }
+
+        if disk_sb.compaction_count == mem_sb.compaction_count
+            && disk_sb.base_snapshot_offset == mem_sb.base_snapshot_offset
+            && disk_sb.base_snapshot_len == mem_sb.base_snapshot_len
+            && disk_sb.delta_start_offset == mem_sb.delta_start_offset
+            && disk_sb.commit_seq > mem_sb.commit_seq
+            && disk_sb.data_tail_offset > mem_sb.data_tail_offset
+        {
+            let mut inodes = cur_snap.inodes.clone();
+            let mut overflow_synapses = cur_snap.overflow_synapses.clone();
+            let mut key_dir = cur_snap.key_dir.clone();
+            let mut reverse_keys = cur_snap.reverse_keys.clone();
+            if Self::replay_delta_range(
+                &*self.backend,
+                file_len,
+                mem_sb.data_tail_offset,
+                disk_sb.data_tail_offset,
+                &mut inodes,
+                &mut key_dir,
+                &mut reverse_keys,
+                &mut overflow_synapses,
+            )
+            .is_ok()
+            {
+                let mut guard = self.state.write();
+                if disk_sb.compaction_count >= guard.superblock.compaction_count
+                    && disk_sb.commit_seq > guard.superblock.commit_seq
+                {
+                    *guard = Arc::new(SnapshotState {
+                        superblock: disk_sb,
+                        inodes,
+                        overflow_synapses,
+                        key_dir,
+                        reverse_keys,
+                    });
+                }
+                return Ok(true);
+            }
+        }
+
         let reloaded = Self::recover_existing(&*self.backend, file_len)?;
         *self.state.write() = Arc::new(reloaded);
         Ok(true)
@@ -932,7 +1072,7 @@ impl LibreDb {
 
         // Step 1: Write self-verifying delta envelope at `env_start` and fsync BEFORE touching Superblock.
         self.backend.write_at(env_start, &envelope_buf)?;
-        self.backend.sync_data()?;
+        self.sync_or_defer()?;
 
         // Step 2: Update ping-pong Superblock in the inactive slot and fsync.
         next_snap.superblock.commit_seq = new_seq;
@@ -1134,7 +1274,7 @@ impl LibreDb {
         envelope_buf[8..12].copy_from_slice(&meta_rel_offset.to_le_bytes());
 
         self.backend.write_at(env_start, &envelope_buf)?;
-        self.backend.sync_data()?;
+        self.sync_or_defer()?;
 
         next_snap.superblock.commit_seq = new_seq;
         next_snap.superblock.data_tail_offset = env_start + (total_env_len as u64);
@@ -1367,7 +1507,7 @@ impl LibreDb {
         envelope_buf[8..12].copy_from_slice(&meta_rel_offset.to_le_bytes());
 
         self.backend.write_at(env_start, &envelope_buf)?;
-        self.backend.sync_data()?;
+        self.sync_or_defer()?;
 
         next_snap.superblock.commit_seq = new_seq;
         next_snap.superblock.data_tail_offset = env_start + (total_env_len as u64);
@@ -1441,7 +1581,7 @@ impl LibreDb {
         envelope_buf.extend_from_slice(&commit_frame);
 
         self.backend.write_at(env_start, &envelope_buf)?;
-        self.backend.sync_data()?;
+        self.sync_or_defer()?;
 
         next_snap.superblock.commit_seq = new_seq;
         next_snap.superblock.data_tail_offset = env_start + (total_env_len as u64);
@@ -1528,7 +1668,7 @@ impl LibreDb {
         envelope_buf.extend_from_slice(&commit_frame);
 
         self.backend.write_at(env_start, &envelope_buf)?;
-        self.backend.sync_data()?;
+        self.sync_or_defer()?;
 
         next_snap.superblock.commit_seq = new_seq;
         next_snap.superblock.data_tail_offset = env_start + (total_env_len as u64);
@@ -2498,7 +2638,7 @@ impl LibreDb {
         };
         let encoded = sb.encode();
         self.backend.write_at(slot_offset, &encoded)?;
-        self.backend.sync_data()?;
+        self.sync_or_defer()?;
         Ok(())
     }
 
