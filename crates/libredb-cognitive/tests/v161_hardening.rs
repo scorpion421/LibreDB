@@ -315,6 +315,51 @@ fn overlay_pulse_normalizes_cross_layer_idf_and_attenuates_foreign_stack_skills(
             .with_importance(200),
         )
         .unwrap();
+    for (sk_key, sk_body, sec_key, sec_body) in [
+        (
+            "android-app-design",
+            "Native Android Material 3 UI design architecture layout for Jetpack Compose mobile",
+            "android-app-design::Material 3 Surface",
+            "Windows desktop and UI design architecture comparison with Material 3 edge-to-edge",
+        ),
+        (
+            "apple-hig-design",
+            "Native Apple HIG design architecture layout for iOS iPadOS and macOS SwiftUI",
+            "apple-hig-design::macOS Split View",
+            "Desktop UI Fluent and HIG architecture navigation layout for native apps",
+        ),
+        (
+            "linux-desktop-hig-design",
+            "Native Linux desktop HIG design architecture for GNOME Libadwaita and KDE Kirigami",
+            "linux-desktop-hig-design::GNOME HeaderBar",
+            "Desktop UI Fluent and HIG design architecture layout for GTK4 and Qt6",
+        ),
+    ] {
+        glob_db
+            .put(
+                WriteRequest::new(NodeKind::Skill, sk_body.as_bytes().to_vec())
+                    .with_key(sk_key)
+                    .with_importance(200),
+            )
+            .unwrap();
+        glob_db
+            .put(
+                WriteRequest::new(NodeKind::SkillSection, sec_body.as_bytes().to_vec())
+                    .with_key(sec_key)
+                    .with_importance(200),
+            )
+            .unwrap();
+    }
+    glob_db
+        .put(
+            WriteRequest::new(
+                NodeKind::Skill,
+                b"Native Microsoft Windows Fluent 2 UI design architecture for desktop apps".to_vec(),
+            )
+            .with_key("windows-app-design")
+            .with_importance(200),
+        )
+        .unwrap();
     glob_db
         .put(
             WriteRequest::new(
@@ -372,23 +417,27 @@ fn overlay_pulse_normalizes_cross_layer_idf_and_attenuates_foreign_stack_skills(
     );
 
     let top_proj_score = proj_keys.iter().map(|c| c.score).fold(0.0_f64, f64::max);
-    let max_flutter_score = resp
+    let max_foreign_score = resp
         .capsules
         .iter()
         .filter(|c| {
-            c.key
-                .as_deref()
-                .is_some_and(|k| k.strip_prefix("global::").unwrap_or(k).starts_with("flutter-layout"))
+            c.key.as_deref().is_some_and(|k| {
+                let tail = k.strip_prefix("global::").unwrap_or(k);
+                tail.starts_with("flutter-layout")
+                    || tail.starts_with("android-app-design")
+                    || tail.starts_with("apple-hig-design")
+                    || tail.starts_with("linux-desktop-hig-design")
+            })
         })
         .map(|c| c.score)
         .fold(0.0_f64, f64::max);
     assert!(
-        max_flutter_score == 0.0 || max_flutter_score < top_proj_score,
-        "Foreign flutter-layout skill must be attenuated/suppressed in Cargo.toml workspace: proj={top_proj_score:.2}, flutter={max_flutter_score:.2}"
+        max_foreign_score == 0.0 || max_foreign_score < top_proj_score,
+        "Foreign stack skills must be attenuated/suppressed in Cargo.toml workspace: proj={top_proj_score:.2}, foreign={max_foreign_score:.2}"
     );
 
     let mut flutter_req = PulseRequest::new("flutter desktop layout architecture", 1800);
-    flutter_req.workspace_dir = Some(proj_dir);
+    flutter_req.workspace_dir = Some(proj_dir.clone());
     flutter_req.epoch = 2;
     let flutter_resp = brain.pulse(&flutter_req).unwrap();
     assert!(
@@ -398,6 +447,57 @@ fn overlay_pulse_normalizes_cross_layer_idf_and_attenuates_foreign_stack_skills(
                 .is_some_and(|k| k.strip_prefix("global::").unwrap_or(k).starts_with("flutter-layout"))
         }),
         "Explicit query mentioning flutter must opt back in without foreign stack attenuation"
+    );
+
+    for (epoch, query, expected_prefix) in [
+        (3u32, "android material compose layout architecture", "android-app-design"),
+        (4u32, "apple hig macos swiftui design layout", "apple-hig-design"),
+        (5u32, "linux gnome libadwaita kirigami design architecture", "linux-desktop-hig-design"),
+    ] {
+        let mut opt_in = PulseRequest::new(query, 1800);
+        opt_in.workspace_dir = Some(proj_dir.clone());
+        opt_in.epoch = epoch;
+        let opt_resp = brain.pulse(&opt_in).unwrap();
+        assert!(
+            opt_resp.capsules.iter().any(|c| {
+                c.key
+                    .as_deref()
+                    .is_some_and(|k| k.strip_prefix("global::").unwrap_or(k).starts_with(expected_prefix))
+            }),
+            "Explicit platform query '{query}' must surface '{expected_prefix}'"
+        );
+    }
+
+    // Apple workspace markers (.xcodeproj) must keep apple-hig-design unattenuated and suppress windows-app-design.
+    let apple_dir = dir.join("ios_app");
+    fs::create_dir_all(apple_dir.join("MyApp.xcodeproj")).unwrap();
+    let mut apple_ws_req = PulseRequest::new("UI design architecture layout", 1800);
+    apple_ws_req.workspace_dir = Some(apple_dir);
+    apple_ws_req.epoch = 6;
+    let apple_ws_resp = brain.pulse(&apple_ws_req).unwrap();
+    let apple_score = apple_ws_resp
+        .capsules
+        .iter()
+        .filter(|c| {
+            c.key
+                .as_deref()
+                .is_some_and(|k| k.strip_prefix("global::").unwrap_or(k).starts_with("apple-hig-design"))
+        })
+        .map(|c| c.score)
+        .fold(0.0_f64, f64::max);
+    let win_score_in_apple = apple_ws_resp
+        .capsules
+        .iter()
+        .filter(|c| {
+            c.key
+                .as_deref()
+                .is_some_and(|k| k.strip_prefix("global::").unwrap_or(k).starts_with("windows-app-design"))
+        })
+        .map(|c| c.score)
+        .fold(0.0_f64, f64::max);
+    assert!(
+        apple_score > 0.0 && apple_score > win_score_in_apple,
+        "In .xcodeproj workspace apple-hig-design ({apple_score:.2}) must outrank attenuated windows-app-design ({win_score_in_apple:.2})"
     );
 
     drop(brain);

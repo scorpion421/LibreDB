@@ -458,5 +458,95 @@ fn foreign_skill_stack_multiplier(
         }
     }
 
+    if skill_name.starts_with("apple-hig") || skill_name.starts_with("xcode") {
+        let q_wants = query_low.contains("apple")
+            || has_exact_tok(query_low, "ios")
+            || query_low.contains("ipados")
+            || query_low.contains("macos")
+            || query_low.contains("swift")
+            || query_low.contains("uikit")
+            || query_low.contains("appkit")
+            || query_low.contains("xcode")
+            || has_exact_tok(query_low, "iphone")
+            || has_exact_tok(query_low, "ipad");
+        let ws_uses = marker_has(&[
+            ".xcodeproj",
+            ".xcworkspace",
+            "package.swift",
+            "podfile",
+            "info.plist",
+            "project.pbxproj",
+        ]);
+        if !q_wants && !ws_uses {
+            return 0.25;
+        }
+    }
+
+    if skill_name.starts_with("linux-desktop-hig") {
+        let q_wants = query_low.contains("linux")
+            || query_low.contains("gnome")
+            || has_exact_tok(query_low, "kde")
+            || query_low.contains("libadwaita")
+            || query_low.contains("adwaita")
+            || has_exact_tok(query_low, "gtk")
+            || query_low.contains("gtk4")
+            || query_low.contains("kirigami")
+            || query_low.contains("breeze")
+            || has_exact_tok(query_low, "qt")
+            || query_low.contains("qt6")
+            || has_exact_tok(query_low, "qml")
+            || query_low.contains("wayland")
+            || query_low.contains("flatpak");
+        let ws_uses = marker_has(&[
+            "meson.build",
+            "cmakelists.txt",
+            "flatpak",
+            ".desktop",
+            "org.gnome",
+            "org.kde",
+        ]);
+        if !q_wants && !ws_uses {
+            return 0.25;
+        }
+    }
+
+    if skill_name.starts_with("windows-app-design") {
+        let q_wants = query_low.contains("windows")
+            || query_low.contains("winui")
+            || query_low.contains("fluent")
+            || has_exact_tok(query_low, "wpf")
+            || has_exact_tok(query_low, "egui")
+            || query_low.contains("eframe")
+            || query_low.contains("xaml")
+            || query_low.contains("tauri");
+        let ws_has_windows = marker_has(&[".sln", ".csproj", ".vcxproj", "appxmanifest.xml"])
+            || (marker_has(&["cargo.toml"])
+                && !marker_has(&[
+                    ".xcodeproj",
+                    ".xcworkspace",
+                    "package.swift",
+                    "androidmanifest.xml",
+                    "build.gradle",
+                    "meson.build",
+                    "flatpak",
+                ]));
+        let ws_is_other_platform = marker_has(&[
+            ".xcodeproj",
+            ".xcworkspace",
+            "package.swift",
+            "podfile",
+            "androidmanifest.xml",
+            "build.gradle",
+            "build.gradle.kts",
+            "settings.gradle",
+            "pubspec.yaml",
+            "meson.build",
+            "flatpak",
+        ]);
+        if !q_wants && ws_is_other_platform && !ws_has_windows {
+            return 0.25;
+        }
+    }
+
     1.0
 }

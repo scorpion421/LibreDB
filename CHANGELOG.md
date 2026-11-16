@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.5] - 2026-11-16
+
+### Added
+- **Cross-platform native app design standards (`windows-app-design`, `android-app-design`, `apple-hig-design`, `linux-desktop-hig-design`)**: Embedded official UI guidelines for Android (`Material 3`, edge-to-edge mobile and tablet layouts), Apple (`iOS`/`iPadOS` and `macOS` Human Interface Guidelines), and Linux desktops (`GNOME Libadwaita` and `KDE Kirigami`/`Breeze` HIG) alongside Windows `Fluent 2` in Personal setups so UI generation consistently adheres to each target system's native look, typography, and accessibility conventions (`libredb get-skill <name>`).
+- **Platform-aware UI triggers and Neutral separation (`AGENTS.md`, `pulse`)**: Updated the global UI design rule, proactive trigger keywords, and workspace stack filtering so each platform's design skill surfaces when building for or asking about that platform without crowding unrelated workspaces, while remaining completely absent in Neutral corporate installations.
+
 ## [1.6.4] - 2026-11-15
 
 ### Added

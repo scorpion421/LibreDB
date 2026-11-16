@@ -2,6 +2,7 @@
 
 mod bench;
 mod cli_args;
+mod design_skills;
 mod gitea;
 mod hooks;
 mod mcp;
@@ -2183,6 +2184,21 @@ fn sync_skill_markdown(
     explicit_name: Option<&str>,
 ) -> Result<(String, usize), Box<dyn std::error::Error>> {
     let raw = std::fs::read_to_string(md_path)?;
+    let fallback = md_path
+        .parent()
+        .and_then(|p| p.file_name())
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    sync_skill_markdown_str(gdb, &raw, explicit_name, &fallback)
+}
+
+fn sync_skill_markdown_str(
+    gdb: &Arc<LibreDb>,
+    raw: &str,
+    explicit_name: Option<&str>,
+    fallback_name: &str,
+) -> Result<(String, usize), Box<dyn std::error::Error>> {
     let normalized = raw.replace("\r\n", "\n");
     let mut name_opt: Option<String> = explicit_name.map(ToOwned::to_owned);
     let mut desc = String::new();
@@ -2222,14 +2238,7 @@ fn sync_skill_markdown(
         }
     }
 
-    let skill_name = name_opt.unwrap_or_else(|| {
-        md_path
-            .parent()
-            .and_then(|p| p.file_name())
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned()
-    });
+    let skill_name = name_opt.unwrap_or_else(|| fallback_name.to_owned());
     if desc.is_empty() {
         desc = format!("Specialized Antigravity skill '{skill_name}'");
     }
@@ -2316,6 +2325,28 @@ fn sync_skill_markdown(
     gdb.link_batch(&edges)?;
 
     Ok((skill_name, sections.len()))
+}
+
+fn deprecate_skill_and_sections(
+    gdb: &LibreDb,
+    skill_name: &str,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let mut removed = 0usize;
+    if gdb.deprecate_key(NodeKind::Skill, skill_name)? {
+        removed += 1;
+    }
+    if gdb.deprecate_key(NodeKind::Generic, &format!("skill_full::{skill_name}"))? {
+        removed += 1;
+    }
+    let sec_prefix = format!("{skill_name}::");
+    for (_, k_opt, _) in gdb.list_inodes(Some(NodeKind::SkillSection), false) {
+        if let Some(k) = k_opt {
+            if k.starts_with(&sec_prefix) && gdb.deprecate_key(NodeKind::SkillSection, &k)? {
+                removed += 1;
+            }
+        }
+    }
+    Ok(removed)
 }
 
 fn modernize_global_db(
@@ -2433,6 +2464,9 @@ fn modernize_global_db(
             if gdb.deprecate_key(NodeKind::Rule, &format!("reflex::{personal_reflex_id}"))? {
                 deprecated_legacy += 1;
             }
+        }
+        for (skill_name, _) in design_skills::PERSONAL_DESIGN_SKILLS {
+            deprecated_legacy += deprecate_skill_and_sections(gdb, skill_name)?;
         }
     }
 
@@ -2595,6 +2629,24 @@ fn modernize_global_db(
                 "windows".to_owned(),
                 "tauri".to_owned(),
                 "xaml".to_owned(),
+                "android".to_owned(),
+                "compose".to_owned(),
+                "kotlin".to_owned(),
+                "jetpack".to_owned(),
+                "swiftui".to_owned(),
+                "uikit".to_owned(),
+                "appkit".to_owned(),
+                "ios".to_owned(),
+                "macos".to_owned(),
+                "xcode".to_owned(),
+                "gtk".to_owned(),
+                "gtk4".to_owned(),
+                "libadwaita".to_owned(),
+                "kirigami".to_owned(),
+                "kde".to_owned(),
+                "gnome".to_owned(),
+                "qt".to_owned(),
+                "qml".to_owned(),
                 "ui".to_owned(),
                 "gui".to_owned(),
                 "theme".to_owned(),
@@ -2608,9 +2660,14 @@ fn modernize_global_db(
                 "window".to_owned(),
                 "button".to_owned(),
                 "style".to_owned(),
+                "screen".to_owned(),
+                "sheet".to_owned(),
+                "dialog".to_owned(),
+                "toolbar".to_owned(),
+                "navigation".to_owned(),
             ],
             env_or_error_any: Vec::new(),
-            directive: "Apply Microsoft Fluent 2 Windows design natively: Segoe UI Variable (400/600 weights only), 8px overlay / 4px control corner radii, neutral layered fills + 1px hairline strokes, single system accent, >=4.5:1 contrast, DPI scaling, full keyboard/UI Automation focus, and zero AI-slop gradients or pill-heavy cards (see 'libredb get-skill windows-app-design').".to_owned(),
+            directive: "Apply native platform UI design (Windows Fluent 2, Android Material 3, Apple HIG iOS/macOS, Linux GNOME Libadwaita & KDE Kirigami HIG) cleanly with semantic system colors, native typography/spacing scales, >=4.5:1 contrast, platform navigation/insets, keyboard/screen-reader accessibility, and zero AI-slop gradients or pill-heavy cards (see 'libredb get-skill <windows-app-design | android-app-design | apple-hig-design | linux-desktop-hig-design>').".to_owned(),
             ..Default::default()
         },
     ];
@@ -2626,6 +2683,13 @@ fn modernize_global_db(
         }
         active_reflex_count += personal_reflexes.len();
 
+        let mut design_sections = 0usize;
+        for (skill_name, skill_md) in design_skills::PERSONAL_DESIGN_SKILLS {
+            let (_, cnt) = sync_skill_markdown_str(gdb, skill_md, Some(skill_name), skill_name)?;
+            design_sections += cnt;
+        }
+        synced_sections += design_sections;
+
         let pushback_rule = "[Rule: candid-architectural-pushback | priority=100 | enforcement=CRITICAL]\nSummary: Candid engineering pushback without false politeness when coding ideas overshoot the target.\nWhenever a user idea or architectural direction shoots past the target, introduces unnecessary complexity, hardcodes a fragile assumption, or heads in the wrong technical direction, state directly and candidly that it is suboptimal and immediately propose the cleaner engineering alternative. Never hold back technical criticism out of personal consideration.";
         gdb.put(
             WriteRequest::new(NodeKind::Rule, pushback_rule.as_bytes().to_vec())
@@ -2634,7 +2698,7 @@ fn modernize_global_db(
                 .with_pinned(true),
         )?;
 
-        let fluent_rule = "[Rule: windows-fluent-app-design | priority=100 | enforcement=CRITICAL]\nSummary: Mandatory native Windows Fluent 2 UI/UX standard enforcing Microsoft Learn design guidelines and banning generic AI-slop styling.\nFor every Windows or desktop GUI, tray app, setup wizard, or custom-drawn interface: (1) Ban AI-slop aesthetics - zero neon purple/cyan/rainbow gradients, zero oversized >=16px rounded cards, zero glassmorphism blobs, zero gratuitous animations, zero heavy bold-all-over typography. (2) Enforce Fluent 2 tokens: Segoe UI Variable type ramp (Caption 12/16, Body 14/20, Body Strong 14/20, Subtitle 20/28, Title 28/36), weights Regular (400) and Semibold (600) only (avoid Bold 700+ and Italics), crisp semantic radii (8px OverlayCornerRadius for windows/dialogs/flyouts, 4px ControlCornerRadius for buttons/inputs/list rows, 2px micro badges/bars), neutral layered luminance (LayerFillColorDefault, SolidBackgroundFillColorBase, CardBackgroundFillColorDefault, ControlFillColorDefault) with 1px CardStrokeColorDefault/ControlStrokeColorDefault borders, Mica/Acrylic backdrop materials, and a single restrained Windows system AccentFillColorDefault strictly for primary actions and active indicators. (3) Meet Windows best practices: respect Light/Dark and Windows Contrast themes (>=4.5:1 text contrast), per-monitor DPI scaling (epx), explicit Left/Right/Up/Down/Tab/Enter/Escape keyboard navigation with visible focus rects, UI Automation labels/roles, localized layout tolerance, and instant responsive feedback without blocking dialogs.";
+        let fluent_rule = "[Rule: windows-fluent-app-design | priority=100 | enforcement=CRITICAL]\nSummary: Mandatory native cross-platform UI/UX standard enforcing official Windows Fluent 2, Android Material 3, Apple iOS/macOS HIG, and Linux KDE/GNOME HIG design guidelines while banning AI-slop styling.\nFor every GUI across all platforms: (1) Ban AI-slop aesthetics - zero neon purple/cyan/rainbow gradients, zero oversized pill-heavy cards or glassmorphism blobs, zero gratuitous animations, zero heavy bold-all-over typography, and zero hardcoded hex palettes ignoring Light/Dark/Contrast system themes. (2) Windows (Fluent 2 & Best Practices): Segoe UI Variable (400/600 weights only), 8px/4px/2px radii, 4px grid, neutral layered surfaces + 1px borders, Mica/Acrylic, single system accent, >=4.5:1 contrast, epx DPI scaling, full keyboard/UIA accessibility (see 'libredb get-skill windows-app-design'). (3) Android (Material 3 & Mobile): Roboto Flex in sp (up to 200% scaling), dynamic/tonal surfaceContainer tiers + M3 shape scale (4dp..28dp), edge-to-edge WindowInsets, 48dp touch targets, adaptive Compact/Medium/Expanded navigation (NavigationBar/Rail/Drawer + ListDetailPaneScaffold), predictive back, TalkBack (see 'libredb get-skill android-app-design'). (4) Apple iOS/iPadOS & macOS (HIG): SF Pro with Dynamic Type & SF Symbols, semantic system colors + Vibrancy materials (reduceTransparency safe), iOS safe areas / 44pt touch / insetGrouped squircles / bottom TabView vs macOS 20-28pt density / translucent NavigationSplitView / unified toolbar / Menu Bar commands + Cmd+, Settings, VoiceOver (see 'libredb get-skill apple-hig-design'). (5) Linux Desktop (GNOME Libadwaita & KDE Kirigami HIG): semantic AdwStyleManager/@window_bg_color/@card_bg_color (12px/6px radii, AdwToolbarView, AdwNavigationSplitView, .boxed-list) and Kirigami.Theme/KColorScheme + Kirigami.Units (Simple by default, FormLayout, InlineMessage, Breeze palette), XDG portal dark/accent, Wayland fractional scaling, AT-SPI2 (see 'libredb get-skill linux-desktop-hig-design').";
         gdb.put(
             WriteRequest::new(NodeKind::Rule, fluent_rule.as_bytes().to_vec())
                 .with_key("rule:global::windows-fluent-app-design")
@@ -3011,13 +3075,30 @@ mod tests {
         assert_eq!(count_non_reflex_rules(&gdb), 0);
         assert_eq!(count_reflexes(&gdb), 3);
 
-        // 2. Switching to personal profile adds personal rules (pushback + Fluent app design + human-readable docs) + all 11 reflexes
+        // 2. Switching to personal profile adds personal rules + all 11 reflexes + all 4 platform design skills
         modernize_global_db(&gdb, Some(&dummy_skill), true).unwrap();
         assert_eq!(count_non_reflex_rules(&gdb), 3);
         assert_eq!(count_reflexes(&gdb), 11);
+        for ds in [
+            "windows-app-design",
+            "android-app-design",
+            "apple-hig-design",
+            "linux-desktop-hig-design",
+        ] {
+            assert!(
+                gdb.get_by_key(NodeKind::Skill, ds).is_ok(),
+                "Personal profile must install design skill '{ds}'"
+            );
+            assert!(
+                gdb.list_inodes(Some(NodeKind::SkillSection), false)
+                    .into_iter()
+                    .any(|(_, k, _)| k.as_deref().is_some_and(|s| s.starts_with(&format!("{ds}::")))),
+                "Personal profile must install skill sections for '{ds}'"
+            );
+        }
 
         // 3. Preserving corporate custom rules (including custom `rule:global::*` keys!) while downgrading
-        //    back to neutral removes ONLY the exact personal rules/reflexes!
+        //    back to neutral removes ONLY the exact personal rules/reflexes/design skills!
         gdb.put(
             WriteRequest::new(NodeKind::Rule, b"Corporate SOC policy".to_vec())
                 .with_key("corp:soc-policy")
@@ -3044,6 +3125,17 @@ mod tests {
         assert!(gdb
             .get_by_key(NodeKind::Rule, "rule:global::human-readable-technical-writing")
             .is_err());
+        for ds in [
+            "windows-app-design",
+            "android-app-design",
+            "apple-hig-design",
+            "linux-desktop-hig-design",
+        ] {
+            assert!(
+                gdb.get_by_key(NodeKind::Skill, ds).is_err(),
+                "Neutral profile must strip personal design skill '{ds}'"
+            );
+        }
         assert!(gdb.get_by_key(NodeKind::Rule, "corp:soc-policy").is_ok());
         assert!(gdb
             .get_by_key(NodeKind::Rule, "rule:global::corp-infosec-policy")

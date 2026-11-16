@@ -97,7 +97,7 @@ $PluginJson = @'
 {
   "name": "libredb",
   "displayName": "LibreDB Cognitive Memory",
-  "version": "1.6.4",
+  "version": "1.6.5",
   "description": "Persistent project memory, fast code-graph search, and token-savings engine for Antigravity. Remembers architectural decisions and resolved bug fixes across sessions, locates functions and call dependencies without reading whole files, enforces workspace guardrails, and automates Git/Gitea releases.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
@@ -285,10 +285,12 @@ All system rules, coding standards, administrative credentials, and skills live 
 7. **Model & concurrency catalog**:
    - `ultra` (16 reader lanes) and `pro` (8 lanes) across `Gemini 4 Argon`, `Gemini 4 Carbon`, `Gemini 3.8 Flash`, `Claude Opus 5.5`, `Claude Sonnet 5.5`, `GPT-OSS 120B`. Keep 100% of code generation on `Argon`, `Carbon`, or `Claude 5.5`; route only read-only `research` subagents to `Model="flash"`.
 
-8. **Native Windows app design & anti-AI-slop UI standard (`Fluent 2`)**:
-   - Ban AI-slop aesthetics across all desktop/Windows GUIs (`WinUI`, `WPF`, `egui`/`eframe`, `Tauri`, tray UIs): zero neon purple/cyan/rainbow gradients, zero oversized `>= 16px` rounded cards, zero glassmorphism blobs, zero gratuitous animations, and zero heavy Bold-all-over text.
-   - Enforce Microsoft `Fluent 2` (`https://learn.microsoft.com/en-us/windows/apps/design/guidelines-overview`): `Segoe UI Variable` type ramp (`Caption 12/16`, `Body 14/20`, `Body Strong 14/20`, `Body Large 18/24`, `Subtitle 20/28`, `Title 28/36`, `Title Large 40/52`, `Display 68/92`) using ONLY Regular (`400`) and Semibold (`600`), sharp semantic corner radii (`8px` `OverlayCornerRadius`, `4px` `ControlCornerRadius`, `2px` micro badges), neutral layered surfaces (`LayerFillColorDefault`, `SolidBackgroundFillColorBase`, `CardBackgroundFillColorDefault`, `ControlFillColorDefault`) with `1px` hairline borders (`CardStrokeColorDefault`/`ControlStrokeColorDefault`), `Mica`/`Acrylic` backdrops, and a single restrained Windows system `AccentFillColorDefault` strictly for primary actions and active states.
-   - Enforce Microsoft Windows best practices (`https://learn.microsoft.com/en-us/windows/apps/get-started/best-practices`): respect system Light/Dark and Windows Contrast themes (`>= 4.5:1` text contrast), scale via effective pixels (`epx`) across monitors/DPI, support complete `Tab`/`Arrow`/`Enter`/`Escape` keyboard focus and UI Automation accessibility, preserve flexible localized layout bounds, and keep controls crisp and responsive without blocking prompts. Recall details anytime via `libredb get-skill windows-app-design`.
+8. **Native cross-platform app design & anti-AI-slop UI standard (`Windows Fluent 2`, `Android Material 3`, `Apple HIG`, `KDE / GNOME HIG`)**:
+   - Ban AI-slop aesthetics across ALL platforms and toolkits (`WinUI`, `WPF`, `egui`/`eframe`, `Tauri`, `Jetpack Compose`, `SwiftUI`/`UIKit`/`AppKit`, `GTK4`/`Libadwaita`, `Kirigami`/`Qt6`): zero neon purple/cyan/rainbow gradients, zero oversized pill-heavy `>= 16px` cards or glassmorphism blobs, zero gratuitous animations, zero heavy Bold-all-over text, and zero hardcoded palettes overriding system Light/Dark/High-Contrast themes.
+   - **Windows (`Fluent 2`)** (`https://learn.microsoft.com/en-us/windows/apps/design/guidelines-overview`, `https://learn.microsoft.com/en-us/windows/apps/get-started/best-practices`): `Segoe UI Variable` (`400`/`600` only), `8px`/`4px`/`2px` corner radii on a `4px` grid, neutral layered surfaces with `1px` borders, `Mica`/`Acrylic`, single system accent, `>= 4.5:1` contrast, `epx` DPI scaling, full keyboard + UI Automation focus (`libredb get-skill windows-app-design`).
+   - **Android (`Material 3` / `Compose`)** (`https://developer.android.com/design/ui/`, `https://developer.android.com/design/ui/mobile`): `Roboto`/`Roboto Flex` in nonlinearly scaled `sp` (up to `200%`), `dynamicLightColorScheme`/`dynamicDarkColorScheme` tonal `surfaceContainer` tiers, M3 shape scale (`4dp`..`28dp`), mandatory `enableEdgeToEdge()` + `WindowInsets` (`safeDrawing`/`ime`), `>= 48dp` touch targets, adaptive `NavigationBar`/`NavigationRail`/`PermanentNavigationDrawer` + `ListDetailPaneScaffold`, predictive back, `TalkBack` (`libredb get-skill android-app-design`).
+   - **Apple iOS/iPadOS & macOS (`Apple HIG`)** (`https://developer.apple.com/design/human-interface-guidelines`, `https://developer.apple.com/design/human-interface-guidelines/designing-for-ios`, `https://developer.apple.com/design/human-interface-guidelines/designing-for-macos`): `SF Pro` (`SF Mono`) + `Dynamic Type` & `SF Symbols`, semantic system colors + `Material`/`NSVisualEffectView` vibrancy (respecting `reduceTransparency`/`Contrast`), iOS `safeAreaInsets` + `44pt` touch targets + `3-5` bottom `TabView` + `.insetGrouped` `.continuous` squircles vs macOS `20-28pt` pointer density + `NavigationSplitView` sidebar + unified `toolbar` + Menu Bar `.commands` (`Cmd+,` Settings) + `VoiceOver` (`libredb get-skill apple-hig-design`).
+   - **Linux Desktop (`GNOME Libadwaita` & `KDE Kirigami` HIG)** (`https://develop.kde.org/hig/`, `https://developer.gnome.org/hig/`, `https://developer.gnome.org/hig/principles.html`): GNOME `AdwToolbarView`/`AdwHeaderBar`, `AdwNavigationSplitView` + `AdwBreakpoint`, `.boxed-list` (`12px`/`6px` radii), `AdwToastOverlay`/`AdwStatusPage`, `AdwStyleManager` `@window_bg_color`/`@accent_bg_color`; KDE `Kirigami.ApplicationWindow`, `FormLayout`, `InlineMessage`, `Kirigami.Theme`/`KColorScheme` + `Kirigami.Units`, `xdg-desktop-portal` dark/accent, Wayland fractional scaling, `AT-SPI2` (`libredb get-skill linux-desktop-hig-design`).
 '@
     $UmlautList = "$([char]0x00E4), $([char]0x00F6), $([char]0x00FC), $([char]0x00DF)"
     $TokenOek = "Token$([char]0x00F6)konomie"
@@ -418,7 +420,7 @@ $LogoSvg = @'
 
 # 7. Write user-facing README.md inside plugin bundle
 $PluginReadme = @'
-# LibreDB cognitive memory plugin (v1.6.4)
+# LibreDB cognitive memory plugin (v1.6.5)
 
 `LibreDB` gives `Antigravity` persistent project memory, targeted code navigation, and automated release workflows in a single local Rust binary:
 
@@ -450,6 +452,6 @@ if (Test-Path $AgyConfigPath) {
     }
 }
 
-Write-Output "[OK] Deployed LibreDB v1.6.4 standalone binaries to: $BinDir (Profile=$Profile)"
+Write-Output "[OK] Deployed LibreDB v1.6.5 standalone binaries to: $BinDir (Profile=$Profile)"
 Write-Output "[OK] Hydrated and modernized global store at: $GlobalLdb"
 Write-Output "[OK] Installed complete Antigravity plugin at: $PluginDir"
