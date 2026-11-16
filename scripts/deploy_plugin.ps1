@@ -8,8 +8,8 @@ $ErrorActionPreference = "Stop"
 
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $VersionFile = Join-Path $ProjectRoot "VERSION"
-$LibreVersion = if (Test-Path $VersionFile) { (Get-Content -Raw $VersionFile).Trim() } else { "2.0.1" }
-if (-not $LibreVersion) { $LibreVersion = "2.0.1" }
+$LibreVersion = if (Test-Path $VersionFile) { (Get-Content -Raw $VersionFile).Trim() } else { "2.1.1" }
+if (-not $LibreVersion) { $LibreVersion = "2.1.1" }
 $UserHome = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
 $GeminiDir = Join-Path $UserHome ".gemini"
 $LibreHome = Join-Path $GeminiDir "libredb"
@@ -81,12 +81,22 @@ foreach ($PathDir in $TargetPathDirs) {
     }
 }
 
+function Test-RipgrepBinary {
+    param([string]$ExePath)
+    if ((-not $ExePath) -or (-not (Test-Path -LiteralPath $ExePath))) { return $false }
+    try {
+        $VerLines = @(& $ExePath --version 2>$null)
+        return ($LASTEXITCODE -eq 0 -and $VerLines.Count -gt 0 -and $VerLines[0] -match '^ripgrep\s')
+    } catch {
+        return $false
+    }
+}
+
 function Find-LocalRipgrep {
     param([string]$HostArch)
     $StaticPatterns = @(
         (Join-Path $UserHome ".cargo\bin\rg.exe"),
         (Join-Path $UserHome "scoop\apps\ripgrep\current\rg.exe"),
-        (Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Packages\BurntSushi.ripgrep*\*\rg.exe"),
         (Join-Path $env:ProgramFiles "ripgrep*\rg.exe"),
         (Join-Path $env:ProgramFiles "Git\usr\bin\rg.exe"),
         (Join-Path $env:LOCALAPPDATA "Programs\Microsoft VS Code*\resources\app\node_modules*\@vscode\ripgrep\bin\rg.exe"),
@@ -98,6 +108,14 @@ function Find-LocalRipgrep {
         if (-not $Pat) { continue }
         Get-Item -Path $Pat -ErrorAction SilentlyContinue | ForEach-Object { [void]$Candidates.Add($_.FullName) }
     }
+    $WinGetPkgs = Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Packages"
+    if (Test-Path $WinGetPkgs) {
+        Get-ChildItem -Path $WinGetPkgs -Filter "BurntSushi.ripgrep*" -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                Get-ChildItem -Path $_.FullName -Filter "rg.exe" -Recurse -ErrorAction SilentlyContinue |
+                    ForEach-Object { [void]$Candidates.Add($_.FullName) }
+            }
+    }
     $VsRoot = Join-Path $env:ProgramFiles "Microsoft Visual Studio"
     if (Test-Path $VsRoot) {
         Get-ChildItem -Path $VsRoot -Filter "rg.exe" -Recurse -ErrorAction SilentlyContinue |
@@ -107,12 +125,8 @@ function Find-LocalRipgrep {
     foreach ($Cand in $Candidates) {
         if ($HostArch -eq "x64" -and $Cand -match '(^|[\\/])(win32-)?arm64([\\/]|$)') { continue }
         if ($HostArch -eq "arm64" -and $Cand -match '(^|[\\/])(win32-)?(x64|x86|amd64|ia32)([\\/]|$)') { continue }
-        try {
-            $Ver = (& $Cand --version 2>$null | Select-Object -First 1)
-            if ($LASTEXITCODE -eq 0 -and $Ver -match '^ripgrep\s') {
-                return $Cand
-            }
-        } catch {
+        if (Test-RipgrepBinary -ExePath $Cand) {
+            return $Cand
         }
     }
     return $null
@@ -122,17 +136,17 @@ $script:ProvisionedRg = $null
 
 function Ensure-RipgrepOnPath {
     param([string]$DefaultBinDir)
+    $DstRg = Join-Path $DefaultBinDir "rg.exe"
+    if (Test-RipgrepBinary -ExePath $DstRg) {
+        $script:ProvisionedRg = $DstRg
+        Write-Output "[OK] Native ripgrep (rg.exe) verified at: $DstRg"
+        return
+    }
     $ExistingRg = Get-Command rg -ErrorAction SilentlyContinue
-    if ($ExistingRg -and $ExistingRg.Source) {
-        try {
-            $Ver = (& $ExistingRg.Source --version 2>$null | Select-Object -First 1)
-            if ($LASTEXITCODE -eq 0 -and $Ver -match '^ripgrep\s') {
-                $script:ProvisionedRg = $ExistingRg.Source
-                Write-Output "[OK] Native ripgrep (rg) available on PATH: $($ExistingRg.Source)"
-                return
-            }
-        } catch {
-        }
+    if ($ExistingRg -and $ExistingRg.Source -and (Test-RipgrepBinary -ExePath $ExistingRg.Source)) {
+        $script:ProvisionedRg = $ExistingRg.Source
+        Write-Output "[OK] Native ripgrep (rg) available on PATH: $($ExistingRg.Source)"
+        return
     }
     $ArchRaw = if ($env:PROCESSOR_ARCHITECTURE) { $env:PROCESSOR_ARCHITECTURE.ToUpperInvariant() } else { "AMD64" }
     $HostArch = if ($ArchRaw -eq "ARM64") { "arm64" } else { "x64" }
@@ -146,7 +160,6 @@ function Ensure-RipgrepOnPath {
         }
     }
     if ($FoundRg) {
-        $DstRg = Join-Path $DefaultBinDir "rg.exe"
         if (-not $FoundRg.Equals($DstRg, [System.StringComparison]::OrdinalIgnoreCase)) {
             Install-BinaryHotSafe -Src $FoundRg -Dst $DstRg
         }
@@ -369,7 +382,7 @@ All system rules, coding standards, administrative credentials, and skills live 
    - Elevate directly, via DPAPI (`~/.gemini/config/credentials/*.credential.xml`), or `Start-Process -Verb RunAs`. Never stage in `C:\Windows\Temp`, use `cmd.exe /c` wrappers, create remote services (`sc.exe \\`), or hardcode identities. After approval, log `[1/4 PRE-CHECK]`, `[2/4..3/4 ACTION]`, `[4/4 POST-CHECK]`, `[CLEANUP]` to `AuditLog_<Target>_<Date>_<hh_mm_ss>.log`.
 
 5. **Turn-economy, diagnostics, and built-in benchmarks**:
-   - **Anti-salami-slicing**: Read files `<= 800 lines` in one `read_file` call; for `> 800 lines` use `libredb_code` (`skeleton`, `locate`, `fim`, `impact` with batched `files`/`symbols`/`slices`) and batch parallel reads.
+   - **Anti-salami-slicing**: Read files `<= 800 lines` in one `read_file` call; for `> 800 lines` use `libredb_code` (`skeleton`, `locate`, `fim` including file-less `symbol`, `impact`, `grep` with batched `files`/`symbols`/`slices`) and batch parallel reads.
    - **Subagent firewall**: Run 1-3 file edits and WMI/CIM commands in main context; delegate `>= 4` searches or `> 5` files to `research` (`Model="flash"`).
    - **Batching & verification**: Fix entire bug classes before rebuilding, chain `build && test && verify`, commit memory via `libredb_memorize`, check `libredb guardrail check --path "<dir>" --staged --strict`, inspect savings/benchmarks natively via `libredb savings` and `libredb bench` (zero ad-hoc scripts), and use `WaitMsBeforeAsync=10000` without polling. Note any internal tool workarounds briefly at the end.
 
@@ -525,7 +538,7 @@ $PluginReadme = @'
 
 - **Persistent project memory (`libredb_pulse`, `libredb_memorize`)**: Stores architectural decisions, project facts, open tasks, and global rules in a single `.agents/memory.ldb` file, synchronizing updates incrementally (`O(1)` tail-sync) and skipping entries already shown in the session.
 - **In-memory hook coordinator (`libredb mcp-serve`)**: Runs `PreInvocation` and `PreToolUse` hooks directly against the live MCP server RAM over a local Named Pipe or Unix socket, avoiding duplicate file locks and timeouts on slow network drives while falling back transparently to disk.
-- **Targeted code navigation (`libredb_code`)**: Indexes functions, classes, and call relationships across 25+ languages so the agent can jump directly to symbol definitions (`locate`), inspect file outlines (`skeleton`), check affected callers (`impact`), and read exact code slices (`fim`) instead of loading entire large files.
+- **Targeted code navigation (`libredb_code`)**: Indexes functions, classes, and call relationships across 25+ languages so the agent can jump directly to symbol definitions (`locate`), inspect file outlines (`skeleton`), check affected callers (`impact`), run symbol-annotated searches (`grep`), and read exact file-less or line-targeted slices (`fim`) instead of loading entire large files.
 - **Self-correcting learning (`libredb learning --verify`)**: Remembers which code symbol solved a failed search and which fix resolved a compiler or test error, refutes wrong hints automatically across 15 verified stages (`L1..L15`), and surfaces accurate pitfalls when similar code is touched later.
 - **Token-savings reports and verification (`libredb savings`, `libredb bench`)**: Tracks real token savings across sessions and workspaces and runs built-in performance and security audit suites.
 - **Workspace security and Git/Gitea releases (`libredb trust`, `libredb guardrail`, `libredb git-sync`)**: Encrypts credentials via OS keystores (`Windows DPAPI` / `ChaCha20-Poly1305`), seals workspace databases against tampering (`HMAC-SHA256`), checks staged commits against project guardrails, and publishes versioned Git/Gitea releases with binary deliverables.

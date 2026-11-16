@@ -294,6 +294,34 @@ fn normalize_safe_workspace_rel_path(ws_root: &Path, target_file: &Path) -> Opti
     is_safe_workspace_rel_key(&rel).then_some(rel)
 }
 
+/// Strips Windows `\\?\` / `//?/` verbatim prefixes from filesystem paths for clean display and
+/// stable cache labeling while preserving normal POSIX and drive paths.
+pub fn strip_verbatim_display_label(p: &Path) -> String {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s
+        .strip_prefix(r"\\?\UNC\")
+        .or_else(|| s.strip_prefix("//?/UNC/"))
+    {
+        format!("//{}", rest.replace('\\', "/"))
+    } else if let Some(rest) = s.strip_prefix(r"\\?\").or_else(|| s.strip_prefix("//?/")) {
+        rest.replace('\\', "/")
+    } else {
+        s.replace('\\', "/")
+    }
+}
+
+/// Resolves a workspace-relative slash path (`src/lib.rs`) matching `index_workspace`'s
+/// `skeleton::<rel_path>` key when `target_file` resides inside `ws_root`, or falls back to
+/// `strip_verbatim_display_label(target_file)`.
+pub fn normalize_workspace_display_label(ws_root: Option<&Path>, target_file: &Path) -> String {
+    if let Some(ws) = ws_root {
+        if let Some(rel) = normalize_safe_workspace_rel_path(ws, target_file) {
+            return rel;
+        }
+    }
+    strip_verbatim_display_label(target_file)
+}
+
 fn infer_agents_ws_root(db: &LibreDb) -> Option<PathBuf> {
     let db_path = db.path()?;
     let agents_dir = db_path.parent()?;
@@ -2240,7 +2268,10 @@ pub fn format_impact_compact(symbol_query: &str, reports: &[SymbolImpactReport])
             }
         }
         if !rep.co_changed_files.is_empty() {
-            out.push_str(&format!("  Co-Changed files ({}):\n", rep.co_changed_files.len()));
+            out.push_str(&format!(
+                "  Co-changed files (git Lift) ({}):\n",
+                rep.co_changed_files.len()
+            ));
             for cf in rep.co_changed_files.iter().take(3) {
                 out.push_str(&format!("    <-> {cf}\n"));
             }
@@ -2559,14 +2590,15 @@ pub fn extract_fim_slice(
     center_line: Option<usize>,
     context_pad: usize,
 ) -> Result<FimSliceBundle> {
-    if let Some(ws_root) = infer_agents_ws_root(db) {
-        let _ = reconcile_tentative_edits(db, &ws_root);
+    let ws_root_opt = infer_agents_ws_root(db);
+    if let Some(ref ws_root) = ws_root_opt {
+        let _ = reconcile_tentative_edits(db, ws_root);
     }
     let raw_bytes = crate::skeleton::read_bounded_source_file(file_path)?;
     let text = String::from_utf8_lossy(&raw_bytes);
     let lines: Vec<&str> = text.lines().collect();
     let total_lines = lines.len();
-    let label = file_path.to_string_lossy().replace('\\', "/");
+    let label = normalize_workspace_display_label(ws_root_opt.as_deref(), file_path);
 
     let (skel, _) = FileSkeleton::index_or_get_cached_bytes(db, label.clone(), &raw_bytes)?;
 
@@ -2644,8 +2676,9 @@ pub fn extract_fim_slice(
     if known_pitfalls.is_empty() {
         let matured = crate::learning::load_matured_pitfalls(db);
         if !matured.is_empty() {
-            let rel_target = infer_agents_ws_root(db)
-                .and_then(|ws| normalize_safe_workspace_rel_path(&ws, file_path))
+            let rel_target = ws_root_opt
+                .as_deref()
+                .and_then(|ws| normalize_safe_workspace_rel_path(ws, file_path))
                 .unwrap_or_else(|| label.clone());
             if let Some(ref qn) = matched_sym {
                 let candidate_key = format!("{rel_target}::{qn}");
@@ -3027,8 +3060,15 @@ pub struct WorkspaceGrepReport {
     pub matches: Vec<GrepMatchItem>,
 }
 
+#[derive(Debug, Clone)]
+struct GrepBranch {
+    anchored_start: bool,
+    anchored_end: bool,
+    segments: Vec<String>,
+}
+
 struct PureGrepMatcher {
-    branches: Vec<Vec<String>>,
+    branches: Vec<GrepBranch>,
     ignore_case: bool,
     word_boundary: bool,
 }
@@ -3050,29 +3090,40 @@ impl PureGrepMatcher {
         let norm = |s: String| if ignore_case { s.to_lowercase() } else { s };
         if fixed_strings {
             return Ok(Self {
-                branches: vec![vec![norm(pattern.to_owned())]],
+                branches: vec![GrepBranch {
+                    anchored_start: false,
+                    anchored_end: false,
+                    segments: vec![norm(pattern.to_owned())],
+                }],
                 ignore_case,
                 word_boundary,
             });
         }
 
-        // Parse alternation branches (`|`) and wildcard sequences (`.*`) linearly with `\` escapes
-        // so untrusted search patterns can never trigger catastrophic regex backtracking.
-        let mut branches: Vec<Vec<String>> = Vec::new();
+        // Parse alternation (`|`), line anchors (`^`, `$`), and wildcard sequences (`.*`) linearly
+        // with `\` escapes so untrusted search patterns can never trigger regex backtracking.
+        let mut branches: Vec<GrepBranch> = Vec::new();
         let mut cur_branch: Vec<String> = Vec::new();
         let mut cur_seg = String::new();
+        let mut anchored_start = false;
+        let mut anchored_end = false;
+        let mut at_branch_start = true;
+        let mut saw_trailing_wildcard = false;
         let chars: Vec<char> = pattern.chars().collect();
         let mut i = 0usize;
         while i < chars.len() {
             let c = chars[i];
             if c == '\\' && i + 1 < chars.len() {
                 let nxt = chars[i + 1];
-                if matches!(nxt, '|' | '.' | '*' | '\\') {
+                if matches!(nxt, '|' | '.' | '*' | '\\' | '^' | '$') {
                     cur_seg.push(nxt);
                 } else {
                     cur_seg.push('\\');
                     cur_seg.push(nxt);
                 }
+                at_branch_start = false;
+                saw_trailing_wildcard = false;
+                anchored_end = false;
                 i += 2;
                 continue;
             }
@@ -3087,18 +3138,48 @@ impl PureGrepMatcher {
                     )
                     .into());
                 }
-                branches.push(std::mem::take(&mut cur_branch));
+                branches.push(GrepBranch {
+                    anchored_start,
+                    anchored_end: anchored_end && !saw_trailing_wildcard,
+                    segments: std::mem::take(&mut cur_branch),
+                });
+                anchored_start = false;
+                anchored_end = false;
+                at_branch_start = true;
+                saw_trailing_wildcard = false;
+                i += 1;
+                continue;
+            }
+            if c == '^' && at_branch_start {
+                anchored_start = true;
+                at_branch_start = false;
+                i += 1;
+                continue;
+            }
+            if c == '$' && (i + 1 == chars.len() || chars[i + 1] == '|') {
+                if !saw_trailing_wildcard {
+                    anchored_end = true;
+                }
+                at_branch_start = false;
                 i += 1;
                 continue;
             }
             if c == '.' && i + 1 < chars.len() && chars[i + 1] == '*' {
                 if !cur_seg.is_empty() {
                     cur_branch.push(norm(std::mem::take(&mut cur_seg)));
+                } else if cur_branch.is_empty() {
+                    anchored_start = false;
                 }
+                at_branch_start = false;
+                saw_trailing_wildcard = true;
+                anchored_end = false;
                 i += 2;
                 continue;
             }
             cur_seg.push(c);
+            at_branch_start = false;
+            saw_trailing_wildcard = false;
+            anchored_end = false;
             i += 1;
         }
         if !cur_seg.is_empty() {
@@ -3111,7 +3192,11 @@ impl PureGrepMatcher {
             )
             .into());
         }
-        branches.push(cur_branch);
+        branches.push(GrepBranch {
+            anchored_start,
+            anchored_end: anchored_end && !saw_trailing_wildcard,
+            segments: cur_branch,
+        });
 
         Ok(Self {
             branches,
@@ -3138,26 +3223,76 @@ impl PureGrepMatcher {
             .map_or(true, |c| !Self::is_word_char(c))
     }
 
-    fn branch_matches(&self, hay: &str, segs: &[String]) -> bool {
+    fn branch_matches(&self, hay: &str, b: &GrepBranch) -> bool {
+        let segs = &b.segments;
         let Some(first) = segs.first() else {
             return false;
         };
-        let mut offset = 0usize;
-        while offset <= hay.len() {
-            let Some(rel) = hay[offset..].find(first.as_str()) else {
-                return false;
+        if segs.len() == 1 {
+            return match (b.anchored_start, b.anchored_end) {
+                (true, true) => {
+                    hay == first.as_str()
+                        && (!self.word_boundary
+                            || (Self::is_word_start(hay, 0) && Self::is_word_end(hay, hay.len())))
+                }
+                (true, false) => {
+                    hay.starts_with(first.as_str())
+                        && (!self.word_boundary || Self::is_word_end(hay, first.len()))
+                }
+                (false, true) => {
+                    hay.ends_with(first.as_str())
+                        && (!self.word_boundary
+                            || Self::is_word_start(hay, hay.len() - first.len()))
+                }
+                (false, false) => {
+                    let mut offset = 0usize;
+                    while offset <= hay.len() {
+                        let Some(rel) = hay[offset..].find(first.as_str()) else {
+                            return false;
+                        };
+                        let s0 = offset + rel;
+                        let e0 = s0 + first.len();
+                        if (!self.word_boundary || Self::is_word_start(hay, s0))
+                            && (!self.word_boundary || Self::is_word_end(hay, e0))
+                        {
+                            return true;
+                        }
+                        offset = s0 + hay[s0..].chars().next().map_or(1, char::len_utf8);
+                    }
+                    false
+                }
             };
-            let s0 = offset + rel;
+        }
+
+        let last = &segs[segs.len() - 1];
+        let search_limit = if b.anchored_end {
+            if !hay.ends_with(last.as_str()) {
+                return false;
+            }
+            hay.len() - last.len()
+        } else {
+            hay.len()
+        };
+
+        let mut offset = 0usize;
+        while offset <= search_limit {
+            let s0 = if b.anchored_start {
+                if offset > 0 || !hay[..search_limit].starts_with(first.as_str()) {
+                    return false;
+                }
+                0
+            } else {
+                let Some(rel) = hay[offset..search_limit].find(first.as_str()) else {
+                    return false;
+                };
+                offset + rel
+            };
             let e0 = s0 + first.len();
             let next_step = s0 + hay[s0..].chars().next().map_or(1, char::len_utf8);
 
             if self.word_boundary && !Self::is_word_start(hay, s0) {
-                offset = next_step;
-                continue;
-            }
-            if segs.len() == 1 {
-                if !self.word_boundary || Self::is_word_end(hay, e0) {
-                    return true;
+                if b.anchored_start {
+                    return false;
                 }
                 offset = next_step;
                 continue;
@@ -3166,7 +3301,7 @@ impl PureGrepMatcher {
             let mut cur = e0;
             let mut mid_ok = true;
             for mid in &segs[1..segs.len() - 1] {
-                let Some(mrel) = hay[cur..].find(mid.as_str()) else {
+                let Some(mrel) = hay[cur..search_limit].find(mid.as_str()) else {
                     mid_ok = false;
                     break;
                 };
@@ -3175,7 +3310,9 @@ impl PureGrepMatcher {
             if !mid_ok {
                 return false;
             }
-            let last = &segs[segs.len() - 1];
+            if b.anchored_end {
+                return true;
+            }
             if !self.word_boundary {
                 return hay[cur..].contains(last.as_str());
             }
@@ -3190,6 +3327,9 @@ impl PureGrepMatcher {
                     return true;
                 }
                 last_off = ls + hay[ls..].chars().next().map_or(1, char::len_utf8);
+            }
+            if b.anchored_start {
+                return false;
             }
             offset = next_step;
         }
@@ -4469,6 +4609,32 @@ public sealed class SqlOrderRepository(IDbConnection db) : BaseRepository, IOrde
         assert_eq!(fx_rep.total_matches, 1);
         assert_eq!(fx_rep.matches[0].line_number, 5);
         assert!(fx_rep.matches[0].enclosing_symbol.is_some());
+
+        // Start (`^`) and end (`$`) line anchors operate cleanly in linear time
+        let anc_start = grep_workspace(&tmp, None, "^pub fn verify_token", None, &WorkspaceGrepOptions::default()).unwrap();
+        assert_eq!(anc_start.total_matches, 1);
+        assert_eq!(anc_start.matches[0].line_number, 3);
+        let anc_miss = grep_workspace(&tmp, None, "^tok_", None, &WorkspaceGrepOptions::default()).unwrap();
+        assert_eq!(anc_miss.total_matches, 0);
+        let anc_end = grep_workspace(&tmp, None, "true }$", None, &WorkspaceGrepOptions::default()).unwrap();
+        assert_eq!(anc_end.total_matches, 1);
+        assert_eq!(anc_end.matches[0].line_number, 1);
+
+        // `extract_fim_slice` on an indexed workspace uses clean relative labels and hits cache cleanly
+        std::fs::create_dir_all(tmp.join(".agents")).unwrap();
+        let db = LibreDb::open(tmp.join(".agents").join("memory.ldb")).unwrap();
+        index_workspace(&db, &tmp, false).unwrap();
+        let seq_before = db.stats().unwrap().commit_seq;
+        let fim_abs = tmp.join("src").join("auth.rs");
+        let bundle = extract_fim_slice(&db, &fim_abs, Some("verify_token"), None, 1).unwrap();
+        let seq_after = db.stats().unwrap().commit_seq;
+        assert_eq!(bundle.file_label, "src/auth.rs");
+        assert!(!bundle.file_label.contains("//?/"));
+        assert_eq!(
+            seq_after, seq_before,
+            "extract_fim_slice must reuse index_workspace skeleton::<rel_path> with 0 duplicate writes"
+        );
+        drop(db);
 
         // Path traversal outside workspace MUST fail closed
         assert!(grep_workspace(&tmp, Some(Path::new("..")), "verify_token", None, &WorkspaceGrepOptions::default()).is_err());

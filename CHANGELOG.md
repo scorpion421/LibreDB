@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.1] - 2026-11-16
+
+### Added
+- **Start and end line anchors in `libredb grep`**: The pure-Rust pattern search now supports unescaped leading `^` and trailing `$` line anchors (plus `\^` and `\$` literals) in linear time across both CLI and MCP searches.
+- **Unified CLI and MCP token-savings accounting**: CLI invocations of `pulse`, `locate`, `impact`, and `grep` (as well as MCP `action="grep"` and transcript-fallback `=== GREP:` scanning) now record workspace savings metrics alongside `skeleton` and `fim`, and `libredb impact` uses the same token-minimal format across CLI and MCP.
+
+### Fixed
+- **Unified workspace-relative `skeleton` and `fim` cache labels**: Normalized Windows verbatim prefixes (`\\?\`) and aligned `fim`, CLI `skeleton`, and MCP `skeleton` cache keys with `index_workspace` so indexed workspaces always get direct cache hits without duplicate cache entries or path prefixes.
+- **`ripgrep` version check broken-pipe bug and Python deliverable binary (`deploy_plugin.ps1`, `deploy_plugin.sh`, `dist/libredb.pyd`)**: Replaced `Select-Object -First 1` on `rg --version` with buffered array capture so already-installed `rg.exe` binaries verify cleanly without triggering `winget`, expanded WinGet package discovery, removed stale `libredb.dll` output in favor of `libredb_py.dll`, and updated the packaged `v2.1.1` `libredb.pyd` module.
+
 ## [2.1.0] - 2026-11-16
 
 ### Added

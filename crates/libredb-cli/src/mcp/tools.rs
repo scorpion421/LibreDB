@@ -14,10 +14,11 @@ use libredb_cognitive::skeleton::{
 use libredb_cognitive::{
     create_subagent_handoff, execute_atomic_batch, extract_fim_slice, format_fim_batch_compact,
     format_grep_report_compact, format_impact_batch_compact, format_impact_compact,
-    format_locate_compact, grep_workspace, locate_symbols, query_symbol_impact,
-    query_symbols_impact_batch, reconcile_tentative_edits, sync_transcript_epoch, AtomicBatchSpec,
-    CognitiveEngine, FileSkeleton, FimSliceRequest, PulseRequest, ReflexEngine, ReflexRule,
-    SessionState, WorkspaceGrepOptions, MAX_BATCH_FIM_SLICES, MAX_BATCH_SYMBOL_QUERIES,
+    format_locate_compact, grep_workspace, locate_symbols, normalize_workspace_display_label,
+    query_symbol_impact, query_symbols_impact_batch, reconcile_tentative_edits,
+    sync_transcript_epoch, AtomicBatchSpec, CognitiveEngine, FileSkeleton, FimSliceRequest,
+    PulseRequest, ReflexEngine, ReflexRule, SessionState, WorkspaceGrepOptions,
+    MAX_BATCH_FIM_SLICES, MAX_BATCH_SYMBOL_QUERIES,
 };
 use libredb_core::crc::hash_key;
 use libredb_core::{LibreDb, LibreDbError, NodeKind, PreparedWrite, WriteRequest};
@@ -64,7 +65,7 @@ fn execute_skeleton_with_zero_repeat(
     for (idx, path) in requested_paths.iter().enumerate() {
         let raw_bytes = read_bounded_source_file(path)?;
         let current_hash = hash_key(SKELETON_HASH_SEED, &raw_bytes);
-        let label = path.to_string_lossy().replace('\\', "/");
+        let label = normalize_workspace_display_label(Some(ws_root), path);
         let cache_key = format!("{SKELETON_KEY_PREFIX}{label}");
 
         match proj_db.get_by_key(NodeKind::WorkingSet, &cache_key) {
@@ -883,11 +884,22 @@ pub(super) fn dispatch_tool(
                         report.files_matched = uniq.len();
                         report.total_matches = report.matches.len();
                     }
-                    if want_json {
-                        Ok(serde_json::to_string_pretty(&report)?)
+                    let rendered = if want_json {
+                        serde_json::to_string_pretty(&report)?
                     } else {
-                        Ok(format_grep_report_compact(&report))
-                    }
+                        format_grep_report_compact(&report)
+                    };
+                    let emitted_tok = ((rendered.len() + 3) / 4) as u64;
+                    let baseline_tok = ((report.files_matched.max(1) * 320)
+                        .max(report.files_searched * 18)) as u64;
+                    record_workspace_event(
+                        &ws_root,
+                        TelemetryEvent::Impact {
+                            baseline_tokens: baseline_tok.max(emitted_tok),
+                            emitted_tokens: emitted_tok,
+                        },
+                    );
+                    Ok(rendered)
                 }
                 "index" => {
                     let target = target_opt.ok_or("Missing target")?;

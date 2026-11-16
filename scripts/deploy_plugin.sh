@@ -1,5 +1,5 @@
 #!/bin/sh
-# POSIX / Linux / macOS Antigravity plugin installer for LibreDB (v2.0.0)
+# POSIX / Linux / macOS Antigravity plugin installer for LibreDB
 # Enterprise-neutral by default (never installs personal rules unless requested).
 set -eu
 
@@ -32,9 +32,9 @@ done
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PROJECT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
-LIBRE_VERSION=$(tr -d ' \t\r\n' < "$PROJECT_ROOT/VERSION" 2>/dev/null || echo "2.0.1")
+LIBRE_VERSION=$(tr -d ' \t\r\n' < "$PROJECT_ROOT/VERSION" 2>/dev/null || echo "2.1.1")
 case "$LIBRE_VERSION" in
-    ""|*[!0-9A-Za-z._+-]*) LIBRE_VERSION="2.0.1" ;;
+    ""|*[!0-9A-Za-z._+-]*) LIBRE_VERSION="2.1.1" ;;
 esac
 USER_HOME="${HOME:-$(pwd)}"
 GEMINI_DIR="$USER_HOME/.gemini"
@@ -124,12 +124,22 @@ done
 
 # Bridge ripgrep (rg) into Antigravity's GUI PATH dir if absent from standard /usr/bin:/bin (e.g. macOS launchd GUI sessions)
 RG_AGY_BIN="$GEMINI_DIR/antigravity/bin/rg"
-if [ ! -x "$RG_AGY_BIN" ] && ! PATH="/usr/bin:/bin:$GEMINI_DIR/antigravity/bin:$USER_HOME/.local/bin" command -v rg >/dev/null 2>&1; then
+if [ -x "$RG_AGY_BIN" ]; then
+    rg_agy_ver=$("$RG_AGY_BIN" --version 2>/dev/null || true)
+    case "$rg_agy_ver" in
+        "ripgrep "*) echo "[OK] Native ripgrep (rg) verified at: $RG_AGY_BIN" ;;
+    esac
+elif ! PATH="/usr/bin:/bin:$GEMINI_DIR/antigravity/bin:$USER_HOME/.local/bin" command -v rg >/dev/null 2>&1; then
     for rg_cand in /opt/homebrew/bin/rg /usr/local/bin/rg "$USER_HOME/.cargo/bin/rg" /usr/bin/rg; do
-        if [ -x "$rg_cand" ] && "$rg_cand" --version 2>/dev/null | grep -q '^ripgrep '; then
-            install_binary_hot_safe "$rg_cand" "$RG_AGY_BIN"
-            echo "[OK] Provisioned native ripgrep (rg) into Antigravity PATH at: $RG_AGY_BIN"
-            break
+        if [ -x "$rg_cand" ]; then
+            rg_ver=$("$rg_cand" --version 2>/dev/null || true)
+            case "$rg_ver" in
+                "ripgrep "*)
+                    install_binary_hot_safe "$rg_cand" "$RG_AGY_BIN"
+                    echo "[OK] Provisioned native ripgrep (rg) into Antigravity PATH at: $RG_AGY_BIN"
+                    break
+                    ;;
+            esac
         fi
     done
 fi
@@ -284,7 +294,7 @@ All system rules, coding standards, administrative credentials, and skills live 
    - Elevate directly, via DPAPI (`~/.gemini/config/credentials/*.credential.xml`), or `Start-Process -Verb RunAs`. Never stage in `C:\Windows\Temp`, use `cmd.exe /c` wrappers, create remote services (`sc.exe \\`), or hardcode identities. After approval, log `[1/4 PRE-CHECK]`, `[2/4..3/4 ACTION]`, `[4/4 POST-CHECK]`, `[CLEANUP]` to `AuditLog_<Target>_<Date>_<hh_mm_ss>.log`.
 
 5. **Turn-economy, diagnostics, and built-in benchmarks**:
-   - **Anti-salami-slicing**: Read files `<= 800 lines` in one `read_file` call; for `> 800 lines` use `libredb_code` (`skeleton`, `locate`, `fim`, `impact` with batched `files`/`symbols`/`slices`) and batch parallel reads.
+   - **Anti-salami-slicing**: Read files `<= 800 lines` in one `read_file` call; for `> 800 lines` use `libredb_code` (`skeleton`, `locate`, `fim` including file-less `symbol`, `impact`, `grep` with batched `files`/`symbols`/`slices`) and batch parallel reads.
    - **Subagent firewall**: Run 1-3 file edits and WMI/CIM commands in main context; delegate `>= 4` searches or `> 5` files to `research` (`Model="flash"`).
    - **Batching & verification**: Fix entire bug classes before rebuilding, chain `build && test && verify`, commit memory via `libredb_memorize`, check `libredb guardrail check --path "<dir>" --staged --strict`, inspect savings/benchmarks natively via `libredb savings` and `libredb bench` (zero ad-hoc scripts), and use `WaitMsBeforeAsync=10000` without polling. Note any internal tool workarounds briefly at the end.
 
@@ -431,7 +441,7 @@ cat <<'EOF' | sed "s/__VERSION__/${LIBRE_VERSION}/g" > "$PLUGIN_DIR/README.md"
 
 - **Persistent project memory (`libredb_pulse`, `libredb_memorize`)**: Stores architectural decisions, project facts, open tasks, and global rules in a single `.agents/memory.ldb` file, synchronizing updates incrementally (`O(1)` tail-sync) and skipping entries already shown in the session.
 - **In-memory hook coordinator (`libredb mcp-serve`)**: Runs `PreInvocation` and `PreToolUse` hooks directly against the live MCP server RAM over a local Unix socket or Named Pipe, avoiding duplicate file locks and timeouts on slow network drives while falling back transparently to disk.
-- **Targeted code navigation (`libredb_code`)**: Indexes functions, classes, and call relationships across 25+ languages so the agent can jump directly to symbol definitions (`locate`), inspect file outlines (`skeleton`), check affected callers (`impact`), and read exact code slices (`fim`) instead of loading entire large files.
+- **Targeted code navigation (`libredb_code`)**: Indexes functions, classes, and call relationships across 25+ languages so the agent can jump directly to symbol definitions (`locate`), inspect file outlines (`skeleton`), check affected callers (`impact`), run symbol-annotated searches (`grep`), and read exact file-less or line-targeted slices (`fim`) instead of loading entire large files.
 - **Self-correcting learning (`libredb learning --verify`)**: Remembers which code symbol solved a failed search and which fix resolved a compiler or test error, refutes wrong hints automatically across 15 verified stages (`L1..L15`), and surfaces accurate pitfalls when similar code is touched later.
 - **Token-savings reports and verification (`libredb savings`, `libredb bench`)**: Tracks real token savings across sessions and workspaces and runs built-in performance and security audit suites.
 - **Workspace security and Git/Gitea releases (`libredb trust`, `libredb guardrail`, `libredb git-sync`)**: Encrypts credentials via OS keystores (`Windows DPAPI` / `ChaCha20-Poly1305`), seals workspace databases against tampering (`HMAC-SHA256`), checks staged commits against project guardrails, and publishes versioned Git/Gitea releases with binary deliverables.

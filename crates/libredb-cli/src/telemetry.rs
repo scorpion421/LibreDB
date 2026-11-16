@@ -1191,6 +1191,7 @@ fn parse_single_transcript(
                 } else if let Some(rest) = line
                     .strip_prefix("=== IMPACT: ")
                     .or_else(|| line.strip_prefix("=== LOCATE: "))
+                    .or_else(|| line.strip_prefix("=== GREP: "))
                 {
                     let _ = rest;
                     let em_tok = (count_tokens_exact(content.as_bytes()) as u64).max(30);

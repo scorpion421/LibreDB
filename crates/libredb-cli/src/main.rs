@@ -16,11 +16,11 @@ use libredb_cognitive::skeleton::read_bounded_source_file;
 use libredb_cognitive::{
     audit_workspace_guardrails_with_prefixes, create_subagent_handoff, execute_atomic_batch,
     extract_fim_slice, format_fim_batch_compact, format_grep_report_compact,
-    format_impact_batch_compact, format_locate_compact, grep_workspace, has_project_root_marker,
-    index_workspace_with_exclusions, locate_symbols, query_symbol_impact,
-    query_symbols_impact_batch, sync_transcript_epoch, AtomicBatchSpec, CognitiveEngine,
-    FileSkeleton, OverlayBrain, PulseRequest, ReflexEngine, ReflexRule, SessionState,
-    WorkspaceGrepOptions,
+    format_impact_batch_compact, format_impact_compact, format_locate_compact, grep_workspace,
+    has_project_root_marker, index_workspace_with_exclusions, locate_symbols,
+    normalize_workspace_display_label, query_symbol_impact, query_symbols_impact_batch,
+    sync_transcript_epoch, AtomicBatchSpec, CognitiveEngine, FileSkeleton, OverlayBrain,
+    PulseRequest, ReflexEngine, ReflexRule, SessionState, WorkspaceGrepOptions,
 };
 use libredb_core::{EdgeKind, LibreDb, NodeKind, WriteRequest};
 use std::env;
@@ -971,8 +971,27 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
             let brain = OverlayBrain::open(glob_db, proj_db)?;
             let resp = brain.pulse(&req)?;
+            let formatted = resp.format_compact();
+            let emitted_tok = ((formatted.len() + 3) / 4) as u64;
+            let baseline_tok = emitted_tok
+                .saturating_add(resp.tokens_saved_by_delta as u64)
+                .max((resp.tokens_emitted + resp.tokens_saved_by_delta) as u64);
+            if let Some(ref ws_root) = req.workspace_dir {
+                telemetry::record_workspace_event(
+                    ws_root,
+                    telemetry::TelemetryEvent::Pulse {
+                        baseline_tokens: baseline_tok.max(emitted_tok),
+                        emitted_tokens: emitted_tok,
+                    },
+                );
+            } else {
+                telemetry::record_event(telemetry::TelemetryEvent::Pulse {
+                    baseline_tokens: baseline_tok.max(emitted_tok),
+                    emitted_tokens: emitted_tok,
+                });
+            }
             let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-            println!("{}", resp.format_compact());
+            print!("{formatted}");
             println!("[Completed in {elapsed_ms:.2} ms]");
         }
         "index-workspace" => {
@@ -1065,7 +1084,8 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 cli.path_value("--cwd"),
                 Some(Path::new(&file_args[0])),
                 db_opt.as_ref().and_then(|d| d.path()),
-            );
+            )
+            .map(|p| security::strip_verbatim_prefix(&p));
 
             let mut resolved_paths = Vec::with_capacity(file_args.len());
             for raw_f in &file_args {
@@ -1097,12 +1117,13 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
             let mut skeletons: Vec<(FileSkeleton, bool)> = Vec::with_capacity(resolved_paths.len());
             for src_path in &resolved_paths {
+                let disp_label =
+                    normalize_workspace_display_label(ws_root_opt.as_deref(), src_path);
                 let pair = if let Some(ref db) = db_opt {
-                    FileSkeleton::index_or_get_cached(db, src_path, None)?
+                    FileSkeleton::index_or_get_cached(db, src_path, Some(disp_label.as_str()))?
                 } else {
                     let raw_bytes = read_bounded_source_file(src_path)?;
-                    let label = src_path.to_string_lossy().replace('\\', "/");
-                    (FileSkeleton::extract_from_bytes(label, &raw_bytes), false)
+                    (FileSkeleton::extract_from_bytes(disp_label, &raw_bytes), false)
                 };
                 skeletons.push(pair);
             }
@@ -1227,10 +1248,34 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
             let matches = locate_symbols(&db, &queries)?;
             let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-            if cli.has_switch("--json") {
-                println!("{}", serde_json::to_string_pretty(&matches)?);
+            let rendered = if cli.has_switch("--json") {
+                serde_json::to_string_pretty(&matches)?
             } else {
-                print!("{}", format_locate_compact(&queries, &matches));
+                format_locate_compact(&queries, &matches)
+            };
+            let ws_root_tel = db
+                .path()
+                .and_then(|p| p.parent())
+                .filter(|p| p.file_name().is_some_and(|n| n.eq_ignore_ascii_case(".agents")))
+                .and_then(|p| p.parent())
+                .map(security::strip_verbatim_prefix)
+                .or_else(|| ws_dir_opt.map(|p| security::strip_verbatim_prefix(&p)));
+            if let Some(ref ws_root) = ws_root_tel {
+                let emitted_tok = ((rendered.len() + 3) / 4) as u64;
+                let baseline_tok = ((matches.len().max(queries.len()) * 140)
+                    .max(rendered.len() / 4)) as u64;
+                telemetry::record_workspace_event(
+                    ws_root,
+                    telemetry::TelemetryEvent::Impact {
+                        baseline_tokens: baseline_tok.max(emitted_tok),
+                        emitted_tokens: emitted_tok,
+                    },
+                );
+            }
+            if cli.has_switch("--json") {
+                println!("{rendered}");
+            } else {
+                print!("{rendered}");
                 println!("[Located in {elapsed_ms:.2} ms]");
             }
         }
@@ -1271,53 +1316,62 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     let _ = libredb_cognitive::index_workspace(&db, ws_root, false);
                 }
             }
-            if queries.len() == 1 {
+            let want_json = cli.has_switch("--json");
+            let (rendered, total_refs) = if queries.len() == 1 {
                 let reports = query_symbol_impact(&db, &queries[0])?;
-                if cli.has_switch("--json") {
-                    println!("{}", serde_json::to_string_pretty(&reports)?);
+                let refs: usize = reports
+                    .iter()
+                    .map(|r| r.total_callers.max(r.callers.len()))
+                    .sum();
+                let txt = if want_json {
+                    serde_json::to_string_pretty(&reports)?
                 } else {
-                    println!(
-                        "=== BLAST-RADIUS & CAUSAL IMPACT: '{}' ({} matches in {:.2} ms) ===",
-                        queries[0],
-                        reports.len(),
-                        t0.elapsed().as_secs_f64() * 1000.0
-                    );
-                    for r in reports {
-                        println!("\n* [#{}] {}", r.node_id, r.contract);
-                        for g in &r.governing_decisions {
-                            println!("    [Governed by]:    {g}");
-                        }
-                        for p in &r.known_pitfalls {
-                            println!("    [Known Pitfalls]: {p}");
-                        }
-                        for imp in &r.implementors {
-                            println!("    [Implemented by] <= {imp}");
-                        }
-                        for c in &r.callers {
-                            println!("    [Called by]      <- {c}");
-                        }
-                        for d in &r.callees {
-                            println!("    [Calls/Depends]  -> {d}");
-                        }
-                        if !r.co_changed_files.is_empty() {
-                            println!(
-                                "    [Co-changed files (git Lift)]: {}",
-                                r.co_changed_files.join(" | ")
-                            );
-                        }
-                    }
-                }
+                    format_impact_compact(&queries[0], &reports)
+                };
+                (txt, refs)
             } else {
                 let batches = query_symbols_impact_batch(&db, &queries)?;
-                if cli.has_switch("--json") {
+                let refs: usize = batches
+                    .iter()
+                    .flat_map(|(_, reps)| reps.iter())
+                    .map(|r| r.total_callers.max(r.callers.len()))
+                    .sum();
+                let txt = if want_json {
                     let json_batches: Vec<serde_json::Value> = batches
                         .iter()
                         .map(|(q, reps)| serde_json::json!({ "query": q, "reports": reps }))
                         .collect();
-                    println!("{}", serde_json::to_string_pretty(&json_batches)?);
+                    serde_json::to_string_pretty(&json_batches)?
                 } else {
-                    print!("{}", format_impact_batch_compact(&batches));
-                }
+                    format_impact_batch_compact(&batches)
+                };
+                (txt, refs)
+            };
+            let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let ws_root_tel = db
+                .path()
+                .and_then(|p| p.parent())
+                .filter(|p| p.file_name().is_some_and(|n| n.eq_ignore_ascii_case(".agents")))
+                .and_then(|p| p.parent())
+                .map(security::strip_verbatim_prefix)
+                .or_else(|| ws_dir_opt.map(|p| security::strip_verbatim_prefix(&p)));
+            if let Some(ref ws_root) = ws_root_tel {
+                let emitted_tok = ((rendered.len() + 3) / 4) as u64;
+                let baseline_tok = ((total_refs.max(queries.len()) * 180)
+                    .max(rendered.len() / 4)) as u64;
+                telemetry::record_workspace_event(
+                    ws_root,
+                    telemetry::TelemetryEvent::Impact {
+                        baseline_tokens: baseline_tok.max(emitted_tok),
+                        emitted_tokens: emitted_tok,
+                    },
+                );
+            }
+            if want_json {
+                println!("{rendered}");
+            } else {
+                print!("{rendered}");
+                println!("[Impact computed in {elapsed_ms:.2} ms]");
             }
         }
         "fim" => {
@@ -1379,8 +1433,8 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 .and_then(|p| p.parent())
                 .filter(|p| p.file_name().is_some_and(|n| n.eq_ignore_ascii_case(".agents")))
                 .and_then(|p| p.parent())
-                .map(Path::to_path_buf)
-                .or_else(|| ws_dir_opt.clone());
+                .map(security::strip_verbatim_prefix)
+                .or_else(|| ws_dir_opt.clone().map(|p| security::strip_verbatim_prefix(&p)));
 
             let mut bundles = Vec::new();
             let mut baseline_raw_tok = 0u64;
@@ -1580,10 +1634,26 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 &opts,
             )?;
             let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-            if cli.has_switch("--json") {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+            let want_json = cli.has_switch("--json");
+            let rendered = if want_json {
+                serde_json::to_string_pretty(&report)?
             } else {
-                print!("{}", format_grep_report_compact(&report));
+                format_grep_report_compact(&report)
+            };
+            let emitted_tok = ((rendered.len() + 3) / 4) as u64;
+            let baseline_tok = ((report.files_matched.max(1) * 320)
+                .max(report.files_searched * 18)) as u64;
+            telemetry::record_workspace_event(
+                &ws_root,
+                telemetry::TelemetryEvent::Impact {
+                    baseline_tokens: baseline_tok.max(emitted_tok),
+                    emitted_tokens: emitted_tok,
+                },
+            );
+            if want_json {
+                println!("{rendered}");
+            } else {
+                print!("{rendered}");
                 println!("[Grep completed in {elapsed_ms:.2} ms]");
             }
         }
