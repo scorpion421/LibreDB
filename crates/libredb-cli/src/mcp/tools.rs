@@ -242,7 +242,8 @@ pub(super) fn dispatch_tool(
                 .and_then(Value::as_str)
                 .filter(|s| !s.trim().is_empty())
                 .map(PathBuf::from)
-                .or_else(|| state.pinned_workspace_root.clone());
+                .or_else(|| state.pinned_workspace_root.clone())
+                .filter(|ws| !crate::security::is_private_brain_workspace(ws));
             if let Some(err) = args.get("error").and_then(Value::as_str) {
                 req.error_context = Some(err.to_owned());
             }

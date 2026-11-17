@@ -558,15 +558,11 @@ fn evaluate_pre_invocation_payload_inner(
         None => (None, None),
     };
 
-    let ws_root = resolve_hook_workspace(payload, transcript_opt.as_deref());
-    let target_ldb: Option<PathBuf> = if let Some(ref root) = ws_root {
-        Some(root.join(".agents").join("memory.ldb"))
-    } else if let Some(ref cid) = cid_opt {
-        let cand_ldb = resolve_brain_conv_dir(cid).join(".agents").join("memory.ldb");
-        cand_ldb.exists().then_some(cand_ldb)
-    } else {
-        None
-    };
+    let ws_root = resolve_hook_workspace(payload, transcript_opt.as_deref())
+        .filter(|root| !crate::security::is_private_brain_workspace(root));
+    let target_ldb: Option<PathBuf> = ws_root
+        .as_ref()
+        .map(|root| root.join(".agents").join("memory.ldb"));
 
     let Some(mem_ldb_path) = target_ldb else {
         return Ok(json!({ "injectSteps": [] }));
@@ -2071,6 +2067,9 @@ fn record_working_set_edit(
     global_db: Option<&LibreDb>,
     cid_transcript: Option<(&str, &Path)>,
 ) -> Result<(), String> {
+    if crate::security::is_private_brain_workspace(ws_root) {
+        return Ok(());
+    }
     let ldb_path = ws_root.join(".agents").join("memory.ldb");
     let db_sibling = ldb_path.with_extension("db");
     if preopened_db.is_none() && !ldb_path.exists() && !db_sibling.exists() {
@@ -2504,9 +2503,14 @@ fn resolve_hook_workspace(payload: &Value, transcript_opt: Option<&Path>) -> Opt
         for item in arr {
             if let Some(s) = item.as_str() {
                 let p = PathBuf::from(s);
-                if p.is_dir() && !is_protected_profile_dir(&p) {
+                if p.is_dir()
+                    && !is_protected_profile_dir(&p)
+                    && !crate::security::is_private_brain_workspace(&p)
+                {
                     if let Some(root) = find_workspace_root(&p) {
-                        if !is_protected_profile_dir(&root) {
+                        if !is_protected_profile_dir(&root)
+                            && !crate::security::is_private_brain_workspace(&root)
+                        {
                             return Some(root);
                         }
                     }
@@ -2547,9 +2551,14 @@ fn infer_workspace_from_transcript(transcript_path: &Path) -> Option<PathBuf> {
                     if let Some(end_q) = after_quote.find('"') {
                         let raw_p = after_quote[..end_q].replace("\\\\", "\\");
                         let candidate = PathBuf::from(&raw_p);
-                        if candidate.exists() && !is_protected_profile_dir(&candidate) {
+                        if candidate.exists()
+                            && !is_protected_profile_dir(&candidate)
+                            && !crate::security::is_private_brain_workspace(&candidate)
+                        {
                             if let Some(root) = find_workspace_root(&candidate) {
-                                if !is_protected_profile_dir(&root) {
+                                if !is_protected_profile_dir(&root)
+                                    && !crate::security::is_private_brain_workspace(&root)
+                                {
                                     return Some(root);
                                 }
                             }
@@ -2568,7 +2577,7 @@ pub fn find_workspace_root(start: &Path) -> Option<PathBuf> {
     } else {
         start
     };
-    if is_protected_profile_dir(dir) {
+    if is_protected_profile_dir(dir) || crate::security::is_private_brain_workspace(dir) {
         return None;
     }
     let mut fallback_marker: Option<PathBuf> = None;
@@ -2576,6 +2585,7 @@ pub fn find_workspace_root(start: &Path) -> Option<PathBuf> {
     while let Some(c) = curr {
         if c.parent().is_none()
             || is_protected_profile_dir(c)
+            || crate::security::is_private_brain_workspace(c)
             || c.file_name().and_then(|s| s.to_str()) == Some("target")
         {
             break;

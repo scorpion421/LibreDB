@@ -326,23 +326,330 @@ fn detect_git_exec_or_vault_tamper_command(cmd_low: &str) -> Option<&'static str
     None
 }
 
-fn strip_inline_code_and_urls(line: &str) -> String {
-    let mut out = String::with_capacity(line.len());
-    let mut in_tick = false;
-    for ch in line.chars() {
-        if ch == '`' {
-            in_tick = !in_tick;
-            out.push(' ');
-        } else if in_tick {
-            out.push(' ');
-        } else {
-            out.push(ch);
-        }
+fn ascii_ci_tag_len(rest: &str, tag: &str) -> Option<usize> {
+    if rest.len() < tag.len() {
+        return None;
     }
-    out
+    let bytes = rest.as_bytes();
+    let tag_bytes = tag.as_bytes();
+    if !bytes[..tag_bytes.len()].eq_ignore_ascii_case(tag_bytes) {
+        return None;
+    }
+    let next = bytes.get(tag_bytes.len()).copied();
+    if matches!(next, None | Some(b'>' | b'/' | b' ' | b'\t' | b'\r' | b'\n')) {
+        Some(tag_bytes.len())
+    } else {
+        None
+    }
 }
 
-fn has_german_prose_context(text: &str) -> bool {
+fn close_raw_block_len(rest: &str, close_tag: &str) -> Option<usize> {
+    if rest.len() < close_tag.len() {
+        return None;
+    }
+    let bytes = rest.as_bytes();
+    if !bytes[..close_tag.len()].eq_ignore_ascii_case(close_tag.as_bytes()) {
+        return None;
+    }
+    let mut k = close_tag.len();
+    while k < bytes.len() && matches!(bytes[k], b' ' | b'\t') {
+        k += 1;
+    }
+    if bytes.get(k) == Some(&b'>') {
+        Some(k + 1)
+    } else {
+        None
+    }
+}
+
+fn push_spaces_for_ascii_len(out: &mut String, len: usize) {
+    for _ in 0..len {
+        out.push(' ');
+    }
+}
+
+/// Blanks Markdown code fences, inline backticks, Markdown link URLs, HTML comments,
+/// raw/code HTML elements (`<pre>`, `<style>`, `<script>`, `<svg>`, `<code>`), and HTML
+/// tag attributes across lines while preserving word boundaries as ASCII spaces.
+fn sanitize_prose_lines(lines: &[&str]) -> Vec<String> {
+    let mut sanitized = Vec::with_capacity(lines.len());
+    let mut in_fence = false;
+    let mut in_comment = false;
+    let mut raw_block_end: Option<&'static str> = None;
+    let mut code_depth = 0usize;
+    let mut in_tag = false;
+    let mut tag_quote: Option<char> = None;
+    let mut self_closing_slash = false;
+    let mut pending_raw_end: Option<&'static str> = None;
+    let mut pending_code_open = false;
+    let mut pending_code_close = false;
+
+    for &line in lines {
+        if line.trim().is_empty() && !in_comment && raw_block_end.is_none() && code_depth == 0 {
+            // Reset dangling unclosed `<` in plain Markdown prose on blank paragraph boundaries.
+            in_tag = false;
+            tag_quote = None;
+            self_closing_slash = false;
+            pending_raw_end = None;
+            pending_code_open = false;
+            pending_code_close = false;
+        }
+        if raw_block_end.is_none()
+            && !in_comment
+            && !in_tag
+            && line.trim_start().starts_with("```")
+        {
+            in_fence = !in_fence;
+            sanitized.push(String::new());
+            continue;
+        }
+        if in_fence {
+            sanitized.push(String::new());
+            continue;
+        }
+
+        let mut out = String::with_capacity(line.len());
+        let mut in_tick = false;
+        let bytes = line.as_bytes();
+        let mut i = 0usize;
+        while i < line.len() {
+            let Some(ch) = line[i..].chars().next() else {
+                break;
+            };
+            if in_comment {
+                if line[i..].starts_with("-->") {
+                    out.push_str("   ");
+                    i += 3;
+                    in_comment = false;
+                } else {
+                    out.push(' ');
+                    i += ch.len_utf8();
+                }
+                continue;
+            }
+            if let Some(end_tag) = raw_block_end {
+                if let Some(close_len) = close_raw_block_len(&line[i..], end_tag) {
+                    push_spaces_for_ascii_len(&mut out, close_len);
+                    i += close_len;
+                    raw_block_end = None;
+                } else {
+                    out.push(' ');
+                    i += ch.len_utf8();
+                }
+                continue;
+            }
+            if in_tag {
+                out.push(' ');
+                if let Some(q) = tag_quote {
+                    if ch == q {
+                        tag_quote = None;
+                    }
+                    self_closing_slash = false;
+                } else if ch == '"' || ch == '\'' {
+                    tag_quote = Some(ch);
+                    self_closing_slash = false;
+                } else if ch == '>' {
+                    in_tag = false;
+                    if pending_code_close {
+                        code_depth = code_depth.saturating_sub(1);
+                    } else if !self_closing_slash {
+                        if let Some(end_tag) = pending_raw_end {
+                            raw_block_end = Some(end_tag);
+                        } else if pending_code_open {
+                            code_depth += 1;
+                        }
+                    }
+                    self_closing_slash = false;
+                    pending_raw_end = None;
+                    pending_code_open = false;
+                    pending_code_close = false;
+                } else if ch == '/' {
+                    self_closing_slash = true;
+                } else if !ch.is_whitespace() {
+                    self_closing_slash = false;
+                }
+                i += ch.len_utf8();
+                continue;
+            }
+
+            if ch == '`' && code_depth == 0 {
+                in_tick = !in_tick;
+                out.push(' ');
+                i += 1;
+                continue;
+            }
+            if !in_tick {
+                if line[i..].starts_with("<!--") {
+                    in_comment = true;
+                    out.push_str("    ");
+                    i += 4;
+                    continue;
+                }
+                if ch == '<'
+                    && bytes
+                        .get(i + 1)
+                        .is_some_and(|&b| b.is_ascii_alphabetic() || matches!(b, b'/' | b'!' | b'?'))
+                {
+                    let rest = &line[i + 1..];
+                    pending_raw_end = None;
+                    pending_code_open = false;
+                    pending_code_close = false;
+                    if ascii_ci_tag_len(rest, "/code").is_some() {
+                        pending_code_close = true;
+                    } else if ascii_ci_tag_len(rest, "code").is_some() {
+                        pending_code_open = true;
+                    } else if ascii_ci_tag_len(rest, "pre").is_some() {
+                        pending_raw_end = Some("</pre");
+                    } else if ascii_ci_tag_len(rest, "style").is_some() {
+                        pending_raw_end = Some("</style");
+                    } else if ascii_ci_tag_len(rest, "script").is_some() {
+                        pending_raw_end = Some("</script");
+                    } else if ascii_ci_tag_len(rest, "svg").is_some() {
+                        pending_raw_end = Some("</svg");
+                    }
+                    in_tag = true;
+                    tag_quote = None;
+                    self_closing_slash = false;
+                    out.push(' ');
+                    i += 1;
+                    continue;
+                }
+                if code_depth == 0 && line[i..].starts_with("](") {
+                    out.push(']');
+                    out.push(' ');
+                    i += 2;
+                    let mut depth = 1usize;
+                    while i < line.len() && depth > 0 {
+                        let Some(u_ch) = line[i..].chars().next() else {
+                            break;
+                        };
+                        match u_ch {
+                            '(' => depth += 1,
+                            ')' => depth -= 1,
+                            _ => {}
+                        }
+                        out.push(' ');
+                        i += u_ch.len_utf8();
+                    }
+                    continue;
+                }
+            }
+
+            if in_tick || code_depth > 0 {
+                out.push(' ');
+            } else {
+                out.push(ch);
+            }
+            i += ch.len_utf8();
+        }
+        sanitized.push(out);
+    }
+
+    sanitized
+}
+
+fn is_exempt_technical_hyphen_term(l_low: &str, r_low: &str) -> bool {
+    matches!(
+        (l_low, r_low),
+        ("wi", "fi")
+            | ("add", "in")
+            | ("add", "ins")
+            | ("add", "on")
+            | ("add", "ons")
+            | ("opt", "in")
+            | ("opt", "out")
+            | ("plug", "in")
+            | ("plug", "ins")
+            | ("stand", "by")
+            | ("sign", "on")
+            | ("sign", "in")
+            | ("sign", "out")
+            | ("log", "in")
+            | ("log", "on")
+            | ("log", "out")
+            | ("check", "in")
+            | ("check", "out")
+            | ("roll", "out")
+            | ("roll", "back")
+            | ("fail", "over")
+            | ("built", "in")
+            | ("pass", "through")
+    )
+}
+
+fn is_powershell_cmdlet_verb(l_low: &str) -> bool {
+    matches!(
+        l_low,
+        "get"
+            | "set"
+            | "start"
+            | "stop"
+            | "restart"
+            | "enable"
+            | "disable"
+            | "new"
+            | "remove"
+            | "invoke"
+            | "test"
+            | "select"
+            | "where"
+            | "foreach"
+            | "import"
+            | "export"
+            | "register"
+            | "unregister"
+            | "resolve"
+            | "clear"
+            | "update"
+            | "install"
+            | "uninstall"
+            | "add"
+            | "read"
+            | "write"
+            | "out"
+            | "format"
+            | "convertto"
+            | "convertfrom"
+            | "compare"
+            | "expand"
+            | "compress"
+            | "copy"
+            | "move"
+            | "rename"
+            | "split"
+            | "join"
+            | "enter"
+            | "exit"
+            | "push"
+            | "pop"
+            | "show"
+            | "hide"
+            | "find"
+            | "search"
+            | "watch"
+            | "wait"
+            | "measure"
+            | "trace"
+            | "debug"
+            | "reset"
+            | "repair"
+            | "restore"
+            | "backup"
+            | "confirm"
+            | "grant"
+            | "revoke"
+            | "protect"
+            | "unprotect"
+            | "mount"
+            | "dismount"
+            | "publish"
+            | "unpublish"
+            | "connect"
+            | "disconnect"
+    )
+}
+
+fn has_german_prose_context_lines(sanitized_lines: &[&str]) -> bool {
     const GERMAN_MARKERS: &[&str] = &[
         concat!("ni", "cht"),
         concat!("au", "ch"),
@@ -377,18 +684,8 @@ fn has_german_prose_context(text: &str) -> bool {
     ];
     let mut hits = 0usize;
     let mut seen = [false; 30];
-    let mut in_fence = false;
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") {
-            in_fence = !in_fence;
-            continue;
-        }
-        if in_fence {
-            continue;
-        }
-        let cleaned = strip_inline_code_and_urls(line);
-        for word in cleaned.split(|c: char| !c.is_alphabetic()) {
+    for line in sanitized_lines {
+        for word in line.split(|c: char| !c.is_alphabetic()) {
             if word.len() < 2 {
                 continue;
             }
@@ -549,28 +846,22 @@ pub fn check_german_prose_style(text: &str, filename: &str) -> Vec<GuardrailViol
     ];
 
     let lines: Vec<&str> = text.lines().collect();
+    let sanitized_lines = sanitize_prose_lines(&lines);
     let mut line_german_ctx = vec![false; lines.len()];
     {
         let mut start = 0usize;
-        let mut in_blk_fence = false;
         while start < lines.len() {
-            if lines[start].trim().is_empty() {
+            if sanitized_lines[start].trim().is_empty() {
                 start += 1;
                 continue;
             }
             let mut end = start;
-            let mut para_buf = String::new();
-            while end < lines.len() && !lines[end].trim().is_empty() {
-                let t = lines[end].trim_start();
-                if t.starts_with("```") {
-                    in_blk_fence = !in_blk_fence;
-                } else if !in_blk_fence {
-                    para_buf.push_str(lines[end]);
-                    para_buf.push('\n');
-                }
+            let mut para_lines: Vec<&str> = Vec::new();
+            while end < lines.len() && !sanitized_lines[end].trim().is_empty() {
+                para_lines.push(sanitized_lines[end].as_str());
                 end += 1;
             }
-            if has_german_prose_context(&para_buf) {
+            if has_german_prose_context_lines(&para_lines) {
                 for flag in &mut line_german_ctx[start..end] {
                     *flag = true;
                 }
@@ -580,19 +871,13 @@ pub fn check_german_prose_style(text: &str, filename: &str) -> Vec<GuardrailViol
     }
 
     let mut violations = Vec::new();
-    let mut in_fence = false;
 
     for (idx, &line) in lines.iter().enumerate() {
         let line_no = idx + 1;
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") {
-            in_fence = !in_fence;
+        let cleaned = sanitized_lines[idx].as_str();
+        if cleaned.trim().is_empty() {
             continue;
         }
-        if in_fence {
-            continue;
-        }
-        let cleaned = strip_inline_code_and_urls(line);
 
         // 1. ASCII umlaut substitution check (`ae`/`oe`/`ue` in German words).
         // Preserve `'_'` inside tokens so snake_case code identifiers or template placeholders
@@ -624,6 +909,19 @@ pub fn check_german_prose_style(text: &str, filename: &str) -> Vec<GuardrailViol
             if low_tok.contains("://") || low_tok.contains("file:") {
                 continue;
             }
+            let switch_core = raw_tok.trim_matches(|c: char| {
+                matches!(
+                    c,
+                    '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'' | ',' | '.' | ';' | ':' | '!' | '?'
+                )
+            });
+            if switch_core.starts_with('/')
+                || switch_core.starts_with('-')
+                || switch_core.contains('/')
+                || switch_core.contains('\\')
+            {
+                continue;
+            }
             let tok = raw_tok.trim_matches(|c: char| {
                 !c.is_alphabetic() && c != '-'
             });
@@ -642,6 +940,15 @@ pub fn check_german_prose_style(text: &str, filename: &str) -> Vec<GuardrailViol
             }
             let l_low = left.to_lowercase();
             let r_low = right.to_lowercase();
+            if is_exempt_technical_hyphen_term(&l_low, &r_low) {
+                continue;
+            }
+            if tok.is_ascii()
+                && !GERMAN_NOUN_ROOTS.contains(&r_low.as_str())
+                && is_powershell_cmdlet_verb(&l_low)
+            {
+                continue;
+            }
             let has_non_ascii = tok.chars().any(|c| !c.is_ascii());
             let has_german_noun = GERMAN_NOUN_ROOTS.contains(&l_low.as_str())
                 || GERMAN_NOUN_ROOTS.contains(&r_low.as_str());

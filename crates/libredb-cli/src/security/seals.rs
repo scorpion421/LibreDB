@@ -1044,16 +1044,28 @@ impl PreMutationSealGuard {
             ));
         }
 
-        let Some(gdb) = global_db else {
-            let is_agents_memory = resolved_db
-                .parent()
-                .and_then(|p| p.file_name())
+        let is_agents_memory = resolved_db
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case(".agents"))
+            && resolved_db
+                .file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| n.eq_ignore_ascii_case(".agents"))
-                && resolved_db
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.eq_ignore_ascii_case("memory.ldb"));
+                .is_some_and(|n| n.eq_ignore_ascii_case("memory.ldb"));
+        if is_agents_memory
+            && resolved_db
+                .parent()
+                .and_then(|p| p.parent())
+                .is_some_and(is_private_brain_workspace)
+        {
+            return Err(format!(
+                "Refusing to create or mutate '.agents/memory.ldb' inside Antigravity private brain directory '{}'; use global customizations.ldb or session ephemeral storage.",
+                db_path.display()
+            ));
+        }
+
+        let Some(gdb) = global_db else {
             if is_agents_memory && resolved_db.is_file() {
                 let db = LibreDb::open(&resolved_db).map_err(|e| {
                     format!(

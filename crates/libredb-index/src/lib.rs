@@ -34,6 +34,9 @@ pub struct SearchHit {
     pub key: Option<String>,
     pub score: f64,
     pub matched_features: Vec<String>,
+    /// Distinct normalized query terms (`word_postings`) that contributed to this hit.
+    #[serde(default)]
+    pub matched_query_terms: usize,
 }
 
 /// Persisted Hebbian association map for a single learned cue token (`hebbian::<cue_token>`).
@@ -459,13 +462,25 @@ impl HybridIndex {
         }
 
         let mut weighted_words: HashMap<String, f64> = HashMap::new();
+        let mut distinct_q_idx: HashMap<String, usize> = HashMap::new();
+        let mut term_q_indices: HashMap<String, Vec<usize>> = HashMap::new();
         for tok in &q_tokens {
+            let next_id = distinct_q_idx.len();
+            let q_idx = *distinct_q_idx.entry(tok.clone()).or_insert(next_id);
             weighted_words.insert(tok.clone(), 1.0);
+            let direct_list = term_q_indices.entry(tok.clone()).or_default();
+            if !direct_list.contains(&q_idx) {
+                direct_list.push(q_idx);
+            }
             if let Some(learned) = self.learned_bridges.get(tok) {
                 for (assoc_tok, w) in learned {
                     let slot = weighted_words.entry(assoc_tok.clone()).or_insert(0.0);
                     if *w > *slot {
                         *slot = *w;
+                    }
+                    let bridge_list = term_q_indices.entry(assoc_tok.clone()).or_default();
+                    if !bridge_list.contains(&q_idx) {
+                        bridge_list.push(q_idx);
                     }
                 }
             }
@@ -479,6 +494,7 @@ impl HybridIndex {
 
         let mut scores: HashMap<u64, f64> = HashMap::new();
         let mut features: HashMap<u64, Vec<String>> = HashMap::new();
+        let mut matched_terms: HashMap<u64, HashSet<usize>> = HashMap::new();
 
         for (term, q_weight) in &weighted_words {
             let Some(plist) = self.word_postings.get(term) else {
@@ -497,6 +513,7 @@ impl HybridIndex {
                 continue;
             }
 
+            let term_indices = term_q_indices.get(term);
             for &(nid, tf) in plist {
                 let Some(meta) = self.docs.get(&nid) else {
                     continue;
@@ -510,6 +527,12 @@ impl HybridIndex {
                 let dl = meta.word_len as f64;
                 let bm25 = idf * ((tf_f * (K1 + 1.0)) / (tf_f + K1 * (1.0 - B + B * (dl / avg_wl))));
                 *scores.entry(nid).or_insert(0.0) += bm25 * q_weight;
+                if let Some(q_indices) = term_indices {
+                    let set = matched_terms.entry(nid).or_default();
+                    for &qi in q_indices {
+                        set.insert(qi);
+                    }
+                }
                 let fl = features.entry(nid).or_default();
                 if fl.len() < 5 && !fl.contains(term) {
                     fl.push(term.clone());
@@ -575,6 +598,7 @@ impl HybridIndex {
                     key: meta.key.clone(),
                     score: raw_score * imp_factor,
                     matched_features: features.remove(&nid).unwrap_or_default(),
+                    matched_query_terms: matched_terms.get(&nid).map_or(0, HashSet::len),
                 })
             })
             .collect();

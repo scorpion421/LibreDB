@@ -192,6 +192,7 @@ impl LearnedPitfallEntry {
             action_any: self.action_tokens.clone(),
             env_or_error_any: triggers,
             context_tags: Vec::new(),
+            exclude_any: Vec::new(),
             supersedes: self
                 .supersedes
                 .iter()

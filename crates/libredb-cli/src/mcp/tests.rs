@@ -1895,3 +1895,135 @@ use super::{canonical_brain_cache_key, handle_rpc_method, process_mcp_stream, Mc
         drop(state);
         let _ = fs::remove_dir_all(&tmp);
     }
+
+    #[test]
+    fn mcp_and_hooks_never_create_agents_memory_ldb_inside_private_brain_dir() {
+        use serde_json::json;
+        let tmp = std::env::temp_dir().join(format!(
+            "libredb_private_brain_guard_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+
+        let cid = "e8091d33-dca2-46aa-af83-dab94cad0744";
+        let brain_dir = tmp
+            .join(".gemini")
+            .join("antigravity")
+            .join("brain")
+            .join(cid);
+        let logs_dir = brain_dir.join(".system_generated").join("logs");
+        fs::create_dir_all(&logs_dir).unwrap();
+        let transcript_path = logs_dir.join("transcript.jsonl");
+        fs::write(&transcript_path, b"{\"step_index\":1,\"type\":\"USER_INPUT\"}\n").unwrap();
+
+        let global_path = tmp.join(".gemini").join("libredb").join("customizations.ldb");
+        fs::create_dir_all(global_path.parent().unwrap()).unwrap();
+        let gdb = LibreDb::open(&global_path).unwrap();
+        let brain_str = brain_dir.to_string_lossy().to_string();
+        let agents_dir = brain_dir.join(".agents");
+        let agents_ldb = agents_dir.join("memory.ldb");
+
+        // 1. Workspace-less MCP calls targeting the brain conversation directory must use ephemeral
+        // storage and never materialize `<brain>/<cid>/.agents/memory.ldb`.
+        let mut state = McpServerState::new(None, Some(&global_path)).unwrap();
+        let pulse_res = handle_rpc_method(
+            "tools/call",
+            &json!({
+                "name": "libredb_pulse",
+                "arguments": {
+                    "query": "Windows 11 diagnostics session checkpoint",
+                    "cwd": &brain_str,
+                    "cid": cid,
+                    "budget": 600
+                }
+            }),
+            &mut state,
+        )
+        .expect("MCP libredb_pulse in workspace-less private brain chat must succeed via ephemeral DB");
+        assert!(pulse_res.get("content").is_some());
+        assert!(
+            !agents_dir.exists() && !agents_ldb.exists(),
+            "libredb_pulse must never create .agents/memory.ldb inside brain dir"
+        );
+
+        let mem_res = handle_rpc_method(
+            "tools/call",
+            &json!({
+                "name": "libredb_memorize",
+                "arguments": {
+                    "cwd": &brain_str,
+                    "cid": cid,
+                    "facts": { "chat_only_probe": "ephemeral_only" }
+                }
+            }),
+            &mut state,
+        )
+        .expect("MCP libredb_memorize in private brain dir must write to ephemeral session storage");
+        assert!(mem_res.get("content").is_some());
+        assert!(
+            !agents_dir.exists() && !agents_ldb.exists(),
+            "libredb_memorize must never create .agents/memory.ldb inside brain dir"
+        );
+        drop(state);
+
+        // 2. Hooks (`PreInvocation` and `PreToolUse`) must ignore private brain folders as
+        // workspaces and never create `<brain>/<cid>/.agents/memory.ldb`.
+        assert!(
+            crate::hooks::find_workspace_root(&brain_dir).is_none(),
+            "find_workspace_root must return None inside private brain dir"
+        );
+        let pre_inv = crate::hooks::evaluate_pre_invocation_payload(
+            &json!({
+                "conversationId": cid,
+                "workspacePaths": [&brain_str],
+                "transcriptPath": transcript_path.to_string_lossy().to_string()
+            }),
+            Some(&global_path),
+        )
+        .unwrap();
+        assert_eq!(pre_inv["injectSteps"], json!([]));
+        assert!(
+            !agents_dir.exists() && !agents_ldb.exists(),
+            "PreInvocation must never create .agents/memory.ldb inside brain dir"
+        );
+
+        let report_html = brain_dir.join("report.html");
+        assert!(
+            crate::hooks::find_workspace_root(&report_html).is_none(),
+            "find_workspace_root must return None for report file inside private brain dir"
+        );
+        let pre_tool = crate::hooks::evaluate_pre_tool_payload(
+            &json!({
+                "toolName": "write_file",
+                "workspacePaths": [&brain_str],
+                "toolArgs": {
+                    "Path": report_html.to_string_lossy().to_string(),
+                    "Content": "<!DOCTYPE html><html><body><p>All good.</p></body></html>\n",
+                    "Overwrite": true
+                }
+            }),
+            Some(&global_path),
+        );
+        assert_eq!(pre_tool["decision"], "allow");
+        assert!(
+            !agents_dir.exists() && !agents_ldb.exists(),
+            "PreToolUse must never create .agents/memory.ldb inside brain dir"
+        );
+
+        // 3. Seal guard must also refuse direct CLI/seal writes into private brain `.agents/memory.ldb`.
+        let seal_err =
+            crate::security::PreMutationSealGuard::verify_before_write(Some(&gdb), &agents_ldb)
+                .err()
+                .expect("PreMutationSealGuard must refuse creating private brain .agents/memory.ldb");
+        assert!(
+            seal_err.contains("private brain"),
+            "Unexpected error message from PreMutationSealGuard: {seal_err}"
+        );
+        assert!(!agents_dir.exists() && !agents_ldb.exists());
+
+        drop(gdb);
+        let _ = fs::remove_dir_all(&tmp);
+    }

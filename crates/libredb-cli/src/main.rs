@@ -2861,9 +2861,15 @@ fn modernize_global_db(
                 "eframe".to_owned(),
                 "winui".to_owned(),
                 "wpf".to_owned(),
-                "windows".to_owned(),
+                "winappsdk".to_owned(),
+                "windows app sdk".to_owned(),
+                "windows-app-design".to_owned(),
+                "fluent 2".to_owned(),
+                "fluent design".to_owned(),
                 "tauri".to_owned(),
                 "xaml".to_owned(),
+                "maui".to_owned(),
+                "avalonia".to_owned(),
                 "android".to_owned(),
                 "compose".to_owned(),
                 "kotlin".to_owned(),
@@ -2871,8 +2877,6 @@ fn modernize_global_db(
                 "swiftui".to_owned(),
                 "uikit".to_owned(),
                 "appkit".to_owned(),
-                "ios".to_owned(),
-                "macos".to_owned(),
                 "xcode".to_owned(),
                 "gtk".to_owned(),
                 "gtk4".to_owned(),
@@ -2882,24 +2886,47 @@ fn modernize_global_db(
                 "gnome".to_owned(),
                 "qt".to_owned(),
                 "qml".to_owned(),
-                "ui".to_owned(),
                 "gui".to_owned(),
-                "theme".to_owned(),
+                "frontend".to_owned(),
+                "apple-hig-design".to_owned(),
+                "android-app-design".to_owned(),
+                "linux-desktop-hig-design".to_owned(),
             ],
             action_any: vec![
                 "ui".to_owned(),
+                "ux".to_owned(),
                 "theme".to_owned(),
                 "design".to_owned(),
                 "color".to_owned(),
+                "palette".to_owned(),
+                "typography".to_owned(),
                 "layout".to_owned(),
-                "window".to_owned(),
                 "button".to_owned(),
-                "style".to_owned(),
-                "screen".to_owned(),
+                "card".to_owned(),
                 "sheet".to_owned(),
-                "dialog".to_owned(),
                 "toolbar".to_owned(),
                 "navigation".to_owned(),
+                "tabview".to_owned(),
+                "insets".to_owned(),
+                "contrast".to_owned(),
+                "hig".to_owned(),
+            ],
+            exclude_any: vec![
+                "winlogon".to_owned(),
+                "logonui".to_owned(),
+                "credential provider".to_owned(),
+                "taskmanager".to_owned(),
+                "task manager".to_owned(),
+                "grafiktreiber".to_owned(),
+                "display driver".to_owned(),
+                "eventlog".to_owned(),
+                "event log".to_owned(),
+                "eventvwr".to_owned(),
+                "bsod".to_owned(),
+                "dism".to_owned(),
+                "winrm".to_owned(),
+                "gpupdate".to_owned(),
+                "regedit".to_owned(),
             ],
             env_or_error_any: Vec::new(),
             directive: "Apply native platform UI design (Windows Fluent 2, Android Material 3, Apple HIG iOS/macOS, Linux GNOME Libadwaita & KDE Kirigami HIG) cleanly with semantic system colors, native typography/spacing scales, >=4.5:1 contrast, platform navigation/insets, keyboard/screen-reader accessibility, and zero AI-slop gradients or pill-heavy cards (see 'libredb get-skill <windows-app-design | android-app-design | apple-hig-design | linux-desktop-hig-design>').".to_owned(),
@@ -3054,8 +3081,14 @@ fn open_cli_verified_project_db(
         if is_agents && is_mem {
             if let Some(ws_root) = parent.parent() {
                 if security::is_private_brain_workspace(ws_root) {
-                    let ldb_file = ws_root.join(".agents").join("memory.ldb");
-                    return Ok(Arc::new(LibreDb::open(&ldb_file)?));
+                    if let Some(ref gdb) = gdb_opt {
+                        return Ok(Arc::clone(gdb));
+                    }
+                    return Err(format!(
+                        "Refusing to create or open '.agents/memory.ldb' inside Antigravity private brain directory '{}'; run 'libredb init' to initialize global customizations.ldb instead.",
+                        ws_root.display()
+                    )
+                    .into());
                 }
                 let Some(ref gdb) = gdb_opt else {
                     return Err(format!(
@@ -3117,6 +3150,9 @@ fn find_existing_cli_project_db(ws_dir_opt: Option<&Path>) -> Option<PathBuf> {
     let ws = ws_dir_opt?;
     let mut curr: Option<&Path> = Some(ws);
     while let Some(dir) = curr {
+        if security::is_private_brain_workspace(dir) {
+            break;
+        }
         let ldb_cand = dir.join(".agents").join("memory.ldb");
         if ldb_cand.is_file() {
             return Some(ldb_cand);
@@ -3229,6 +3265,12 @@ fn resolve_default_cli_project_db(
         .map(Path::to_path_buf)
         .or_else(|| env::current_dir().ok())
         .ok_or("Unable to resolve current working directory or project .agents/memory.ldb")?;
+    if security::is_private_brain_workspace(&fallback_ws) {
+        return Err(
+            "No initialized global customizations.ldb and refusing to create .agents/memory.ldb inside Antigravity private brain directory."
+                .into(),
+        );
+    }
     open_cli_verified_project_db(
         global_path_opt,
         &fallback_ws.join(".agents").join("memory.ldb"),

@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.1] - 2026-11-17
+
+### Fixed
+- **HTML code blocks and technical token false positives in `german-deppenbindestrich` guardrails**: Stateful prose sanitization now masks multi-line HTML elements (`<code>`, `<pre>`, `<style>`, `<script>`, `<svg>`), HTML comments, and tag attributes alongside Markdown code fences and backticks before style checking. CLI switches (`/Cleanup-Image`, `--Dry-Run`), established IT terms (`Wi-Fi`, `Add-In`, `Opt-In`, `Opt-Out`, `Plug-In`, `Stand-By`), and PowerShell `Verb-Noun` cmdlets (`Stop-Service`, `Set-Service`, `Get-*`) are exempted unless paired with German compound noun roots, while real hyphenated German nouns continue to fail closed.
+- **Single-word global skill filler noise and over-broad UI reflex triggers in `libredb_pulse`**: Global `Skill` and `SkillSection` results without an active workspace stack now require multi-term query overlap and a higher score threshold (or an explicit query naming the skill) while attenuating unrelated platform, cloud, and data stacks even in workspace-less sessions. Short and ambiguous reflex keywords (`window`, `<= 3`-char ASCII tokens like `ui`) now match on word boundaries and honor negative diagnostic exclusions (`exclude_any`), preventing OS and driver diagnostics (`Winlogon`, `LogonUI`, `Credential Provider`) from triggering `windows-fluent-app-design`.
+- **Private conversation directory `.agents/memory.ldb` isolation**: Enforced `is_private_brain_workspace` consistently across MCP routing, lifecycle hooks (`PreInvocation`, `PreToolUse`), seal guards, and CLI workspace lookup so chats inside `.gemini/antigravity*/brain/<cid>` never create `.agents/memory.ldb` artifacts on disk and route strictly through global `customizations.ldb` and ephemeral session storage.
+
 ## [2.2.0] - 2026-11-16
 
 ### Added

@@ -314,29 +314,25 @@ impl McpServerState {
         &mut self,
         ws_root: &Path,
     ) -> Option<Arc<LibreDb>> {
-        let is_private = crate::security::is_private_brain_workspace(ws_root);
-        if !is_private {
-            if let Some(ref pin) = self.pinned_workspace_root {
-                if crate::security::check_mcp_workspace_containment(ws_root, pin).is_some() {
-                    return None;
-                }
+        if crate::security::is_private_brain_workspace(ws_root) {
+            return None;
+        }
+        if let Some(ref pin) = self.pinned_workspace_root {
+            if crate::security::check_mcp_workspace_containment(ws_root, pin).is_some() {
+                return None;
             }
         }
         let ldb_path = ws_root.join(".agents").join("memory.ldb");
         let cache_key = canonical_brain_cache_key(&ldb_path);
 
-        if !is_private {
-            if let Some(ref gdb) = self.global_db {
-                let norm = crate::security::normalize_workspace_key(ws_root);
-                if crate::security::has_config_key_fail_closed(
-                    gdb,
-                    &format!("trust:revoked::{norm}"),
-                ) != Ok(false)
-                {
-                    self.brains.remove(&cache_key);
-                    self.clear_ram_sessions_for_cache_key(&cache_key);
-                    return None;
-                }
+        if let Some(ref gdb) = self.global_db {
+            let norm = crate::security::normalize_workspace_key(ws_root);
+            if crate::security::has_config_key_fail_closed(gdb, &format!("trust:revoked::{norm}"))
+                != Ok(false)
+            {
+                self.brains.remove(&cache_key);
+                self.clear_ram_sessions_for_cache_key(&cache_key);
+                return None;
             }
         }
 
@@ -358,9 +354,7 @@ impl McpServerState {
         if !ldb_path.is_file() {
             return None;
         }
-        if !is_private
-            && !crate::security::is_workspace_memory_trusted(self.global_db.as_deref(), ws_root)
-        {
+        if !crate::security::is_workspace_memory_trusted(self.global_db.as_deref(), ws_root) {
             return None;
         }
 

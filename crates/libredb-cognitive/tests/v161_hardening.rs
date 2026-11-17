@@ -1,9 +1,9 @@
 use libredb_cognitive::{
     check_german_prose_style, extract_error_file_hint, index_workspace, is_banal_syntax_error,
     is_code_learning_eligible_path, learning_state_report, reconcile_tentative_edits,
-    record_error_cue, sanitize_learning_artifacts, stage_tentative_file_edit, ErrorPitfallBook,
-    LearnedPitfallEntry, OverlayBrain, PendingErrorCue, PulseRequest, ERROR_PITFALL_BOOK_KEY,
-    PENDING_ERROR_CUES_KEY,
+    record_error_cue, sanitize_learning_artifacts, stage_tentative_file_edit, CognitiveEngine,
+    ErrorPitfallBook, LearnedPitfallEntry, OverlayBrain, PendingErrorCue, PulseRequest,
+    ReflexEngine, ReflexRule, ERROR_PITFALL_BOOK_KEY, PENDING_ERROR_CUES_KEY,
 };
 use libredb_core::{LibreDb, NodeKind, WriteRequest};
 use std::fs;
@@ -728,4 +728,233 @@ pub fn compute_metric_hash(seed: u64) -> u64 {
 
     drop(db);
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn check_german_prose_style_skips_html_code_blocks_cli_flags_ps_cmdlets_and_wifi() {
+    let clean_html = format!(
+        "<!DOCTYPE html>\n\
+<html lang=\"de\">\n\
+<head>\n\
+  <style>\n\
+    .{css_hdr} {{ color: #222; }}\n\
+  </style>\n\
+  <script>\n\
+    const AutoScroll = '{ps_script}';\n\
+  </script>\n\
+</head>\n\
+<body>\n\
+  <!-- {cmt_tag}: {u_word} {p_word} {ps_stop} -->\n\
+  <p class=\"{attr_cls}\">Dieser Bericht pr{u_uml}ft das System, weil keine Fehler vorliegen.</p>\n\
+  <p>Verbauter Adapter: <code>Intel {wifi_tok} 6E AX211 160MHz</code> ohne St{o_uml}rung.</p>\n\
+  <p>Dienstbefehl: <code>{ps_stop} WinRM; {ps_set} WinRM -StartupType Disabled</code>.</p>\n\
+  <p>Systemwartung: <code>DISM /Online {cli_clean} /RestoreHealth</code> abschlie{sz_ch}en.</p>\n\
+  <pre><code>\n\
+{ps_evt} -LogName System\n\
+{ps_rst} -Force\n\
+  </code></pre>\n\
+  <p>Auch im Flie{sz_ch}text sind {wifi_tok}, {ps_stop}, {ps_set}, {cli_clean} und {cli_dry} erlaubt.</p>\n\
+</body>\n\
+</html>\n",
+        css_hdr = concat!("Report", "-Header"),
+        ps_script = concat!("Enable", "-Feature"),
+        cmt_tag = concat!("Auto", "-Comment"),
+        u_word = concat!("ue", "ber"),
+        p_word = concat!("prue", "fen"),
+        attr_cls = concat!("Auto", "-Box"),
+        wifi_tok = concat!("Wi", "-Fi"),
+        ps_stop = concat!("Stop", "-Service"),
+        ps_set = concat!("Set", "-Service"),
+        ps_evt = concat!("Get", "-WinEvent"),
+        ps_rst = concat!("Restart", "-Computer"),
+        cli_clean = concat!("/Cleanup", "-Image"),
+        cli_dry = concat!("--Dry", "-Run"),
+        u_uml = "\u{00fc}",
+        o_uml = "\u{00f6}",
+        sz_ch = "\u{00df}",
+    );
+    let clean_v = check_german_prose_style(&clean_html, "report.html");
+    assert!(
+        clean_v.is_empty(),
+        "Valid German HTML report with code blocks, wireless LAN tokens, PowerShell cmdlets, and CLI switches must pass: {clean_v:?}"
+    );
+
+    let bad_html = format!(
+        "<p>Dieser {bad_tok} muss erkannt werden, weil ein Deppenbindestrich vorliegt.</p>",
+        bad_tok = concat!("Auto", "-", "Modus"),
+    );
+    let bad_v = check_german_prose_style(&bad_html, "report.html");
+    assert_eq!(
+        bad_v.len(),
+        1,
+        "Expected real German Deppenbindestrich outside <code> in HTML prose to be flagged: {bad_v:?}"
+    );
+    assert_eq!(bad_v[0].rule, "german-deppenbindestrich");
+
+    let dual_ps_german = format!(
+        "<p>Dieser {test_tok} ist nicht zul{a_uml}ssig.</p>",
+        test_tok = concat!("Test", "-", "Laufzeit"),
+        a_uml = "\u{00e4}",
+    );
+    let dual_v = check_german_prose_style(&dual_ps_german, "report.html");
+    assert!(
+        dual_v.iter().any(|v| v.rule == "german-deppenbindestrich"),
+        "German compound noun with 'Test-' + German root must still be flagged: {dual_v:?}"
+    );
+}
+
+#[test]
+fn pulse_suppresses_single_word_global_skill_fillers_and_admin_ui_reflex_false_positives() {
+    let base = temp_test_dir("pulse_v221_noise");
+    let gdb = Arc::new(LibreDb::open(&base.join("global.ldb")).unwrap());
+    let pdb = Arc::new(LibreDb::open(&base.join("project.ldb")).unwrap());
+
+    gdb.put(
+        WriteRequest::new(
+            NodeKind::Rule,
+            b"Always verify Winlogon, LogonUI, Credential Provider, and display driver event logs on Windows 11 25H2 systems.".to_vec(),
+        )
+        .with_key("local-admin")
+        .with_importance(240),
+    )
+    .unwrap();
+
+    for (key, body) in [
+        (
+            "flutter-build-responsive-layout::Layout Provider",
+            "[flutter-build-responsive-layout > Layout Provider]\nUse MediaQuery and LayoutBuilder Provider widgets.",
+        ),
+        (
+            "gcp-managed-airflow-migrations::Provider Policy",
+            "[gcp-managed-airflow-migrations > Provider Policy]\nConfigure Airflow Provider Policy roles for GCP Composer.",
+        ),
+        (
+            "firebase-auth-basics::Credential Provider",
+            "[firebase-auth-basics > Credential Provider]\nConfigure OAuth Credential Provider in Firebase Console.",
+        ),
+        (
+            "federate-lakehouse-catalog::Governance Policy",
+            "[federate-lakehouse-catalog > Governance Policy]\nDatabricks Lakehouse Unity Catalog Provider setup.",
+        ),
+        (
+            "a11y-debugging::Screen Report",
+            "[a11y-debugging > Screen Report]\nInspect ARIA roles and Screen Report output.",
+        ),
+    ] {
+        gdb.put(
+            WriteRequest::new(NodeKind::SkillSection, body.as_bytes().to_vec())
+                .with_key(key)
+                .with_importance(210),
+        )
+        .unwrap();
+    }
+
+    ReflexEngine::learn_reflex(
+        &gdb,
+        &ReflexRule {
+            id: "windows-fluent-app-design".to_owned(),
+            stack_any: vec!["winui".to_owned(), "egui".to_owned(), "fluent 2".to_owned()],
+            action_any: vec!["ui".to_owned(), "layout".to_owned(), "design".to_owned()],
+            exclude_any: vec![
+                "winlogon".to_owned(),
+                "logonui".to_owned(),
+                "credential provider".to_owned(),
+                "taskmanager".to_owned(),
+                "grafiktreiber".to_owned(),
+            ],
+            env_or_error_any: Vec::new(),
+            directive: "Apply Fluent 2 / native UI guidelines cleanly.".to_owned(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    // Separate rule testing word-boundary matching for short/ambiguous tokens (`ui`, `window`)
+    // without `exclude_any`: neither `"LogonUI"` (`"ui"`) nor `"Windows"` (`"window"`) may match.
+    ReflexEngine::learn_reflex(
+        &gdb,
+        &ReflexRule {
+            id: "word-boundary-ui-guard".to_owned(),
+            stack_any: vec!["window".to_owned()],
+            action_any: vec!["ui".to_owned()],
+            env_or_error_any: Vec::new(),
+            directive: "Window UI boundary rule.".to_owned(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    {
+        let mut cog = CognitiveEngine::open_db(Arc::clone(&gdb)).unwrap();
+        cog.save_index_snapshot().unwrap();
+    }
+
+    let brain = OverlayBrain::open(Some(gdb), pdb).unwrap();
+    let admin_req = PulseRequest::new(
+        "25H2 Windows 11 notebook Winlogon LogonUI Taskmanager Grafiktreiber Credential Provider",
+        1200,
+    );
+    let admin_resp = brain.pulse(&admin_req).unwrap();
+
+    assert!(
+        !admin_resp
+            .fired_reflexes
+            .iter()
+            .any(|r| r.id == "windows-fluent-app-design" || r.id == "word-boundary-ui-guard"),
+        "OS diagnostic query must never trigger UI design reflexes: {:?}",
+        admin_resp.fired_reflexes
+    );
+    let keys: Vec<String> = admin_resp
+        .capsules
+        .iter()
+        .filter_map(|c| c.key.clone())
+        .collect();
+    assert!(
+        keys.iter().any(|k| k == "global::local-admin"),
+        "Expected matching admin rule 'global::local-admin' in capsules: {keys:?}"
+    );
+    for noisy_prefix in [
+        "flutter-build-responsive-layout",
+        "gcp-managed-airflow-migrations",
+        "firebase-auth-basics",
+        "federate-lakehouse-catalog",
+        "a11y-debugging",
+    ] {
+        assert!(
+            !keys
+                .iter()
+                .any(|k| k.strip_prefix("global::").unwrap_or(k).starts_with(noisy_prefix)),
+            "Single-word unrelated global skill filler '{noisy_prefix}' must be suppressed: {keys:?}"
+        );
+    }
+
+    // Genuine UI design query still fires the reflex cleanly.
+    let mut ui_req = PulseRequest::new("Build a WinUI Fluent 2 toolbar UI layout", 1200);
+    ui_req.conversation_id = Some("conv-ui-real".to_owned());
+    let ui_resp = brain.pulse(&ui_req).unwrap();
+    assert!(
+        ui_resp
+            .fired_reflexes
+            .iter()
+            .any(|r| r.id == "windows-fluent-app-design"),
+        "Genuine UI design query must still fire windows-fluent-app-design: {:?}",
+        ui_resp.fired_reflexes
+    );
+
+    // Explicit framework query still resolves the explicitly requested skill.
+    let mut flutter_req = PulseRequest::new("flutter", 600);
+    flutter_req.conversation_id = Some("conv-flutter".to_owned());
+    let flutter_resp = brain.pulse(&flutter_req).unwrap();
+    assert!(
+        flutter_resp.capsules.iter().any(|c| {
+            c.key.as_deref().is_some_and(|k| {
+                k.strip_prefix("global::")
+                    .unwrap_or(k)
+                    .starts_with("flutter-build-responsive-layout")
+            })
+        }),
+        "Explicit single-word skill query 'flutter' must still retrieve flutter skill: {:?}",
+        flutter_resp.capsules
+    );
+
+    let _ = fs::remove_dir_all(&base);
 }

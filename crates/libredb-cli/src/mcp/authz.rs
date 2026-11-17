@@ -68,7 +68,9 @@ pub(crate) fn resolve_canonical_workspace_lock_root(
 pub(super) fn find_owning_repo_or_agents_ancestor(start_dir: &Path) -> Option<PathBuf> {
     let mut curr = Some(start_dir);
     while let Some(c) = curr {
-        if crate::security::is_forbidden_mcp_workspace_root(c) {
+        if crate::security::is_forbidden_mcp_workspace_root(c)
+            || crate::security::is_private_brain_workspace(c)
+        {
             break;
         }
         if c.join(".agents").is_dir() || c.join(".git").exists() {
@@ -613,7 +615,9 @@ impl McpServerState {
         let (db_path, cache_key) =
             if let Some(ws_root) = workspace_root_from_agents_ldb(&candidate_path) {
                 if crate::security::is_private_brain_workspace(&ws_root) {
-                    (candidate_path, candidate_cache_key)
+                    let eph_path = self.ephemeral_workspace_ldb_path(&ws_root)?;
+                    let eph_key = canonical_brain_cache_key(&eph_path);
+                    (eph_path, eph_key)
                 } else {
                     match self.authorize_mcp_workspace_path(&ws_root, false) {
                         Ok(auth_root) => {

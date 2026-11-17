@@ -190,7 +190,11 @@ impl OverlayBrain {
         }
         let glob_peak = glob_cands.iter().map(|c| c.score).fold(0.0_f64, f64::max);
         let glob_floor = (glob_peak * 0.35).max(0.80);
-        glob_cands.retain(|c| c.score >= glob_floor || c.via_bridge);
+        glob_cands.retain(|c| {
+            (c.score >= glob_floor
+                && global_skill_passes_specificity_gate(c, &query_low, &ws_markers))
+                || c.via_bridge
+        });
 
         // Normalize project BM25 scores onto the global corpus scale so a large global store
         // (high IDF) never starves project-local capsules (lower IDF) before budget reservation.
@@ -281,10 +285,23 @@ impl OverlayBrain {
             }
         }
 
-        // Phase 3c: Fill remaining budget across all unselected candidates in original score order.
+        // Phase 3c: Fill remaining budget across unselected high-signal candidates in score order.
+        let fill_skill_floor = (glob_peak * 0.55).max(1.35);
         let mut any_picked = picked.iter().any(|&p| p);
-        for (idx, (_, cand)) in fresh.iter().enumerate() {
+        for (idx, (is_global, cand)) in fresh.iter().enumerate() {
             if picked[idx] {
+                continue;
+            }
+            if *is_global
+                && (any_picked || !fired_reflexes.is_empty())
+                && matches!(
+                    cand.kind,
+                    libredb_core::NodeKind::Skill | libredb_core::NodeKind::SkillSection
+                )
+                && !cand.via_bridge
+                && cand.score < fill_skill_floor
+                && cand.matched_term_count < 2
+            {
                 continue;
             }
             let tok = cand.token_count.max(1);
@@ -382,6 +399,158 @@ impl OverlayBrain {
 
 /// Attenuates global skill hits belonging to an unrelated framework stack when workspace markers
 /// establish the active project stack and the query did not ask for that stack.
+fn has_exact_alpha_tok(hay: &str, needle: &str) -> bool {
+    hay.split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|tok| tok == needle)
+}
+
+fn marker_matches_any(ws_markers: &[String], needles: &[&str]) -> bool {
+    ws_markers
+        .iter()
+        .any(|m| needles.iter().any(|n| m == n || m.contains(n)))
+}
+
+fn skill_matches_active_workspace_stack(skill_name: &str, ws_markers: &[String]) -> bool {
+    if ws_markers.is_empty() || skill_name.is_empty() {
+        return false;
+    }
+    let m = |needles: &[&str]| marker_matches_any(ws_markers, needles);
+    if skill_name.starts_with("libredb") {
+        return m(&["cargo.toml", ".agents"]);
+    }
+    if skill_name.contains("flutter")
+        || has_exact_alpha_tok(skill_name, "dart")
+        || skill_name.starts_with("dart-")
+        || skill_name.starts_with("dart_")
+    {
+        return m(&["pubspec.yaml", "pubspec.lock", ".dart_tool", ".flutter"]);
+    }
+    if skill_name.starts_with("chrome-extension") || skill_name.contains("chrome_extension") {
+        return m(&["manifest.json"]);
+    }
+    if skill_name.starts_with("android") || has_exact_alpha_tok(skill_name, "android") {
+        return m(&[
+            "androidmanifest.xml",
+            "build.gradle",
+            "build.gradle.kts",
+            "settings.gradle",
+            "settings.gradle.kts",
+            "gradlew",
+        ]);
+    }
+    if skill_name.starts_with("apple-hig") || skill_name.starts_with("xcode") {
+        return m(&[
+            ".xcodeproj",
+            ".xcworkspace",
+            "package.swift",
+            "podfile",
+            "info.plist",
+            "project.pbxproj",
+        ]);
+    }
+    if skill_name.starts_with("linux-desktop-hig") {
+        return m(&[
+            "meson.build",
+            "cmakelists.txt",
+            "flatpak",
+            ".desktop",
+            "org.gnome",
+            "org.kde",
+        ]);
+    }
+    if skill_name.starts_with("windows-app-design") {
+        return m(&[".sln", ".csproj", ".vcxproj", "appxmanifest.xml"])
+            || (m(&["cargo.toml"])
+                && !m(&[
+                    ".xcodeproj",
+                    ".xcworkspace",
+                    "package.swift",
+                    "androidmanifest.xml",
+                    "build.gradle",
+                    "meson.build",
+                    "flatpak",
+                ]));
+    }
+    if skill_name.contains("firebase") || skill_name.contains("firestore") {
+        return m(&["firebase.json", ".firebaserc"]);
+    }
+    if skill_name.contains("databricks")
+        || skill_name.contains("lakehouse")
+        || skill_name.contains("snowflake")
+    {
+        return m(&["databricks.yml", "dbt_project.yml"]);
+    }
+    if skill_name.contains("airflow") || skill_name.starts_with("gcp") {
+        return m(&["airflow.cfg", "dags"]);
+    }
+    if skill_name.contains("react")
+        || skill_name.contains("nextjs")
+        || skill_name.contains("next-js")
+        || has_exact_alpha_tok(skill_name, "vue")
+        || skill_name.contains("angular")
+        || skill_name.contains("tailwind")
+        || has_exact_alpha_tok(skill_name, "a11y")
+    {
+        return m(&[
+            "package.json",
+            "next.config",
+            "vite.config",
+            "angular.json",
+            "tailwind.config",
+        ]);
+    }
+    if skill_name.contains("terraform")
+        || skill_name.contains("kubernetes")
+        || has_exact_alpha_tok(skill_name, "helm")
+    {
+        return m(&[".tf", "chart.yaml", "kustomization.yaml", "helmfile.yaml"]);
+    }
+    false
+}
+
+fn global_skill_passes_specificity_gate(
+    c: &crate::ScoredInodeCandidate,
+    query_low: &str,
+    ws_markers: &[String],
+) -> bool {
+    if c.via_bridge
+        || !matches!(
+            c.kind,
+            libredb_core::NodeKind::Skill | libredb_core::NodeKind::SkillSection
+        )
+    {
+        return true;
+    }
+    let raw_key = c.key.as_deref().unwrap_or("");
+    let skill_name = raw_key
+        .split_once("::")
+        .map_or(raw_key, |(head, _)| head)
+        .trim()
+        .to_ascii_lowercase();
+    if skill_matches_active_workspace_stack(&skill_name, ws_markers) {
+        return true;
+    }
+    if c.matched_term_count >= 2 && c.score >= 1.20 {
+        return true;
+    }
+    if c.matched_term_count >= 1 && c.score >= 1.00 && !skill_name.is_empty() {
+        let skill_named_in_query = skill_name
+            .split(|ch: char| !ch.is_ascii_alphanumeric())
+            .filter(|tok| {
+                tok.len() >= 3
+                    && !matches!(
+                        *tok,
+                        "design" | "guide" | "app" | "basics" | "build" | "catalog" | "managed"
+                    )
+            })
+            .any(|tok| has_exact_alpha_tok(query_low, tok));
+        if skill_named_in_query {
+            return true;
+        }
+    }
+    false
+}
+
 fn foreign_skill_stack_multiplier(
     kind: libredb_core::NodeKind,
     key_opt: Option<&str>,
@@ -391,8 +560,7 @@ fn foreign_skill_stack_multiplier(
     if !matches!(
         kind,
         libredb_core::NodeKind::Skill | libredb_core::NodeKind::SkillSection
-    ) || ws_markers.is_empty()
-    {
+    ) {
         return 1.0;
     }
     let Some(raw_key) = key_opt else {
@@ -403,15 +571,8 @@ fn foreign_skill_stack_multiplier(
         .map_or(raw_key, |(head, _)| head)
         .trim()
         .to_ascii_lowercase();
-    let has_exact_tok = |hay: &str, needle: &str| {
-        hay.split(|c: char| !c.is_ascii_alphanumeric())
-            .any(|tok| tok == needle)
-    };
-    let marker_has = |needles: &[&str]| {
-        ws_markers
-            .iter()
-            .any(|m| needles.iter().any(|n| m == n || m.contains(n)))
-    };
+    let has_exact_tok = has_exact_alpha_tok;
+    let marker_has = |needles: &[&str]| marker_matches_any(ws_markers, needles);
 
     if skill_name.contains("flutter")
         || has_exact_tok(&skill_name, "dart")
@@ -502,7 +663,101 @@ fn foreign_skill_stack_multiplier(
         }
     }
 
-    if skill_name.starts_with("windows-app-design") {
+    if skill_name.contains("firebase") || skill_name.contains("firestore") {
+        let q_wants = query_low.contains("firebase") || query_low.contains("firestore");
+        let ws_uses = marker_has(&["firebase.json", ".firebaserc"]);
+        if !q_wants && !ws_uses {
+            return 0.25;
+        }
+    }
+
+    if skill_name.contains("gcp")
+        || skill_name.contains("airflow")
+        || skill_name.contains("bigquery")
+    {
+        let q_wants = has_exact_tok(query_low, "gcp")
+            || query_low.contains("airflow")
+            || query_low.contains("bigquery")
+            || query_low.contains("google cloud")
+            || query_low.contains("dataflow");
+        let ws_uses = marker_has(&["airflow.cfg", "dags"]);
+        if !q_wants && !ws_uses {
+            return 0.25;
+        }
+    }
+
+    if skill_name.contains("databricks")
+        || skill_name.contains("lakehouse")
+        || skill_name.contains("snowflake")
+    {
+        let q_wants = query_low.contains("databricks")
+            || query_low.contains("lakehouse")
+            || query_low.contains("snowflake")
+            || query_low.contains("unity catalog")
+            || query_low.contains("iceberg")
+            || query_low.contains("delta lake");
+        let ws_uses = marker_has(&["databricks.yml", "dbt_project.yml"]);
+        if !q_wants && !ws_uses {
+            return 0.25;
+        }
+    }
+
+    if has_exact_tok(&skill_name, "a11y") {
+        let q_wants = has_exact_tok(query_low, "a11y")
+            || query_low.contains("accessibility")
+            || query_low.contains("wcag")
+            || has_exact_tok(query_low, "aria")
+            || query_low.contains("screenreader")
+            || query_low.contains("screen reader")
+            || query_low.contains("talkback")
+            || query_low.contains("voiceover");
+        let ws_uses = marker_has(&["package.json", "pubspec.yaml", "androidmanifest.xml"]);
+        if !q_wants && !ws_uses {
+            return 0.25;
+        }
+    }
+
+    if skill_name.contains("react")
+        || skill_name.contains("nextjs")
+        || skill_name.contains("next-js")
+        || has_exact_tok(&skill_name, "vue")
+        || skill_name.contains("angular")
+        || skill_name.contains("tailwind")
+    {
+        let q_wants = query_low.contains("react")
+            || query_low.contains("nextjs")
+            || query_low.contains("next.js")
+            || has_exact_tok(query_low, "vue")
+            || query_low.contains("angular")
+            || query_low.contains("tailwind");
+        let ws_uses = marker_has(&[
+            "package.json",
+            "next.config",
+            "vite.config",
+            "angular.json",
+            "tailwind.config",
+        ]);
+        if !q_wants && !ws_uses {
+            return 0.25;
+        }
+    }
+
+    if skill_name.contains("kubernetes")
+        || has_exact_tok(&skill_name, "k8s")
+        || has_exact_tok(&skill_name, "helm")
+        || skill_name.contains("terraform")
+    {
+        let q_wants = query_low.contains("kubernetes")
+            || has_exact_tok(query_low, "k8s")
+            || has_exact_tok(query_low, "helm")
+            || query_low.contains("terraform");
+        let ws_uses = marker_has(&[".tf", "chart.yaml", "kustomization.yaml", "helmfile.yaml"]);
+        if !q_wants && !ws_uses {
+            return 0.25;
+        }
+    }
+
+    if skill_name.starts_with("windows-app-design") && !ws_markers.is_empty() {
         let q_wants = query_low.contains("windows")
             || query_low.contains("winui")
             || query_low.contains("fluent")

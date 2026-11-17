@@ -201,7 +201,16 @@ pub fn workspace_id_config_key(norm: &str) -> String {
 pub fn is_private_brain_workspace(ws_root: &Path) -> bool {
     let norm = normalize_workspace_key(ws_root);
     let home_norm = normalize_workspace_key(&user_home_dir());
-    norm.starts_with(&format!("{home_norm}/.gemini/")) && norm.contains("/brain/")
+    if norm.starts_with(&format!("{home_norm}/.gemini/")) && norm.contains("/brain/") {
+        return true;
+    }
+    [
+        "/.gemini/antigravity/brain/",
+        "/.gemini/antigravity-ide/brain/",
+        "/.gemini/antigravity-cli/brain/",
+    ]
+    .iter()
+    .any(|pat| norm.contains(pat) || norm.ends_with(pat.trim_end_matches('/')))
 }
 
 

@@ -69,6 +69,9 @@ pub struct ReflexRule {
     /// Optional specialized conjunctive context tags: ALL tags must appear in the combined context.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub context_tags: Vec<String>,
+    /// Optional negative context tags: if any matches `env`/`query`/`error` context, this reflex is suppressed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude_any: Vec<String>,
     /// Optional IDs of older reflexes overridden in matching contexts when this reflex remains viable.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub supersedes: Vec<String>,
@@ -414,10 +417,20 @@ impl ReflexEngine {
                 }
             }
 
+            let excluded = !rule.exclude_any.is_empty()
+                && rule
+                    .exclude_any
+                    .iter()
+                    .any(|ex| reflex_keyword_matches(&env_combined, &ex.to_lowercase()));
+            if excluded {
+                continue;
+            }
+
             let stack_ok = rule.stack_any.is_empty()
                 || rule.stack_any.iter().any(|s| {
                     let sl = s.to_lowercase();
-                    markers.iter().any(|m| m.contains(&sl)) || q_low.contains(&sl)
+                    markers.iter().any(|m| reflex_keyword_matches(m, &sl))
+                        || reflex_keyword_matches(&q_low, &sl)
                 });
             if !stack_ok {
                 continue;
@@ -426,7 +439,7 @@ impl ReflexEngine {
             let action_matched = !rule.action_any.is_empty()
                 && rule.action_any.iter().any(|a| {
                     let al = a.to_lowercase();
-                    q_low.contains(&al) || err_low.contains(&al)
+                    reflex_keyword_matches(&q_low, &al) || reflex_keyword_matches(&err_low, &al)
                 });
             // Learned error pitfalls fire on direct error recurrence regardless of which CLI/build
             // verb (`build`, `test`, `pulse`) surfaced the error, reserving `action_any` for pure proactive runs.
@@ -435,7 +448,7 @@ impl ReflexEngine {
                 && rule
                     .env_or_error_any
                     .iter()
-                    .any(|e| err_low.contains(&e.to_lowercase()));
+                    .any(|e| reflex_keyword_matches(&err_low, &e.to_lowercase()));
             let action_ok = rule.action_any.is_empty() || action_matched || pitfall_error_override;
             if !action_ok {
                 continue;
@@ -445,7 +458,7 @@ impl ReflexEngine {
                 || rule
                     .env_or_error_any
                     .iter()
-                    .any(|e| env_combined.contains(&e.to_lowercase()));
+                    .any(|e| reflex_keyword_matches(&env_combined, &e.to_lowercase()));
             if !env_ok {
                 continue;
             }
@@ -454,7 +467,7 @@ impl ReflexEngine {
                 || rule
                     .context_tags
                     .iter()
-                    .all(|ct| env_combined.contains(&ct.to_lowercase()));
+                    .all(|ct| reflex_keyword_matches(&env_combined, &ct.to_lowercase()));
             if !context_ok {
                 continue;
             }
@@ -571,6 +584,19 @@ impl ReflexEngine {
         });
         fired
     }
+}
+
+fn reflex_keyword_matches(haystack_low: &str, kw_low: &str) -> bool {
+    let kw = kw_low.trim();
+    if kw.is_empty() {
+        return false;
+    }
+    if kw == "window" || (kw.len() <= 3 && kw.bytes().all(|b| b.is_ascii_alphanumeric())) {
+        return haystack_low
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|tok| tok == kw);
+    }
+    haystack_low.contains(kw)
 }
 
 fn load_utility_book(db: &LibreDb) -> ReflexUtilityBook {

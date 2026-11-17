@@ -169,6 +169,8 @@ pub struct ScoredInodeCandidate {
     /// `true` if the candidate was surfaced by a calibrated learned bridge (`BridgeScorer`), which
     /// carries its own absolute acceptance threshold and is exempt from relative peak floors.
     pub via_bridge: bool,
+    /// Distinct query terms matched in `HybridIndex::search` (or inherited from direct parent seed).
+    pub matched_term_count: usize,
 }
 
 /// Ranked `NodeKind::SkillSection` capsule returned by `CognitiveEngine::slice_skill_sections`.
@@ -266,6 +268,7 @@ impl CognitiveEngine {
                     key: None,
                     score: sym_score,
                     matched_features: Vec::new(),
+                    matched_query_terms: 0,
                 });
             }
         }
@@ -287,6 +290,7 @@ impl CognitiveEngine {
                         key: None,
                         score: bridge_score,
                         matched_features: Vec::new(),
+                        matched_query_terms: 0,
                     });
                 }
             }
@@ -304,12 +308,17 @@ impl CognitiveEngine {
             ),
         > = HashMap::with_capacity(64);
         let mut energy_map: HashMap<u64, f64> = HashMap::with_capacity(64);
+        let mut term_count_map: HashMap<u64, usize> = HashMap::with_capacity(64);
         let mut queue: VecDeque<(u64, usize, f64)> = VecDeque::with_capacity(64);
 
         for hit in &lexical_hits {
             if let Some(meta) = self.db.get_inode_meta(hit.node_id) {
                 meta_cache.insert(hit.node_id, meta);
                 energy_map.insert(hit.node_id, hit.score);
+                term_count_map
+                    .entry(hit.node_id)
+                    .and_modify(|c| *c = (*c).max(hit.matched_query_terms))
+                    .or_insert(hit.matched_query_terms);
                 queue.push_back((hit.node_id, 0, hit.score));
             }
         }
@@ -318,6 +327,7 @@ impl CognitiveEngine {
             if hop >= 2 || energy < 0.25 {
                 continue;
             }
+            let curr_terms = term_count_map.get(&curr_id).copied().unwrap_or(0);
             let syns = match meta_cache.get(&curr_id) {
                 Some((_, _, s)) => s.clone(),
                 None => continue,
@@ -354,6 +364,12 @@ impl CognitiveEngine {
                                 *slot = next_e;
                                 queue.push_back((syn.target_id, hop + 1, next_e));
                             }
+                            if curr_terms > 0 {
+                                term_count_map
+                                    .entry(syn.target_id)
+                                    .and_modify(|c| *c = (*c).max(curr_terms))
+                                    .or_insert(curr_terms);
+                            }
                         }
                     }
                 }
@@ -378,6 +394,7 @@ impl CognitiveEngine {
                     token_count: ino.token_count.max(1),
                     score: score * kind_mult,
                     via_bridge: bridged_ids.contains(&nid),
+                    matched_term_count: term_count_map.get(&nid).copied().unwrap_or(0),
                 })
             })
             .collect();
@@ -602,6 +619,7 @@ impl CognitiveEngine {
                                 key: Some(k),
                                 score: 1.0,
                                 matched_features: Vec::new(),
+                                matched_query_terms: 0,
                             });
                         }
                     }
