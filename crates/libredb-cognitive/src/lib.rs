@@ -171,6 +171,8 @@ pub struct ScoredInodeCandidate {
     pub via_bridge: bool,
     /// Distinct query terms matched in `HybridIndex::search` (or inherited from direct parent seed).
     pub matched_term_count: usize,
+    /// Distinct normalized query tokens directly matched by this candidate in `HybridIndex::search`.
+    pub matched_query_tokens: Vec<String>,
 }
 
 /// Ranked `NodeKind::SkillSection` capsule returned by `CognitiveEngine::slice_skill_sections`.
@@ -257,6 +259,13 @@ impl CognitiveEngine {
             NodeKind::Handoff,
         ];
         let mut lexical_hits = self.index.search(query, Some(&searchable_kinds), 24);
+        lexical_hits.retain(|hit| {
+            !matches!(hit.kind, NodeKind::Skill | NodeKind::SkillSection)
+                || hit
+                    .matched_query_tokens
+                    .iter()
+                    .any(|tok| !overlay::is_generic_skill_collision_token(tok))
+        });
         if lexical_hits.is_empty() {
             // Fallback for pure code-symbol queries when no prose capsule matched:
             // match active `NodeKind::Symbol` keys directly in RAM (`0` disk I/O, `0` index bloat).
@@ -269,6 +278,7 @@ impl CognitiveEngine {
                     score: sym_score,
                     matched_features: Vec::new(),
                     matched_query_terms: 0,
+                    matched_query_tokens: Vec::new(),
                 });
             }
         }
@@ -291,6 +301,7 @@ impl CognitiveEngine {
                         score: bridge_score,
                         matched_features: Vec::new(),
                         matched_query_terms: 0,
+                        matched_query_tokens: Vec::new(),
                     });
                 }
             }
@@ -309,9 +320,10 @@ impl CognitiveEngine {
         > = HashMap::with_capacity(64);
         let mut energy_map: HashMap<u64, f64> = HashMap::with_capacity(64);
         let mut term_count_map: HashMap<u64, usize> = HashMap::with_capacity(64);
+        let mut matched_tokens_map: HashMap<u64, Vec<String>> = HashMap::with_capacity(64);
         let mut queue: VecDeque<(u64, usize, f64)> = VecDeque::with_capacity(64);
 
-        for hit in &lexical_hits {
+        for hit in lexical_hits {
             if let Some(meta) = self.db.get_inode_meta(hit.node_id) {
                 meta_cache.insert(hit.node_id, meta);
                 energy_map.insert(hit.node_id, hit.score);
@@ -319,6 +331,12 @@ impl CognitiveEngine {
                     .entry(hit.node_id)
                     .and_modify(|c| *c = (*c).max(hit.matched_query_terms))
                     .or_insert(hit.matched_query_terms);
+                let tok_slot = matched_tokens_map.entry(hit.node_id).or_default();
+                for tok in hit.matched_query_tokens {
+                    if !tok_slot.contains(&tok) {
+                        tok_slot.push(tok);
+                    }
+                }
                 queue.push_back((hit.node_id, 0, hit.score));
             }
         }
@@ -364,7 +382,12 @@ impl CognitiveEngine {
                                 *slot = next_e;
                                 queue.push_back((syn.target_id, hop + 1, next_e));
                             }
-                            if curr_terms > 0 {
+                            if curr_terms > 0
+                                && !matches!(
+                                    target_ino.kind,
+                                    NodeKind::Skill | NodeKind::SkillSection
+                                )
+                            {
                                 term_count_map
                                     .entry(syn.target_id)
                                     .and_modify(|c| *c = (*c).max(curr_terms))
@@ -395,6 +418,7 @@ impl CognitiveEngine {
                     score: score * kind_mult,
                     via_bridge: bridged_ids.contains(&nid),
                     matched_term_count: term_count_map.get(&nid).copied().unwrap_or(0),
+                    matched_query_tokens: matched_tokens_map.remove(&nid).unwrap_or_default(),
                 })
             })
             .collect();
@@ -620,6 +644,7 @@ impl CognitiveEngine {
                                 score: 1.0,
                                 matched_features: Vec::new(),
                                 matched_query_terms: 0,
+                                matched_query_tokens: Vec::new(),
                             });
                         }
                     }

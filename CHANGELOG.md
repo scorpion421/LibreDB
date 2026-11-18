@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.3] - 2026-11-18
+
+### Fixed
+- **Strict domain specificity and graph-hop isolation for global skill recall (`libredb_pulse`, `libredb pulse`)**: Prevents unrelated global skill guides (such as Antigravity SDK, MCP, or mobile UI documentation) from matching everyday IT, server, certificate, or network questions solely via ubiquitous technical words (`https`, `server`, `config`, `json`) or parent-to-section graph activation. Global skills now require genuine non-generic domain-term overlap and matching intent for UI design or framework guides, non-workspace CLI `pulse` calls isolate the global store instead of duplicating it as project-local memory, and explicit skill or UI design queries still retrieve the right documentation on demand.
+
+### Changed
+- **Automatic cleanup of legacy external skill catalogs during global upgrades (`libredb modernize-global`, `libredb install`, `libredb update`, `deploy_plugin`)**: Deprecates legacy `SkillsDB v1` bulk-imported third-party catalog and built-in Antigravity guides in a single atomic batch and compacts `customizations.ldb`, eliminating ~2,900 redundant skill sections from the index while strictly preserving `libredb`, core administrative and credential safety skills, custom user or organization skills synced via `libredb sync-skill`, and the four platform UI design skills in `Personal` profiles.
+
 ## [2.4.2] - 2026-11-18
 
 ### Changed

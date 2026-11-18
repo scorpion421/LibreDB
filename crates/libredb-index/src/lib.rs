@@ -37,6 +37,9 @@ pub struct SearchHit {
     /// Distinct normalized query terms (`word_postings`) that contributed to this hit.
     #[serde(default)]
     pub matched_query_terms: usize,
+    /// Distinct normalized query tokens that contributed to this hit.
+    #[serde(default)]
+    pub matched_query_tokens: Vec<String>,
 }
 
 /// Persisted Hebbian association map for a single learned cue token (`hebbian::<cue_token>`).
@@ -463,10 +466,17 @@ impl HybridIndex {
 
         let mut weighted_words: HashMap<String, f64> = HashMap::new();
         let mut distinct_q_idx: HashMap<String, usize> = HashMap::new();
+        let mut distinct_q_tokens: Vec<String> = Vec::new();
         let mut term_q_indices: HashMap<String, Vec<usize>> = HashMap::new();
         for tok in &q_tokens {
-            let next_id = distinct_q_idx.len();
-            let q_idx = *distinct_q_idx.entry(tok.clone()).or_insert(next_id);
+            let q_idx = if let Some(&existing) = distinct_q_idx.get(tok) {
+                existing
+            } else {
+                let next_id = distinct_q_tokens.len();
+                distinct_q_tokens.push(tok.clone());
+                distinct_q_idx.insert(tok.clone(), next_id);
+                next_id
+            };
             weighted_words.insert(tok.clone(), 1.0);
             let direct_list = term_q_indices.entry(tok.clone()).or_default();
             if !direct_list.contains(&q_idx) {
@@ -592,13 +602,24 @@ impl HybridIndex {
                 }
                 let meta = self.docs.get(&nid)?;
                 let imp_factor = 0.85 + (meta.importance as f64 / 255.0) * 0.40;
+                let mut q_indices: Vec<usize> = matched_terms
+                    .remove(&nid)
+                    .map(|set| set.into_iter().collect())
+                    .unwrap_or_default();
+                q_indices.sort_unstable();
+                let matched_query_terms = q_indices.len();
+                let matched_query_tokens = q_indices
+                    .into_iter()
+                    .filter_map(|qi| distinct_q_tokens.get(qi).cloned())
+                    .collect();
                 Some(SearchHit {
                     node_id: nid,
                     kind: meta.kind,
                     key: meta.key.clone(),
                     score: raw_score * imp_factor,
                     matched_features: features.remove(&nid).unwrap_or_default(),
-                    matched_query_terms: matched_terms.get(&nid).map_or(0, HashSet::len),
+                    matched_query_terms,
+                    matched_query_tokens,
                 })
             })
             .collect();

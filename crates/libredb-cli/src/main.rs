@@ -37,6 +37,137 @@ const PERSONAL_DESIGN_SKILL_NAMES: [&str; 4] = [
     "linux-desktop-hig-design",
 ];
 
+// Explicit legacy catalog and Antigravity builtin skills imported from `SkillsDB v1` that bloat
+// `customizations.ldb` and trigger false-positive skill matches on unrelated IT queries. Custom user
+// or organization skills synced via `libredb sync-skill`, plus `libredb` and core safety skills
+// (`accidental-data-loss-prevention`, `admin-elevation`, `credentials`), are strictly preserved.
+const LEGACY_V1_IMPORTED_CATALOG_SKILLS: &[&str] = &[
+    "a11y-debugging",
+    "agy-customizations",
+    "alphafold-database-fetch-and-analyze",
+    "alphagenome-atlas-website-links",
+    "alphagenome-single-variant-analysis",
+    "alphagenome-variant-impact-score",
+    "android-cli",
+    "antigravity-guide",
+    "automation",
+    "bigquery-ai-ml",
+    "bigquery-bigframes",
+    "bigquery-data-transfer-service",
+    "bigquery-graph",
+    "bigquery-sql",
+    "building-data-apps",
+    "chembl-database",
+    "chrome-devtools",
+    "chrome-extensions",
+    "clinical-trials-database",
+    "clinvar-database",
+    "customizations-db",
+    "dart-add-unit-test",
+    "dart-build-cli-app",
+    "dart-collect-coverage",
+    "dart-fix-runtime-errors",
+    "dart-generate-test-mocks",
+    "dart-migrate-to-checks-package",
+    "dart-resolve-package-conflicts",
+    "dart-run-static-analysis",
+    "dart-setup-ffi-assets",
+    "dart-use-ffigen",
+    "dart-use-pattern-matching",
+    "dart-use-primary-constructors",
+    "dart-write-documentation",
+    "data-autocleaning",
+    "dataform-bigquery",
+    "dbsnp-database",
+    "dbt-bigquery",
+    "debug-optimize-lcp",
+    "discovering-gcp-data-assets",
+    "embl-ebi-ols",
+    "encode-ccres-database",
+    "enforcing-resource-attribution",
+    "ensembl-database",
+    "federate-lakehouse-catalog",
+    "firebase-ai-logic-basics",
+    "firebase-app-hosting-basics",
+    "firebase-auth-basics",
+    "firebase-basics",
+    "firebase-crashlytics",
+    "firebase-data-connect",
+    "firebase-firestore",
+    "firebase-hosting-basics",
+    "firebase-remote-config-basics",
+    "firebase-security-rules-auditor",
+    "flutter-add-integration-test",
+    "flutter-add-widget-preview",
+    "flutter-add-widget-test",
+    "flutter-apply-architecture-best-practices",
+    "flutter-build-responsive-layout",
+    "flutter-fix-layout-issues",
+    "flutter-implement-json-serialization",
+    "flutter-setup-declarative-routing",
+    "flutter-setup-localization",
+    "flutter-use-http-package",
+    "foldseek-structural-search",
+    "gcloud-auth-verification",
+    "gcp-composer-troubleshooting",
+    "gcp-data-pipelines",
+    "gcp-dataflow",
+    "gcp-managed-airflow-migrations",
+    "gcp-pipeline-orchestration",
+    "gcp-pipeline-resource-provisioning",
+    "gcp-spark",
+    "gcs-security-assessment",
+    "gemini-api-dev",
+    "gemini-interactions-api",
+    "gemini-live-api-dev",
+    "gemini-omni-flash-api",
+    "generative_ui",
+    "gnomad-database",
+    "google-antigravity-sdk",
+    "google-maps-platform",
+    "gtex-database",
+    "human-protein-atlas-database",
+    "interpro-database",
+    "jaspar-database",
+    "literature-search-arxiv",
+    "literature-search-biorxiv",
+    "literature-search-europepmc",
+    "literature-search-openalex",
+    "managing-python-dependencies",
+    "memory-leak-debugging",
+    "migrate-agent-settings",
+    "migrate-workflows",
+    "ml-best-practices",
+    "modern-web-guidance",
+    "ncbi-sequence-fetch",
+    "notebook-guidance",
+    "openfda-database",
+    "opentargets-database",
+    "pdb-database",
+    "permissioned-github",
+    "plugin",
+    "predictingthepast",
+    "protein-sequence-msa",
+    "protein-sequence-similarity-search",
+    "pubchem-database",
+    "pubmed-database",
+    "pymol",
+    "quickgo-database",
+    "reactome-database",
+    "run-workflow",
+    "string-database",
+    "swarm",
+    "swarm_monitor",
+    "troubleshooting",
+    "ucsc-conservation-and-tfbs",
+    "ui-plugin-navigation",
+    "unibind-database",
+    "uniprot-database",
+    "uv",
+    "workflow-skill-creator",
+    "xcode-project-setup",
+];
+
 const EMBEDDED_PERSONAL_DESIGN_SKILLS: [(&str, &str); 4] = [
     (
         "windows-app-design",
@@ -2847,26 +2978,39 @@ fn sync_skill_markdown_str(
     Ok((skill_name, sections.len()))
 }
 
-fn deprecate_skill_and_sections(
+fn deprecate_skills_and_sections_batch(
     gdb: &LibreDb,
-    skill_name: &str,
+    skill_names: &[&str],
 ) -> Result<usize, Box<dyn std::error::Error>> {
-    let mut removed = 0usize;
-    if gdb.deprecate_key(NodeKind::Skill, skill_name)? {
-        removed += 1;
+    if skill_names.is_empty() {
+        return Ok(0);
     }
-    if gdb.deprecate_key(NodeKind::Generic, &format!("skill_full::{skill_name}"))? {
-        removed += 1;
-    }
-    let sec_prefix = format!("{skill_name}::");
-    for (_, k_opt, _) in gdb.list_inodes(Some(NodeKind::SkillSection), false) {
-        if let Some(k) = k_opt {
-            if k.starts_with(&sec_prefix) && gdb.deprecate_key(NodeKind::SkillSection, &k)? {
-                removed += 1;
-            }
+    let targets: std::collections::HashSet<&str> = skill_names.iter().copied().collect();
+    let mut ids: Vec<u64> = Vec::new();
+    for (ino, k_opt, _) in gdb.list_inodes(Some(NodeKind::Skill), false) {
+        if k_opt.as_deref().is_some_and(|k| targets.contains(k)) {
+            ids.push(ino.node_id);
         }
     }
-    Ok(removed)
+    for (ino, k_opt, _) in gdb.list_inodes(Some(NodeKind::Generic), false) {
+        if k_opt
+            .as_deref()
+            .and_then(|k| k.strip_prefix("skill_full::"))
+            .is_some_and(|s| targets.contains(s))
+        {
+            ids.push(ino.node_id);
+        }
+    }
+    for (ino, k_opt, _) in gdb.list_inodes(Some(NodeKind::SkillSection), false) {
+        if k_opt
+            .as_deref()
+            .and_then(|k| k.split_once("::"))
+            .is_some_and(|(s, _)| targets.contains(s))
+        {
+            ids.push(ino.node_id);
+        }
+    }
+    Ok(gdb.deprecate_nodes(&ids)?)
 }
 
 pub(crate) fn modernize_global_db(
@@ -2886,14 +3030,9 @@ pub(crate) fn modernize_global_db_with_options(
     quiet_stdout: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let t0 = Instant::now();
-    let mut deprecated_legacy = 0usize;
+    let mut deprecated_legacy =
+        deprecate_skills_and_sections_batch(gdb, LEGACY_V1_IMPORTED_CATALOG_SKILLS)?;
 
-    if gdb.deprecate_key(NodeKind::Skill, "customizations-db")? {
-        deprecated_legacy += 1;
-    }
-    if gdb.deprecate_key(NodeKind::Generic, "skill_full::customizations-db")? {
-        deprecated_legacy += 1;
-    }
     if gdb.deprecate_key(NodeKind::Generic, "sqlite_mirror::central")? {
         deprecated_legacy += 1;
     }
@@ -2909,15 +3048,6 @@ pub(crate) fn modernize_global_db_with_options(
         && gdb.deprecate_key(NodeKind::Rule, "flutter-hot_reload")?
     {
         deprecated_legacy += 1;
-    }
-    for (_, k_opt, _) in gdb.list_inodes(Some(NodeKind::SkillSection), false) {
-        if let Some(k) = k_opt {
-            if k.starts_with("customizations-db::")
-                && gdb.deprecate_key(NodeKind::SkillSection, &k)?
-            {
-                deprecated_legacy += 1;
-            }
-        }
     }
 
     // Purge legacy SQLite telemetry bloat (`QuotaEvent` and `TranscriptCursor`) from global customizations.ldb
@@ -2996,9 +3126,8 @@ pub(crate) fn modernize_global_db_with_options(
                 deprecated_legacy += 1;
             }
         }
-        for skill_name in PERSONAL_DESIGN_SKILL_NAMES {
-            deprecated_legacy += deprecate_skill_and_sections(gdb, skill_name)?;
-        }
+        deprecated_legacy +=
+            deprecate_skills_and_sections_batch(gdb, &PERSONAL_DESIGN_SKILL_NAMES)?;
     }
 
     let default_skill_md = env::var_os("USERPROFILE")
@@ -3796,6 +3925,95 @@ mod tests {
             .get_by_key(NodeKind::Rule, "rule:global::corp-infosec-policy")
             .is_ok());
         assert_eq!(count_reflexes(&gdb), 4);
+
+        // 3b. Legacy v1-imported external catalog & builtin Antigravity skills must be deprecated
+        //     cleanly while preserving core safety skills and custom organization skills.
+        for legacy_skill in [
+            "agy-customizations",
+            "google-antigravity-sdk",
+            "alphafold-database-fetch-and-analyze",
+        ] {
+            gdb.put(
+                WriteRequest::new(NodeKind::Skill, format!("Legacy summary {legacy_skill}").into_bytes())
+                    .with_key(legacy_skill)
+                    .with_importance(200),
+            )
+            .unwrap();
+            gdb.put(
+                WriteRequest::new(NodeKind::Generic, format!("Full body {legacy_skill}").into_bytes())
+                    .with_key(format!("skill_full::{legacy_skill}"))
+                    .with_importance(120),
+            )
+            .unwrap();
+            gdb.put(
+                WriteRequest::new(
+                    NodeKind::SkillSection,
+                    format!("[{legacy_skill} > Overview]\nLegacy section").into_bytes(),
+                )
+                .with_key(format!("{legacy_skill}::Overview"))
+                .with_importance(190),
+            )
+            .unwrap();
+        }
+        for preserved_skill in ["admin-elevation", "corp-custom-runbook"] {
+            gdb.put(
+                WriteRequest::new(
+                    NodeKind::Skill,
+                    format!("Preserved skill {preserved_skill}").into_bytes(),
+                )
+                .with_key(preserved_skill)
+                .with_importance(210),
+            )
+            .unwrap();
+            gdb.put(
+                WriteRequest::new(
+                    NodeKind::SkillSection,
+                    format!("[{preserved_skill} > Runbook]\nSteps").into_bytes(),
+                )
+                .with_key(format!("{preserved_skill}::Runbook"))
+                .with_importance(195),
+            )
+            .unwrap();
+        }
+        modernize_global_db(&gdb, Some(&dummy_skill), Some(&test_skills_dir), false).unwrap();
+        for legacy_skill in [
+            "agy-customizations",
+            "google-antigravity-sdk",
+            "alphafold-database-fetch-and-analyze",
+        ] {
+            assert!(
+                gdb.get_by_key(NodeKind::Skill, legacy_skill).is_err(),
+                "Legacy v1 catalog skill '{legacy_skill}' must be deprecated"
+            );
+            assert!(
+                gdb.get_by_key(NodeKind::Generic, &format!("skill_full::{legacy_skill}"))
+                    .is_err(),
+                "Legacy v1 full skill '{legacy_skill}' must be deprecated"
+            );
+            assert!(
+                gdb.get_by_key(NodeKind::SkillSection, &format!("{legacy_skill}::Overview"))
+                    .is_err(),
+                "Legacy v1 skill section '{legacy_skill}::Overview' must be deprecated"
+            );
+        }
+        for preserved_skill in ["admin-elevation", "corp-custom-runbook"] {
+            assert!(
+                gdb.get_by_key(NodeKind::Skill, preserved_skill).is_ok(),
+                "Preserved/custom skill '{preserved_skill}' must survive neutral modernize"
+            );
+            assert!(
+                gdb.get_by_key(NodeKind::SkillSection, &format!("{preserved_skill}::Runbook"))
+                    .is_ok(),
+                "Preserved/custom skill section '{preserved_skill}::Runbook' must survive neutral modernize"
+            );
+        }
+        modernize_global_db(&gdb, Some(&dummy_skill), Some(&test_skills_dir), true).unwrap();
+        for preserved_skill in ["admin-elevation", "corp-custom-runbook"] {
+            assert!(
+                gdb.get_by_key(NodeKind::Skill, preserved_skill).is_ok(),
+                "Preserved/custom skill '{preserved_skill}' must survive personal modernize"
+            );
+        }
 
         // 4. Offline-tampered workspace `.agents/memory.ldb` must NEVER be automatically re-sealed
         //    by `modernize_global_db` during upgrades ("no trust laundering")!

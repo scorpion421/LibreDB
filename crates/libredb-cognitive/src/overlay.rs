@@ -18,16 +18,31 @@ const GLOBAL_LAYER_TAG: u64 = 1u64 << 47;
 pub struct OverlayBrain {
     global: Option<CognitiveEngine>,
     project: CognitiveEngine,
+    same_as_global: bool,
     last_global_seq: AtomicU64,
     last_project_seq: AtomicU64,
 }
 
 impl OverlayBrain {
     pub fn open(global_db: Option<Arc<LibreDb>>, project_db: Arc<LibreDb>) -> Result<Self> {
+        let same_as_global = global_db.as_ref().is_some_and(|gdb| {
+            Arc::ptr_eq(gdb, &project_db)
+                || match (gdb.path(), project_db.path()) {
+                    (Some(gp), Some(pp)) => {
+                        gp == pp
+                            || (std::fs::canonicalize(gp).ok().is_some()
+                                && std::fs::canonicalize(gp).ok()
+                                    == std::fs::canonicalize(pp).ok())
+                    }
+                    _ => false,
+                }
+        });
         if let Some(ref gdb) = global_db {
             gdb.sync_from_disk_if_changed()?;
         }
-        project_db.sync_from_disk_if_changed()?;
+        if !same_as_global {
+            project_db.sync_from_disk_if_changed()?;
+        }
         let last_global_seq = match &global_db {
             Some(gdb) => gdb.stats()?.commit_seq,
             None => 0,
@@ -41,6 +56,7 @@ impl OverlayBrain {
         Ok(Self {
             global,
             project,
+            same_as_global,
             last_global_seq: AtomicU64::new(last_global_seq),
             last_project_seq: AtomicU64::new(last_project_seq),
         })
@@ -94,14 +110,18 @@ impl OverlayBrain {
         // 1. Evaluate reflexes across both layers in RAM (`0` disk reads), and record any
         //    unmatched non-banal error into `sys::pending_error_cues` without refuting a pitfall
         //    that is actively being recalled on this `pulse` query.
-        let proj_rf = self.project.evaluate_reflexes(
-            req.workspace_dir.as_deref(),
-            &req.query,
-            req.error_context.as_deref(),
-        );
+        let proj_rf = if self.same_as_global {
+            Vec::new()
+        } else {
+            self.project.evaluate_reflexes(
+                req.workspace_dir.as_deref(),
+                &req.query,
+                req.error_context.as_deref(),
+            )
+        };
         let project_reflex_fired = !proj_rf.is_empty();
         let pitfall_recalled = proj_rf.iter().any(|r| r.id.starts_with("pitfall::"));
-        if !pitfall_recalled {
+        if !self.same_as_global && !pitfall_recalled {
             if let Some(err_str) = req
                 .error_context
                 .as_deref()
@@ -121,7 +141,11 @@ impl OverlayBrain {
             req.workspace_dir.as_deref(),
             &req.query,
             req.error_context.as_deref(),
-            Some(self.project.reflex_engine()),
+            if self.same_as_global {
+                None
+            } else {
+                Some(self.project.reflex_engine())
+            },
         );
 
         for (is_global, rf) in proj_rf
@@ -153,12 +177,16 @@ impl OverlayBrain {
         }
 
         // 2. Score candidates across both layers 100% in RAM (`0` payload disk I/O!).
-        let proj_cands = self.project.score_candidates_in_ram(&req.query);
+        let proj_cands = if self.same_as_global {
+            Vec::new()
+        } else {
+            self.project.score_candidates_in_ram(&req.query)
+        };
         let mut glob_cands = global_eng.score_candidates_in_ram(&req.query);
 
         // Only the project layer decides whether a query was a workspace miss: generic global
         // rule/skill matches must never mask an unresolved project-specific concept.
-        if proj_cands.is_empty() && !project_reflex_fired {
+        if !self.same_as_global && proj_cands.is_empty() && !project_reflex_fired {
             let recorded = crate::learning::record_search_miss_cue_with_source(
                 self.project.db(),
                 &req.query,
@@ -180,6 +208,12 @@ impl OverlayBrain {
             .map(crate::reflex::detect_workspace_markers)
             .unwrap_or_default();
         let query_low = req.query.to_ascii_lowercase();
+        let mut query_specific_tokens: Vec<String> = Vec::new();
+        for tok in libredb_index::segment_universal_tokens(&req.query) {
+            if !is_generic_skill_collision_token(&tok) && !query_specific_tokens.contains(&tok) {
+                query_specific_tokens.push(tok);
+            }
+        }
         for c in &mut glob_cands {
             c.score *= foreign_skill_stack_multiplier(
                 c.kind,
@@ -192,7 +226,12 @@ impl OverlayBrain {
         let glob_floor = (glob_peak * 0.35).max(0.80);
         glob_cands.retain(|c| {
             (c.score >= glob_floor
-                && global_skill_passes_specificity_gate(c, &query_low, &ws_markers))
+                && global_skill_passes_specificity_gate(
+                    c,
+                    &query_specific_tokens,
+                    &query_low,
+                    &ws_markers,
+                ))
                 || c.via_bridge
         });
 
@@ -410,13 +449,253 @@ fn marker_matches_any(ws_markers: &[String], needles: &[&str]) -> bool {
         .any(|m| needles.iter().any(|n| m == n || m.contains(n)))
 }
 
-fn skill_matches_active_workspace_stack(skill_name: &str, ws_markers: &[String]) -> bool {
+pub(crate) fn is_generic_skill_collision_token(tok: &str) -> bool {
+    matches!(
+        tok,
+        "http"
+            | "https"
+            | "url"
+            | "urls"
+            | "uri"
+            | "server"
+            | "servers"
+            | "client"
+            | "clients"
+            | "endpoint"
+            | "endpoints"
+            | "host"
+            | "hosts"
+            | "port"
+            | "ports"
+            | "local"
+            | "localhost"
+            | "remote"
+            | "api"
+            | "apis"
+            | "sdk"
+            | "sdks"
+            | "cli"
+            | "app"
+            | "apps"
+            | "application"
+            | "service"
+            | "services"
+            | "system"
+            | "systems"
+            | "tool"
+            | "tools"
+            | "config"
+            | "configs"
+            | "configuration"
+            | "setting"
+            | "settings"
+            | "option"
+            | "options"
+            | "default"
+            | "defaults"
+            | "env"
+            | "file"
+            | "files"
+            | "folder"
+            | "folders"
+            | "dir"
+            | "directory"
+            | "path"
+            | "paths"
+            | "json"
+            | "yaml"
+            | "yml"
+            | "toml"
+            | "xml"
+            | "text"
+            | "string"
+            | "strings"
+            | "value"
+            | "values"
+            | "data"
+            | "type"
+            | "types"
+            | "name"
+            | "names"
+            | "key"
+            | "keys"
+            | "list"
+            | "lists"
+            | "code"
+            | "example"
+            | "examples"
+            | "sample"
+            | "guide"
+            | "guides"
+            | "doc"
+            | "docs"
+            | "overview"
+            | "basics"
+            | "readme"
+            | "user"
+            | "users"
+            | "error"
+            | "errors"
+            | "warning"
+            | "status"
+            | "info"
+            | "log"
+            | "logs"
+            | "check"
+            | "checks"
+            | "test"
+            | "tests"
+            | "testing"
+            | "debug"
+            | "run"
+            | "running"
+            | "start"
+            | "stop"
+            | "use"
+            | "using"
+            | "used"
+            | "allow"
+            | "allows"
+            | "deny"
+            | "enable"
+            | "enabled"
+            | "disable"
+            | "disabled"
+            | "set"
+            | "get"
+            | "add"
+            | "create"
+            | "update"
+            | "install"
+            | "build"
+            | "deploy"
+            | "setup"
+            | "manage"
+            | "managed"
+            | "query"
+            | "search"
+            | "read"
+            | "write"
+            | "open"
+            | "close"
+            | "connect"
+            | "connection"
+            | "request"
+            | "response"
+            | "header"
+            | "headers"
+            | "bearer"
+            | "english"
+            | "german"
+            | "bitte"
+            | "frage"
+            | "hier"
+            | "sind"
+            | "und"
+            | "oder"
+            | "der"
+            | "die"
+            | "das"
+            | "mit"
+            | "von"
+            | "auf"
+            | "ist"
+            | "the"
+            | "and"
+            | "for"
+            | "with"
+            | "from"
+            | "how"
+            | "where"
+            | "what"
+            | "when"
+            | "why"
+    )
+}
+
+fn is_ui_design_skill(skill_name: &str) -> bool {
+    matches!(
+        skill_name,
+        "windows-app-design" | "android-app-design" | "apple-hig-design" | "linux-desktop-hig-design"
+    )
+}
+
+fn query_has_ui_design_intent(query_low: &str) -> bool {
+    const EXACT_TOKENS: &[&str] = &[
+        "ui", "ux", "gui", "hig", "wpf", "egui", "gtk", "qt", "qml", "kde", "css", "dom", "a11y",
+        "aria", "dpi", "epx",
+    ];
+    if EXACT_TOKENS
+        .iter()
+        .any(|tok| has_exact_alpha_tok(query_low, tok))
+    {
+        return true;
+    }
+    const SUBSTRINGS: &[&str] = &[
+        "fluent",
+        "winui",
+        "eframe",
+        "xaml",
+        "tauri",
+        "maui",
+        "avalonia",
+        "winappsdk",
+        "mica",
+        "acrylic",
+        "segoe",
+        "material",
+        "compose",
+        "jetpack",
+        "swiftui",
+        "uikit",
+        "appkit",
+        "libadwaita",
+        "adwaita",
+        "gtk4",
+        "kirigami",
+        "breeze",
+        "qt6",
+        "design",
+        "layout",
+        "theme",
+        "theming",
+        "palette",
+        "typography",
+        "font",
+        "toolbar",
+        "sidebar",
+        "tabview",
+        "splitview",
+        "navigation",
+        "insets",
+        "touch target",
+        "dark mode",
+        "light mode",
+        "contrast",
+        "voiceover",
+        "talkback",
+        "screen reader",
+        "screenreader",
+        "widget",
+        "windows-app-design",
+        "android-app-design",
+        "apple-hig-design",
+        "linux-desktop-hig-design",
+    ];
+    SUBSTRINGS.iter().any(|sub| query_low.contains(sub))
+}
+
+fn skill_matches_active_workspace_stack(
+    skill_name: &str,
+    query_low: &str,
+    ws_markers: &[String],
+) -> bool {
     if ws_markers.is_empty() || skill_name.is_empty() {
         return false;
     }
     let m = |needles: &[&str]| marker_matches_any(ws_markers, needles);
-    if skill_name.starts_with("libredb") {
-        return m(&["cargo.toml", ".agents"]);
+    if is_ui_design_skill(skill_name) && !query_has_ui_design_intent(query_low) {
+        return false;
     }
     if skill_name.contains("flutter")
         || has_exact_alpha_tok(skill_name, "dart")
@@ -508,8 +787,112 @@ fn skill_matches_active_workspace_stack(skill_name: &str, ws_markers: &[String])
     false
 }
 
+fn skill_distinctively_named_in_query(skill_name: &str, query_low: &str) -> bool {
+    if skill_name.is_empty() {
+        return false;
+    }
+    skill_name
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|tok| {
+            tok.len() >= 3
+                && !matches!(
+                    *tok,
+                    "design"
+                        | "skill"
+                        | "guide"
+                        | "app"
+                        | "basics"
+                        | "build"
+                        | "catalog"
+                        | "managed"
+                        | "windows"
+                        | "linux"
+                        | "desktop"
+                        | "server"
+                        | "system"
+                        | "admin"
+                        | "data"
+                        | "loss"
+                        | "prevention"
+                        | "accidental"
+                        | "security"
+                        | "database"
+                        | "search"
+                        | "python"
+                        | "modern"
+                        | "web"
+                        | "debug"
+                        | "debugging"
+                        | "memory"
+                        | "workflow"
+                        | "workflows"
+                        | "plugin"
+                        | "run"
+                        | "migrate"
+                        | "automation"
+                        | "troubleshooting"
+                        | "building"
+                        | "managing"
+                        | "enforcing"
+                        | "discovering"
+                        | "clinical"
+                        | "human"
+                        | "string"
+                        | "literature"
+                        | "protein"
+                        | "single"
+                        | "variant"
+                        | "analysis"
+                        | "score"
+                        | "fetch"
+                        | "setup"
+                        | "use"
+                        | "add"
+                        | "fix"
+                        | "write"
+                        | "collect"
+                        | "generate"
+                        | "resolve"
+                        | "implement"
+                        | "apply"
+                        | "architecture"
+                        | "best"
+                        | "practices"
+                        | "responsive"
+                        | "layout"
+                        | "declarative"
+                        | "routing"
+                        | "localization"
+                        | "http"
+                        | "package"
+                        | "unit"
+                        | "test"
+                        | "widget"
+                        | "integration"
+                        | "runtime"
+                        | "errors"
+                        | "static"
+                        | "coverage"
+                        | "mocks"
+                        | "primary"
+                        | "constructors"
+                        | "pattern"
+                        | "matching"
+                        | "documentation"
+                        | "cli"
+                        | "api"
+                        | "dev"
+                        | "live"
+                        | "interactions"
+                        | "platform"
+                )
+        })
+        .any(|tok| has_exact_alpha_tok(query_low, tok))
+}
+
 fn global_skill_passes_specificity_gate(
     c: &crate::ScoredInodeCandidate,
+    query_specific_tokens: &[String],
     query_low: &str,
     ws_markers: &[String],
 ) -> bool {
@@ -521,34 +904,34 @@ fn global_skill_passes_specificity_gate(
     {
         return true;
     }
+    let cand_specific_matched = c
+        .matched_query_tokens
+        .iter()
+        .filter(|t| !is_generic_skill_collision_token(t.as_str()))
+        .count();
+    if cand_specific_matched == 0 {
+        return false;
+    }
     let raw_key = c.key.as_deref().unwrap_or("");
     let skill_name = raw_key
         .split_once("::")
         .map_or(raw_key, |(head, _)| head)
         .trim()
         .to_ascii_lowercase();
-    if skill_matches_active_workspace_stack(&skill_name, ws_markers) {
-        return true;
+    if is_ui_design_skill(&skill_name) && !query_has_ui_design_intent(query_low) {
+        return false;
     }
-    if c.matched_term_count >= 2 && c.score >= 1.20 {
-        return true;
+    if skill_matches_active_workspace_stack(&skill_name, query_low, ws_markers) {
+        return c.score >= 1.00;
     }
-    if c.matched_term_count >= 1 && c.score >= 1.00 && !skill_name.is_empty() {
-        let skill_named_in_query = skill_name
-            .split(|ch: char| !ch.is_ascii_alphanumeric())
-            .filter(|tok| {
-                tok.len() >= 3
-                    && !matches!(
-                        *tok,
-                        "design" | "guide" | "app" | "basics" | "build" | "catalog" | "managed"
-                    )
-            })
-            .any(|tok| has_exact_alpha_tok(query_low, tok));
-        if skill_named_in_query {
-            return true;
+    if skill_distinctively_named_in_query(&skill_name, query_low) {
+        if query_specific_tokens.len() <= 2 {
+            return c.score >= 1.00;
         }
+        return cand_specific_matched >= 2 && c.score >= 1.10;
     }
-    false
+    let required_specific = ((query_specific_tokens.len() + 3) / 4).max(2);
+    cand_specific_matched >= required_specific && c.score >= 1.35
 }
 
 fn foreign_skill_stack_multiplier(
@@ -573,6 +956,122 @@ fn foreign_skill_stack_multiplier(
         .to_ascii_lowercase();
     let has_exact_tok = has_exact_alpha_tok;
     let marker_has = |needles: &[&str]| marker_matches_any(ws_markers, needles);
+
+    if is_ui_design_skill(&skill_name) && !query_has_ui_design_intent(query_low) {
+        return 0.25;
+    }
+
+    if skill_name.starts_with("agy-")
+        || skill_name.contains("antigravity")
+        || skill_name.starts_with("gemini-")
+        || matches!(
+            skill_name.as_str(),
+            "plugin"
+                | "run-workflow"
+                | "ui-plugin-navigation"
+                | "migrate-workflows"
+                | "migrate-agent-settings"
+                | "workflow-skill-creator"
+                | "permissioned-github"
+                | "automation"
+                | "generative_ui"
+        )
+    {
+        let q_wants = query_low.contains("antigravity")
+            || has_exact_tok(query_low, "agy")
+            || query_low.contains("gemini")
+            || has_exact_tok(query_low, "mcp")
+            || query_low.contains("subagent")
+            || query_low.contains("plugin")
+            || query_low.contains("workflow")
+            || has_exact_tok(query_low, "skill")
+            || query_low.contains("skills");
+        if !q_wants {
+            return 0.25;
+        }
+    }
+
+    if matches!(
+        skill_name.as_str(),
+        "chrome-devtools"
+            | "debug-optimize-lcp"
+            | "memory-leak-debugging"
+            | "modern-web-guidance"
+            | "troubleshooting"
+    ) {
+        let q_wants = query_low.contains("chrome")
+            || query_low.contains("devtools")
+            || query_low.contains("browser")
+            || has_exact_tok(query_low, "lcp")
+            || query_low.contains("web vitals")
+            || query_low.contains("heap")
+            || has_exact_tok(query_low, "html")
+            || has_exact_tok(query_low, "css")
+            || query_low.contains("javascript")
+            || has_exact_tok(query_low, "dom")
+            || query_low.contains("frontend")
+            || query_low.contains("troubleshoot");
+        let ws_uses = marker_has(&["package.json"]);
+        if !q_wants && !ws_uses {
+            return 0.25;
+        }
+    }
+
+    if skill_name.starts_with("alphafold")
+        || skill_name.starts_with("alphagenome")
+        || skill_name.starts_with("chembl")
+        || skill_name.starts_with("clinical-trials")
+        || skill_name.starts_with("clinvar")
+        || skill_name.starts_with("dbsnp")
+        || skill_name.starts_with("embl-")
+        || skill_name.starts_with("encode-")
+        || skill_name.starts_with("ensembl")
+        || skill_name.starts_with("foldseek")
+        || skill_name.starts_with("gnomad")
+        || skill_name.starts_with("gtex")
+        || skill_name.starts_with("human-protein")
+        || skill_name.starts_with("interpro")
+        || skill_name.starts_with("jaspar")
+        || skill_name.starts_with("literature-search-")
+        || skill_name.starts_with("ncbi-")
+        || skill_name.starts_with("openfda")
+        || skill_name.starts_with("opentargets")
+        || skill_name.starts_with("pdb-")
+        || skill_name == "predictingthepast"
+        || skill_name.starts_with("protein-")
+        || skill_name.starts_with("pubchem")
+        || skill_name.starts_with("pubmed")
+        || skill_name == "pymol"
+        || skill_name.starts_with("quickgo")
+        || skill_name.starts_with("reactome")
+        || skill_name == "string-database"
+        || skill_name.starts_with("ucsc-")
+        || skill_name.starts_with("unibind")
+        || skill_name.starts_with("uniprot")
+    {
+        let q_wants = query_low.contains("protein")
+            || query_low.contains("gene")
+            || query_low.contains("variant")
+            || query_low.contains("genom")
+            || query_low.contains("alphafold")
+            || query_low.contains("pubmed")
+            || query_low.contains("pubchem")
+            || query_low.contains("uniprot")
+            || query_low.contains("chembl")
+            || query_low.contains("clinvar")
+            || query_low.contains("ensembl")
+            || query_low.contains("arxiv")
+            || query_low.contains("biorxiv")
+            || query_low.contains("molecule")
+            || query_low.contains("clinical")
+            || has_exact_tok(query_low, "pdb")
+            || has_exact_tok(query_low, "dna")
+            || has_exact_tok(query_low, "rna")
+            || query_low.contains("pymol");
+        if !q_wants {
+            return 0.25;
+        }
+    }
 
     if skill_name.contains("flutter")
         || has_exact_tok(&skill_name, "dart")

@@ -5,7 +5,7 @@ use libredb_cognitive::{
     ErrorPitfallBook, LearnedPitfallEntry, OverlayBrain, PendingErrorCue, PulseRequest,
     ReflexEngine, ReflexRule, ERROR_PITFALL_BOOK_KEY, PENDING_ERROR_CUES_KEY,
 };
-use libredb_core::{LibreDb, NodeKind, WriteRequest};
+use libredb_core::{EdgeKind, LibreDb, NodeKind, WriteRequest};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -954,6 +954,259 @@ fn pulse_suppresses_single_word_global_skill_fillers_and_admin_ui_reflex_false_p
         }),
         "Explicit single-word skill query 'flutter' must still retrieve flutter skill: {:?}",
         flutter_resp.capsules
+    );
+
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn pulse_suppresses_generic_it_collisions_and_has_section_laundering_on_global_skills() {
+    let base = temp_test_dir("pulse_v243_it_gate");
+    let ws_dir = base.join("rust_ws");
+    fs::create_dir_all(ws_dir.join(".agents")).unwrap();
+    fs::write(
+        ws_dir.join("Cargo.toml"),
+        "[package]\nname = \"demo_srv\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+
+    let gdb = Arc::new(LibreDb::open(&base.join("global.ldb")).unwrap());
+    let pdb = Arc::new(LibreDb::open(&base.join("project.ldb")).unwrap());
+
+    let agy_skill_id = gdb
+        .put(
+            WriteRequest::new(
+                NodeKind::Skill,
+                b"[Skill: agy-customizations]\nGuide for Antigravity MCP servers, hooks, and plugins."
+                    .to_vec(),
+            )
+            .with_key("agy-customizations")
+            .with_importance(210),
+        )
+        .unwrap();
+    let agy_sec_id = gdb
+        .put(
+            WriteRequest::new(
+                NodeKind::SkillSection,
+                b"[agy-customizations > 2. Streamable HTTP Transport (Remote)]\nUsed to connect to a remote MCP server over HTTP/HTTPS transport. Point url at the /mcp server endpoint.".to_vec(),
+            )
+            .with_key("agy-customizations::2. Streamable HTTP Transport (Remote)")
+            .with_importance(195),
+        )
+        .unwrap();
+    gdb.link(agy_skill_id, EdgeKind::HasSection, agy_sec_id, 240)
+        .unwrap();
+
+    let sdk_skill_id = gdb
+        .put(
+            WriteRequest::new(
+                NodeKind::Skill,
+                b"[Skill: google-antigravity-sdk]\nBuild Antigravity agents with McpStreamableHttpServer and LocalOpenAIAgentConfig."
+                    .to_vec(),
+            )
+            .with_key("google-antigravity-sdk")
+            .with_importance(210),
+        )
+        .unwrap();
+    for (key, body) in [
+        (
+            "google-antigravity-sdk::Example (2)",
+            "[google-antigravity-sdk > Example (2)]\nMcpStreamableHttpServer url https://example.com/mcp agent chat server.",
+        ),
+        (
+            "google-antigravity-sdk::LocalOpenAIAgentConfig",
+            "[google-antigravity-sdk > LocalOpenAIAgentConfig]\nConnects to locally running OpenAI-compatible HTTP server such as Ollama.",
+        ),
+        (
+            "google-antigravity-sdk::Allow a specific list of tools on a server",
+            "[google-antigravity-sdk > Allow a specific list of tools on a server]\nstdio_server = types.McpStdioServer(name=\"pirate_math\") policy allowlist.",
+        ),
+    ] {
+        let sec_id = gdb
+            .put(
+                WriteRequest::new(NodeKind::SkillSection, body.as_bytes().to_vec())
+                    .with_key(key)
+                    .with_importance(195),
+            )
+            .unwrap();
+        gdb.link(sdk_skill_id, EdgeKind::HasSection, sec_id, 240)
+            .unwrap();
+        gdb.link(sec_id, EdgeKind::RelatedTo, sdk_skill_id, 240)
+            .unwrap();
+    }
+
+    for (key, body) in [
+        (
+            "windows-app-design",
+            "[Skill: windows-app-design]\nNative Microsoft Windows Fluent 2 UI design standard for WinUI 3, WPF, egui, and desktop apps.",
+        ),
+        (
+            "linux-desktop-hig-design",
+            "[Skill: linux-desktop-hig-design]\nNative Linux desktop HIG standard for GNOME Libadwaita GTK4 and KDE Kirigami.",
+        ),
+        (
+            "admin-elevation",
+            "[Skill: admin-elevation]\nUse this skill whenever a task requires local Windows administrator UAC elevation privileges on this computer.",
+        ),
+        (
+            "credentials",
+            "[Skill: credentials]\nInstructions for handling API keys and credentials safely.",
+        ),
+    ] {
+        gdb.put(
+            WriteRequest::new(NodeKind::Skill, body.as_bytes().to_vec())
+                .with_key(key)
+                .with_importance(210),
+        )
+        .unwrap();
+    }
+    gdb.put(
+        WriteRequest::new(
+            NodeKind::SkillSection,
+            b"[libredb > MCP Server & Security]\nRun libredb mcp-serve over stdio for Antigravity workspace memory.".to_vec(),
+        )
+        .with_key("libredb::MCP Server & Security")
+        .with_importance(195),
+    )
+    .unwrap();
+
+    {
+        let mut cog = CognitiveEngine::open_db(Arc::clone(&gdb)).unwrap();
+        cog.save_index_snapshot().unwrap();
+    }
+
+    let gdb_for_same_db = Arc::clone(&gdb);
+    let brain = OverlayBrain::open(Some(gdb), pdb).unwrap();
+
+    // Exact office regression query + common IT admin / generic prose queries must emit 0 noise capsules.
+    for (idx, use_ws, q) in [
+        (1u32, false, "RDAC MMC HTTPS certificate server"),
+        (2u32, true, "RDAC MMC HTTPS certificate server"),
+        (3u32, true, "Windows Server IIS HTTPS TLS certificate renewal MMC"),
+        (4u32, false, "Linux desktop systemd journalctl sshd port 22"),
+        (5u32, true, "https server config json"),
+    ] {
+        let mut req = PulseRequest::new(q, 1200);
+        req.conversation_id = Some(format!("it-noise-{idx}"));
+        if use_ws {
+            req.workspace_dir = Some(ws_dir.clone());
+        }
+        let resp = brain.pulse(&req).unwrap();
+        assert!(
+            resp.capsules.is_empty(),
+            "General IT/generic query '{q}' (ws={use_ws}) must emit 0 false-positive skill capsules, got: {:?}",
+            resp.capsules
+                .iter()
+                .map(|c| (&c.key, c.score, c.token_count))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // Explicit domain queries still retrieve their intended skill cleanly.
+    let mut mcp_req = PulseRequest::new("Antigravity MCP Streamable HTTP server url", 1200);
+    mcp_req.conversation_id = Some("real-mcp-query".to_owned());
+    let mcp_resp = brain.pulse(&mcp_req).unwrap();
+    assert!(
+        mcp_resp.capsules.iter().any(|c| {
+            c.key.as_deref().is_some_and(|k| {
+                k.contains("agy-customizations::2. Streamable HTTP Transport (Remote)")
+            })
+        }),
+        "Explicit MCP Streamable HTTP query must still retrieve agy-customizations section: {:?}",
+        mcp_resp.capsules.iter().map(|c| &c.key).collect::<Vec<_>>()
+    );
+
+    let mut admin_req =
+        PulseRequest::new("Windows local administrator UAC elevation privileges", 1200);
+    admin_req.conversation_id = Some("real-admin-query".to_owned());
+    let admin_resp = brain.pulse(&admin_req).unwrap();
+    assert!(
+        admin_resp
+            .capsules
+            .iter()
+            .any(|c| c.key.as_deref() == Some("global::admin-elevation")),
+        "Explicit UAC elevation query must retrieve admin-elevation skill: {:?}",
+        admin_resp
+            .capsules
+            .iter()
+            .map(|c| &c.key)
+            .collect::<Vec<_>>()
+    );
+
+    let mut ui_req = PulseRequest::new("Windows UI Fluent 2 toolbar layout", 1200);
+    ui_req.conversation_id = Some("real-winui-query".to_owned());
+    ui_req.workspace_dir = Some(ws_dir);
+    let ui_resp = brain.pulse(&ui_req).unwrap();
+    assert!(
+        ui_resp
+            .capsules
+            .iter()
+            .any(|c| c.key.as_deref() == Some("global::windows-app-design")),
+        "Explicit WinUI design query must still retrieve windows-app-design: {:?}",
+        ui_resp.capsules.iter().map(|c| &c.key).collect::<Vec<_>>()
+    );
+
+    // Same-DB fallback (mirroring `libredb pulse` outside any project workspace) must NOT mirror
+    // `customizations.ldb` into `proj::` candidates, duplicate global reflexes, or record miss cues.
+    gdb_for_same_db
+        .put(
+            WriteRequest::new(
+                NodeKind::SkillSection,
+                b"[android-app-design > 4. Edge-to-edge, adaptive navigation, and gestures]\nDesigning for Android mobile (https://developer.android.com/design/ui/mobile) requires responsive adaptation and overriding predictive back navigation.".to_vec(),
+            )
+            .with_key("android-app-design::4. Edge-to-edge, adaptive navigation, and gestures")
+            .with_importance(195),
+        )
+        .unwrap();
+    ReflexEngine::learn_reflex(
+        &gdb_for_same_db,
+        &ReflexRule {
+            id: "same-db-global-reflex".to_owned(),
+            stack_any: vec!["windows".to_owned()],
+            action_any: vec!["uac".to_owned()],
+            env_or_error_any: Vec::new(),
+            directive: "Follow UAC elevation guidelines.".to_owned(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    {
+        let mut cog = CognitiveEngine::open_db(Arc::clone(&gdb_for_same_db)).unwrap();
+        cog.save_index_snapshot().unwrap();
+    }
+    let same_brain =
+        OverlayBrain::open(Some(Arc::clone(&gdb_for_same_db)), Arc::clone(&gdb_for_same_db))
+            .unwrap();
+    let mut non_ws_req = PulseRequest::new("RDAC MMC HTTPS certificate server", 1200);
+    non_ws_req.conversation_id = Some("non-ws-same-db-1".to_owned());
+    let non_ws_resp = same_brain.pulse(&non_ws_req).unwrap();
+    assert!(
+        non_ws_resp.capsules.is_empty(),
+        "Non-workspace same-DB pulse must emit 0 false-positive capsules (including android-app-design::4): {:?}",
+        non_ws_resp
+            .capsules
+            .iter()
+            .map(|c| (&c.key, c.score, c.token_count))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        gdb_for_same_db
+            .get_by_key(NodeKind::Generic, libredb_cognitive::PENDING_MISS_CUES_KEY)
+            .is_err(),
+        "Non-workspace same-DB pulse must never pollute customizations.ldb with pending workspace miss cues"
+    );
+    let mut reflex_req = PulseRequest::new("Windows UAC elevation", 1200);
+    reflex_req.conversation_id = Some("non-ws-same-db-2".to_owned());
+    let reflex_resp = same_brain.pulse(&reflex_req).unwrap();
+    assert_eq!(
+        reflex_resp
+            .fired_reflexes
+            .iter()
+            .filter(|r| r.id == "same-db-global-reflex")
+            .count(),
+        1,
+        "Non-workspace same-DB pulse must fire matching global reflex exactly once: {:?}",
+        reflex_resp.fired_reflexes
     );
 
     let _ = fs::remove_dir_all(&base);
