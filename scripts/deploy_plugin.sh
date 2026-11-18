@@ -37,9 +37,9 @@ done
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PROJECT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
-LIBRE_VERSION=$(tr -d ' \t\r\n' < "$PROJECT_ROOT/VERSION" 2>/dev/null || echo "2.4.0")
+LIBRE_VERSION=$(tr -d ' \t\r\n' < "$PROJECT_ROOT/VERSION" 2>/dev/null || echo "2.4.1")
 case "$LIBRE_VERSION" in
-    ""|*[!0-9A-Za-z._+-]*) LIBRE_VERSION="2.4.0" ;;
+    ""|*[!0-9A-Za-z._+-]*) LIBRE_VERSION="2.4.1" ;;
 esac
 USER_HOME="${HOME:-$(pwd)}"
 GEMINI_DIR="$USER_HOME/.gemini"
@@ -372,7 +372,7 @@ description: >-
    - `"fim"`: Returns surgical `[Lstart-Lend]` edit slices with blast-radius callers, implementors, and governing decisions attached for a file `target` (including `<path>:<line>` syntax), file-less workspace `symbol`/`symbols` lookup, or batched `slices` (`<= 32`).
    - `"grep"`: Pure-Rust `.gitignore`-aware, credential/binary-safe workspace text and pattern search annotated with enclosing `[kind name Lstart-Lend]` contracts (optional `subpath`, `ignore_case`, `fixed_strings`, `word_boundary`, `context`, `max_matches`, `extensions`).
    - `"savings"`: Returns an authorized workspace 3-tier token-consumption and savings report (`days=0` for today, `days <= 3660`).
-   - `"backup"` / `"restore"` / `"migrate"` / `"read"`: Portable unencrypted export with `sys::backup_manifest` (`destination`, `instance`, `all`), integrity-verified local re-encryption and sealing (`source`, `instance`, `all`), standalone chat or moved-folder migration (`source`, `cid`, `from_path`, `include_artifacts`), and own-risk read-only inspection (`target`, `query`, `show_secrets`).
+   - `"backup"` / `"restore"` / `"migrate"` / `"read"`: Portable unencrypted export with `sys::backup_manifest` (`destination`), integrity-verified local re-encryption and sealing (`source`), standalone chat or moved-folder migration (`source`, `cid`, `from_path`, `include_artifacts`), and own-risk read-only inspection (`target`, `query`).
 3. **`libredb_memorize`** (`cwd`, `cid`, `facts`, `decisions`, `tasks`, `snapshot`, `learn_assoc`, `learn_reflex`, `learn_error`):
    - Atomically commits workspace/chat facts, architectural decisions (auto-linked to symbols), tasks, milestone snapshots, language-agnostic Hebbian concept bridges, situational pitfall reflexes, or error-recovery directives.
 

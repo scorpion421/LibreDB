@@ -790,3 +790,74 @@ fn v130_closed_loop_search_bridge_git_cochange_and_falsifiable_reflexes_work() {
         "Expected falsified grounded reflex to be suppressed after src/legacy_v1.rs removal, got: {p_after_txt}"
     );
 }
+
+#[test]
+fn standalone_cli_install_verifies_live_hooks_and_posix_local_bin() {
+    let sbx = fresh_sandbox("standalone_cli_install");
+    let bin = env!("CARGO_BIN_EXE_libredb");
+    let fake_home = sbx.0.join("fake_home");
+    fs::create_dir_all(&fake_home).unwrap();
+
+    let out = Command::new(bin)
+        .args(["install", "--home", &fake_home.to_string_lossy(), "--json"])
+        .current_dir(&sbx.0)
+        .env("USERPROFILE", &fake_home)
+        .env("HOME", &fake_home)
+        .output()
+        .expect("run libredb install --json");
+    assert!(
+        out.status.success(),
+        "libredb install failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let rep: Value = serde_json::from_slice(&out.stdout).expect("valid install JSON");
+    assert_eq!(rep.get("hooks_enabled").and_then(Value::as_bool), Some(true));
+    assert_eq!(rep.get("profile").and_then(Value::as_str), Some("neutral"));
+
+    let plugin_dir = fake_home
+        .join(".gemini")
+        .join("config")
+        .join("plugins")
+        .join("libredb");
+    let hooks_raw = fs::read_to_string(plugin_dir.join("hooks.json")).unwrap();
+    assert!(
+        hooks_raw.contains("hook-pre-invocation"),
+        "Expected enabled hooks.json with hook-pre-invocation, got: {hooks_raw}"
+    );
+    assert!(
+        !plugin_dir.join("rules").join("AGENTS.md").exists(),
+        "Neutral install must not create personal rules/AGENTS.md"
+    );
+
+    let libre_home = fake_home.join(".gemini").join("libredb");
+    let global_ldb = libre_home.join("customizations.ldb");
+    assert!(global_ldb.is_file());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert!(
+            fake_home.join(".local").join("bin").join("libredb").is_file(),
+            "Expected ~/.local/bin/libredb to be installed on Unix"
+        );
+        let dir_mode = fs::metadata(&libre_home).unwrap().permissions().mode();
+        let db_mode = fs::metadata(&global_ldb).unwrap().permissions().mode();
+        assert_eq!(dir_mode & 0o077, 0, "Expected 0700 mode on libre_home, got {dir_mode:04o}");
+        assert_eq!(db_mode & 0o077, 0, "Expected 0600 mode on global_ldb, got {db_mode:04o}");
+    }
+
+    let reflexes = Command::new(bin)
+        .args(["list-reflexes", "--global", &global_ldb.to_string_lossy()])
+        .env("USERPROFILE", &fake_home)
+        .env("HOME", &fake_home)
+        .output()
+        .expect("list-reflexes");
+    assert!(reflexes.status.success());
+    let reflex_txt = String::from_utf8_lossy(&reflexes.stdout);
+    assert!(
+        reflex_txt.contains("Active Situational Reflexes (4)"),
+        "Expected 4 active technical reflexes, got: {reflex_txt}"
+    );
+}

@@ -32,6 +32,7 @@ pub struct InstallOptions {
     pub fallback_drive: Option<PathBuf>,
     pub home_override: Option<PathBuf>,
     pub global_path: Option<PathBuf>,
+    pub quiet_stdout: bool,
 }
 
 pub struct UpdateOptions {
@@ -44,6 +45,7 @@ pub struct UpdateOptions {
     pub fallback_drive: Option<PathBuf>,
     pub home_override: Option<PathBuf>,
     pub global_path: Option<PathBuf>,
+    pub quiet_stdout: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -113,15 +115,19 @@ fn strip_zone_identifier(path: &Path) {
 }
 
 #[cfg(unix)]
-fn set_executable_mode(path: &Path) -> Result<(), String> {
+fn set_unix_mode(path: &Path, mode: u32) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
-        .map_err(|e| format!("Failed to set 0755 permissions on '{}': {e}", path.display()))
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .map_err(|e| format!("Failed to set {mode:04o} permissions on '{}': {e}", path.display()))
 }
 
 #[cfg(not(unix))]
-fn set_executable_mode(_path: &Path) -> Result<(), String> {
+fn set_unix_mode(_path: &Path, _mode: u32) -> Result<(), String> {
     Ok(())
+}
+
+fn set_executable_mode(path: &Path) -> Result<(), String> {
+    set_unix_mode(path, 0o755)
 }
 
 fn canonical_compare_key(p: &Path) -> String {
@@ -318,7 +324,7 @@ fn test_safe_binary_dir(dir: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let Ok(meta) = fs::symlink_metadata(dir) else {
+        let Ok(meta) = fs::metadata(dir) else {
             return false;
         };
         let uid_ok = Command::new("id")
@@ -326,8 +332,10 @@ fn test_safe_binary_dir(dir: &Path) -> bool {
             .output()
             .ok()
             .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u32>().ok())
-            .is_some_and(|euid| meta.uid() == euid);
-        uid_ok && (meta.mode() & 0o022) == 0
+            .is_some_and(|euid| meta.uid() == euid || meta.uid() == 0);
+        let mode = meta.mode();
+        let world_writable_unsticky = (mode & 0o002) != 0 && (mode & 0o1000) == 0;
+        uid_ok && !world_writable_unsticky
     }
 }
 
@@ -339,35 +347,41 @@ fn format_hook_exec_token(raw_path: &str) -> String {
     }
 }
 
-fn probe_hook_command(hook_display_path: &str, exe_disk_path: &Path) -> Option<String> {
+fn probe_hook_command(
+    hook_display_path: &str,
+    exe_disk_path: &Path,
+    home_dir: &Path,
+) -> Option<String> {
     if !exe_disk_path.is_file() {
         return None;
     }
     let formatted = format_hook_exec_token(hook_display_path);
 
     #[cfg(windows)]
-    let spawn_res = {
+    let mut cmd = {
         let comspec = env::var_os("ComSpec")
             .map(PathBuf::from)
             .filter(|p| p.is_file())
             .unwrap_or_else(|| PathBuf::from(r"C:\Windows\System32\cmd.exe"));
-        Command::new(comspec)
-            .args(["/C", &format!("{formatted} hook-pre-invocation")])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
+        let mut c = Command::new(comspec);
+        c.args(["/C", &format!("{formatted} hook-pre-invocation")]);
+        c
     };
 
     #[cfg(not(windows))]
-    let spawn_res = Command::new("/bin/sh")
-        .args(["-c", &format!("{formatted} hook-pre-invocation")])
+    let mut cmd = {
+        let mut c = Command::new("/bin/sh");
+        c.args(["-c", &format!("{formatted} hook-pre-invocation")]);
+        c
+    };
+
+    cmd.env("HOME", home_dir)
+        .env("USERPROFILE", home_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn();
+        .stderr(Stdio::null());
 
-    let mut child = spawn_res.ok()?;
+    let mut child = cmd.spawn().ok()?;
     if let Some(ref mut stdin) = child.stdin {
         let _ = stdin.write_all(b"{}");
     }
@@ -412,6 +426,10 @@ fn locate_local_ripgrep(home_dir: &Path) -> Option<PathBuf> {
             .join("ripgrep")
             .join("current")
             .join(exe_name),
+        #[cfg(unix)]
+        PathBuf::from("/opt/homebrew/bin/rg"),
+        #[cfg(unix)]
+        PathBuf::from("/usr/local/bin/rg"),
     ];
     for cand in candidates {
         if verify_ripgrep_binary(&cand) {
@@ -434,7 +452,13 @@ fn copy_sibling_python_ext_if_present(src_exe: &Path, bin_dir: &Path) -> Option<
             }
         }
     } else {
-        for name in ["libredb.so", "libredb_py.so", "libredb.abi3.so"] {
+        for name in [
+            "libredb.so",
+            "libredb_py.so",
+            "liblibredb_py.so",
+            "liblibredb_py.dylib",
+            "libredb.abi3.so",
+        ] {
             let cand = src_dir.join(name);
             if cand.is_file() {
                 let dst = bin_dir.join("libredb.so");
@@ -680,6 +704,9 @@ pub fn execute_install_command(opts: &InstallOptions) -> Result<InstallReport, S
         fs::create_dir_all(dir)
             .map_err(|e| format!("Failed to create directory '{}': {e}", dir.display()))?;
     }
+    set_unix_mode(&libre_home, 0o700)?;
+    set_unix_mode(&bin_dir, 0o755)?;
+    set_unix_mode(&agy_bin_dir, 0o755)?;
 
     let global_ldb = opts.global_path.clone().unwrap_or_else(|| {
         if opts.home_override.is_some() {
@@ -712,6 +739,25 @@ pub fn execute_install_command(opts: &InstallOptions) -> Result<InstallReport, S
     if canonical_compare_key(&agy_exe) != canonical_compare_key(&target_exe) {
         install_binary_hot_safe(&src_exe, &agy_exe)?;
         installed_binaries.push(agy_exe.display().to_string());
+    }
+    #[cfg(unix)]
+    {
+        let local_bin_dir = home_dir.join(".local").join("bin");
+        fs::create_dir_all(&local_bin_dir).map_err(|e| {
+            format!(
+                "Failed to create directory '{}': {e}",
+                local_bin_dir.display()
+            )
+        })?;
+        set_unix_mode(&local_bin_dir, 0o755)?;
+        let local_exe = local_bin_dir.join(bin_name);
+        let local_key = canonical_compare_key(&local_exe);
+        if local_key != canonical_compare_key(&target_exe)
+            && local_key != canonical_compare_key(&agy_exe)
+        {
+            install_binary_hot_safe(&src_exe, &local_exe)?;
+            installed_binaries.push(local_exe.display().to_string());
+        }
     }
     let legacy_cmd_shim = agy_bin_dir.join("libredb.cmd");
     if legacy_cmd_shim.exists() {
@@ -783,47 +829,52 @@ pub fn execute_install_command(opts: &InstallOptions) -> Result<InstallReport, S
         }
 
         for (display_cmd, disk_exe) in candidates {
-            if let Some(formatted) = probe_hook_command(&display_cmd, &disk_exe) {
+            if let Some(formatted) = probe_hook_command(&display_cmd, &disk_exe, &home_dir) {
                 verified_hook_cmd = Some(formatted);
                 verified_exe_path = Some(disk_exe);
                 break;
             }
         }
 
-        // Enterprise AppLocker fallback drive check on Windows when %USERPROFILE% is blocked:
-        #[cfg(windows)]
+        // Enterprise AppLocker / noexec fallback check when default home dirs cannot execute hooks:
+        let mut fallback_roots: Vec<PathBuf> = Vec::new();
+        if let Some(ref fb) = opts.fallback_drive {
+            fallback_roots.push(fb.clone());
+        }
         if verified_hook_cmd.is_none() {
-            let mut drive_candidates: Vec<PathBuf> = Vec::new();
-            if let Some(ref fb) = opts.fallback_drive {
-                drive_candidates.push(fb.clone());
-            }
-            let home_root = home_dir.components().next().map(|c| PathBuf::from(c.as_os_str()));
-            for probe_p in [&src_exe, &env::current_dir().unwrap_or_default()] {
-                if let Some(comp) = probe_p.components().next() {
-                    let root = PathBuf::from(format!("{}\\", comp.as_os_str().to_string_lossy()));
-                    if home_root.as_ref().is_none_or(|hr| {
-                        !root
-                            .to_string_lossy()
-                            .trim_end_matches('\\')
-                            .eq_ignore_ascii_case(hr.to_string_lossy().trim_end_matches('\\'))
-                    }) && !drive_candidates.contains(&root)
-                    {
-                        drive_candidates.push(root);
+            #[cfg(windows)]
+            {
+                let home_root = home_dir.components().next().map(|c| PathBuf::from(c.as_os_str()));
+                for probe_p in [&src_exe, &env::current_dir().unwrap_or_default()] {
+                    if let Some(comp) = probe_p.components().next() {
+                        let root = PathBuf::from(format!("{}\\", comp.as_os_str().to_string_lossy()));
+                        if home_root.as_ref().is_none_or(|hr| {
+                            !root
+                                .to_string_lossy()
+                                .trim_end_matches('\\')
+                                .eq_ignore_ascii_case(hr.to_string_lossy().trim_end_matches('\\'))
+                        }) && !fallback_roots.contains(&root)
+                        {
+                            fallback_roots.push(root);
+                        }
                     }
                 }
             }
-            for drv in drive_candidates {
+            for drv in fallback_roots {
                 if !test_safe_binary_dir(&drv) {
                     continue;
                 }
-                let fb_dir = drv.join(".gemini").join("libredb").join("bin");
-                let fb_exe = fb_dir.join("libredb.exe");
+                let fb_libre = drv.join(".gemini").join("libredb");
+                let fb_dir = fb_libre.join("bin");
+                let fb_exe = fb_dir.join(bin_name);
                 if install_binary_hot_safe(&src_exe, &fb_exe).is_ok() {
+                    let _ = set_unix_mode(&fb_libre, 0o700);
+                    let _ = set_unix_mode(&fb_dir, 0o755);
                     if let Some(ref rg_src) = locate_local_ripgrep(&home_dir) {
-                        let _ = install_binary_hot_safe(rg_src, &fb_dir.join("rg.exe"));
+                        let _ = install_binary_hot_safe(rg_src, &fb_dir.join(rg_name));
                     }
                     let disp = fb_exe.display().to_string();
-                    if let Some(formatted) = probe_hook_command(&disp, &fb_exe) {
+                    if let Some(formatted) = probe_hook_command(&disp, &fb_exe, &home_dir) {
                         installed_binaries.push(disp);
                         verified_hook_cmd = Some(formatted);
                         verified_exe_path = Some(fb_exe);
@@ -937,12 +988,14 @@ pub fn execute_install_command(opts: &InstallOptions) -> Result<InstallReport, S
 
     // 7. Hydrate and modernize global customizations.ldb in-place
     let gdb = open_global_ldb(Some(&global_ldb))?;
+    set_unix_mode(&global_ldb, 0o600)?;
     let skills_dir = find_repo_skills_dir_near(&src_exe);
-    crate::modernize_global_db(
+    crate::modernize_global_db_with_options(
         &gdb,
         Some(&skill_md_path),
         skills_dir.as_deref(),
         profile == InstallProfile::Personal,
+        opts.quiet_stdout,
     )
     .map_err(|e| format!("Failed to modernize global LibreDB store: {e}"))?;
 
@@ -1356,6 +1409,7 @@ pub fn execute_update_command(opts: &UpdateOptions) -> Result<UpdateReport, Stri
             fallback_drive: opts.fallback_drive.clone(),
             home_override: opts.home_override.clone(),
             global_path: opts.global_path.clone(),
+            quiet_stdout: opts.quiet_stdout,
         })?;
         return Ok(UpdateReport {
             current_version,
@@ -1538,6 +1592,7 @@ mod tests {
             fallback_drive: None,
             home_override: Some(fake_home.clone()),
             global_path: None,
+            quiet_stdout: true,
         })
         .unwrap();
         assert_eq!(rep1.profile, InstallProfile::Personal);
@@ -1565,6 +1620,7 @@ mod tests {
             fallback_drive: None,
             home_override: Some(fake_home.clone()),
             global_path: None,
+            quiet_stdout: true,
         })
         .unwrap();
         assert_eq!(rep2.profile, InstallProfile::Personal);

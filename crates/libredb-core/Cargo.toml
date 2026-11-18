@@ -12,7 +12,6 @@ crc32fast.workspace = true
 lz4_flex.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

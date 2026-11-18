@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.1] - 2026-11-18
+
+### Fixed
+- **Linux and macOS build, POSIX installer parity, JSON output purity, and CI verification (`libredb install`, `libredb update`, `.github/workflows/ci.yml`)**: Enabled cross-platform fallback execution directory support (`--fallback-drive`) in the standalone installer so Linux and macOS builds compile cleanly under strict `-D warnings` checks, removed an unused `serde_json` dependency warning from `libredb-core`, and kept standard output in `libredb install --json` and `libredb update` strictly valid JSON by routing any workspace quarantine warnings to standard error. Aligned POSIX folder and executable permission handling (`0700` data store, `0755` bin directories, `umask 0002` compatibility), `~/.local/bin` synchronization, Homebrew `ripgrep` discovery, and GitHub Actions reflex-count checks (`4` technical reflexes) across Windows, Linux, and macOS.
+
 ## [2.4.0] - 2026-11-18
 
 ### Added

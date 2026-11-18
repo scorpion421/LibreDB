@@ -2593,6 +2593,7 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 fallback_drive: cli.path_value("--fallback-drive"),
                 home_override: cli.path_value("--home"),
                 global_path: cli.global_path.clone(),
+                quiet_stdout: as_json,
             };
             let rep = installer::execute_install_command(&opts)?;
             if as_json {
@@ -2632,6 +2633,7 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 fallback_drive: cli.path_value("--fallback-drive"),
                 home_override: cli.path_value("--home"),
                 global_path: cli.global_path.clone(),
+                quiet_stdout: as_json,
             };
             let rep = installer::execute_update_command(&opts)?;
             if as_json {
@@ -2872,6 +2874,16 @@ pub(crate) fn modernize_global_db(
     skill_md_opt: Option<&Path>,
     skills_dir_opt: Option<&Path>,
     personal: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    modernize_global_db_with_options(gdb, skill_md_opt, skills_dir_opt, personal, false)
+}
+
+pub(crate) fn modernize_global_db_with_options(
+    gdb: &Arc<LibreDb>,
+    skill_md_opt: Option<&Path>,
+    skills_dir_opt: Option<&Path>,
+    personal: bool,
+    quiet_stdout: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let t0 = Instant::now();
     let mut deprecated_legacy = 0usize;
@@ -3319,26 +3331,31 @@ pub(crate) fn modernize_global_db(
                 verified_workspaces += 1;
             } else {
                 quarantined_workspaces += 1;
-                if security::is_unsealed_replacement_of_sealed_workspace(gdb, &ws_path) {
-                    println!(
+                let warn_msg = if security::is_unsealed_replacement_of_sealed_workspace(gdb, &ws_path) {
+                    format!(
                         "[WARN] Quarantined workspace '{}': previously sealed .agents/memory.ldb is missing, unsealed, or rolled back to empty; restore from backup or run 'libredb trust --reinit-lost \"{}\"' to re-initialize.",
                         ws_path.display(),
                         ws_path.display()
-                    );
+                    )
                 } else if let Some((proj_rev, global_rev)) =
                     security::detect_workspace_seal_rollback(gdb, &ws_path)?
                 {
-                    println!(
+                    format!(
                         "[WARN] Quarantined workspace '{}': .agents/memory.ldb carries older seal revision r{proj_rev} while host customizations.ldb requires at least r{global_rev} (historical snapshot rollback detected); restore latest .agents/memory.ldb or run 'libredb trust --accept-rollback \"{}\"' to accept.",
                         ws_path.display(),
                         ws_path.display()
-                    );
+                    )
                 } else {
-                    println!(
+                    format!(
                         "[WARN] Quarantined workspace '{}': .agents/memory.ldb has an unverified, legacy, or modified seal; inspect the database and run 'libredb trust \"{}\"' to re-seal.",
                         ws_path.display(),
                         ws_path.display()
-                    );
+                    )
+                };
+                if quiet_stdout {
+                    eprintln!("{warn_msg}");
+                } else {
+                    println!("{warn_msg}");
                 }
             }
         }
@@ -3348,19 +3365,21 @@ pub(crate) fn modernize_global_db(
     cog.save_index_snapshot()?;
     let comp = gdb.compact_with_options(true)?;
 
-    println!(
-        "[OK] Modernized global LibreDB (profile={}) in {:.2} ms: {} legacy capsules deprecated, {} rules updated, {} libredb skill sections synced, {} reflexes active, {} workspaces verified ({} quarantined) ({} -> {} bytes)",
-        if personal { "personal" } else { "neutral" },
-        t0.elapsed().as_secs_f64() * 1000.0,
-        deprecated_legacy,
-        rules_updated,
-        synced_sections,
-        active_reflex_count,
-        verified_workspaces,
-        quarantined_workspaces,
-        comp.bytes_before,
-        comp.bytes_after
-    );
+    if !quiet_stdout {
+        println!(
+            "[OK] Modernized global LibreDB (profile={}) in {:.2} ms: {} legacy capsules deprecated, {} rules updated, {} libredb skill sections synced, {} reflexes active, {} workspaces verified ({} quarantined) ({} -> {} bytes)",
+            if personal { "personal" } else { "neutral" },
+            t0.elapsed().as_secs_f64() * 1000.0,
+            deprecated_legacy,
+            rules_updated,
+            synced_sections,
+            active_reflex_count,
+            verified_workspaces,
+            quarantined_workspaces,
+            comp.bytes_before,
+            comp.bytes_after
+        );
+    }
     Ok(())
 }
 
