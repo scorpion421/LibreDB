@@ -645,15 +645,6 @@ pub fn cmd_gitea_sync(
             if rel.is_empty() {
                 continue;
             }
-            // Release binaries are uploaded as release assets; never duplicate them in the Git tree.
-            if is_release_deliverable_path(rel) {
-                let _ = Command::new("git")
-                    .args(["-c", "core.fsmonitor=false", "rm", "--cached", "--quiet", "--", rel])
-                    .current_dir(&clean_root)
-                    .output();
-                skipped_deliverables += 1;
-                continue;
-            }
             if let Some(reason) = is_sensitive_staged_file(rel, &allowed_staged) {
                 let norm_rel = rel.replace('\\', "/");
                 if norm_rel == ".agents" || norm_rel.starts_with(".agents/") {
@@ -670,6 +661,15 @@ pub fn cmd_gitea_sync(
                     clean_root.display()
                 )
                 .into());
+            }
+            // Release binaries are uploaded as release assets; never duplicate them in the Git tree.
+            if is_release_deliverable_path(rel) {
+                let _ = Command::new("git")
+                    .args(["-c", "core.fsmonitor=false", "rm", "--cached", "--quiet", "--", rel])
+                    .current_dir(&clean_root)
+                    .output();
+                skipped_deliverables += 1;
+                continue;
             }
         }
         if skipped_deliverables > 0 {
@@ -1301,13 +1301,39 @@ const RELEASE_DELIVERABLE_EXTS: [&str; 15] = [
     ".xpi", ".deb", ".rpm", ".dmg",
 ];
 
-/// Returns `true` for binary release deliverables under `dist/` or `releases/` that must never be
-/// committed to the Git tree because they are published as release assets. Source files inside
-/// those directories (e.g. web build output tracked on purpose) are left untouched.
+fn is_allowed_release_outbox_filename(fname: &str) -> bool {
+    let low = fname.trim().to_ascii_lowercase();
+    if low.is_empty()
+        || low.starts_with('.')
+        || low.starts_with('-')
+        || matches!(low.as_str(), "thumbs.db" | "desktop.ini" | "readme.md")
+        || [".old", ".tmp", ".part", ".bak", ".ldbbak"]
+            .iter()
+            .any(|sfx| low.ends_with(sfx))
+    {
+        return false;
+    }
+    is_sensitive_staged_file(&low, &[]).is_none()
+}
+
+/// Returns `true` for release outbox deliverables under `releases/` or `release/` (any extension
+/// allowed by the outbox filename/secret filter) and binary release deliverables under `dist/`
+/// that must never be committed to the Git tree because they are published as release assets.
 fn is_release_deliverable_path(rel: &str) -> bool {
-    let low = rel.trim().trim_matches('"').replace('\\', "/").to_ascii_lowercase();
-    (low.starts_with("dist/") || low.starts_with("releases/"))
-        && RELEASE_DELIVERABLE_EXTS.iter().any(|ext| low.ends_with(ext))
+    let clean = rel.trim().trim_matches('"').replace('\\', "/");
+    let low = clean.to_ascii_lowercase();
+    let leaf = low.rsplit('/').next().unwrap_or(&low);
+    if low.starts_with("releases/") || low.starts_with("release/") {
+        return is_allowed_release_outbox_filename(leaf)
+            && is_sensitive_staged_file(&clean, &[]).is_none();
+    }
+    low.starts_with("dist/")
+        && is_sensitive_staged_file(&clean, &[]).is_none()
+        && (RELEASE_DELIVERABLE_EXTS.iter().any(|ext| low.ends_with(ext))
+            || matches!(
+                low.rsplit_once('.').map(|(_, ext)| ext),
+                Some("pyd" | "so" | "dylib" | "dll")
+            ))
 }
 
 /// Extracts an explicit `major.minor.patch` SemVer core string from a lowercase deliverable filename.
@@ -1375,6 +1401,23 @@ fn filename_conflicts_with_version(filename_low: &str, clean_ver: &str) -> bool 
     extract_filename_version(filename_low).is_some_and(|found| found != target_core)
 }
 
+fn is_allowed_release_outbox_file(path: &Path, clean_ver: &str) -> bool {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !meta.file_type().is_file() || meta.len() > MAX_DELIVERABLE_ASSET_BYTES {
+        return false;
+    }
+    let Some(fname) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    if !is_allowed_release_outbox_filename(fname) {
+        return false;
+    }
+    let low = fname.to_ascii_lowercase();
+    !filename_conflicts_with_version(&low, clean_ver)
+}
+
 fn discover_deliverable_files(
     project_root: &Path,
     tag: &str,
@@ -1383,13 +1426,27 @@ fn discover_deliverable_files(
     let exts = RELEASE_DELIVERABLE_EXTS;
     let clean_ver = tag.trim_start_matches(['v', 'V']).to_ascii_lowercase();
     let tag_low = tag.to_ascii_lowercase();
-    let mut found = Vec::new();
-    for sub in ["dist", "releases"] {
+
+    let mut outbox = Vec::new();
+    for sub in ["releases", "release"] {
         let dir = project_root.join(sub);
         if fs::symlink_metadata(&dir).is_ok_and(|m| m.file_type().is_symlink()) {
             continue;
         }
         if let Ok(rd) = fs::read_dir(&dir) {
+            let mut entries: Vec<PathBuf> = rd
+                .filter_map(|e| e.ok().map(|x| x.path()))
+                .filter(|p| is_allowed_release_outbox_file(p, &clean_ver))
+                .collect();
+            entries.sort();
+            outbox.extend(entries);
+        }
+    }
+
+    let mut dist_found = Vec::new();
+    let dist_dir = project_root.join("dist");
+    if !fs::symlink_metadata(&dist_dir).is_ok_and(|m| m.file_type().is_symlink()) {
+        if let Ok(rd) = fs::read_dir(&dist_dir) {
             let mut entries: Vec<PathBuf> = rd
                 .filter_map(|e| e.ok().map(|x| x.path()))
                 .filter(|p| {
@@ -1409,25 +1466,51 @@ fn discover_deliverable_files(
                 })
                 .collect();
             entries.sort();
-            found.extend(entries);
+            dist_found.extend(entries);
         }
     }
-    let tag_matched: Vec<PathBuf> = found
+
+    let is_tag_match = |p: &Path| {
+        let n = p
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_ascii_lowercase();
+        n.contains(&tag_low) || (!clean_ver.is_empty() && n.contains(&clean_ver))
+    };
+
+    if is_latest_release && !outbox.is_empty() {
+        let mut seen_names: std::collections::HashSet<String> = outbox
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()))
+            .collect();
+        let mut merged = outbox;
+        for p in dist_found {
+            if is_tag_match(&p) {
+                let name_low = p
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_ascii_lowercase();
+                if seen_names.insert(name_low) {
+                    merged.push(p);
+                }
+            }
+        }
+        return merged;
+    }
+
+    let mut combined = outbox;
+    combined.extend(dist_found);
+    let tag_matched: Vec<PathBuf> = combined
         .iter()
-        .filter(|p| {
-            let n = p
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_ascii_lowercase();
-            n.contains(&tag_low) || (!clean_ver.is_empty() && n.contains(&clean_ver))
-        })
+        .filter(|p| is_tag_match(p))
         .cloned()
         .collect();
     if !tag_matched.is_empty() {
         tag_matched
     } else if is_latest_release {
-        found
+        combined
     } else {
         Vec::new()
     }
@@ -1554,7 +1637,14 @@ fn ensure_git_info_exclude(project_root: &Path) {
     let exclude_path = info_dir.join("exclude");
     let existing = fs::read_to_string(&exclude_path).unwrap_or_default();
     let mut missing = Vec::new();
-    for rule in ["/.agents/", "*.tmp.ldb", "*.credential.xml"] {
+    for rule in [
+        "/.agents/",
+        "/releases/",
+        "/release/",
+        "/dist/",
+        "*.tmp.ldb",
+        "*.credential.xml",
+    ] {
         if !existing.lines().any(|l| l.trim() == rule) {
             missing.push(rule);
         }
@@ -2849,6 +2939,66 @@ mod tests {
             exact_names(discover_deliverable_files(&tmp, "v1.6.2", true)),
             vec!["libredb.exe".to_owned()],
             "Latest release fallback may upload unversioned binary while still excluding mismatched versions"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn release_outbox_uploads_extensionless_and_pyd_files_while_blocking_secrets_and_old_versions() {
+        use crate::gitea::discover_deliverable_files;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "libredb_release_outbox_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        let rel_dir = tmp.join("releases");
+        let dist_dir = tmp.join("dist");
+        fs::create_dir_all(&rel_dir).unwrap();
+        fs::create_dir_all(&dist_dir).unwrap();
+
+        // Outbox contains arbitrary release deliverables plus files that must be excluded.
+        fs::write(rel_dir.join("libredb-v2.4.4-linux-x64"), b"elf").unwrap();
+        fs::write(rel_dir.join("libredb.pyd"), b"pyd").unwrap();
+        fs::write(rel_dir.join("SHA256SUMS.txt"), b"sums").unwrap();
+        fs::write(rel_dir.join("libredb-v2.4.4-windows-x64.exe"), b"exe").unwrap();
+        fs::write(rel_dir.join(".env"), b"SECRET=1").unwrap();
+        fs::write(rel_dir.join("secret.ldb"), b"ldb").unwrap();
+        fs::write(rel_dir.join("notes.tmp"), b"tmp").unwrap();
+        fs::write(rel_dir.join("helper-v1.5.0.zip"), b"old").unwrap();
+
+        // When `releases/` is populated, `dist/` must not leak into release uploads.
+        fs::write(dist_dir.join("libredb.exe"), b"local_dist_only").unwrap();
+
+        let exact_names = |files: Vec<std::path::PathBuf>| -> Vec<String> {
+            let mut names: Vec<String> = files
+                .into_iter()
+                .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .collect();
+            names.sort();
+            names
+        };
+
+        assert!(super::is_release_deliverable_path("releases/libredb-v2.4.4-linux-x64"));
+        assert!(super::is_release_deliverable_path("releases/libredb.pyd"));
+        assert!(super::is_release_deliverable_path("release/libredb-v2.4.4-macos-arm64"));
+        assert!(!super::is_release_deliverable_path("releases/.env"));
+        assert!(!super::is_release_deliverable_path("releases/secret.ldb"));
+        assert!(!super::is_release_deliverable_path("releases/notes.tmp"));
+
+        assert_eq!(
+            exact_names(discover_deliverable_files(&tmp, "v2.4.4", true)),
+            vec![
+                "SHA256SUMS.txt".to_owned(),
+                "libredb-v2.4.4-linux-x64".to_owned(),
+                "libredb-v2.4.4-windows-x64.exe".to_owned(),
+                "libredb.pyd".to_owned(),
+            ],
+            "Release outbox must upload extensionless binaries and .pyd extensions while excluding secrets, temp files, old tags, and dist/"
         );
 
         let _ = fs::remove_dir_all(&tmp);

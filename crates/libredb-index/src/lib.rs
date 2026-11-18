@@ -22,9 +22,9 @@ pub const HEBBIAN_KEY_PREFIX: &str = "hebbian::";
 pub const INDEX_SNAPSHOT_KEY: &str = "sys::index_snapshot";
 /// Binary schema/filtering version for `sys::index_snapshot`. Bumping this automatically
 /// rebuilds any older snapshot (e.g. v1 with `Symbol`/`QuotaEvent` postings, v3 with
-/// retained dead postings from superseded Inodes, or v4 before alphanumeric technical token
-/// preservation) on open.
-pub const INDEX_FORMAT_VERSION: u32 = 5;
+/// retained dead postings from superseded Inodes, v4 before alphanumeric technical token
+/// preservation, or v5 before disabling character 3-grams on `Skill`/`SkillSection`/`Rule`) on open.
+pub const INDEX_FORMAT_VERSION: u32 = 6;
 
 /// Ranked search hit produced by `HybridIndex::search`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -369,6 +369,11 @@ impl HybridIndex {
         let mut word_len = 0u32;
         let mut ngram_len = 0u32;
 
+        let allow_ngrams = !matches!(
+            kind,
+            NodeKind::Skill | NodeKind::SkillSection | NodeKind::Rule
+        );
+
         if let Some(ref k) = key {
             let ngram_source = if kind == NodeKind::Symbol {
                 k.split("::").nth(1).unwrap_or(k.as_str())
@@ -379,10 +384,12 @@ impl HybridIndex {
                 *word_tf.entry(tok).or_insert(0) += 3;
                 word_len += 3;
             }
-            for tok in segment_universal_tokens(ngram_source) {
-                for ng in extract_unicode_ngrams(&tok) {
-                    *ngram_tf.entry(ng).or_insert(0) += 2;
-                    ngram_len += 2;
+            if allow_ngrams {
+                for tok in segment_universal_tokens(ngram_source) {
+                    for ng in extract_unicode_ngrams(&tok) {
+                        *ngram_tf.entry(ng).or_insert(0) += 2;
+                        ngram_len += 2;
+                    }
                 }
             }
         }
@@ -391,7 +398,7 @@ impl HybridIndex {
         let body_tokens = segment_universal_tokens(body);
         let mut seen_ngram_tokens = 0usize;
         for tok in body_tokens {
-            if seen_ngram_tokens < ngram_cap && !word_tf.contains_key(&tok) {
+            if allow_ngrams && seen_ngram_tokens < ngram_cap && !word_tf.contains_key(&tok) {
                 if tok.chars().count() >= 4 || !tok.is_ascii() {
                     seen_ngram_tokens += 1;
                     for ng in extract_unicode_ngrams(&tok).into_iter().take(12) {
@@ -412,8 +419,9 @@ impl HybridIndex {
             self.purge_nodes_from_postings(&single);
         }
 
+        let stored_ngram_len = if allow_ngrams { ngram_len.max(1) } else { 0 };
         self.total_word_len += word_len.max(1) as u64;
-        self.total_ngram_len += ngram_len.max(1) as u64;
+        self.total_ngram_len += stored_ngram_len as u64;
         self.docs.insert(
             node_id,
             DocMeta {
@@ -421,7 +429,7 @@ impl HybridIndex {
                 key,
                 generation,
                 word_len: word_len.max(1),
-                ngram_len: ngram_len.max(1),
+                ngram_len: stored_ngram_len,
                 importance,
             },
         );
@@ -497,8 +505,19 @@ impl HybridIndex {
         }
 
         let n_docs = self.docs.len() as f64;
+        let n_word_eff = n_docs.max(8.0);
         let avg_wl = (self.total_word_len as f64 / n_docs).max(1.0);
-        let avg_ngl = (self.total_ngram_len as f64 / n_docs).max(1.0);
+        let n_ngram_docs = self
+            .docs
+            .values()
+            .filter(|m| m.ngram_len > 0)
+            .count() as f64;
+        let n_ngram_eff = n_ngram_docs.max(8.0);
+        let avg_ngl = if n_ngram_docs > 0.0 {
+            (self.total_ngram_len as f64 / n_ngram_docs).max(1.0)
+        } else {
+            1.0
+        };
         const K1: f64 = 1.2;
         const B: f64 = 0.75;
 
@@ -518,7 +537,7 @@ impl HybridIndex {
             if df == 0.0 {
                 continue;
             }
-            let idf = ((n_docs - df + 0.5) / (df + 0.5) + 1.0).ln();
+            let idf = ((n_word_eff.max(df) - df + 0.5) / (df + 0.5) + 1.0).ln();
             if idf <= 0.05 {
                 continue;
             }
@@ -559,7 +578,7 @@ impl HybridIndex {
             }
         }
 
-        if !query_ngrams.is_empty() {
+        if !query_ngrams.is_empty() && n_ngram_docs > 0.0 {
             let norm_scale = 0.45 / (query_ngrams.len() as f64).sqrt();
             for ng in &query_ngrams {
                 let Some(plist) = self.ngram_postings.get(ng) else {
@@ -567,12 +586,12 @@ impl HybridIndex {
                 };
                 let df = plist
                     .iter()
-                    .filter(|&&(nid, _)| self.docs.contains_key(&nid))
+                    .filter(|&&(nid, _)| self.docs.get(&nid).is_some_and(|m| m.ngram_len > 0))
                     .count() as f64;
                 if df == 0.0 {
                     continue;
                 }
-                let idf = ((n_docs - df + 0.5) / (df + 0.5) + 1.0).ln();
+                let idf = ((n_ngram_eff.max(df) - df + 0.5) / (df + 0.5) + 1.0).ln();
                 if idf <= 0.15 {
                     continue;
                 }
@@ -580,6 +599,12 @@ impl HybridIndex {
                     let Some(meta) = self.docs.get(&nid) else {
                         continue;
                     };
+                    if matches!(
+                        meta.kind,
+                        NodeKind::Skill | NodeKind::SkillSection | NodeKind::Rule
+                    ) {
+                        continue;
+                    }
                     if let Some(allowed) = kind_filter {
                         if !allowed.contains(&meta.kind) {
                             continue;
@@ -1005,5 +1030,90 @@ mod tests {
         let sha_stem_hits = upgraded.search("sha", None, 5);
         assert!(!sha_stem_hits.is_empty());
         assert_eq!(sha_stem_hits[0].node_id, v4_id);
+    }
+
+    #[test]
+    fn skill_and_rule_nodes_never_match_via_character_trigrams_and_upgrade_to_v6() {
+        let dir = tempdir().unwrap();
+        let db = LibreDb::open(dir.path().join("trigram_isolation_v6.ldb")).unwrap();
+
+        let skill_id = db
+            .put(
+                WriteRequest::new(
+                    NodeKind::SkillSection,
+                    b"Designing Android mobile (https://developer.android.com/design/ui/mobile) requires overriding predictive navigation and adaptive rendering."
+                        .to_vec(),
+                )
+                .with_key("android-app-design::4. Edge-to-edge"),
+            )
+            .unwrap();
+        let rule_id = db
+            .put(
+                WriteRequest::new(
+                    NodeKind::Rule,
+                    b"Overriding developer adaptive rendering settings in certificate servers.".to_vec(),
+                )
+                .with_key("rule::adaptive-rule"),
+            )
+            .unwrap();
+        let fact_id = db
+            .put(
+                WriteRequest::new(
+                    NodeKind::Fact,
+                    b"overriding adaptive certificate server configuration noted in fact.".to_vec(),
+                )
+                .with_key("fact::cert-server"),
+            )
+            .unwrap();
+
+        // Simulate a legacy v5 snapshot containing 3-gram postings on SkillSection & Rule:
+        let mut stale = HybridIndex::build_from_db(&db).unwrap();
+        stale
+            .ngram_postings
+            .entry("ver".to_owned())
+            .or_default()
+            .push((skill_id, 4));
+        stale
+            .ngram_postings
+            .entry("ati".to_owned())
+            .or_default()
+            .push((rule_id, 4));
+        stale.format_version = 5;
+        let stale_bytes = serde_json::to_vec(&stale).unwrap();
+        db.put(
+            WriteRequest::new(NodeKind::Generic, stale_bytes)
+                .with_key(INDEX_SNAPSHOT_KEY)
+                .with_importance(255),
+        )
+        .unwrap();
+
+        let upgraded = HybridIndex::load_or_build(&db).unwrap();
+        assert_eq!(upgraded.format_version, INDEX_FORMAT_VERSION);
+
+        // Stem-only trigram query ("overrid", "adaptiv") must match Fact via 3-grams,
+        // NEVER SkillSection or Rule:
+        let stem_hits = upgraded.search("overrid adaptiv", None, 10);
+        assert!(
+            stem_hits.iter().any(|h| h.node_id == fact_id),
+            "Fact must still recall morphologically via 3-grams: {stem_hits:?}"
+        );
+        assert!(
+            !stem_hits
+                .iter()
+                .any(|h| h.node_id == skill_id || h.node_id == rule_id),
+            "SkillSection and Rule must NEVER match via character 3-grams: {stem_hits:?}"
+        );
+
+        // Exact token query still retrieves both SkillSection and Rule cleanly:
+        let exact_skill = upgraded.search("android", None, 5);
+        assert!(
+            exact_skill.iter().any(|h| h.node_id == skill_id),
+            "Exact token must still match SkillSection: {exact_skill:?}"
+        );
+        let exact_rule = upgraded.search("overriding", None, 5);
+        assert!(
+            exact_rule.iter().any(|h| h.node_id == rule_id),
+            "Exact token must still match Rule: {exact_rule:?}"
+        );
     }
 }

@@ -458,7 +458,7 @@ pub fn diff_symbol_body_tokens(
         touched_set.contains(q_key.as_str()) || touched_set.contains(short_key.as_str())
     });
 
-    let sym_tok_limit = if old_bytes.is_some() { usize::MAX } else { 128 };
+    let sym_tok_limit = if old_bytes.is_some() { usize::MAX } else { 1024 };
     let mut added = std::collections::BTreeSet::new();
     for sym in &new_skel.symbols {
         if has_leaf_touched

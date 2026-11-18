@@ -1,9 +1,10 @@
 use libredb_cognitive::{
-    check_german_prose_style, extract_error_file_hint, index_workspace, is_banal_syntax_error,
-    is_code_learning_eligible_path, learning_state_report, reconcile_tentative_edits,
-    record_error_cue, sanitize_learning_artifacts, stage_tentative_file_edit, CognitiveEngine,
-    ErrorPitfallBook, LearnedPitfallEntry, OverlayBrain, PendingErrorCue, PulseRequest,
-    ReflexEngine, ReflexRule, ERROR_PITFALL_BOOK_KEY, PENDING_ERROR_CUES_KEY,
+    check_command_guardrails, check_german_prose_style, extract_error_file_hint, index_workspace,
+    is_banal_syntax_error, is_code_learning_eligible_path, learning_state_report,
+    reconcile_tentative_edits, record_error_cue, sanitize_learning_artifacts,
+    stage_tentative_file_edit, CognitiveEngine, ErrorPitfallBook, LearnedPitfallEntry,
+    OverlayBrain, PendingErrorCue, PulseRequest, ReflexEngine, ReflexRule,
+    ERROR_PITFALL_BOOK_KEY, PENDING_ERROR_CUES_KEY,
 };
 use libredb_core::{EdgeKind, LibreDb, NodeKind, WriteRequest};
 use std::fs;
@@ -1209,5 +1210,129 @@ fn pulse_suppresses_generic_it_collisions_and_has_section_laundering_on_global_s
         reflex_resp.fired_reflexes
     );
 
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn reflex_word_boundaries_and_prose_only_morphological_german_guardrails() {
+    let base = temp_test_dir("reflex_guardrail_v244");
+    let db_path = base.join("rules.ldb");
+    let db = LibreDb::open(&db_path).unwrap();
+
+    for (id, stack_any, action_any) in [
+        ("rule-rust", vec!["rust".to_owned()], vec!["build".to_owned()]),
+        ("rule-plan", vec![], vec!["plan".to_owned()]),
+        ("rule-sheet", vec![], vec!["sheet".to_owned()]),
+        ("rule-fluent2", vec!["fluent 2".to_owned()], vec![]),
+        ("rule-cargo", vec!["cargo.toml".to_owned()], vec![]),
+    ] {
+        ReflexEngine::learn_reflex(
+            &db,
+            &ReflexRule {
+                id: id.to_owned(),
+                stack_any,
+                action_any,
+                directive: format!("Directive for {id}"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+
+    let engine = ReflexEngine::load(&db).unwrap();
+    let empty_ws = base.join("empty_ws");
+    fs::create_dir_all(&empty_ws).unwrap();
+
+    // Word boundaries prevent substring false positives ("trust" != "rust", "explain" != "plan", "spreadsheet" != "sheet").
+    assert!(engine.evaluate(Some(&empty_ws), "trust build", None).is_empty());
+    assert!(engine.evaluate(Some(&empty_ws), "explain this setup", None).is_empty());
+    assert!(engine.evaluate(Some(&empty_ws), "open spreadsheet", None).is_empty());
+
+    // Exact token and multi-token/punctuation boundaries still fire reliably.
+    assert!(engine
+        .evaluate(Some(&empty_ws), "rust build", None)
+        .iter()
+        .any(|r| r.id == "rule-rust"));
+    assert!(engine
+        .evaluate(Some(&empty_ws), "plan the refactor", None)
+        .iter()
+        .any(|r| r.id == "rule-plan"));
+    assert!(engine
+        .evaluate(Some(&empty_ws), "open sheet", None)
+        .iter()
+        .any(|r| r.id == "rule-sheet"));
+    assert!(engine
+        .evaluate(Some(&empty_ws), "Build Windows Fluent 2 app", None)
+        .iter()
+        .any(|r| r.id == "rule-fluent2"));
+    assert!(engine
+        .evaluate(Some(&empty_ws), "Inspect Cargo.toml", None)
+        .iter()
+        .any(|r| r.id == "rule-cargo"));
+
+    // Non-prose files (.rs, .py, .ps1) skip German prose style checks completely.
+    let german_bad = format!(
+        "Dieser Bericht pr\u{00fc}ft die Umsetzung, weil heute ein {} und {} stattfindet.",
+        concat!("Praxis", "-Test"),
+        concat!("Auto", "-Modus"),
+    );
+    assert!(check_german_prose_style(&german_bad, "src/lib.rs").is_empty());
+    assert!(check_german_prose_style(&german_bad, "scripts/helper.py").is_empty());
+    assert!(check_german_prose_style(&german_bad, "scripts/deploy.ps1").is_empty());
+
+    // Prose Markdown allows established English technical compounds and PowerShell cmdlets.
+    let valid_german_prose = format!(
+        "Dieser Bericht pr\u{00fc}ft die Architektur, weil {}, {}, {}, {}, {} und {} sauber bleiben.",
+        concat!("Zero", "-Trust"),
+        concat!("Open", "-Source"),
+        concat!("Cross", "-Platform"),
+        concat!("Single", "-File"),
+        concat!("Read", "-Only"),
+        concat!("Stop", "-Service"),
+    );
+    assert!(
+        check_german_prose_style(&valid_german_prose, "notes.md").is_empty(),
+        "Valid English technical terms and cmdlets must not trigger german-deppenbindestrich: {:?}",
+        check_german_prose_style(&valid_german_prose, "notes.md")
+    );
+
+    // German morphological Deppenbindestriche in Markdown are still caught reliably.
+    for sample in [
+        format!("Dieser Hinweis pr\u{00fc}ft die Regel, weil {} falsch ist.", concat!("Praxis", "-Test")),
+        format!("Dieser Hinweis pr\u{00fc}ft die Regel, weil {} falsch ist.", concat!("Architektur", "-Wildwuchs")),
+        format!("Dieser Hinweis pr\u{00fc}ft die Regel, weil {} falsch ist.", concat!("Auto", "-Modus")),
+        format!("Dieser Hinweis pr\u{00fc}ft die Regel, weil {} falsch ist.", concat!("Test", "-Laufzeit")),
+    ] {
+        let v = check_german_prose_style(&sample, "notes.md");
+        assert!(
+            v.iter().any(|item| item.rule == "german-deppenbindestrich"),
+            "Expected german-deppenbindestrich violation for sample: {sample}"
+        );
+    }
+
+    // Read-only diagnostics pass while mutating/secret-exfiltration commands stay blocked.
+    for allowed_cmd in [
+        "Invoke-Command -ComputerName srv01 -ScriptBlock { schtasks /query /tn demo }",
+        "git -c core.fsmonitor=false status",
+        "rg \".vault.key\" crates/",
+    ] {
+        assert!(
+            check_command_guardrails(allowed_cmd).is_none(),
+            "Read-only diagnostic command should be allowed: {allowed_cmd}"
+        );
+    }
+    for blocked_cmd in [
+        "Invoke-Command -ComputerName srv01 -ScriptBlock { schtasks /create /tn demo /tr calc.exe /sc once /st 12:00 }",
+        "git -c core.fsmonitor=./evil.sh status",
+        "cat ~/.gemini/libredb/.vault.key",
+    ] {
+        assert!(
+            check_command_guardrails(blocked_cmd).is_some(),
+            "Blocked command must trigger guardrail violation: {blocked_cmd}"
+        );
+    }
+
+    drop(engine);
+    drop(db);
     let _ = fs::remove_dir_all(&base);
 }

@@ -9,6 +9,7 @@ __pycache__/
 *.so
 *.egg-info/
 dist/
+/release/
 /releases/
 build/
 .venv/

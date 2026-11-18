@@ -1412,6 +1412,12 @@ pub(crate) fn parse_and_select_release_asset(
             || low.ends_with(".txt")
             || low.ends_with(".zip")
             || low.ends_with(".tar.gz")
+            || low.ends_with(".pyd")
+            || low.ends_with(".dll")
+            || low.ends_with(".so")
+            || low.ends_with(".dylib")
+            || low.ends_with(".whl")
+            || low.ends_with(".pdb")
     };
 
     let mut chosen: Option<(String, String)> = None;

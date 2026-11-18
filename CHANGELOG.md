@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.4] - 2026-11-18
+
+### Added
+- **Extension-agnostic release outbox (`releases/`, `release/`, `libredb git-sync --releases`, `libredb git-release`)**: Release automation now treats the local `.gitignore`-protected `releases/` (and `release/`) directory as an explicit upload outbox, accepting extensionless Linux and macOS binaries, `.pyd` Python bindings, checksum manifests, and packages while automatically blocking secret files, temporary artifacts, and stale version tags. When the outbox contains files, local `dist/` staging binaries are skipped so only finalized release artifacts are published.
+
+### Changed
+- **Prose-only German style guardrails and expanded command diagnostics (`libredb guardrail check`, `PreToolUse` hook)**: Restricted German prose and compound-hyphenation checks strictly to prose and documentation files (`.md`, `.txt`, `.rst`, `.adoc`) while validating compound words morphologically so English technical compounds and PowerShell cmdlets are not misflagged. Read-only diagnostics (`schtasks /query`, `git -c core.fsmonitor=false`, and codebase searches mentioning key filenames) are now permitted while mutating or key-exfiltration commands stay blocked.
+- **Raised initial `skeleton` body cap and expanded multi-language error learning**: Increased the initial symbol body token cap on newly inspected source files from `128` to `1024` tokens so real function implementations remain readable on first load, and added `.dart`, `.vue`, `.svelte`, `.astro`, `.tf`, `.hcl`, `.proto`, `.gradle`, `.smali`, `.groovy`, `.clj`, `.erl`/`.hrl`, `.hs`, `.ml`/`.mli`, `.r`, `.jl`, and matching build manifests to automatic error-pitfall indexing.
+
+### Fixed
+- **Pure-semantic `Skill` and `Rule` recall and exact reflex token boundaries (`libredb_pulse`, `libredb pulse`)**: Stopped character-trigram indexing and scoring on `Skill`, `SkillSection`, and `Rule` records while bumping the index schema version cleanly so unrelated server or infrastructure queries never match technical guides on accidental 3-letter fragments. Situational reflexes now require token boundaries (preventing substrings like `"rust"` inside `"trust"`) and match negative exclusion filters only against the prompt and error context rather than ambient workspace folder names.
+- **Strict layer isolation across CLI code commands, `modernize-global`, and quarantined overlays**: Uninitialized CLI code-graph commands (`locate`, `impact`, `fim`, and `pulse` outside initialized repos) now use per-workspace ephemeral caches instead of creating unsealed `.agents/memory.ldb` files or writing workspace symbols into global `customizations.ldb`, quarantined workspace overlays run strictly read-only, and global database compaction preserves existing rule importance and pinned metadata.
+- **Fail-closed subagent trust verification and `Style Invariant` budget reservation (`PreInvocation` hook)**: Denied subagent hook injection cleanly whenever global database trust checks fail instead of falling back unverified, and reserved budget for the `Style Invariant` trailer before packing project decisions so critical style directives cannot be truncated off the prompt.
+- **Updater asset filtering for shared libraries and Python bindings (`libredb update`)**: Excluded `.pyd`, `.dll`, `.so`, `.dylib`, `.whl`, and `.pdb` release attachments during CLI updater asset selection so publishing Python bindings alongside platform binaries never breaks self-updates.
+
 ## [2.4.3] - 2026-11-18
 
 ### Fixed

@@ -689,13 +689,40 @@ pub fn is_code_learning_eligible_path(rel_path: &str) -> bool {
                 | "scala"
                 | "ex"
                 | "exs"
+                | "dart"
+                | "vue"
+                | "svelte"
+                | "astro"
+                | "tf"
+                | "hcl"
+                | "proto"
+                | "gradle"
+                | "smali"
+                | "groovy"
+                | "clj"
+                | "erl"
+                | "hrl"
+                | "hs"
+                | "ml"
+                | "mli"
+                | "r"
+                | "jl"
         )
     {
         return true;
     }
     matches!(
         file_name,
-        "cargo.toml" | "pyproject.toml" | "package.json" | "tsconfig.json" | "makefile"
+        "cargo.toml"
+            | "pyproject.toml"
+            | "package.json"
+            | "tsconfig.json"
+            | "makefile"
+            | "cmakelists.txt"
+            | "build.gradle"
+            | "build.gradle.kts"
+            | "meson.build"
+            | "pubspec.yaml"
     )
 }
 

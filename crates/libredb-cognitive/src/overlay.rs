@@ -19,6 +19,7 @@ pub struct OverlayBrain {
     global: Option<CognitiveEngine>,
     project: CognitiveEngine,
     same_as_global: bool,
+    learning_enabled: bool,
     last_global_seq: AtomicU64,
     last_project_seq: AtomicU64,
 }
@@ -57,9 +58,16 @@ impl OverlayBrain {
             global,
             project,
             same_as_global,
+            learning_enabled: true,
             last_global_seq: AtomicU64::new(last_global_seq),
             last_project_seq: AtomicU64::new(last_project_seq),
         })
+    }
+
+    /// Controls whether `OverlayBrain::pulse` records pending error/miss cues into `project_db`.
+    /// Quarantined and shared fallback stores set this to `false` to prevent cross-session bleed.
+    pub fn set_learning_enabled(&mut self, enabled: bool) {
+        self.learning_enabled = enabled;
     }
 
     pub fn project_db(&self) -> &Arc<LibreDb> {
@@ -121,7 +129,7 @@ impl OverlayBrain {
         };
         let project_reflex_fired = !proj_rf.is_empty();
         let pitfall_recalled = proj_rf.iter().any(|r| r.id.starts_with("pitfall::"));
-        if !self.same_as_global && !pitfall_recalled {
+        if self.learning_enabled && !self.same_as_global && !pitfall_recalled {
             if let Some(err_str) = req
                 .error_context
                 .as_deref()
@@ -186,7 +194,7 @@ impl OverlayBrain {
 
         // Only the project layer decides whether a query was a workspace miss: generic global
         // rule/skill matches must never mask an unresolved project-specific concept.
-        if !self.same_as_global && proj_cands.is_empty() && !project_reflex_fired {
+        if self.learning_enabled && !self.same_as_global && proj_cands.is_empty() && !project_reflex_fired {
             let recorded = crate::learning::record_search_miss_cue_with_source(
                 self.project.db(),
                 &req.query,
@@ -621,20 +629,16 @@ fn is_ui_design_skill(skill_name: &str) -> bool {
 }
 
 fn query_has_ui_design_intent(query_low: &str) -> bool {
-    const EXACT_TOKENS: &[&str] = &[
-        "ui", "ux", "gui", "hig", "wpf", "egui", "gtk", "qt", "qml", "kde", "css", "dom", "a11y",
-        "aria", "dpi", "epx",
-    ];
-    if EXACT_TOKENS
-        .iter()
-        .any(|tok| has_exact_alpha_tok(query_low, tok))
-    {
-        return true;
-    }
-    const SUBSTRINGS: &[&str] = &[
-        "fluent",
-        "winui",
+    const UNAMBIGUOUS_UI_TOKENS: &[&str] = &[
+        "ui",
+        "ux",
+        "gui",
+        "hig",
+        "wpf",
+        "egui",
         "eframe",
+        "winui",
+        "fluent",
         "xaml",
         "tauri",
         "maui",
@@ -651,38 +655,457 @@ fn query_has_ui_design_intent(query_low: &str) -> bool {
         "appkit",
         "libadwaita",
         "adwaita",
+        "gtk",
         "gtk4",
         "kirigami",
         "breeze",
+        "qt",
         "qt6",
-        "design",
-        "layout",
-        "theme",
-        "theming",
-        "palette",
-        "typography",
-        "font",
+        "qml",
+        "a11y",
+        "aria",
+        "dpi",
+        "epx",
         "toolbar",
         "sidebar",
         "tabview",
         "splitview",
-        "navigation",
         "insets",
         "touch target",
         "dark mode",
         "light mode",
-        "contrast",
         "voiceover",
         "talkback",
         "screen reader",
         "screenreader",
         "widget",
+        "widgets",
+        "theming",
+        "palette",
+        "typography",
         "windows-app-design",
         "android-app-design",
         "apple-hig-design",
         "linux-desktop-hig-design",
     ];
-    SUBSTRINGS.iter().any(|sub| query_low.contains(sub))
+    if UNAMBIGUOUS_UI_TOKENS
+        .iter()
+        .any(|tok| crate::reflex::reflex_keyword_matches(query_low, tok))
+    {
+        return true;
+    }
+    const CONTEXTUAL_UI_WORDS: &[&str] =
+        &["design", "layout", "theme", "font", "contrast", "navigation"];
+    const UI_SURFACE_CONTEXT_TOKENS: &[&str] = &[
+        "windows", "android", "apple", "ios", "ipados", "macos", "linux", "gnome", "kde",
+        "desktop", "mobile", "app", "apps", "window", "screen", "button", "card", "dialog",
+        "sheet", "menu", "form", "icon",
+    ];
+    let has_ui_word = CONTEXTUAL_UI_WORDS
+        .iter()
+        .any(|w| crate::reflex::reflex_keyword_matches(query_low, w));
+    has_ui_word
+        && UI_SURFACE_CONTEXT_TOKENS
+            .iter()
+            .any(|ctx| crate::reflex::reflex_keyword_matches(query_low, ctx))
+}
+
+#[derive(Clone, Copy)]
+enum SkillPattern {
+    Exact(&'static str),
+    Prefix(&'static str),
+    Contains(&'static str),
+    ExactToken(&'static str),
+}
+
+impl SkillPattern {
+    fn matches(self, skill_name: &str) -> bool {
+        match self {
+            Self::Exact(s) => skill_name == s,
+            Self::Prefix(s) => skill_name.starts_with(s),
+            Self::Contains(s) => skill_name.contains(s),
+            Self::ExactToken(s) => has_exact_alpha_tok(skill_name, s),
+        }
+    }
+}
+
+struct SkillDomainRule {
+    skills: &'static [SkillPattern],
+    query_terms: &'static [&'static str],
+    require_all_query_terms: bool,
+    ws_markers: &'static [&'static str],
+    allows_stack_match: bool,
+    requires_ui_intent_for_stack: bool,
+}
+
+const OTHER_UI_PLATFORM_MARKERS: &[&str] = &[
+    ".xcodeproj",
+    ".xcworkspace",
+    "package.swift",
+    "podfile",
+    "androidmanifest.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    "settings.gradle",
+    "pubspec.yaml",
+    "meson.build",
+    "flatpak",
+];
+
+const SKILL_DOMAIN_RULES: &[SkillDomainRule] = &[
+    SkillDomainRule {
+        skills: &[
+            SkillPattern::Exact("plugin"),
+            SkillPattern::Exact("run-workflow"),
+            SkillPattern::Exact("ui-plugin-navigation"),
+            SkillPattern::Exact("migrate-workflows"),
+            SkillPattern::Exact("migrate-agent-settings"),
+            SkillPattern::Exact("workflow-skill-creator"),
+            SkillPattern::Exact("permissioned-github"),
+            SkillPattern::Exact("automation"),
+            SkillPattern::Exact("generative_ui"),
+            SkillPattern::Prefix("agy-"),
+            SkillPattern::Prefix("gemini-"),
+            SkillPattern::Contains("antigravity"),
+        ],
+        query_terms: &[
+            "antigravity",
+            "agy",
+            "gemini",
+            "mcp",
+            "subagent",
+            "subagents",
+            "plugin",
+            "plugins",
+            "workflow",
+            "workflows",
+            "skill",
+            "skills",
+        ],
+        require_all_query_terms: false,
+        ws_markers: &[],
+        allows_stack_match: false,
+        requires_ui_intent_for_stack: false,
+    },
+    SkillDomainRule {
+        skills: &[
+            SkillPattern::Exact("chrome-devtools"),
+            SkillPattern::Exact("debug-optimize-lcp"),
+            SkillPattern::Exact("memory-leak-debugging"),
+            SkillPattern::Exact("modern-web-guidance"),
+            SkillPattern::Exact("troubleshooting"),
+        ],
+        query_terms: &[
+            "chrome",
+            "devtools",
+            "browser",
+            "lcp",
+            "web vitals",
+            "heap",
+            "html",
+            "css",
+            "javascript",
+            "dom",
+            "frontend",
+            "troubleshoot",
+            "troubleshooting",
+        ],
+        require_all_query_terms: false,
+        ws_markers: &["package.json"],
+        allows_stack_match: false,
+        requires_ui_intent_for_stack: false,
+    },
+    SkillDomainRule {
+        skills: &[
+            SkillPattern::Exact("predictingthepast"),
+            SkillPattern::Exact("pymol"),
+            SkillPattern::Exact("string-database"),
+            SkillPattern::Prefix("alphafold"),
+            SkillPattern::Prefix("alphagenome"),
+            SkillPattern::Prefix("chembl"),
+            SkillPattern::Prefix("clinical-trials"),
+            SkillPattern::Prefix("clinvar"),
+            SkillPattern::Prefix("dbsnp"),
+            SkillPattern::Prefix("embl-"),
+            SkillPattern::Prefix("encode-"),
+            SkillPattern::Prefix("ensembl"),
+            SkillPattern::Prefix("foldseek"),
+            SkillPattern::Prefix("gnomad"),
+            SkillPattern::Prefix("gtex"),
+            SkillPattern::Prefix("human-protein"),
+            SkillPattern::Prefix("interpro"),
+            SkillPattern::Prefix("jaspar"),
+            SkillPattern::Prefix("literature-search-"),
+            SkillPattern::Prefix("ncbi-"),
+            SkillPattern::Prefix("openfda"),
+            SkillPattern::Prefix("opentargets"),
+            SkillPattern::Prefix("pdb-"),
+            SkillPattern::Prefix("protein-"),
+            SkillPattern::Prefix("pubchem"),
+            SkillPattern::Prefix("pubmed"),
+            SkillPattern::Prefix("quickgo"),
+            SkillPattern::Prefix("reactome"),
+            SkillPattern::Prefix("ucsc-"),
+            SkillPattern::Prefix("unibind"),
+            SkillPattern::Prefix("uniprot"),
+        ],
+        query_terms: &[
+            "protein",
+            "proteins",
+            "gene",
+            "genes",
+            "variant",
+            "variants",
+            "genome",
+            "genomic",
+            "alphafold",
+            "alphagenome",
+            "pubmed",
+            "pubchem",
+            "uniprot",
+            "chembl",
+            "clinvar",
+            "ensembl",
+            "arxiv",
+            "biorxiv",
+            "molecule",
+            "molecules",
+            "clinical",
+            "pdb",
+            "dna",
+            "rna",
+            "pymol",
+        ],
+        require_all_query_terms: false,
+        ws_markers: &[],
+        allows_stack_match: false,
+        requires_ui_intent_for_stack: false,
+    },
+    SkillDomainRule {
+        skills: &[
+            SkillPattern::Contains("flutter"),
+            SkillPattern::ExactToken("dart"),
+            SkillPattern::Prefix("dart-"),
+            SkillPattern::Prefix("dart_"),
+        ],
+        query_terms: &["flutter", "dart"],
+        require_all_query_terms: false,
+        ws_markers: &["pubspec.yaml", "pubspec.lock", ".dart_tool", ".flutter"],
+        allows_stack_match: true,
+        requires_ui_intent_for_stack: false,
+    },
+    SkillDomainRule {
+        skills: &[
+            SkillPattern::Prefix("chrome-extension"),
+            SkillPattern::Contains("chrome_extension"),
+        ],
+        query_terms: &["chrome", "extension"],
+        require_all_query_terms: true,
+        ws_markers: &["manifest.json"],
+        allows_stack_match: true,
+        requires_ui_intent_for_stack: false,
+    },
+    SkillDomainRule {
+        skills: &[
+            SkillPattern::Prefix("android"),
+            SkillPattern::ExactToken("android"),
+        ],
+        query_terms: &["android", "kotlin", "gradle", "compose", "talkback"],
+        require_all_query_terms: false,
+        ws_markers: &[
+            "androidmanifest.xml",
+            "build.gradle",
+            "build.gradle.kts",
+            "settings.gradle",
+            "settings.gradle.kts",
+            "gradlew",
+        ],
+        allows_stack_match: true,
+        requires_ui_intent_for_stack: true,
+    },
+    SkillDomainRule {
+        skills: &[
+            SkillPattern::Prefix("apple-hig"),
+            SkillPattern::Prefix("xcode"),
+        ],
+        query_terms: &[
+            "apple",
+            "ios",
+            "ipados",
+            "macos",
+            "swift",
+            "swiftui",
+            "uikit",
+            "appkit",
+            "xcode",
+            "iphone",
+            "ipad",
+            "voiceover",
+        ],
+        require_all_query_terms: false,
+        ws_markers: &[
+            ".xcodeproj",
+            ".xcworkspace",
+            "package.swift",
+            "podfile",
+            "info.plist",
+            "project.pbxproj",
+        ],
+        allows_stack_match: true,
+        requires_ui_intent_for_stack: true,
+    },
+    SkillDomainRule {
+        skills: &[SkillPattern::Prefix("linux-desktop-hig")],
+        query_terms: &[
+            "linux",
+            "gnome",
+            "kde",
+            "libadwaita",
+            "adwaita",
+            "gtk",
+            "gtk4",
+            "kirigami",
+            "breeze",
+            "qt",
+            "qt6",
+            "qml",
+            "wayland",
+            "flatpak",
+        ],
+        require_all_query_terms: false,
+        ws_markers: &[
+            "meson.build",
+            "cmakelists.txt",
+            "flatpak",
+            ".desktop",
+            "org.gnome",
+            "org.kde",
+        ],
+        allows_stack_match: true,
+        requires_ui_intent_for_stack: true,
+    },
+    SkillDomainRule {
+        skills: &[SkillPattern::Prefix("windows-app-design")],
+        query_terms: &[
+            "windows", "winui", "fluent", "wpf", "egui", "eframe", "xaml", "tauri",
+        ],
+        require_all_query_terms: false,
+        ws_markers: &[".sln", ".csproj", ".vcxproj", "appxmanifest.xml"],
+        allows_stack_match: true,
+        requires_ui_intent_for_stack: true,
+    },
+    SkillDomainRule {
+        skills: &[
+            SkillPattern::Contains("firebase"),
+            SkillPattern::Contains("firestore"),
+        ],
+        query_terms: &["firebase", "firestore"],
+        require_all_query_terms: false,
+        ws_markers: &["firebase.json", ".firebaserc"],
+        allows_stack_match: true,
+        requires_ui_intent_for_stack: false,
+    },
+    SkillDomainRule {
+        skills: &[
+            SkillPattern::Prefix("gcp"),
+            SkillPattern::Contains("gcp"),
+            SkillPattern::Contains("airflow"),
+            SkillPattern::Contains("bigquery"),
+        ],
+        query_terms: &["gcp", "airflow", "bigquery", "google cloud", "dataflow"],
+        require_all_query_terms: false,
+        ws_markers: &["airflow.cfg", "dags"],
+        allows_stack_match: true,
+        requires_ui_intent_for_stack: false,
+    },
+    SkillDomainRule {
+        skills: &[
+            SkillPattern::Contains("databricks"),
+            SkillPattern::Contains("lakehouse"),
+            SkillPattern::Contains("snowflake"),
+        ],
+        query_terms: &[
+            "databricks",
+            "lakehouse",
+            "snowflake",
+            "unity catalog",
+            "iceberg",
+            "delta lake",
+        ],
+        require_all_query_terms: false,
+        ws_markers: &["databricks.yml", "dbt_project.yml"],
+        allows_stack_match: true,
+        requires_ui_intent_for_stack: false,
+    },
+    SkillDomainRule {
+        skills: &[SkillPattern::ExactToken("a11y")],
+        query_terms: &[
+            "a11y",
+            "accessibility",
+            "wcag",
+            "aria",
+            "screenreader",
+            "screen reader",
+            "talkback",
+            "voiceover",
+        ],
+        require_all_query_terms: false,
+        ws_markers: &["package.json", "pubspec.yaml", "androidmanifest.xml"],
+        allows_stack_match: true,
+        requires_ui_intent_for_stack: false,
+    },
+    SkillDomainRule {
+        skills: &[
+            SkillPattern::Contains("react"),
+            SkillPattern::Contains("nextjs"),
+            SkillPattern::Contains("next-js"),
+            SkillPattern::ExactToken("vue"),
+            SkillPattern::Contains("angular"),
+            SkillPattern::Contains("tailwind"),
+        ],
+        query_terms: &["react", "nextjs", "next.js", "vue", "angular", "tailwind"],
+        require_all_query_terms: false,
+        ws_markers: &[
+            "package.json",
+            "next.config",
+            "vite.config",
+            "angular.json",
+            "tailwind.config",
+        ],
+        allows_stack_match: true,
+        requires_ui_intent_for_stack: false,
+    },
+    SkillDomainRule {
+        skills: &[
+            SkillPattern::Contains("kubernetes"),
+            SkillPattern::ExactToken("k8s"),
+            SkillPattern::ExactToken("helm"),
+            SkillPattern::Contains("terraform"),
+        ],
+        query_terms: &["kubernetes", "k8s", "helm", "terraform"],
+        require_all_query_terms: false,
+        ws_markers: &[".tf", "chart.yaml", "kustomization.yaml", "helmfile.yaml"],
+        allows_stack_match: true,
+        requires_ui_intent_for_stack: false,
+    },
+];
+
+fn rule_query_matches(rule: &SkillDomainRule, query_low: &str) -> bool {
+    if rule.require_all_query_terms {
+        rule.query_terms
+            .iter()
+            .all(|t| crate::reflex::reflex_keyword_matches(query_low, t))
+    } else {
+        rule.query_terms
+            .iter()
+            .any(|t| crate::reflex::reflex_keyword_matches(query_low, t))
+    }
+}
+
+fn find_matching_domain_rule(skill_name: &str) -> Option<&'static SkillDomainRule> {
+    SKILL_DOMAIN_RULES
+        .iter()
+        .find(|rule| rule.skills.iter().any(|p| p.matches(skill_name)))
 }
 
 fn skill_matches_active_workspace_stack(
@@ -693,98 +1116,19 @@ fn skill_matches_active_workspace_stack(
     if ws_markers.is_empty() || skill_name.is_empty() {
         return false;
     }
-    let m = |needles: &[&str]| marker_matches_any(ws_markers, needles);
-    if is_ui_design_skill(skill_name) && !query_has_ui_design_intent(query_low) {
+    let Some(rule) = find_matching_domain_rule(skill_name) else {
+        return false;
+    };
+    if !rule.allows_stack_match || rule.ws_markers.is_empty() {
         return false;
     }
-    if skill_name.contains("flutter")
-        || has_exact_alpha_tok(skill_name, "dart")
-        || skill_name.starts_with("dart-")
-        || skill_name.starts_with("dart_")
+    if rule.requires_ui_intent_for_stack
+        && is_ui_design_skill(skill_name)
+        && !query_has_ui_design_intent(query_low)
     {
-        return m(&["pubspec.yaml", "pubspec.lock", ".dart_tool", ".flutter"]);
+        return false;
     }
-    if skill_name.starts_with("chrome-extension") || skill_name.contains("chrome_extension") {
-        return m(&["manifest.json"]);
-    }
-    if skill_name.starts_with("android") || has_exact_alpha_tok(skill_name, "android") {
-        return m(&[
-            "androidmanifest.xml",
-            "build.gradle",
-            "build.gradle.kts",
-            "settings.gradle",
-            "settings.gradle.kts",
-            "gradlew",
-        ]);
-    }
-    if skill_name.starts_with("apple-hig") || skill_name.starts_with("xcode") {
-        return m(&[
-            ".xcodeproj",
-            ".xcworkspace",
-            "package.swift",
-            "podfile",
-            "info.plist",
-            "project.pbxproj",
-        ]);
-    }
-    if skill_name.starts_with("linux-desktop-hig") {
-        return m(&[
-            "meson.build",
-            "cmakelists.txt",
-            "flatpak",
-            ".desktop",
-            "org.gnome",
-            "org.kde",
-        ]);
-    }
-    if skill_name.starts_with("windows-app-design") {
-        return m(&[".sln", ".csproj", ".vcxproj", "appxmanifest.xml"])
-            || (m(&["cargo.toml"])
-                && !m(&[
-                    ".xcodeproj",
-                    ".xcworkspace",
-                    "package.swift",
-                    "androidmanifest.xml",
-                    "build.gradle",
-                    "meson.build",
-                    "flatpak",
-                ]));
-    }
-    if skill_name.contains("firebase") || skill_name.contains("firestore") {
-        return m(&["firebase.json", ".firebaserc"]);
-    }
-    if skill_name.contains("databricks")
-        || skill_name.contains("lakehouse")
-        || skill_name.contains("snowflake")
-    {
-        return m(&["databricks.yml", "dbt_project.yml"]);
-    }
-    if skill_name.contains("airflow") || skill_name.starts_with("gcp") {
-        return m(&["airflow.cfg", "dags"]);
-    }
-    if skill_name.contains("react")
-        || skill_name.contains("nextjs")
-        || skill_name.contains("next-js")
-        || has_exact_alpha_tok(skill_name, "vue")
-        || skill_name.contains("angular")
-        || skill_name.contains("tailwind")
-        || has_exact_alpha_tok(skill_name, "a11y")
-    {
-        return m(&[
-            "package.json",
-            "next.config",
-            "vite.config",
-            "angular.json",
-            "tailwind.config",
-        ]);
-    }
-    if skill_name.contains("terraform")
-        || skill_name.contains("kubernetes")
-        || has_exact_alpha_tok(skill_name, "helm")
-    {
-        return m(&[".tf", "chart.yaml", "kustomization.yaml", "helmfile.yaml"]);
-    }
-    false
+    marker_matches_any(ws_markers, rule.ws_markers)
 }
 
 fn skill_distinctively_named_in_query(skill_name: &str, query_low: &str) -> bool {
@@ -954,345 +1298,32 @@ fn foreign_skill_stack_multiplier(
         .map_or(raw_key, |(head, _)| head)
         .trim()
         .to_ascii_lowercase();
-    let has_exact_tok = has_exact_alpha_tok;
-    let marker_has = |needles: &[&str]| marker_matches_any(ws_markers, needles);
 
     if is_ui_design_skill(&skill_name) && !query_has_ui_design_intent(query_low) {
         return 0.25;
     }
 
-    if skill_name.starts_with("agy-")
-        || skill_name.contains("antigravity")
-        || skill_name.starts_with("gemini-")
-        || matches!(
-            skill_name.as_str(),
-            "plugin"
-                | "run-workflow"
-                | "ui-plugin-navigation"
-                | "migrate-workflows"
-                | "migrate-agent-settings"
-                | "workflow-skill-creator"
-                | "permissioned-github"
-                | "automation"
-                | "generative_ui"
-        )
-    {
-        let q_wants = query_low.contains("antigravity")
-            || has_exact_tok(query_low, "agy")
-            || query_low.contains("gemini")
-            || has_exact_tok(query_low, "mcp")
-            || query_low.contains("subagent")
-            || query_low.contains("plugin")
-            || query_low.contains("workflow")
-            || has_exact_tok(query_low, "skill")
-            || query_low.contains("skills");
-        if !q_wants {
-            return 0.25;
+    let Some(rule) = find_matching_domain_rule(&skill_name) else {
+        return 1.0;
+    };
+    let q_wants = rule_query_matches(rule, query_low);
+    if skill_name.starts_with("windows-app-design") {
+        if ws_markers.is_empty() {
+            return 1.0;
         }
+        let ws_has_windows = marker_matches_any(ws_markers, rule.ws_markers);
+        let ws_is_other = marker_matches_any(ws_markers, OTHER_UI_PLATFORM_MARKERS);
+        return if !q_wants && ws_is_other && !ws_has_windows {
+            0.25
+        } else {
+            1.0
+        };
     }
 
-    if matches!(
-        skill_name.as_str(),
-        "chrome-devtools"
-            | "debug-optimize-lcp"
-            | "memory-leak-debugging"
-            | "modern-web-guidance"
-            | "troubleshooting"
-    ) {
-        let q_wants = query_low.contains("chrome")
-            || query_low.contains("devtools")
-            || query_low.contains("browser")
-            || has_exact_tok(query_low, "lcp")
-            || query_low.contains("web vitals")
-            || query_low.contains("heap")
-            || has_exact_tok(query_low, "html")
-            || has_exact_tok(query_low, "css")
-            || query_low.contains("javascript")
-            || has_exact_tok(query_low, "dom")
-            || query_low.contains("frontend")
-            || query_low.contains("troubleshoot");
-        let ws_uses = marker_has(&["package.json"]);
-        if !q_wants && !ws_uses {
-            return 0.25;
-        }
+    let ws_uses = !rule.ws_markers.is_empty() && marker_matches_any(ws_markers, rule.ws_markers);
+    if !q_wants && !ws_uses {
+        0.25
+    } else {
+        1.0
     }
-
-    if skill_name.starts_with("alphafold")
-        || skill_name.starts_with("alphagenome")
-        || skill_name.starts_with("chembl")
-        || skill_name.starts_with("clinical-trials")
-        || skill_name.starts_with("clinvar")
-        || skill_name.starts_with("dbsnp")
-        || skill_name.starts_with("embl-")
-        || skill_name.starts_with("encode-")
-        || skill_name.starts_with("ensembl")
-        || skill_name.starts_with("foldseek")
-        || skill_name.starts_with("gnomad")
-        || skill_name.starts_with("gtex")
-        || skill_name.starts_with("human-protein")
-        || skill_name.starts_with("interpro")
-        || skill_name.starts_with("jaspar")
-        || skill_name.starts_with("literature-search-")
-        || skill_name.starts_with("ncbi-")
-        || skill_name.starts_with("openfda")
-        || skill_name.starts_with("opentargets")
-        || skill_name.starts_with("pdb-")
-        || skill_name == "predictingthepast"
-        || skill_name.starts_with("protein-")
-        || skill_name.starts_with("pubchem")
-        || skill_name.starts_with("pubmed")
-        || skill_name == "pymol"
-        || skill_name.starts_with("quickgo")
-        || skill_name.starts_with("reactome")
-        || skill_name == "string-database"
-        || skill_name.starts_with("ucsc-")
-        || skill_name.starts_with("unibind")
-        || skill_name.starts_with("uniprot")
-    {
-        let q_wants = query_low.contains("protein")
-            || query_low.contains("gene")
-            || query_low.contains("variant")
-            || query_low.contains("genom")
-            || query_low.contains("alphafold")
-            || query_low.contains("pubmed")
-            || query_low.contains("pubchem")
-            || query_low.contains("uniprot")
-            || query_low.contains("chembl")
-            || query_low.contains("clinvar")
-            || query_low.contains("ensembl")
-            || query_low.contains("arxiv")
-            || query_low.contains("biorxiv")
-            || query_low.contains("molecule")
-            || query_low.contains("clinical")
-            || has_exact_tok(query_low, "pdb")
-            || has_exact_tok(query_low, "dna")
-            || has_exact_tok(query_low, "rna")
-            || query_low.contains("pymol");
-        if !q_wants {
-            return 0.25;
-        }
-    }
-
-    if skill_name.contains("flutter")
-        || has_exact_tok(&skill_name, "dart")
-        || skill_name.starts_with("dart-")
-        || skill_name.starts_with("dart_")
-    {
-        let q_wants = query_low.contains("flutter") || has_exact_tok(query_low, "dart");
-        let ws_uses = marker_has(&["pubspec.yaml", "pubspec.lock", ".dart_tool", ".flutter"]);
-        if !q_wants && !ws_uses {
-            return 0.25;
-        }
-    }
-
-    if skill_name.starts_with("chrome-extension") || skill_name.contains("chrome_extension") {
-        let q_wants = query_low.contains("chrome") && query_low.contains("extension");
-        let ws_uses = marker_has(&["manifest.json"]);
-        if !q_wants && !ws_uses {
-            return 0.25;
-        }
-    }
-
-    if skill_name.starts_with("android") || has_exact_tok(&skill_name, "android") {
-        let q_wants = query_low.contains("android")
-            || query_low.contains("kotlin")
-            || query_low.contains("gradle");
-        let ws_uses = marker_has(&[
-            "androidmanifest.xml",
-            "build.gradle",
-            "build.gradle.kts",
-            "settings.gradle",
-            "settings.gradle.kts",
-            "gradlew",
-        ]);
-        if !q_wants && !ws_uses {
-            return 0.25;
-        }
-    }
-
-    if skill_name.starts_with("apple-hig") || skill_name.starts_with("xcode") {
-        let q_wants = query_low.contains("apple")
-            || has_exact_tok(query_low, "ios")
-            || query_low.contains("ipados")
-            || query_low.contains("macos")
-            || query_low.contains("swift")
-            || query_low.contains("uikit")
-            || query_low.contains("appkit")
-            || query_low.contains("xcode")
-            || has_exact_tok(query_low, "iphone")
-            || has_exact_tok(query_low, "ipad");
-        let ws_uses = marker_has(&[
-            ".xcodeproj",
-            ".xcworkspace",
-            "package.swift",
-            "podfile",
-            "info.plist",
-            "project.pbxproj",
-        ]);
-        if !q_wants && !ws_uses {
-            return 0.25;
-        }
-    }
-
-    if skill_name.starts_with("linux-desktop-hig") {
-        let q_wants = query_low.contains("linux")
-            || query_low.contains("gnome")
-            || has_exact_tok(query_low, "kde")
-            || query_low.contains("libadwaita")
-            || query_low.contains("adwaita")
-            || has_exact_tok(query_low, "gtk")
-            || query_low.contains("gtk4")
-            || query_low.contains("kirigami")
-            || query_low.contains("breeze")
-            || has_exact_tok(query_low, "qt")
-            || query_low.contains("qt6")
-            || has_exact_tok(query_low, "qml")
-            || query_low.contains("wayland")
-            || query_low.contains("flatpak");
-        let ws_uses = marker_has(&[
-            "meson.build",
-            "cmakelists.txt",
-            "flatpak",
-            ".desktop",
-            "org.gnome",
-            "org.kde",
-        ]);
-        if !q_wants && !ws_uses {
-            return 0.25;
-        }
-    }
-
-    if skill_name.contains("firebase") || skill_name.contains("firestore") {
-        let q_wants = query_low.contains("firebase") || query_low.contains("firestore");
-        let ws_uses = marker_has(&["firebase.json", ".firebaserc"]);
-        if !q_wants && !ws_uses {
-            return 0.25;
-        }
-    }
-
-    if skill_name.contains("gcp")
-        || skill_name.contains("airflow")
-        || skill_name.contains("bigquery")
-    {
-        let q_wants = has_exact_tok(query_low, "gcp")
-            || query_low.contains("airflow")
-            || query_low.contains("bigquery")
-            || query_low.contains("google cloud")
-            || query_low.contains("dataflow");
-        let ws_uses = marker_has(&["airflow.cfg", "dags"]);
-        if !q_wants && !ws_uses {
-            return 0.25;
-        }
-    }
-
-    if skill_name.contains("databricks")
-        || skill_name.contains("lakehouse")
-        || skill_name.contains("snowflake")
-    {
-        let q_wants = query_low.contains("databricks")
-            || query_low.contains("lakehouse")
-            || query_low.contains("snowflake")
-            || query_low.contains("unity catalog")
-            || query_low.contains("iceberg")
-            || query_low.contains("delta lake");
-        let ws_uses = marker_has(&["databricks.yml", "dbt_project.yml"]);
-        if !q_wants && !ws_uses {
-            return 0.25;
-        }
-    }
-
-    if has_exact_tok(&skill_name, "a11y") {
-        let q_wants = has_exact_tok(query_low, "a11y")
-            || query_low.contains("accessibility")
-            || query_low.contains("wcag")
-            || has_exact_tok(query_low, "aria")
-            || query_low.contains("screenreader")
-            || query_low.contains("screen reader")
-            || query_low.contains("talkback")
-            || query_low.contains("voiceover");
-        let ws_uses = marker_has(&["package.json", "pubspec.yaml", "androidmanifest.xml"]);
-        if !q_wants && !ws_uses {
-            return 0.25;
-        }
-    }
-
-    if skill_name.contains("react")
-        || skill_name.contains("nextjs")
-        || skill_name.contains("next-js")
-        || has_exact_tok(&skill_name, "vue")
-        || skill_name.contains("angular")
-        || skill_name.contains("tailwind")
-    {
-        let q_wants = query_low.contains("react")
-            || query_low.contains("nextjs")
-            || query_low.contains("next.js")
-            || has_exact_tok(query_low, "vue")
-            || query_low.contains("angular")
-            || query_low.contains("tailwind");
-        let ws_uses = marker_has(&[
-            "package.json",
-            "next.config",
-            "vite.config",
-            "angular.json",
-            "tailwind.config",
-        ]);
-        if !q_wants && !ws_uses {
-            return 0.25;
-        }
-    }
-
-    if skill_name.contains("kubernetes")
-        || has_exact_tok(&skill_name, "k8s")
-        || has_exact_tok(&skill_name, "helm")
-        || skill_name.contains("terraform")
-    {
-        let q_wants = query_low.contains("kubernetes")
-            || has_exact_tok(query_low, "k8s")
-            || has_exact_tok(query_low, "helm")
-            || query_low.contains("terraform");
-        let ws_uses = marker_has(&[".tf", "chart.yaml", "kustomization.yaml", "helmfile.yaml"]);
-        if !q_wants && !ws_uses {
-            return 0.25;
-        }
-    }
-
-    if skill_name.starts_with("windows-app-design") && !ws_markers.is_empty() {
-        let q_wants = query_low.contains("windows")
-            || query_low.contains("winui")
-            || query_low.contains("fluent")
-            || has_exact_tok(query_low, "wpf")
-            || has_exact_tok(query_low, "egui")
-            || query_low.contains("eframe")
-            || query_low.contains("xaml")
-            || query_low.contains("tauri");
-        let ws_has_windows = marker_has(&[".sln", ".csproj", ".vcxproj", "appxmanifest.xml"])
-            || (marker_has(&["cargo.toml"])
-                && !marker_has(&[
-                    ".xcodeproj",
-                    ".xcworkspace",
-                    "package.swift",
-                    "androidmanifest.xml",
-                    "build.gradle",
-                    "meson.build",
-                    "flatpak",
-                ]));
-        let ws_is_other_platform = marker_has(&[
-            ".xcodeproj",
-            ".xcworkspace",
-            "package.swift",
-            "podfile",
-            "androidmanifest.xml",
-            "build.gradle",
-            "build.gradle.kts",
-            "settings.gradle",
-            "pubspec.yaml",
-            "meson.build",
-            "flatpak",
-        ]);
-        if !q_wants && ws_is_other_platform && !ws_has_windows {
-            return 0.25;
-        }
-    }
-
-    1.0
 }

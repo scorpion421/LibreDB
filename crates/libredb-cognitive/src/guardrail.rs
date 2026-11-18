@@ -252,13 +252,13 @@ pub fn check_command_guardrails(cmd_line: &str) -> Option<GuardrailViolation> {
         "register-scheduledtask",
         "start-scheduledtask",
         "new-scheduledtaskaction",
-        "schtasks",
         "psexec",
         "sc.exe \\\\",
         "windows\\temp\\",
     ]
     .iter()
-    .any(|k| cmd_low.contains(k));
+    .any(|k| cmd_low.contains(k))
+        || schtasks_is_mutating(&cmd_low);
 
     if (is_remote && has_forbidden_lateral)
         || cmd_low.contains("sc.exe \\\\")
@@ -302,10 +302,76 @@ pub fn check_command_guardrails(cmd_line: &str) -> Option<GuardrailViolation> {
     None
 }
 
+fn schtasks_is_mutating(cmd_low: &str) -> bool {
+    if !cmd_low.contains("schtasks") {
+        return false;
+    }
+    let has_query = ["/query", "\\query", "-query"]
+        .iter()
+        .any(|op| cmd_low.contains(op));
+    let has_write = [
+        "/create", "\\create", "-create",
+        "/run", "\\run", "-run",
+        "/change", "\\change", "-change",
+        "/delete", "\\delete", "-delete",
+        "/end", "\\end", "-end",
+    ]
+    .iter()
+    .any(|op| cmd_low.contains(op));
+    !(has_query && !has_write)
+}
+
+fn core_fsmonitor_overrides_command(cmd_low: &str) -> bool {
+    let mut rest = cmd_low;
+    while let Some(pos) = rest.find("core.fsmonitor") {
+        let after = &rest[pos + "core.fsmonitor".len()..];
+        let trimmed = after.trim_start();
+        if let Some(val_part) = trimmed.strip_prefix('=') {
+            let val = val_part
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_matches(['"', '\'']);
+            if !matches!(val, "" | "false" | "0" | "no" | "off") {
+                return true;
+            }
+        } else if !trimmed.is_empty() {
+            return true;
+        }
+        rest = &rest[pos + "core.fsmonitor".len()..];
+    }
+    false
+}
+
+fn is_readonly_code_search_command(cmd_low: &str) -> bool {
+    let single = !cmd_low.contains(';')
+        && !cmd_low.contains("&&")
+        && !cmd_low.contains("||")
+        && !cmd_low.contains('|')
+        && !cmd_low.contains('>');
+    if !single {
+        return false;
+    }
+    let trimmed = cmd_low.trim_start();
+    let is_search_bin = trimmed.starts_with("rg ")
+        || trimmed.starts_with("rg.exe ")
+        || trimmed.starts_with("ripgrep ")
+        || trimmed.starts_with("git grep ");
+    let touches_store = trimmed.contains(".gemini")
+        || trimmed.contains("get-content")
+        || trimmed.contains("cat ")
+        || trimmed.contains("type ");
+    is_search_bin && !touches_store
+}
+
 fn detect_git_exec_or_vault_tamper_command(cmd_low: &str) -> Option<&'static str> {
+    if core_fsmonitor_overrides_command(cmd_low) {
+        return Some(
+            "Overriding Git execution hooks, fsmonitor, SSH command, or ext protocol via shell commands is prohibited.",
+        );
+    }
     for pat in [
         "core.hookspath",
-        "core.fsmonitor",
         "core.sshcommand",
         "git_ssh_command=",
         "protocol.ext.allow",
@@ -318,7 +384,9 @@ fn detect_git_exec_or_vault_tamper_command(cmd_low: &str) -> Option<&'static str
             );
         }
     }
-    if cmd_low.contains(".vault.key") || cmd_low.contains(".seal_locks") {
+    if (cmd_low.contains(".vault.key") || cmd_low.contains(".seal_locks"))
+        && !is_readonly_code_search_command(cmd_low)
+    {
         return Some(
             "Direct shell access to LibreDB '.vault.key' or '.seal_locks' security state is prohibited.",
         );
@@ -651,36 +719,9 @@ fn is_powershell_cmdlet_verb(l_low: &str) -> bool {
 
 fn has_german_prose_context_lines(sanitized_lines: &[&str]) -> bool {
     const GERMAN_MARKERS: &[&str] = &[
-        concat!("ni", "cht"),
-        concat!("au", "ch"),
-        concat!("no", "ch"),
-        concat!("od", "er"),
-        concat!("ab", "er"),
-        concat!("we", "il"),
-        concat!("da", "ss"),
-        concat!("si", "nd"),
-        concat!("wi", "rd"),
-        concat!("wer", "den"),
-        concat!("ka", "nn"),
-        concat!("ei", "ne"),
-        concat!("ei", "nen"),
-        concat!("ei", "ner"),
-        concat!("ei", "nem"),
-        concat!("fu", "er"),
-        concat!("ue", "ber"),
-        concat!("mi", "t"),
-        concat!("au", "f"),
-        concat!("be", "i"),
-        concat!("na", "ch"),
-        concat!("zu", "m"),
-        concat!("zu", "r"),
-        concat!("vo", "m"),
-        concat!("se", "hr"),
-        concat!("me", "hr"),
-        concat!("sc", "hon"),
-        concat!("die", "ser"),
-        concat!("die", "se"),
-        concat!("die", "ses"),
+        "nicht", "auch", "noch", "oder", "aber", "weil", "dass", "sind", "wird", "werden",
+        "kann", "eine", "einen", "einer", "einem", "fuer", "ueber", "mit", "auf", "bei",
+        "nach", "zum", "zur", "vom", "sehr", "mehr", "schon", "dieser", "diese", "dieses",
     ];
     let mut hits = 0usize;
     let mut seen = [false; 30];
@@ -704,145 +745,75 @@ fn has_german_prose_context_lines(sanitized_lines: &[&str]) -> bool {
     false
 }
 
+/// Returns `true` when `filename` is a Markdown, HTML, plain text, or reStructuredText/AsciiDoc
+/// prose file rather than source code or machine-readable config.
+pub fn is_prose_style_target_file(filename: &str) -> bool {
+    let low = filename.trim().replace('\\', "/").to_ascii_lowercase();
+    let leaf = low.rsplit('/').next().unwrap_or(&low);
+    matches!(
+        leaf.rsplit_once('.').map(|(_, ext)| ext),
+        Some("md" | "markdown" | "txt" | "html" | "htm" | "rst" | "adoc")
+    )
+}
+
+fn has_german_word_morphology(word_low: &str) -> bool {
+    if word_low
+        .chars()
+        .any(|c| matches!(c, '\u{00E4}' | '\u{00F6}' | '\u{00FC}' | '\u{00DF}'))
+    {
+        return true;
+    }
+    if matches!(
+        word_low,
+        "praxis" | "architektur" | "fehler" | "befund" | "kontext" | "kontingent" | "speicher"
+            | "regel" | "datenbank" | "wildwuchs" | "modus" | "steuerung" | "verwaltung"
+            | "umsetzung" | "auswertung" | "einstellung" | "abfrage" | "zugriff" | "laufzeit"
+    ) {
+        return true;
+    }
+    const GERMAN_SUFFIXES: &[&str] = &[
+        "ung", "ungen", "keit", "keiten", "heit", "heiten", "schaft", "schaften", "zeit", "zeiten",
+        "datei", "dateien", "regeln", "dienst", "dienste", "lauf", "wert", "werte", "schutz",
+        "grenze", "ebene", "konto", "bericht", "struktur", "modell", "prozess", "zustand",
+        "wechsel", "auswahl", "ansicht", "fenster", "tabelle", "liste", "schalter", "befehl",
+        "aufruf", "nutzer", "benutzer", "eingabe", "ausgabe", "suche", "spur", "kanten", "sperre",
+        "sperren", "wache", "ordner", "pfad", "treiber", "kontrolle", "laufwerk", "netzwerk",
+        "abteilung", "umgebung", "anfrage", "meldung", "speicher", "fehler", "kontext", "modus",
+        "praxis", "architektur",
+    ];
+    GERMAN_SUFFIXES.iter().any(|sfx| word_low.ends_with(sfx))
+}
+
 /// Checks German prose/Markdown/artifact text for ASCII umlaut substitutions (`ae`/`oe`/`ue`)
-/// and hyphen-split German compound nouns (Deppenbindestriche), skipping code fences and inline code.
+/// and hyphen-split German compound nouns (Deppenbindestriche), skipping code fences, inline code,
+/// and non-prose source code files.
 pub fn check_german_prose_style(text: &str, filename: &str) -> Vec<GuardrailViolation> {
+    if !is_prose_style_target_file(filename) {
+        return Vec::new();
+    }
     const ASCII_UMLAUT_WORDS: &[&str] = &[
-        concat!("lae", "sst"),
-        concat!("lae", "ngst"),
-        concat!("lae", "nge"),
-        concat!("wae", "re"),
-        concat!("wae", "ren"),
-        concat!("hae", "tte"),
-        concat!("hae", "tten"),
-        concat!("nae", "chste"),
-        concat!("nae", "chsten"),
-        concat!("nae", "chstes"),
-        concat!("nae", "chster"),
-        concat!("zae", "hlt"),
-        concat!("ae", "hnlich"),
-        concat!("ae", "hnliche"),
-        concat!("ae", "nderung"),
-        concat!("ae", "nderungen"),
-        concat!("stae", "rker"),
-        concat!("spae", "ter"),
-        concat!("mae", "ssig"),
-        concat!("trae", "gt"),
-        concat!("fae", "llt"),
-        concat!("hae", "lt"),
-        concat!("schlae", "gt"),
-        concat!("wae", "hlt"),
-        concat!("wae", "hrend"),
-        concat!("erwae", "hnt"),
-        concat!("vertrae", "gt"),
-        concat!("bewae", "hrt"),
-        concat!("prae", "zise"),
-        concat!("tempo", "raer"),
-        concat!("pri", "maer"),
-        concat!("sekun", "daer"),
-        concat!("koe", "nnen"),
-        concat!("koe", "nnte"),
-        concat!("koe", "nnten"),
-        concat!("koe", "nnt"),
-        concat!("moe", "glich"),
-        concat!("moe", "gliche"),
-        concat!("moe", "glichen"),
-        concat!("moe", "glichkeit"),
-        concat!("moe", "chte"),
-        concat!("moe", "chten"),
-        concat!("groe", "sser"),
-        concat!("groe", "sste"),
-        concat!("groe", "ssten"),
-        concat!("groe", "sse"),
-        concat!("hoe", "her"),
-        concat!("hoe", "chste"),
-        concat!("loe", "sen"),
-        concat!("loe", "sung"),
-        concat!("loe", "sungen"),
-        concat!("loe", "schen"),
-        concat!("gehoe", "rt"),
-        concat!("stoe", "rt"),
-        concat!("voe", "llig"),
-        concat!("noe", "tig"),
-        concat!("benoe", "tigt"),
-        concat!("persoe", "nlich"),
-        concat!("woe", "rtlich"),
-        concat!("unmoe", "glich"),
-        concat!("ausloe", "sen"),
-        concat!("abloe", "sen"),
-        concat!("oeko", "nomie"),
-        concat!("fu", "er"),
-        concat!("fue", "rs"),
-        concat!("fue", "hrt"),
-        concat!("fue", "hren"),
-        concat!("fue", "hrte"),
-        concat!("fue", "hlen"),
-        concat!("ue", "ber"),
-        concat!("ue", "bersicht"),
-        concat!("ueb", "rig"),
-        concat!("ueb", "ung"),
-        concat!("ueb", "lich"),
-        concat!("rue", "ck"),
-        concat!("zurue", "ck"),
-        concat!("prue", "fen"),
-        concat!("prue", "fung"),
-        concat!("geprue", "ft"),
-        concat!("mue", "ssen"),
-        concat!("mue", "sste"),
-        concat!("mue", "ssten"),
-        concat!("gru", "en"),
-        concat!("grue", "nde"),
-        concat!("grue", "ndung"),
-        concat!("gue", "ltig"),
-        concat!("ungue", "ltig"),
-        concat!("kue", "rzen"),
-        concat!("frue", "h"),
-        concat!("frue", "her"),
-        concat!("natue", "rlich"),
-        concat!("wue", "rde"),
-        concat!("wue", "rden"),
-        concat!("stue", "tzt"),
-        concat!("unterstue", "tzt"),
-        concat!("unterstue", "tzen"),
-        concat!("verfue", "gbar"),
-        concat!("fu", "enf"),
-        concat!("schue", "tzt"),
-        concat!("schlue", "ssel"),
-        concat!("ausfue", "hren"),
-        concat!("ausfue", "hrung"),
-        concat!("einfue", "hren"),
-        concat!("einfue", "hrung"),
-        concat!("aufgefue", "hrt"),
-        concat!("durchgefue", "hrt"),
-        concat!("lue", "cke"),
-        concat!("due", "rfen"),
-        concat!("due", "rfte"),
-        concat!("brue", "cke"),
-        concat!("bue", "ro"),
-        concat!("spue", "rbar"),
-        concat!("verknue", "pft"),
+        "laesst", "laengst", "laenge", "waere", "waeren", "haette", "haetten", "naechste",
+        "naechsten", "naechstes", "naechster", "zaehlt", "aehnlich", "aehnliche", "aenderung",
+        "aenderungen", "staerker", "spaeter", "maessig", "traegt", "faellt", "haelt", "schlaegt",
+        "waehlt", "waehrend", "erwaehnt", "vertraegt", "bewaehrt", "praezise", "temporaer",
+        "primaer", "sekundaer", "koennen", "koennte", "koennten", "koennt", "moeglich", "moegliche",
+        "moeglichen", "moeglichkeit", "moechte", "moechten", "groesser", "groesste", "groessten",
+        "groesse", "hoeher", "hoechste", "loesen", "loesung", "loesungen", "loeschen", "gehoert",
+        "stoert", "voellig", "noetig", "benoetigt", "persoenlich", "woertlich", "unmoeglich",
+        "ausloesen", "abloesen", "oekonomie", "fuer", "fuers", "fuehrt", "fuehren", "fuehrte",
+        "fuehlen", "ueber", "uebersicht", "uebrig", "uebung", "ueblich", "rueck", "zurueck",
+        "pruefen", "pruefung", "geprueft", "muessen", "muesste", "muessten", "gruen", "gruende",
+        "gruendung", "gueltig", "ungueltig", "kuerzen", "frueh", "frueher", "natuerlich", "wuerde",
+        "wuerden", "stuetzt", "unterstuetzt", "unterstuetzen", "verfuegbar", "fuenf", "schuetzt",
+        "schluessel", "ausfuehren", "ausfuehrung", "einfuehren", "einfuehrung", "aufgefuehrt",
+        "durchgefuehrt", "luecke", "duerfen", "duerfte", "bruecke", "buero", "spuerbar",
+        "verknuepft",
     ];
     const GERMAN_NOUN_ROOTS: &[&str] = &[
-        concat!("pra", "xis"),
-        concat!("archi", "tektur"),
-        concat!("feh", "ler"),
-        concat!("bef", "und"),
-        concat!("kon", "text"),
-        concat!("kontin", "gent"),
-        concat!("spei", "cher"),
-        concat!("re", "gel"),
-        concat!("steue", "rung"),
-        concat!("verwal", "tung"),
-        concat!("daten", "bank"),
-        concat!("oeko", "nomie"),
-        concat!("prue", "fung"),
-        concat!("ue", "bersicht"),
-        concat!("umset", "zung"),
-        concat!("auswer", "tung"),
-        concat!("einstel", "lung"),
-        concat!("abfr", "age"),
-        concat!("zugr", "iff"),
-        concat!("lauf", "zeit"),
+        "praxis", "architektur", "fehler", "befund", "kontext", "kontingent", "speicher", "regel",
+        "steuerung", "verwaltung", "datenbank", "oekonomie", "pruefung", "uebersicht",
+        "umsetzung", "auswertung", "einstellung", "abfrage", "zugriff", "laufzeit", "wildwuchs",
+        "modus",
     ];
 
     let lines: Vec<&str> = text.lines().collect();
@@ -949,10 +920,10 @@ pub fn check_german_prose_style(text: &str, filename: &str) -> Vec<GuardrailViol
             {
                 continue;
             }
+            let has_german_morph =
+                has_german_word_morphology(&l_low) || has_german_word_morphology(&r_low);
             let has_non_ascii = tok.chars().any(|c| !c.is_ascii());
-            let has_german_noun = GERMAN_NOUN_ROOTS.contains(&l_low.as_str())
-                || GERMAN_NOUN_ROOTS.contains(&r_low.as_str());
-            if german_ctx || has_non_ascii || has_german_noun {
+            if (german_ctx || has_non_ascii || has_german_morph) && has_german_morph {
                 violations.push(GuardrailViolation {
                     rule: "german-deppenbindestrich".to_owned(),
                     severity: "CRITICAL".to_owned(),

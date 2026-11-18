@@ -380,6 +380,7 @@ impl ReflexEngine {
             .unwrap_or_default();
         let q_low = query.to_lowercase();
         let err_low = error_context.unwrap_or("").to_lowercase();
+        let q_err_combined = format!("{err_low} {q_low}");
         let markers_joined = markers.join(" ");
         let env_combined = format!("{ws_low} {markers_joined} {err_low} {q_low}");
         let foreign_sets = if self.live_sets.is_none() {
@@ -421,7 +422,7 @@ impl ReflexEngine {
                 && rule
                     .exclude_any
                     .iter()
-                    .any(|ex| reflex_keyword_matches(&env_combined, &ex.to_lowercase()));
+                    .any(|ex| reflex_keyword_matches(&q_err_combined, &ex.to_lowercase()));
             if excluded {
                 continue;
             }
@@ -586,17 +587,33 @@ impl ReflexEngine {
     }
 }
 
-fn reflex_keyword_matches(haystack_low: &str, kw_low: &str) -> bool {
+pub(crate) fn reflex_keyword_matches(haystack_low: &str, kw_low: &str) -> bool {
     let kw = kw_low.trim();
     if kw.is_empty() {
         return false;
     }
-    if kw == "window" || (kw.len() <= 3 && kw.bytes().all(|b| b.is_ascii_alphanumeric())) {
-        return haystack_low
-            .split(|c: char| !c.is_ascii_alphanumeric())
-            .any(|tok| tok == kw);
+    let hb = haystack_low.as_bytes();
+    let kb = kw.as_bytes();
+    if kb.len() > hb.len() {
+        return false;
     }
-    haystack_low.contains(kw)
+    let check_left = kb[0].is_ascii_alphanumeric();
+    let check_right = kb[kb.len() - 1].is_ascii_alphanumeric();
+    let mut start = 0usize;
+    while let Some(rel) = haystack_low[start..].find(kw) {
+        let pos = start + rel;
+        let end = pos + kb.len();
+        let left_ok = !check_left || pos == 0 || !hb[pos - 1].is_ascii_alphanumeric();
+        let right_ok = !check_right || end == hb.len() || !hb[end].is_ascii_alphanumeric();
+        if left_ok && right_ok {
+            return true;
+        }
+        start = pos + 1;
+        while start < hb.len() && !haystack_low.is_char_boundary(start) {
+            start += 1;
+        }
+    }
+    false
 }
 
 fn load_utility_book(db: &LibreDb) -> ReflexUtilityBook {

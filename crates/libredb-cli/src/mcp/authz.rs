@@ -545,14 +545,16 @@ impl McpServerState {
         let q_key = canonical_brain_cache_key(&q_path);
         if !self.brains.contains_key(&q_key) {
             let q_db = open_project_ldb_silent(&q_path)?;
-            let q_brain = OverlayBrain::open(self.global_db.clone(), q_db)
+            let mut q_brain = OverlayBrain::open(self.global_db.clone(), q_db)
                 .map_err(|e| e.to_string())?;
+            q_brain.set_learning_enabled(false);
             insert_brain_bounded(&mut self.brains, q_key.clone(), q_brain);
         }
         let brain = self
             .brains
             .get_mut(&q_key)
             .ok_or_else(|| "quarantined brain cache entry missing after insert".to_owned())?;
+        brain.set_learning_enabled(false);
         brain.refresh_if_needed().map_err(|e| e.to_string())?;
         Ok(brain)
     }
@@ -759,10 +761,17 @@ impl McpServerState {
                 (candidate_path, candidate_cache_key)
             };
 
+        let is_quarantine_db = db_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case("quarantined_workspace.ldb"));
         if !self.brains.contains_key(&cache_key) {
             let proj_db = open_project_ldb_silent(&db_path)?;
-            let brain = OverlayBrain::open(self.global_db.clone(), proj_db)
+            let mut brain = OverlayBrain::open(self.global_db.clone(), proj_db)
                 .map_err(|e| e.to_string())?;
+            if is_quarantine_db {
+                brain.set_learning_enabled(false);
+            }
             insert_brain_bounded(&mut self.brains, cache_key.clone(), brain);
         }
 
@@ -770,6 +779,9 @@ impl McpServerState {
             .brains
             .get_mut(&cache_key)
             .ok_or_else(|| "workspace brain cache entry missing after insert".to_owned())?;
+        if is_quarantine_db {
+            brain.set_learning_enabled(false);
+        }
         brain.refresh_if_needed().map_err(|e| e.to_string())?;
         Ok((ws_write_lock, ws_root_to_seal, brain))
     }

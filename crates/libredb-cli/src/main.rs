@@ -1391,13 +1391,11 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 None => hooks::open_global_ldb_checked(None)?,
             };
             let db = if let Some(ref db_p) = explicit_db_opt {
+                let _ = &glob_db;
                 open_cli_verified_project_db(cli.global_deref(), db_p)?
             } else {
-                resolve_default_cli_project_db(
-                    cli.global_deref(),
-                    glob_db.as_ref(),
-                    ws_dir_opt.as_deref(),
-                )?
+                let _ = &glob_db;
+                resolve_default_cli_code_graph_db(cli.global_deref(), ws_dir_opt.as_deref())?
             };
             if db
                 .get_by_key(NodeKind::Generic, "sys::workspace_graph_state")
@@ -1461,13 +1459,11 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 None => hooks::open_global_ldb_checked(None)?,
             };
             let db = if let Some(ref db_p) = explicit_db_opt {
+                let _ = &glob_db;
                 open_cli_verified_project_db(cli.global_deref(), db_p)?
             } else {
-                resolve_default_cli_project_db(
-                    cli.global_deref(),
-                    glob_db.as_ref(),
-                    ws_dir_opt.as_deref(),
-                )?
+                let _ = &glob_db;
+                resolve_default_cli_code_graph_db(cli.global_deref(), ws_dir_opt.as_deref())?
             };
             if db
                 .get_by_key(NodeKind::Generic, "sys::workspace_graph_state")
@@ -1581,13 +1577,11 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 None => hooks::open_global_ldb_checked(None)?,
             };
             let db = if let Some(ref db_p) = explicit_db_opt {
+                let _ = &glob_db;
                 open_cli_verified_project_db(cli.global_deref(), db_p)?
             } else {
-                resolve_default_cli_project_db(
-                    cli.global_deref(),
-                    glob_db.as_ref(),
-                    ws_dir_opt.as_deref(),
-                )?
+                let _ = &glob_db;
+                resolve_default_cli_code_graph_db(cli.global_deref(), ws_dir_opt.as_deref())?
             };
             let db_ws_root = db
                 .path()
@@ -3084,12 +3078,13 @@ pub(crate) fn modernize_global_db_with_options(
                 .replace("memory.db", "memory.ldb")
                 .replace("SkillsDB", "LibreDB");
             if updated != orig {
+                let is_pinned = rec.flags.contains(libredb_core::NodeFlags::PINNED);
                 rule_writes.push(
                     gdb.prepare(
                         WriteRequest::new(NodeKind::Rule, updated.into_bytes())
                             .with_key(key)
-                            .with_importance(230)
-                            .with_pinned(true),
+                            .with_importance(rec.importance)
+                            .with_pinned(is_pinned),
                         idx,
                     )?,
                 );
@@ -3703,6 +3698,36 @@ fn split_cli_db_and_symbol_queries(
     (None, queries)
 }
 
+fn open_cli_ephemeral_code_db(
+    ws_dir_opt: Option<&Path>,
+) -> Result<Arc<LibreDb>, Box<dyn std::error::Error>> {
+    let eph_dir = hooks::default_global_ldb_path()
+        .parent()
+        .map(|p| p.join("ephemeral"))
+        .unwrap_or_else(|| env::temp_dir().join("libredb_ephemeral"));
+    std::fs::create_dir_all(&eph_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&eph_dir, std::fs::Permissions::from_mode(0o700));
+    }
+    let fname = match ws_dir_opt {
+        Some(ws) => security::ephemeral_workspace_ldb_filename(ws),
+        None => format!("cli_ephemeral_{}.ldb", process::id()),
+    };
+    Ok(Arc::new(LibreDb::open(eph_dir.join(fname))?))
+}
+
+fn resolve_default_cli_code_graph_db(
+    global_path_opt: Option<&Path>,
+    ws_dir_opt: Option<&Path>,
+) -> Result<Arc<LibreDb>, Box<dyn std::error::Error>> {
+    if let Some(ldb_cand) = find_existing_cli_project_db(ws_dir_opt) {
+        return open_cli_verified_project_db(global_path_opt, &ldb_cand);
+    }
+    open_cli_ephemeral_code_db(ws_dir_opt)
+}
+
 fn resolve_default_cli_project_db(
     global_path_opt: Option<&Path>,
     glob_db_opt: Option<&Arc<LibreDb>>,
@@ -3714,20 +3739,7 @@ fn resolve_default_cli_project_db(
     if let Some(gdb) = glob_db_opt {
         return Ok(Arc::clone(gdb));
     }
-    let fallback_ws = ws_dir_opt
-        .map(Path::to_path_buf)
-        .or_else(|| env::current_dir().ok())
-        .ok_or("Unable to resolve current working directory or project .agents/memory.ldb")?;
-    if security::is_private_brain_workspace(&fallback_ws) {
-        return Err(
-            "No initialized global customizations.ldb and refusing to create .agents/memory.ldb inside Antigravity private brain directory."
-                .into(),
-        );
-    }
-    open_cli_verified_project_db(
-        global_path_opt,
-        &fallback_ws.join(".agents").join("memory.ldb"),
-    )
+    open_cli_ephemeral_code_db(ws_dir_opt)
 }
 
 fn execute_skill_slice_query(
@@ -4233,6 +4245,80 @@ mod tests {
         ])
         .unwrap();
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cli_locate_without_project_db_never_pollutes_customizations_ldb() {
+        let dir = env::temp_dir().join(format!(
+            "libredb_cli_locate_iso_{}_{}",
+            process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let ws = dir.join("ephemeral_repo");
+        let libre_home = dir.join("libre_home");
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::create_dir_all(&libre_home).unwrap();
+        std::fs::write(
+            ws.join("Cargo.toml"),
+            "[package]\nname = \"ephemeral_iso\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ws.join("src").join("lib.rs"),
+            "pub fn demo_ephemeral_symbol() -> u32 {\n    42\n}\n",
+        )
+        .unwrap();
+
+        let gdb_path = libre_home.join("customizations.ldb");
+        let gdb = LibreDb::open(&gdb_path).unwrap();
+        drop(gdb);
+
+        assert!(!ws.join(".agents").exists());
+
+        run_with_args(&[
+            "locate".to_owned(),
+            "demo_ephemeral_symbol".to_owned(),
+            "--cwd".to_owned(),
+            ws.to_string_lossy().into_owned(),
+            "--global".to_owned(),
+            gdb_path.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+
+        // Must never create `.agents/memory.ldb` in the project directory on read-only locate.
+        assert!(!ws.join(".agents").exists());
+
+        // Global customizations.ldb must retain 0 workspace code-graph symbols or working-set nodes.
+        let gdb_after = LibreDb::open(&gdb_path).unwrap();
+        assert!(
+            gdb_after.list_inodes(Some(NodeKind::Symbol), false).is_empty(),
+            "customizations.ldb must never be polluted with Symbol inodes from locate"
+        );
+        assert!(
+            gdb_after
+                .list_inodes(Some(NodeKind::WorkingSet), false)
+                .is_empty(),
+            "customizations.ldb must never be polluted with WorkingSet inodes from locate"
+        );
+        drop(gdb_after);
+
+        // Ephemeral code DB must hold the indexed symbol for locate_symbols.
+        let eph_db = open_cli_ephemeral_code_db(Some(&ws)).unwrap();
+        let matches =
+            locate_symbols(&eph_db, &["demo_ephemeral_symbol".to_owned()]).unwrap();
+        assert!(
+            matches.iter().any(|m| m.symbol_name == "demo_ephemeral_symbol"),
+            "Expected ephemeral code graph DB to resolve demo_ephemeral_symbol, got {:?}",
+            matches
+        );
+        let eph_path = eph_db.path().map(|p| p.to_path_buf());
+        drop(eph_db);
+        if let Some(p) = eph_path {
+            let _ = std::fs::remove_file(p);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

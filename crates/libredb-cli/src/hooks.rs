@@ -211,7 +211,17 @@ fn evaluate_pre_tool_payload_inner(
                 .or_else(|| args.get("model"))
                 .and_then(Value::as_str)
                 .unwrap_or("inherit");
-            let gdb_opt = get_global_db_checked().ok().flatten();
+            let gdb_opt = match get_global_db_checked() {
+                Ok(opt) => opt,
+                Err(err) => {
+                    return json!({
+                        "decision": "deny",
+                        "reason": format!(
+                            "LibreDB PreToolUse failed closed because global customizations.ldb could not be verified: {err}"
+                        )
+                    });
+                }
+            };
             if !model_str.eq_ignore_ascii_case("flash")
                 && !model_str.eq_ignore_ascii_case("flash_lite")
                 && crate::security::load_bool_config(
@@ -732,13 +742,7 @@ fn evaluate_pre_invocation_payload_inner(
         }
     }
 
-    let prompt_hint = extract_prompt_hint(payload, transcript_opt.as_deref());
-    let (mut context_block, naive_baseline_bytes) = build_project_memory_hydration(
-        &proj_db,
-        ws_root.as_deref(),
-        prompt_hint.as_deref(),
-        error_hint,
-    );
+    const STYLE_INVARIANT: &str = "Style Invariant: Informal German ('Du'), natural umlauts (never ae/oe/ue), closed German Komposita (zero Deppenbindestriche), zero em/en-dashes or emojis, 100% ASCII English in code/commits.";
     let gdb_opt = ensure_global_db().ok().flatten();
     let enforce_style = crate::security::load_bool_config(
         gdb_opt.as_deref(),
@@ -746,23 +750,25 @@ fn evaluate_pre_invocation_payload_inner(
         "guardrail:style_rules",
         false,
     );
-    if enforce_style && !context_block.is_empty() {
-        const STYLE_INVARIANT: &str = "Style Invariant: Informal German ('Du'), natural umlauts (never ae/oe/ue), closed German Komposita (zero Deppenbindestriche), zero em/en-dashes or emojis, 100% ASCII English in code/commits.";
-        const MAX_PRE_INV_BYTES: usize = 1800;
-        let needed = STYLE_INVARIANT.len() + 1;
-        while context_block.len() + needed > MAX_PRE_INV_BYTES {
-            let Some(pos) = context_block.rfind('\n') else {
-                break;
-            };
-            if pos == 0 {
-                break;
-            }
-            context_block.truncate(pos);
-        }
-        if context_block.len() + needed <= MAX_PRE_INV_BYTES {
-            context_block.push('\n');
-            context_block.push_str(STYLE_INVARIANT);
-        }
+    let hydration_cap = if enforce_style {
+        MAX_PRE_INVOCATION_BYTES.saturating_sub(STYLE_INVARIANT.len() + 1)
+    } else {
+        MAX_PRE_INVOCATION_BYTES
+    };
+    let prompt_hint = extract_prompt_hint(payload, transcript_opt.as_deref());
+    let (mut context_block, naive_baseline_bytes) = build_project_memory_hydration_with_cap(
+        &proj_db,
+        ws_root.as_deref(),
+        prompt_hint.as_deref(),
+        error_hint,
+        hydration_cap,
+    );
+    if enforce_style
+        && !context_block.is_empty()
+        && context_block.len() + STYLE_INVARIANT.len() + 1 <= MAX_PRE_INVOCATION_BYTES
+    {
+        context_block.push('\n');
+        context_block.push_str(STYLE_INVARIANT);
     }
     if context_block.is_empty() {
         Ok(json!({ "injectSteps": [] }))
@@ -967,11 +973,12 @@ pub fn extract_prompt_hint(payload: &Value, transcript_opt: Option<&Path>) -> Op
 /// Priority reservation guarantees that `BM25`-matched `Decision` and `Fact` capsules are never
 /// evicted by verbose tasks, handoffs, or recency filler. Unsealed `WorkingSet` and `Symbol` nodes
 /// are NEVER read here.
-fn build_project_memory_hydration(
+fn build_project_memory_hydration_with_cap(
     proj_db: &LibreDb,
     ws_root: Option<&Path>,
     prompt_hint: Option<&str>,
     error_hint: Option<&str>,
+    max_bytes: usize,
 ) -> (String, usize) {
     let mut naive_baseline_bytes = 64usize;
     let mut git_line_opt = ws_root.and_then(collect_git_telemetry_line);
@@ -1313,7 +1320,7 @@ fn build_project_memory_hydration(
         if secs.is_empty() {
             return String::new();
         }
-        let mut out = String::with_capacity(MAX_PRE_INVOCATION_BYTES);
+        let mut out = String::with_capacity(max_bytes);
         out.push_str(header);
         for (idx, sec) in secs.iter().enumerate() {
             if idx > 0 {
@@ -1345,7 +1352,7 @@ fn build_project_memory_hydration(
             true,
         )
         .len()
-            > MAX_PRE_INVOCATION_BYTES
+            > max_bytes
         {
             chosen_decs.pop();
             omitted = true;
@@ -1364,7 +1371,7 @@ fn build_project_memory_hydration(
             true,
         )
         .len()
-            > MAX_PRE_INVOCATION_BYTES
+            > max_bytes
         {
             chosen_facts.pop();
             omitted = true;
@@ -1385,7 +1392,7 @@ fn build_project_memory_hydration(
             true,
         )
         .len()
-            > MAX_PRE_INVOCATION_BYTES
+            > max_bytes
         {
             chosen_tasks.pop();
             omitted = true;
@@ -1404,7 +1411,7 @@ fn build_project_memory_hydration(
             true,
         )
         .len()
-            > MAX_PRE_INVOCATION_BYTES
+            > max_bytes
         {
             chosen_handoffs.pop();
             omitted = true;
@@ -1425,7 +1432,7 @@ fn build_project_memory_hydration(
             true,
         )
         .len()
-            > MAX_PRE_INVOCATION_BYTES
+            > max_bytes
         {
             chosen_decs.pop();
             omitted = true;
@@ -1444,7 +1451,7 @@ fn build_project_memory_hydration(
             true,
         )
         .len()
-            > MAX_PRE_INVOCATION_BYTES
+            > max_bytes
         {
             chosen_facts.pop();
             omitted = true;
@@ -1463,7 +1470,7 @@ fn build_project_memory_hydration(
             true,
         )
         .len()
-            > MAX_PRE_INVOCATION_BYTES
+            > max_bytes
         {
             chosen_snap.pop();
             omitted = true;
