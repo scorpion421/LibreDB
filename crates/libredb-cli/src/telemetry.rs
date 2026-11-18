@@ -858,9 +858,8 @@ fn lexical_clean_slash(p: &Path) -> String {
     out.to_ascii_lowercase()
 }
 
-/// Builds verified lowercase byte needles for `p` across both its logical path (preserving OS
-/// root symlinks such as macOS `/var/folders/...` and `/tmp/...`) and its canonical target
-/// (`/private/var/folders/...`, junctions, or symlinked workspace roots), plus Windows JSON-escaped
+/// Builds verified lowercase byte needles for `p` across both its logical path and its canonical
+/// target (symlinks, Windows junctions, or symlinked workspace roots), plus Windows JSON-escaped
 /// double-backslash (`d:\\...`) and `file:///d%3a/...` URI representations.
 fn build_workspace_needles(p: &Path) -> Vec<Vec<u8>> {
     let mut slash_variants: Vec<String> = Vec::with_capacity(4);
@@ -898,25 +897,6 @@ fn build_workspace_needles(p: &Path) -> Vec<Vec<u8>> {
             .or_else(|| std::fs::canonicalize(p).ok());
         if let Some(ref canon) = canon_opt {
             push_unique_str(&mut slash_variants, lexical_clean_slash(canon));
-
-            // When `p` was already canonicalized upstream (e.g. `/private/var/...` or `/private/tmp/...`
-            // on macOS), also admit the unprefixed `/var/...` or `/tmp/...` alias iff it resolves back
-            // to the exact same canonical inode path on this host.
-            let canon_slash = canon.to_string_lossy().replace('\\', "/");
-            for firmlink_prefix in ["/private/var/", "/private/tmp/", "/private/etc/"] {
-                if canon_slash.starts_with(firmlink_prefix) {
-                    let unprefixed = &canon_slash["/private".len()..];
-                    let alt_canon =
-                        crate::security::canonicalize_with_missing_tail(Path::new(unprefixed))
-                            .or_else(|| std::fs::canonicalize(unprefixed).ok());
-                    if alt_canon.as_ref() == Some(canon) {
-                        push_unique_str(
-                            &mut slash_variants,
-                            lexical_clean_slash(Path::new(unprefixed)),
-                        );
-                    }
-                }
-            }
         }
     }
 
@@ -1502,23 +1482,23 @@ mod tests {
             &win_needles
         ));
 
-        let macos_logical =
-            build_workspace_needles(Path::new("/var/folders/zz/abc123/T/libredb_test/ws_alpha"));
+        let linux_logical =
+            build_workspace_needles(Path::new("/tmp/libredb_test/ws_alpha"));
         assert!(line_mentions_workspace_bytes(
-            br#"{"content":"Workspace: /var/folders/zz/abc123/T/libredb_test/ws_alpha\n</SYSTEM_MESSAGE>"}"#,
-            &macos_logical
+            br#"{"content":"Workspace: /tmp/libredb_test/ws_alpha\n</SYSTEM_MESSAGE>"}"#,
+            &linux_logical
         ));
         assert!(line_mentions_workspace_bytes(
-            br#"{"uri":"file:///var/folders/zz/abc123/T/libredb_test/ws_alpha/src/lib.rs"}"#,
-            &macos_logical
+            br#"{"uri":"file:///tmp/libredb_test/ws_alpha/src/lib.rs"}"#,
+            &linux_logical
         ));
         assert!(!line_mentions_workspace_bytes(
-            br#"{"content":"Workspace: /var/folders/zz/abc123/T/libredb_test/ws_alpha_other"}"#,
-            &macos_logical
+            br#"{"content":"Workspace: /tmp/libredb_test/ws_alpha_other"}"#,
+            &linux_logical
         ));
         assert!(!line_mentions_workspace_bytes(
-            br#"{"content":"Workspace: /other_prefix/var/folders/zz/abc123/T/libredb_test/ws_alpha"}"#,
-            &macos_logical
+            br#"{"content":"Workspace: /other_prefix/tmp/libredb_test/ws_alpha"}"#,
+            &linux_logical
         ));
     }
 }

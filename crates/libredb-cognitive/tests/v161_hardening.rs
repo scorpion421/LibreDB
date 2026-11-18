@@ -1271,39 +1271,29 @@ fn reflex_word_boundaries_and_prose_only_morphological_german_guardrails() {
         .any(|r| r.id == "rule-cargo"));
 
     // Non-prose files (.rs, .py, .ps1) skip German prose style checks completely.
-    let german_bad = format!(
-        "Dieser Bericht pr\u{00fc}ft die Umsetzung, weil heute ein {} und {} stattfindet.",
-        concat!("Praxis", "-Test"),
-        concat!("Auto", "-Modus"),
-    );
-    assert!(check_german_prose_style(&german_bad, "src/lib.rs").is_empty());
-    assert!(check_german_prose_style(&german_bad, "scripts/helper.py").is_empty());
-    assert!(check_german_prose_style(&german_bad, "scripts/deploy.ps1").is_empty());
+    let german_bad =
+        "Dieser Bericht pr\u{00fc}ft die Umsetzung, weil heute ein Praxis-Test und Auto-Modus stattfindet.";
+    assert!(check_german_prose_style(german_bad, "src/lib.rs").is_empty());
+    assert!(check_german_prose_style(german_bad, "scripts/helper.py").is_empty());
+    assert!(check_german_prose_style(german_bad, "scripts/deploy.ps1").is_empty());
 
     // Prose Markdown allows established English technical compounds and PowerShell cmdlets.
-    let valid_german_prose = format!(
-        "Dieser Bericht pr\u{00fc}ft die Architektur, weil {}, {}, {}, {}, {} und {} sauber bleiben.",
-        concat!("Zero", "-Trust"),
-        concat!("Open", "-Source"),
-        concat!("Cross", "-Platform"),
-        concat!("Single", "-File"),
-        concat!("Read", "-Only"),
-        concat!("Stop", "-Service"),
-    );
+    let valid_german_prose =
+        "Dieser Bericht pr\u{00fc}ft die Architektur, weil Zero-Trust, Open-Source, Cross-Platform, Single-File, Read-Only und Stop-Service sauber bleiben.";
     assert!(
-        check_german_prose_style(&valid_german_prose, "notes.md").is_empty(),
+        check_german_prose_style(valid_german_prose, "notes.md").is_empty(),
         "Valid English technical terms and cmdlets must not trigger german-deppenbindestrich: {:?}",
-        check_german_prose_style(&valid_german_prose, "notes.md")
+        check_german_prose_style(valid_german_prose, "notes.md")
     );
 
     // German morphological Deppenbindestriche in Markdown are still caught reliably.
     for sample in [
-        format!("Dieser Hinweis pr\u{00fc}ft die Regel, weil {} falsch ist.", concat!("Praxis", "-Test")),
-        format!("Dieser Hinweis pr\u{00fc}ft die Regel, weil {} falsch ist.", concat!("Architektur", "-Wildwuchs")),
-        format!("Dieser Hinweis pr\u{00fc}ft die Regel, weil {} falsch ist.", concat!("Auto", "-Modus")),
-        format!("Dieser Hinweis pr\u{00fc}ft die Regel, weil {} falsch ist.", concat!("Test", "-Laufzeit")),
+        "Dieser Hinweis pr\u{00fc}ft die Regel, weil Praxis-Test falsch ist.",
+        "Dieser Hinweis pr\u{00fc}ft die Regel, weil Architektur-Wildwuchs falsch ist.",
+        "Dieser Hinweis pr\u{00fc}ft die Regel, weil Auto-Modus falsch ist.",
+        "Dieser Hinweis pr\u{00fc}ft die Regel, weil Test-Laufzeit falsch ist.",
     ] {
-        let v = check_german_prose_style(&sample, "notes.md");
+        let v = check_german_prose_style(sample, "notes.md");
         assert!(
             v.iter().any(|item| item.rule == "german-deppenbindestrich"),
             "Expected german-deppenbindestrich violation for sample: {sample}"

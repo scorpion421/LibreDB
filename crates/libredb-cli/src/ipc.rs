@@ -4,7 +4,7 @@
 //! - Windows: local Named Pipe (`\\.\pipe\libredb-ipc-v1-<24hex>`) with `PIPE_REJECT_REMOTE_CLIENTS`,
 //!   `FILE_FLAG_FIRST_PIPE_INSTANCE`, protected owner/SYSTEM/Administrators SDDL DACL, and client
 //!   pipe-owner SID verification (no drivers, no admin elevation, and no SMB/network I/O).
-//! - Unix (Linux/macOS): `0600` Unix Domain Socket inside a verified `0700` user-owned directory
+//! - Linux (POSIX): `0600` Unix Domain Socket inside a verified `0700` user-owned directory
 //!   guarded by an advisory file lock.
 
 use crate::hooks::{

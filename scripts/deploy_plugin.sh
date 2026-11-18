@@ -1,5 +1,5 @@
 #!/bin/sh
-# POSIX / Linux / macOS Antigravity plugin installer for LibreDB
+# Linux (POSIX) Antigravity plugin installer for LibreDB
 # Enterprise-neutral by default (never installs personal rules unless requested).
 set -eu
 
@@ -37,9 +37,9 @@ done
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PROJECT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
-LIBRE_VERSION=$(tr -d ' \t\r\n' < "$PROJECT_ROOT/VERSION" 2>/dev/null || echo "2.4.4")
+LIBRE_VERSION=$(tr -d ' \t\r\n' < "$PROJECT_ROOT/VERSION" 2>/dev/null || echo "2.4.5")
 case "$LIBRE_VERSION" in
-    ""|*[!0-9A-Za-z._+-]*) LIBRE_VERSION="2.4.4" ;;
+    ""|*[!0-9A-Za-z._+-]*) LIBRE_VERSION="2.4.5" ;;
 esac
 USER_HOME="${HOME:-$(pwd)}"
 GEMINI_DIR="$USER_HOME/.gemini"
@@ -120,7 +120,7 @@ test_safe_binary_dir() {
 TARGET_EXE="$BIN_DIR/libredb"
 install_binary_hot_safe "$RELEASE_BIN" "$TARGET_EXE"
 
-for py_lib in "$PROJECT_ROOT/target/release/liblibredb_py.so" "$PROJECT_ROOT/target/release/liblibredb_py.dylib"; do
+for py_lib in "$PROJECT_ROOT/target/release/liblibredb_py.so"; do
     if [ -f "$py_lib" ]; then
         install_binary_hot_safe "$py_lib" "$BIN_DIR/libredb.so"
         break

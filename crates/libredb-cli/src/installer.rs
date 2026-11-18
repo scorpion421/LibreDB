@@ -760,7 +760,6 @@ fn copy_sibling_python_ext_if_present(src_exe: &Path, bin_dir: &Path) -> Option<
             "libredb.so",
             "libredb_py.so",
             "liblibredb_py.so",
-            "liblibredb_py.dylib",
             "libredb.abi3.so",
         ] {
             let cand = src_dir.join(name);
@@ -1401,9 +1400,12 @@ pub(crate) fn parse_and_select_release_asset(
     };
     let os_aliases: &[&str] = match os {
         "windows" => &["windows", "win32", "pc-windows"],
-        "macos" => &["macos", "darwin", "apple"],
         "linux" => &["linux", "unknown-linux"],
-        other => &[other],
+        other => {
+            return Err(format!(
+                "LibreDB self-update is only supported on Windows and Linux (detected '{other}')."
+            ));
+        }
     };
     let is_aux_file = |low: &str| {
         low.ends_with(".sha256")
@@ -1575,22 +1577,14 @@ fn verify_executable_magic(path: &Path) -> Result<(), String> {
     if &bytes[..4] != b"\x7fELF" {
         return Err("Downloaded Linux executable is missing ELF magic header.".to_owned());
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
-        let m = &bytes[..4];
-        let is_macho = matches!(
-            m,
-            [0xFE, 0xED, 0xFA, 0xCE]
-                | [0xFE, 0xED, 0xFA, 0xCF]
-                | [0xCE, 0xFA, 0xED, 0xFE]
-                | [0xCF, 0xFA, 0xED, 0xFE]
-                | [0xCA, 0xFE, 0xBA, 0xBE]
-        );
-        if !is_macho {
-            return Err("Downloaded macOS executable is missing Mach-O magic header.".to_owned());
-        }
+        Err("LibreDB binary self-update is only supported on Windows and Linux.".to_owned())
     }
-    Ok(())
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    {
+        Ok(())
+    }
 }
 
 fn download_release_asset(
@@ -2051,8 +2045,10 @@ mod tests {
         let lin = parse_and_select_release_asset(&sample, "scorpion421/LibreDB", "linux", "x86_64").unwrap();
         assert_eq!(lin.asset_name, "libredb-v2.4.0-linux-x64");
 
-        let mac = parse_and_select_release_asset(&sample, "scorpion421/LibreDB", "macos", "aarch64").unwrap();
-        assert_eq!(mac.asset_name, "libredb-v2.4.0-macos-arm64");
+        assert!(
+            parse_and_select_release_asset(&sample, "scorpion421/LibreDB", "macos", "aarch64").is_err(),
+            "Unsupported macOS target must fail closed instead of selecting a binary"
+        );
 
         let evil = serde_json::to_vec(&json!({
             "tag_name": "v2.4.0",

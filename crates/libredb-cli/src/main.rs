@@ -1402,7 +1402,9 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 .is_err()
             {
                 if let Some(ref ws_root) = ws_dir_opt {
-                    let _ = libredb_cognitive::index_workspace(&db, ws_root, false);
+                    if should_auto_index_cli_workspace(explicit_db_opt.as_deref(), ws_root) {
+                        let _ = libredb_cognitive::index_workspace(&db, ws_root, false);
+                    }
                 }
             }
             let matches = locate_symbols(&db, &queries)?;
@@ -1470,7 +1472,9 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 .is_err()
             {
                 if let Some(ref ws_root) = ws_dir_opt {
-                    let _ = libredb_cognitive::index_workspace(&db, ws_root, false);
+                    if should_auto_index_cli_workspace(explicit_db_opt.as_deref(), ws_root) {
+                        let _ = libredb_cognitive::index_workspace(&db, ws_root, false);
+                    }
                 }
             }
             let want_json = cli.has_switch("--json");
@@ -1648,7 +1652,9 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     .is_err()
                 {
                     if let Some(ref ws_root) = db_ws_root {
-                        let _ = libredb_cognitive::index_workspace(&db, ws_root, false);
+                        if should_auto_index_cli_workspace(explicit_db_opt.as_deref(), ws_root) {
+                            let _ = libredb_cognitive::index_workspace(&db, ws_root, false);
+                        }
                     }
                 }
                 let located = locate_symbols(&db, &[sym.to_owned()])?;
@@ -3718,6 +3724,16 @@ fn open_cli_ephemeral_code_db(
     Ok(Arc::new(LibreDb::open(eph_dir.join(fname))?))
 }
 
+fn should_auto_index_cli_workspace(explicit_db_opt: Option<&Path>, ws_root: &Path) -> bool {
+    if explicit_db_opt.is_some() {
+        return true;
+    }
+    if security::is_private_brain_workspace(ws_root) {
+        return false;
+    }
+    ws_root.join(".agents").join("memory.ldb").is_file() || has_project_root_marker(ws_root)
+}
+
 fn resolve_default_cli_code_graph_db(
     global_path_opt: Option<&Path>,
     ws_dir_opt: Option<&Path>,
@@ -4317,6 +4333,35 @@ mod tests {
         let eph_path = eph_db.path().map(|p| p.to_path_buf());
         drop(eph_db);
         if let Some(p) = eph_path {
+            let _ = std::fs::remove_file(p);
+        }
+
+        // Bare directories without project markers (e.g. a home directory) must never trigger auto-indexing.
+        let bare_dir = dir.join("no_marker_dir");
+        std::fs::create_dir_all(&bare_dir).unwrap();
+        std::fs::write(
+            bare_dir.join("stray.rs"),
+            "pub fn stray_home_symbol() -> u32 {\n    1\n}\n",
+        )
+        .unwrap();
+        run_with_args(&[
+            "locate".to_owned(),
+            "stray_home_symbol".to_owned(),
+            "--cwd".to_owned(),
+            bare_dir.to_string_lossy().into_owned(),
+            "--global".to_owned(),
+            gdb_path.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        assert!(!bare_dir.join(".agents").exists());
+        let bare_eph = open_cli_ephemeral_code_db(Some(&bare_dir)).unwrap();
+        assert!(
+            bare_eph.list_inodes(Some(NodeKind::Symbol), false).is_empty(),
+            "locate in bare directory without project markers must not auto-index non-project files"
+        );
+        let bare_eph_path = bare_eph.path().map(|p| p.to_path_buf());
+        drop(bare_eph);
+        if let Some(p) = bare_eph_path {
             let _ = std::fs::remove_file(p);
         }
         let _ = std::fs::remove_dir_all(&dir);

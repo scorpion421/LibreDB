@@ -424,7 +424,7 @@ impl Drop for PosixVaultInitLock {
 }
 
 /// Kernel-atomic non-overwriting same-directory rename (`RENAME_NOREPLACE` on Linux,
-/// `RENAME_EXCL` on macOS, `MoveFileExW(..., 0)` without `MOVEFILE_REPLACE_EXISTING` on Windows).
+/// `MoveFileExW(..., 0)` without `MOVEFILE_REPLACE_EXISTING` on Windows).
 /// Returns `ErrorKind::AlreadyExists` if `dst` already exists, and NEVER falls back to an
 /// overwriting `rename(2)` if the kernel or filesystem rejects the non-replace flag.
 #[cfg_attr(windows, allow(dead_code))]
@@ -465,31 +465,6 @@ pub(super) fn atomic_rename_noreplace(src: &Path, dst: &Path) -> std::io::Result
             Err(std::io::Error::last_os_error())
         }
     }
-    #[cfg(target_os = "macos")]
-    {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
-        const RENAME_EXCL: u32 = 0x0000_0004;
-        extern "C" {
-            fn renamex_np(
-                from: *const core::ffi::c_char,
-                to: *const core::ffi::c_char,
-                flags: u32,
-            ) -> i32;
-        }
-        let src_c = CString::new(src.as_os_str().as_bytes()).map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "interior NUL in src path")
-        })?;
-        let dst_c = CString::new(dst.as_os_str().as_bytes()).map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "interior NUL in dst path")
-        })?;
-        let rc = unsafe { renamex_np(src_c.as_ptr(), dst_c.as_ptr(), RENAME_EXCL) };
-        if rc == 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error())
-        }
-    }
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
@@ -520,12 +495,12 @@ pub(super) fn atomic_rename_noreplace(src: &Path, dst: &Path) -> std::io::Result
             Err(std::io::Error::last_os_error())
         }
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         let _ = (src, dst);
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
-            "non-overwriting atomic rename is unsupported on this OS",
+            "non-overwriting atomic rename is only supported on Windows and Linux",
         ))
     }
 }

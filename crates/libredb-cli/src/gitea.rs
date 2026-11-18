@@ -2985,7 +2985,7 @@ mod tests {
 
         assert!(super::is_release_deliverable_path("releases/libredb-v2.4.4-linux-x64"));
         assert!(super::is_release_deliverable_path("releases/libredb.pyd"));
-        assert!(super::is_release_deliverable_path("release/libredb-v2.4.4-macos-arm64"));
+        assert!(super::is_release_deliverable_path("release/libredb-v2.4.5-linux-arm64"));
         assert!(!super::is_release_deliverable_path("releases/.env"));
         assert!(!super::is_release_deliverable_path("releases/secret.ldb"));
         assert!(!super::is_release_deliverable_path("releases/notes.tmp"));

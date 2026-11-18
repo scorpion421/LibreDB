@@ -1,4 +1,4 @@
-# LibreDB POSIX / Linux / macOS source build and Antigravity plugin installer
+# LibreDB Linux (POSIX) source build and Antigravity plugin installer
 # 100% pure Rust with zero external C or system library dependencies (LZ4 and crypto are pure Rust).
 # Prerequisites: Rust toolchain (cargo + rustc).
 
@@ -29,7 +29,7 @@ build-native: check-deps
 test: check-deps
 	$(CARGO) test --release
 
-## Build optional PyO3 abi3 shared library (crates/libredb-py -> liblibredb_py.so / .dylib)
+## Build optional PyO3 abi3 shared library (crates/libredb-py -> liblibredb_py.so)
 python: check-deps
 	PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 $(CARGO) build --release -p libredb-py
 

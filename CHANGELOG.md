@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.5] - 2026-11-18
+
+### Changed
+- **Windows and Linux native runtime, updater, and CI focus (`.github/workflows/ci.yml`, `libredb update`, `Makefile`, `deploy_plugin.sh`)**: Narrowed first-class binary builds, self-update platform validation, atomic keyfile locks, and GitHub Actions verification strictly to Windows and Linux hosts so CI no longer blocks on untested macOS runners. Cross-platform UI reference documentation (`apple-hig-design` and Rule 8 guidelines) remains intact, and community contributors can still port or compile from source on other Unix targets.
+
+### Fixed
+- **Prevented unrequested indexing of non-project and user-home directories (`locate`, `impact`, `fim`, workspace indexer)**: Stopped CLI code-graph commands from automatically crawling arbitrary directories that lack `.agents/memory.ldb` or a project root marker (eliminating multi-gigabyte ephemeral cache creation on user home folders), and added OS user-profile and package-manager cache folders (`AppData`, `.gemini`, `.cargo`, `.rustup`, `.local`, `.cache`, `.npm`, `.gradle`, `.m2`, `.nuget`) to default workspace indexer exclusions.
+
 ## [2.4.4] - 2026-11-18
 
 ### Added

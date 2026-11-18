@@ -1,11 +1,11 @@
 # LibreDB
 
-[![Version](https://img.shields.io/badge/version-2.4.4-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.4.5-blue.svg)](CHANGELOG.md)
 [![Tests](https://img.shields.io/badge/tests-passing%20(168%20tests%20%2B%2012%20audits%20%2B%2015%20learning%20checks%20%2B%2010k%20crash%20sims)-brightgreen.svg)](crates/libredb-cli/tests/)
 [![Tech Stack](https://img.shields.io/badge/pure%20rust-1.89%2B%20%7C%20zero%20C%20%7C%20MCP-orange.svg)](Cargo.toml)
 [![License](https://img.shields.io/badge/license-Apache%202.0%20%2B%20Commons%20Clause-purple.svg)](LICENSE)
 
-`LibreDB` is a 100% pure-Rust, single-binary local memory database, code-graph indexer, and release automation tool built for `Antigravity` and `MCP`-compatible AI coding assistants. Instead of re-reading entire source files or losing project context across turns, it stores decisions, tasks, skills, and resolved bug patterns in a compact `.agents/memory.ldb` file, routes sub-millisecond lifecycle hooks through an in-memory `MCP` `IPC` coordinator with incremental `O(1)` tail-sync, locates exact symbols and call dependencies on demand, and deduplicates session context automatically. It also encrypts repository credentials via OS keystores, seals workspace databases against tampering, checks staged commits against project guardrails, and optionally publishes Git/Gitea releases (`git-automation` feature) across Windows, Linux, and macOS.
+`LibreDB` is a 100% pure-Rust, single-binary local memory database, code-graph indexer, and release automation tool built for `Antigravity` and `MCP`-compatible AI coding assistants. Instead of re-reading entire source files or losing project context across turns, it stores decisions, tasks, skills, and resolved bug patterns in a compact `.agents/memory.ldb` file, routes sub-millisecond lifecycle hooks through an in-memory `MCP` `IPC` coordinator with incremental `O(1)` tail-sync, locates exact symbols and call dependencies on demand, and deduplicates session context automatically. It also encrypts repository credentials via OS keystores, seals workspace databases against tampering, checks staged commits against project guardrails, and optionally publishes Git/Gitea releases (`git-automation` feature) across Windows and Linux.
 
 ## Table of contents
 
@@ -17,7 +17,7 @@
 
 ## Executive summary and impact
 
-| Dimension | Legacy Python + `SQLite` (`SkillsDB`) | `LibreDB v2.4.4` (100% Pure `Rust` + `MCP` + `PyO3`) |
+| Dimension | Legacy Python + `SQLite` (`SkillsDB`) | `LibreDB v2.4.5` (100% Pure `Rust` + `MCP` + `PyO3`) |
 | :--- | :--- | :--- |
 | **Hook response latency** | `350-500 ms` Python startup + `SQLite` WAL per edit or turn | **`< 0.5 ms` via the in-memory `MCP` `IPC` coordinator (`< 2 ms` direct fallback), loading matching rules and project memory without disk polling** |
 | **Multi-turn recall & I/O** | Repeated subprocess spawns and full-file re-reads | **RAM-cached session delta and `O(1)` incremental tail-sync (`2` reads total on external updates), keeping turn 2+ recall instant even over network shares** |
@@ -32,7 +32,7 @@
 - **Rust toolchain:** `1.89+` (`cargo` + `rustc`, 100% pure Rust with zero C code, zero C compiler, and zero external `-dev` libraries required)
 - **Optional Python integration:** `Python 3.12+` (verified on `Python 3.14.5` via Stable ABI `abi3`, decoupled from default `CLI`/`MCP` builds)
 
-### Linux and macOS (enterprise-neutral source build & plugin install)
+### Linux (enterprise-neutral source build & plugin install)
 
 ```sh
 make test
@@ -71,8 +71,8 @@ pwsh -ExecutionPolicy Bypass -File .\scripts\deploy_plugin.ps1 -Profile Personal
 ```text
 LibreDB/
 |-- Cargo.toml                                     # Pure-Rust workspace (4 default CLI/MCP crates + optional PyO3 crate)
-|-- Makefile                                       # Zero-dependency POSIX/Linux/macOS source build & installer
-|-- VERSION                                        # Semantic Version (2.4.4)
+|-- Makefile                                       # Zero-dependency Linux/POSIX source build & installer
+|-- VERSION                                        # Semantic Version (2.4.5)
 |-- CHANGELOG.md                                   # Keep a Changelog 1.1.0 release history
 |-- LICENSE                                        # Commons Clause v1.0 + full verbatim Apache License 2.0 text
 |-- README.md                                      # 9-block standardized documentation
@@ -83,7 +83,7 @@ LibreDB/
 |   |-- linux-desktop-hig-design/SKILL.md          # GNOME Libadwaita and KDE Kirigami desktop HIG standard
 |-- scripts/
 |   |-- deploy_plugin.ps1                          # Windows PowerShell installer (-Profile Neutral|Personal, -NoHooks)
-|   |-- deploy_plugin.sh                           # POSIX/Linux/macOS installer (--profile neutral|personal, --no-hooks)
+|   |-- deploy_plugin.sh                           # Linux/POSIX installer (--profile neutral|personal, --no-hooks)
 |-- crates/
     |-- libredb-core/                              # Frozen single-file LIBREDB1 storage kernel (Inodes, Extents, MVCC, Tail-Sync)
     |-- libredb-index/                             # Language-agnostic IDF n-grams, alphanumeric v5 tokens & Hebbian learner
