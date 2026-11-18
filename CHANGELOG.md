@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.0] - 2026-11-18
+
+### Added
+- **Standalone plugin installer and GitHub Release updater (`libredb install`, `libredb update`)**: Embedded a zero-dependency pure-Rust installer and updater directly inside `libredb` so any workstation or secondary office instance can deploy or upgrade from a single release binary without a local repository checkout, `cargo`, or forbidden JSON file edits. `libredb update` queries GitHub Releases, downloads and verifies the matching platform executable, and delegates installation to the new binary while preserving the active profile and any existing AppLocker-permitted installation path.
+- **Embedded UI design skill hydration and flexible deployment script binary lookup (`deploy_plugin.ps1`, `deploy_plugin.sh`)**: Bundled the four platform design `SKILL.md` guides inside `libredb` so standalone binaries outside a repo checkout still hydrate complete `Personal` profiles, added `-BinaryPath` / `--binary` overrides plus `dist/` fallback lookup to the deployment scripts, and added a technical reflex reinforcing `libredb update` over direct edits to `mcp_config.json` or `hooks.json`.
+
 ## [2.3.1] - 2026-11-18
 
 ### Security

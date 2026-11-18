@@ -5,6 +5,7 @@ set -eu
 
 PROFILE="neutral"
 NO_HOOKS=0
+BINARY_PATH=""
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --personal-rules|--personal)
@@ -19,8 +20,12 @@ while [ "$#" -gt 0 ]; do
             NO_HOOKS=1
             shift
             ;;
+        --binary)
+            BINARY_PATH="${2:-}"
+            shift 2
+            ;;
         -h|--help)
-            echo "Usage: ./scripts/deploy_plugin.sh [--personal-rules | --profile neutral|personal] [--no-hooks]"
+            echo "Usage: ./scripts/deploy_plugin.sh [--personal-rules | --profile neutral|personal] [--no-hooks] [--binary <path>]"
             exit 0
             ;;
         *)
@@ -32,9 +37,9 @@ done
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PROJECT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
-LIBRE_VERSION=$(tr -d ' \t\r\n' < "$PROJECT_ROOT/VERSION" 2>/dev/null || echo "2.3.1")
+LIBRE_VERSION=$(tr -d ' \t\r\n' < "$PROJECT_ROOT/VERSION" 2>/dev/null || echo "2.4.0")
 case "$LIBRE_VERSION" in
-    ""|*[!0-9A-Za-z._+-]*) LIBRE_VERSION="2.3.1" ;;
+    ""|*[!0-9A-Za-z._+-]*) LIBRE_VERSION="2.4.0" ;;
 esac
 USER_HOME="${HOME:-$(pwd)}"
 GEMINI_DIR="$USER_HOME/.gemini"
@@ -48,10 +53,20 @@ ASSETS_DIR="$PLUGIN_DIR/assets"
 mkdir -p "$BIN_DIR" "$RULES_DIR" "$SKILL_DIR" "$ASSETS_DIR"
 chmod 700 "$LIBRE_HOME" 2>/dev/null || true
 
-RELEASE_BIN="$PROJECT_ROOT/target/release/libredb"
-if [ ! -f "$RELEASE_BIN" ]; then
-    echo "[INFO] Release binary not found at $RELEASE_BIN; compiling from source..."
+if [ -n "$BINARY_PATH" ]; then
+    RELEASE_BIN="$BINARY_PATH"
+elif [ -f "$PROJECT_ROOT/target/release/libredb" ]; then
+    RELEASE_BIN="$PROJECT_ROOT/target/release/libredb"
+elif [ -f "$PROJECT_ROOT/dist/libredb" ]; then
+    RELEASE_BIN="$PROJECT_ROOT/dist/libredb"
+else
+    RELEASE_BIN="$PROJECT_ROOT/target/release/libredb"
+    echo "[INFO] Release binary not found at $RELEASE_BIN or dist/libredb; compiling from source..."
     (cd "$PROJECT_ROOT" && cargo build --release)
+fi
+if [ ! -f "$RELEASE_BIN" ]; then
+    echo "Release binary not found at $RELEASE_BIN." >&2
+    exit 1
 fi
 
 # Atomic POSIX hot-swap install: copy to sibling temp file + chmod 0755 + mv -f
@@ -363,6 +378,10 @@ description: >-
 
 ## CLI commands (`libredb`)
 
+- **Self-update & standalone install (zero repo or cargo required):**
+  - `libredb update [--check] [--force] [--version <vX.Y.Z>] [--repo <owner/repo>] [--profile neutral|personal] [--no-hooks] [--fallback-drive <dir>]` (aliases: `self-update`, `upgrade`)
+  - `libredb install [<binary_path>] [--profile neutral|personal] [--no-hooks] [--fallback-drive <dir>]` (alias: `self-install`)
+  - **Rule for plugin updates:** Always update or install LibreDB by running `libredb update` or `<binary> install` via `run_command`. NEVER call `edit_file` or `write_file` on `mcp_config.json`, `hooks.json`, `plugin.json`, or files inside `~/.gemini/libredb/` (`PreToolUse` blocks direct edits to control-plane files by design).
 - **Zero-boilerplate cognitive & code-graph queries:**
   - `libredb pulse [<db.ldb>] "<query>" [--cwd "<dir>" | --project "<dir>"] [--cid <id>] [--budget <tok>] [--err <msg>]`
   - `libredb skeleton [<db.ldb>] <source_file...> [--filter <substr>] [--cwd "<dir>" | --project "<dir>"] [--cid <id>] [--force] [--json]`

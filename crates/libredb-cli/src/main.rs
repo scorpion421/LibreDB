@@ -5,6 +5,7 @@ mod cli_args;
 #[cfg(feature = "git-automation")]
 mod gitea;
 mod hooks;
+mod installer;
 mod ipc;
 mod mcp;
 mod security;
@@ -34,6 +35,25 @@ const PERSONAL_DESIGN_SKILL_NAMES: [&str; 4] = [
     "android-app-design",
     "apple-hig-design",
     "linux-desktop-hig-design",
+];
+
+const EMBEDDED_PERSONAL_DESIGN_SKILLS: [(&str, &str); 4] = [
+    (
+        "windows-app-design",
+        include_str!("../../../skills/windows-app-design/SKILL.md"),
+    ),
+    (
+        "android-app-design",
+        include_str!("../../../skills/android-app-design/SKILL.md"),
+    ),
+    (
+        "apple-hig-design",
+        include_str!("../../../skills/apple-hig-design/SKILL.md"),
+    ),
+    (
+        "linux-desktop-hig-design",
+        include_str!("../../../skills/linux-desktop-hig-design/SKILL.md"),
+    ),
 ];
 
 fn print_usage() {
@@ -94,7 +114,11 @@ Backup, restore, migration & read-only inspection commands:
   libredb backup | backup-ldb [<dest_dir>] [--project <dir> | --cwd <dir>] [--cid <id>] [--instance] [--all] [--json] [--global <customizations.ldb>]
   libredb restore | restore-ldb <source_path> [--project <dir> | --cwd <dir>] [--instance] [--all] [--json] [--global <customizations.ldb>]
   libredb migrate | migrate-ldb [<source_path>] [--cid <id>] [--project <dir> | --cwd <dir>] [--from-path <old_dir>] [--include-artifacts] [--json] [--global <customizations.ldb>]
-  libredb read | read-ldb <path_or_dir> [--query <substr>] [--show-secrets] [--json] [--global <customizations.ldb>]",
+  libredb read | read-ldb <path_or_dir> [--query <substr>] [--show-secrets] [--json] [--global <customizations.ldb>]
+
+Plugin deployment & self-update commands:
+  libredb install | self-install [<binary_path>] [--profile neutral|personal] [--no-hooks] [--fallback-drive <dir>] [--home <dir>] [--json] [--global <customizations.ldb>]
+  libredb update | self-update | upgrade [--check] [--force] [--version <vX.Y.Z>] [--repo <owner/repo>] [--profile neutral|personal] [--no-hooks] [--fallback-drive <dir>] [--home <dir>] [--json] [--global <customizations.ldb>]",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -2551,6 +2575,96 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 print!("{}", security::format_read_ldb_report(&rep));
             }
         }
+        "install" | "self-install" => {
+            let cli = CliSpec::new(
+                "install",
+                "libredb install [<binary_path>] [--profile neutral|personal] [--no-hooks] [--fallback-drive <dir>] [--home <dir>] [--json]",
+            )
+            .positionals(0, Some(1))
+            .switches(&["--no-hooks", "--json"])
+            .values(&["--profile", "--fallback-drive", "--home"])
+            .allow_global()
+            .parse(sub_args)?;
+            let as_json = cli.has_switch("--json");
+            let opts = installer::InstallOptions {
+                binary_path: cli.positionals.first().map(PathBuf::from),
+                profile: cli.value("--profile").map(str::to_owned),
+                no_hooks: cli.has_switch("--no-hooks"),
+                fallback_drive: cli.path_value("--fallback-drive"),
+                home_override: cli.path_value("--home"),
+                global_path: cli.global_path.clone(),
+            };
+            let rep = installer::execute_install_command(&opts)?;
+            if as_json {
+                println!("{}", serde_json::to_string_pretty(&rep)?);
+            } else {
+                println!(
+                    "[OK] Installed LibreDB v{} ({:?} profile) into '{}'",
+                    rep.version, rep.profile, rep.plugin_dir
+                );
+                println!("  mcp_command={}, hooks_enabled={}", rep.mcp_command, rep.hooks_enabled);
+                if let Some(ref hc) = rep.hook_command {
+                    println!("  hook_command={hc}");
+                }
+                for bin in &rep.installed_binaries {
+                    println!("  * binary: {bin}");
+                }
+            }
+        }
+        "update" | "self-update" | "upgrade" => {
+            let cli = CliSpec::new(
+                "update",
+                "libredb update [--check] [--force] [--version <vX.Y.Z>] [--repo <owner/repo>] [--profile neutral|personal] [--no-hooks] [--fallback-drive <dir>] [--home <dir>] [--json]",
+            )
+            .positionals(0, Some(0))
+            .switches(&["--check", "--force", "--no-hooks", "--json"])
+            .values(&["--version", "--repo", "--profile", "--fallback-drive", "--home"])
+            .allow_global()
+            .parse(sub_args)?;
+            let as_json = cli.has_switch("--json");
+            let opts = installer::UpdateOptions {
+                check_only: cli.has_switch("--check"),
+                force: cli.has_switch("--force"),
+                version: cli.value("--version").map(str::to_owned),
+                repo: cli.value("--repo").map(str::to_owned),
+                profile: cli.value("--profile").map(str::to_owned),
+                no_hooks: cli.has_switch("--no-hooks"),
+                fallback_drive: cli.path_value("--fallback-drive"),
+                home_override: cli.path_value("--home"),
+                global_path: cli.global_path.clone(),
+            };
+            let rep = installer::execute_update_command(&opts)?;
+            if as_json {
+                println!("{}", serde_json::to_string_pretty(&rep)?);
+            } else if rep.check_only {
+                let cmp = if rep.latest_version == rep.current_version {
+                    "up to date"
+                } else {
+                    "update available"
+                };
+                println!(
+                    "LibreDB {}: current={}, latest={} ({cmp}, asset={})",
+                    rep.repo, rep.current_version, rep.latest_version, rep.asset_name
+                );
+                println!("Download URL: {}", rep.download_url);
+            } else if rep.updated {
+                println!(
+                    "[OK] Updated LibreDB {} -> {} via '{}'",
+                    rep.current_version, rep.latest_version, rep.asset_name
+                );
+                if let Some(ref irep) = rep.install_report {
+                    println!(
+                        "  plugin={}, profile={:?}, hooks_enabled={}, mcp_command={}",
+                        irep.plugin_dir, irep.profile, irep.hooks_enabled, irep.mcp_command
+                    );
+                }
+            } else {
+                println!(
+                    "[OK] LibreDB is already at the latest release v{} ({}); refreshed plugin configuration cleanly.",
+                    rep.current_version, rep.tag_name
+                );
+            }
+        }
         other => {
             return Err(format!("Unknown subcommand '{other}'. Run 'libredb --help'.").into());
         }
@@ -2753,7 +2867,7 @@ fn deprecate_skill_and_sections(
     Ok(removed)
 }
 
-fn modernize_global_db(
+pub(crate) fn modernize_global_db(
     gdb: &Arc<LibreDb>,
     skill_md_opt: Option<&Path>,
     skills_dir_opt: Option<&Path>,
@@ -2919,6 +3033,27 @@ fn modernize_global_db(
             action_any: vec!["git".to_owned(), "gitea-init".to_owned()],
             env_or_error_any: vec!["dubious ownership".to_owned()],
             directive: "On non-ACL drives, run 'git config --global --add safe.directory <repo>' right after git init.".to_owned(),
+            ..Default::default()
+        },
+        ReflexRule {
+            id: "libredb-self-update-no-edit-guard".to_owned(),
+            stack_any: vec![
+                "libredb".to_owned(),
+                "plugin".to_owned(),
+                "github".to_owned(),
+                "hooks".to_owned(),
+                "mcp_config".to_owned(),
+            ],
+            action_any: vec![
+                "update".to_owned(),
+                "upgrade".to_owned(),
+                "install".to_owned(),
+                "deploy".to_owned(),
+                "release".to_owned(),
+                "einspielen".to_owned(),
+            ],
+            env_or_error_any: Vec::new(),
+            directive: "To install or update LibreDB (including latest release from GitHub), run 'libredb update' or '<downloaded_binary> install' via run_command. NEVER call edit_file or write_file on mcp_config.json, hooks.json, plugin.json, or ~/.gemini/libredb/*; PreToolUse blocks direct edits to control-plane files by design.".to_owned(),
             ..Default::default()
         },
     ];
@@ -3121,17 +3256,22 @@ fn modernize_global_db(
                 let cwd_skills = PathBuf::from("skills");
                 cwd_skills.is_dir().then_some(cwd_skills)
             });
-        if let Some(ref sdir) = effective_skills_dir {
-            let mut design_sections = 0usize;
-            for skill_name in PERSONAL_DESIGN_SKILL_NAMES {
-                let p = sdir.join(skill_name).join("SKILL.md");
-                if p.is_file() {
-                    let (_, cnt) = sync_skill_markdown(gdb, &p, Some(skill_name))?;
-                    design_sections += cnt;
-                }
+        let mut design_sections = 0usize;
+        for (skill_name, embedded_md) in EMBEDDED_PERSONAL_DESIGN_SKILLS {
+            let disk_path_opt = effective_skills_dir
+                .as_ref()
+                .map(|sdir| sdir.join(skill_name).join("SKILL.md"))
+                .filter(|p| p.is_file());
+            if let Some(p) = disk_path_opt {
+                let (_, cnt) = sync_skill_markdown(gdb, &p, Some(skill_name))?;
+                design_sections += cnt;
+            } else {
+                let (_, cnt) =
+                    sync_skill_markdown_str(gdb, embedded_md, Some(skill_name), skill_name)?;
+                design_sections += cnt;
             }
-            synced_sections += design_sections;
         }
+        synced_sections += design_sections;
 
         let pushback_rule = "[Rule: candid-architectural-pushback | priority=100 | enforcement=CRITICAL]\nSummary: Candid engineering pushback without false politeness when coding ideas overshoot the target.\nWhenever a user idea or architectural direction shoots past the target, introduces unnecessary complexity, hardcodes a fragile assumption, or heads in the wrong technical direction, state directly and candidly that it is suboptimal and immediately propose the cleaner engineering alternative. Never hold back technical criticism out of personal consideration.";
         gdb.put(
@@ -3569,12 +3709,12 @@ mod tests {
                 .count()
         };
         assert_eq!(count_non_reflex_rules(&gdb), 0);
-        assert_eq!(count_reflexes(&gdb), 3);
+        assert_eq!(count_reflexes(&gdb), 4);
 
-        // 2. Switching to personal profile adds personal rules + all 11 reflexes + all 4 platform design skills
+        // 2. Switching to personal profile adds personal rules + all 12 reflexes + all 4 platform design skills
         modernize_global_db(&gdb, Some(&dummy_skill), Some(&test_skills_dir), true).unwrap();
         assert_eq!(count_non_reflex_rules(&gdb), 3);
-        assert_eq!(count_reflexes(&gdb), 11);
+        assert_eq!(count_reflexes(&gdb), 12);
         for ds in [
             "windows-app-design",
             "android-app-design",
@@ -3636,7 +3776,7 @@ mod tests {
         assert!(gdb
             .get_by_key(NodeKind::Rule, "rule:global::corp-infosec-policy")
             .is_ok());
-        assert_eq!(count_reflexes(&gdb), 3);
+        assert_eq!(count_reflexes(&gdb), 4);
 
         // 4. Offline-tampered workspace `.agents/memory.ldb` must NEVER be automatically re-sealed
         //    by `modernize_global_db` during upgrades ("no trust laundering")!

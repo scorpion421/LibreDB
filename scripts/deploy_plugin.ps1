@@ -1,15 +1,16 @@
 param(
     [ValidateSet("Neutral", "Personal")]
     [string]$Profile = "Neutral",
-    [switch]$NoHooks
+    [switch]$NoHooks,
+    [string]$BinaryPath = ""
 )
 
 $ErrorActionPreference = "Stop"
 
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $VersionFile = Join-Path $ProjectRoot "VERSION"
-$LibreVersion = if (Test-Path $VersionFile) { (Get-Content -Raw $VersionFile).Trim() } else { "2.3.1" }
-if (-not $LibreVersion) { $LibreVersion = "2.3.1" }
+$LibreVersion = if (Test-Path $VersionFile) { (Get-Content -Raw $VersionFile).Trim() } else { "2.4.0" }
+if (-not $LibreVersion) { $LibreVersion = "2.4.0" }
 $UserHome = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
 $GeminiDir = Join-Path $UserHome ".gemini"
 $LibreHome = Join-Path $GeminiDir "libredb"
@@ -21,10 +22,21 @@ $AssetsDir = Join-Path $PluginDir "assets"
 
 New-Item -ItemType Directory -Force -Path $BinDir, $RulesDir, $SkillDir, $AssetsDir | Out-Null
 
-$ReleaseExe = Join-Path $ProjectRoot "target\release\libredb.exe"
+$ReleaseExe = if ($BinaryPath -and $BinaryPath.Trim()) {
+    $BinaryPath.Trim()
+} else {
+    @(
+        (Join-Path $ProjectRoot "target\release\libredb.exe"),
+        (Join-Path $ProjectRoot "dist\libredb-v$LibreVersion-windows-x64.exe"),
+        (Join-Path $ProjectRoot "dist\libredb.exe")
+    ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+}
 $ReleaseDll = Join-Path $ProjectRoot "target\release\libredb_py.dll"
-if (-not (Test-Path $ReleaseExe)) {
-    throw "Release binary not found at $ReleaseExe. Run 'cargo build --release' first."
+if (-not (Test-Path -LiteralPath $ReleaseDll)) {
+    $ReleaseDll = Join-Path $ProjectRoot "dist\libredb.pyd"
+}
+if ((-not $ReleaseExe) -or (-not (Test-Path -LiteralPath $ReleaseExe))) {
+    throw "Release binary not found in target\release or dist\. Build with 'cargo build --release' or pass -BinaryPath <path> (or run 'libredb update')."
 }
 
 function Install-BinaryHotSafe {
@@ -452,6 +464,10 @@ description: >-
 
 ## CLI commands (`libredb`)
 
+- **Self-update & standalone install (zero repo or cargo required):**
+  - `libredb update [--check] [--force] [--version <vX.Y.Z>] [--repo <owner/repo>] [--profile neutral|personal] [--no-hooks] [--fallback-drive <dir>]` (aliases: `self-update`, `upgrade`)
+  - `libredb install [<binary_path>] [--profile neutral|personal] [--no-hooks] [--fallback-drive <dir>]` (alias: `self-install`)
+  - **Rule for plugin updates:** Always update or install LibreDB by running `libredb update` or `<binary> install` via `run_command`. NEVER call `edit_file` or `write_file` on `mcp_config.json`, `hooks.json`, `plugin.json`, or files inside `~/.gemini/libredb/` (`PreToolUse` blocks direct edits to control-plane files by design).
 - **Zero-boilerplate cognitive & code-graph queries:**
   - `libredb pulse [<db.ldb>] "<query>" [--cwd "<dir>" | --project "<dir>"] [--cid <id>] [--budget <tok>] [--err <msg>]`
   - `libredb skeleton [<db.ldb>] <source_file...> [--filter <substr>] [--cwd "<dir>" | --project "<dir>"] [--cid <id>] [--force] [--json]`
