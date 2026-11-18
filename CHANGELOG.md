@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.6] - 2026-11-18
+
+### Fixed
+- **CLI `pulse` flag ergonomics and read-only database existence guards (`libredb pulse`, `locate`, `impact`, `fim`, `skeleton`, `grep`, `status`)**: Added `--query` (`-q`) and `--db` flag support to `libredb pulse` while rejecting unknown `-`-prefixed flags in two-argument invocations so passing CLI flags like `--query` or an unrecognized option no longer opens a file named after the flag in the working directory. Stopped all read-only CLI commands from creating empty `.ldb` files when given a nonexistent explicit `<db.ldb>` path, and rejected `-`-prefixed database filenames across database commands.
+
 ## [2.4.5] - 2026-11-18
 
 ### Changed

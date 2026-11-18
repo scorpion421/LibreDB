@@ -1,6 +1,6 @@
 # LibreDB
 
-[![Version](https://img.shields.io/badge/version-2.4.5-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.4.6-blue.svg)](CHANGELOG.md)
 [![Tests](https://img.shields.io/badge/tests-passing%20(168%20tests%20%2B%2012%20audits%20%2B%2015%20learning%20checks%20%2B%2010k%20crash%20sims)-brightgreen.svg)](crates/libredb-cli/tests/)
 [![Tech Stack](https://img.shields.io/badge/pure%20rust-1.89%2B%20%7C%20zero%20C%20%7C%20MCP-orange.svg)](Cargo.toml)
 [![License](https://img.shields.io/badge/license-Apache%202.0%20%2B%20Commons%20Clause-purple.svg)](LICENSE)
@@ -17,7 +17,7 @@
 
 ## Executive summary and impact
 
-| Dimension | Legacy Python + `SQLite` (`SkillsDB`) | `LibreDB v2.4.5` (100% Pure `Rust` + `MCP` + `PyO3`) |
+| Dimension | Legacy Python + `SQLite` (`SkillsDB`) | `LibreDB v2.4.6` (100% Pure `Rust` + `MCP` + `PyO3`) |
 | :--- | :--- | :--- |
 | **Hook response latency** | `350-500 ms` Python startup + `SQLite` WAL per edit or turn | **`< 0.5 ms` via the in-memory `MCP` `IPC` coordinator (`< 2 ms` direct fallback), loading matching rules and project memory without disk polling** |
 | **Multi-turn recall & I/O** | Repeated subprocess spawns and full-file re-reads | **RAM-cached session delta and `O(1)` incremental tail-sync (`2` reads total on external updates), keeping turn 2+ recall instant even over network shares** |
@@ -72,7 +72,7 @@ pwsh -ExecutionPolicy Bypass -File .\scripts\deploy_plugin.ps1 -Profile Personal
 LibreDB/
 |-- Cargo.toml                                     # Pure-Rust workspace (4 default CLI/MCP crates + optional PyO3 crate)
 |-- Makefile                                       # Zero-dependency Linux/POSIX source build & installer
-|-- VERSION                                        # Semantic Version (2.4.5)
+|-- VERSION                                        # Semantic Version (2.4.6)
 |-- CHANGELOG.md                                   # Keep a Changelog 1.1.0 release history
 |-- LICENSE                                        # Commons Clause v1.0 + full verbatim Apache License 2.0 text
 |-- README.md                                      # 9-block standardized documentation

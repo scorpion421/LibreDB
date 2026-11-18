@@ -192,7 +192,7 @@ fn print_usage() {
         "LibreDB v{} - Tailored cognitive memory, workspace graph & MCP engine for Antigravity
 
 Antigravity Cognitive & Code-Graph Commands:
-  libredb pulse [<db.ldb>] <query> [--global <g.ldb>] [--cid <id>] [--transcript <t.jsonl>] [--epoch <n>] [--budget <tok>] [--cwd <dir> | --project <dir>] [--err <msg>]
+  libredb pulse [<db.ldb>] [<query>] [--query <q>] [--db <db.ldb>] [--global <g.ldb>] [--cid <id>] [--transcript <t.jsonl>] [--epoch <n>] [--budget <tok>] [--cwd <dir> | --project <dir>] [--err <msg>]
   libredb index-workspace <db.ldb> <workspace_dir> [--force]
   libredb skeleton [<db.ldb>] <source_file...> [--filter <substr>] [--cwd <dir> | --project <dir>] [--db <db.ldb>] [--cid <id>] [--force] [--json]
   libredb locate [<db.ldb>] <symbol_query...> [--cwd <dir> | --project <dir>] [--json]
@@ -1080,12 +1080,14 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "pulse" => {
             let cli = CliSpec::new(
                 "pulse",
-                "libredb pulse [<db.ldb>] <query> [--global <g.ldb>] [--cid <id>] [--transcript <t.jsonl>] [--epoch <n>] [--budget <tok>] [--cwd <dir>] [--err <msg>]",
+                "libredb pulse [<db.ldb>] [<query>] [--query <q>] [--db <db.ldb>] [--global <g.ldb>] [--cid <id>] [--transcript <t.jsonl>] [--epoch <n>] [--budget <tok>] [--cwd <dir> | --project <dir>] [--err <msg>]",
             )
-            .positionals(1, Some(2))
+            .positionals(0, Some(2))
             .raw_value_slots(&[0, 1])
             .allow_global()
             .values(&[
+                "--query",
+                "--db",
                 "--cid",
                 "--transcript",
                 "--epoch",
@@ -1093,12 +1095,71 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 "--cwd",
                 "--err",
             ])
+            .alias("-q", "--query")
             .alias("--project", "--cwd")
             .parse(sub_args)?;
-            let (explicit_db_opt, query_str) = if cli.positionals.len() == 2 {
-                (Some(PathBuf::from(&cli.positionals[0])), &cli.positionals[1])
+            let db_flag = cli.path_value("--db");
+            let query_flag = cli.value("--query");
+            let (explicit_db_opt, query_str): (Option<PathBuf>, &str) = if let Some(q) = query_flag
+            {
+                if db_flag.is_some() {
+                    if !cli.positionals.is_empty() {
+                        return Err(format!(
+                            "Unexpected positional argument '{}' in 'pulse' when both '--db' and '--query' are specified",
+                            cli.positionals[0]
+                        )
+                        .into());
+                    }
+                    (db_flag, q)
+                } else {
+                    match cli.positionals.as_slice() {
+                        [] => (None, q),
+                        [db_pos] => {
+                            if db_pos.starts_with('-') {
+                                return Err(format!("Unknown pulse flag '{db_pos}'").into());
+                            }
+                            (Some(PathBuf::from(db_pos)), q)
+                        }
+                        [_, extra, ..] => {
+                            return Err(format!(
+                                "Unexpected positional argument '{extra}' in 'pulse'"
+                            )
+                            .into());
+                        }
+                    }
+                }
+            } else if db_flag.is_some() {
+                match cli.positionals.as_slice() {
+                    [q_pos] => (db_flag, q_pos.as_str()),
+                    [] => {
+                        return Err(
+                            "Missing <query> in 'pulse' (pass <query> or --query <q>)".into(),
+                        );
+                    }
+                    [_, extra, ..] => {
+                        return Err(format!(
+                            "Unexpected positional argument '{extra}' in 'pulse'"
+                        )
+                        .into());
+                    }
+                }
             } else {
-                (None, &cli.positionals[0])
+                match cli.positionals.as_slice() {
+                    [] => {
+                        return Err(
+                            "Usage: libredb pulse [<db.ldb>] [<query>] [--query <q>] [--db <db.ldb>] [--cwd <dir>]"
+                                .into(),
+                        );
+                    }
+                    [single] => (None, single.as_str()),
+                    [first, second] => {
+                        if first.starts_with('-') {
+                            return Err(format!("Unknown pulse flag '{first}'").into());
+                        }
+                        (Some(PathBuf::from(first)), second.as_str())
+                    }
+                    _ => unreachable!("positionals(0, Some(2)) enforces at most 2 positionals"),
+                }
             };
             let mut req = PulseRequest::new(query_str, 800);
             req.conversation_id = cli.value("--cid").map(ToOwned::to_owned);
@@ -1119,7 +1180,7 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 None => hooks::open_global_ldb_checked(None)?,
             };
             let proj_db = if let Some(ref db_p) = explicit_db_opt {
-                open_cli_verified_project_db(cli.global_deref(), db_p)?
+                open_cli_verified_readonly_db(cli.global_deref(), db_p)?
             } else {
                 resolve_default_cli_project_db(
                     cli.global_deref(),
@@ -1167,6 +1228,7 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let force = cli.has_switch("--force");
             let t0 = Instant::now();
             let db_path = Path::new(&cli.positionals[0]);
+            ensure_valid_cli_db_path(db_path)?;
             let gdb_opt = hooks::open_global_ldb_checked(cli.global_deref())?;
             let seal_guard =
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
@@ -1235,9 +1297,9 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 })
                 .or_else(|| env::current_dir().ok());
             let db_opt = if let Some(ref db_p) = explicit_db_opt {
-                Some(open_cli_verified_project_db(cli.global_deref(), db_p)?)
+                Some(open_cli_verified_readonly_db(cli.global_deref(), db_p)?)
             } else if let Some(found_db) = find_existing_cli_project_db(ws_hint.as_deref()) {
-                Some(open_cli_verified_project_db(cli.global_deref(), &found_db)?)
+                Some(open_cli_verified_readonly_db(cli.global_deref(), &found_db)?)
             } else {
                 None
             };
@@ -1392,7 +1454,7 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             };
             let db = if let Some(ref db_p) = explicit_db_opt {
                 let _ = &glob_db;
-                open_cli_verified_project_db(cli.global_deref(), db_p)?
+                open_cli_verified_readonly_db(cli.global_deref(), db_p)?
             } else {
                 let _ = &glob_db;
                 resolve_default_cli_code_graph_db(cli.global_deref(), ws_dir_opt.as_deref())?
@@ -1462,7 +1524,7 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             };
             let db = if let Some(ref db_p) = explicit_db_opt {
                 let _ = &glob_db;
-                open_cli_verified_project_db(cli.global_deref(), db_p)?
+                open_cli_verified_readonly_db(cli.global_deref(), db_p)?
             } else {
                 let _ = &glob_db;
                 resolve_default_cli_code_graph_db(cli.global_deref(), ws_dir_opt.as_deref())?
@@ -1582,7 +1644,7 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             };
             let db = if let Some(ref db_p) = explicit_db_opt {
                 let _ = &glob_db;
-                open_cli_verified_project_db(cli.global_deref(), db_p)?
+                open_cli_verified_readonly_db(cli.global_deref(), db_p)?
             } else {
                 let _ = &glob_db;
                 resolve_default_cli_code_graph_db(cli.global_deref(), ws_dir_opt.as_deref())?
@@ -1769,9 +1831,9 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let db_opt = if cli.has_switch("--no-symbols") {
                 None
             } else if let Some(db_p) = cli.path_value("--db") {
-                Some(open_cli_verified_project_db(cli.global_deref(), &db_p)?)
+                Some(open_cli_verified_readonly_db(cli.global_deref(), &db_p)?)
             } else if let Some(found_db) = find_existing_cli_project_db(Some(&ws_root)) {
-                open_cli_verified_project_db(cli.global_deref(), &found_db).ok()
+                open_cli_verified_readonly_db(cli.global_deref(), &found_db).ok()
             } else {
                 None
             };
@@ -1884,6 +1946,7 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
             let t0 = Instant::now();
             let db_path = Path::new(&cli.positionals[0]);
+            ensure_valid_cli_db_path(db_path)?;
             let gdb_opt = hooks::open_global_ldb_checked(cli.global_deref())?;
             let seal_guard =
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
@@ -1909,6 +1972,7 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .parse(sub_args)?;
             let notes = cli.value("--notes").unwrap_or("");
             let db_path = Path::new(&cli.positionals[0]);
+            ensure_valid_cli_db_path(db_path)?;
             let gdb_opt = hooks::open_global_ldb_checked(cli.global_deref())?;
             let seal_guard =
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
@@ -1939,6 +2003,7 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 .collect();
             let target_ids = target_ids?;
             let db_path = Path::new(&cli.positionals[0]);
+            ensure_valid_cli_db_path(db_path)?;
             let gdb_opt = hooks::open_global_ldb_checked(cli.global_deref())?;
             let seal_guard =
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
@@ -1979,6 +2044,7 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     .collect()
             };
             let db_path = Path::new(&cli.positionals[0]);
+            ensure_valid_cli_db_path(db_path)?;
             let gdb_opt = hooks::open_global_ldb_checked(cli.global_deref())?;
             if let Some(outcome_raw) = cli.value("--outcome") {
                 let success = match outcome_raw.trim().to_ascii_lowercase().as_str() {
@@ -1991,7 +2057,7 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         .into())
                     }
                 };
-                let db = open_cli_verified_project_db(cli.global_deref(), db_path)?;
+                let db = open_cli_verified_readonly_db(cli.global_deref(), db_path)?;
                 let new_util = ReflexEngine::record_reflex_outcome(&db, &cli.positionals[1], success)?;
                 println!(
                     "Recorded {} outcome for reflex '{}' (utility={new_util:.2})",
@@ -2093,7 +2159,7 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     None => hooks::open_global_ldb_checked(None)?,
                 };
                 let db = if let Some(ref db_p) = explicit_db_opt {
-                    open_cli_verified_project_db(cli.global_deref(), db_p)?
+                    open_cli_verified_readonly_db(cli.global_deref(), db_p)?
                 } else {
                     resolve_default_cli_project_db(
                         cli.global_deref(),
@@ -2118,6 +2184,7 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .allow_global()
             .parse(sub_args)?;
             let db_path = Path::new(&cli.positionals[0]);
+            ensure_valid_cli_db_path(db_path)?;
             let gdb_opt = hooks::open_global_ldb_checked(cli.global_deref())?;
             let _seal_guard =
                 security::PreMutationSealGuard::verify_before_write_allow_fresh_global_import(
@@ -2167,6 +2234,7 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let db_path = Path::new(&cli.positionals[0]);
+            ensure_valid_cli_db_path(db_path)?;
             let gdb_opt = hooks::open_global_ldb_checked(cli.global_deref())?;
             let seal_guard =
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
@@ -2192,7 +2260,7 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .allow_global()
             .parse(sub_args)?;
             let db =
-                open_cli_verified_project_db(cli.global_deref(), Path::new(&cli.positionals[0]))?;
+                open_cli_verified_readonly_db(cli.global_deref(), Path::new(&cli.positionals[0]))?;
             let id: u64 = cli.positionals[1].parse()?;
             let rec = db.get(id)?;
             print_record(&rec);
@@ -2209,7 +2277,7 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let kind = NodeKind::parse(&cli.positionals[1])
                 .ok_or_else(|| format!("Unknown node kind '{}'", cli.positionals[1]))?;
             let db =
-                open_cli_verified_project_db(cli.global_deref(), Path::new(&cli.positionals[0]))?;
+                open_cli_verified_readonly_db(cli.global_deref(), Path::new(&cli.positionals[0]))?;
             let rec = db.get_by_key(kind, &cli.positionals[2])?;
             print_record(&rec);
         }
@@ -2228,6 +2296,7 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let dst_id: u64 = cli.positionals[3].parse()?;
             let weight: u8 = cli.parse_value::<u8>("--weight")?.unwrap_or(200);
             let db_path = Path::new(&cli.positionals[0]);
+            ensure_valid_cli_db_path(db_path)?;
             let gdb_opt = hooks::open_global_ldb_checked(cli.global_deref())?;
             let seal_guard =
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
@@ -2263,6 +2332,7 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 .into());
             }
             let db_path = Path::new(&cli.positionals[0]);
+            ensure_valid_cli_db_path(db_path)?;
             let gdb_opt = hooks::open_global_ldb_checked(cli.global_deref())?;
             let seal_guard =
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
@@ -2295,7 +2365,7 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let root_id: u64 = cli.positionals[1].parse()?;
             let depth: usize = cli.parse_value::<usize>("--depth")?.unwrap_or(8);
             let db =
-                open_cli_verified_project_db(cli.global_deref(), Path::new(&cli.positionals[0]))?;
+                open_cli_verified_readonly_db(cli.global_deref(), Path::new(&cli.positionals[0]))?;
             let chain = db.trace_lineage(root_id, depth)?;
             println!(
                 "Causal & temporal lineage from node #{root_id} ({} steps):",
@@ -2329,7 +2399,7 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let hops: usize = cli.parse_value::<usize>("--hops")?.unwrap_or(2);
             let budget: u32 = cli.parse_value::<u32>("--budget")?.unwrap_or(800);
             let db =
-                open_cli_verified_project_db(cli.global_deref(), Path::new(&cli.positionals[0]))?;
+                open_cli_verified_readonly_db(cli.global_deref(), Path::new(&cli.positionals[0]))?;
             let bundle = db.recall_within_budget(&[seed_id], hops, budget, false)?;
             println!(
                 "Recall bundle: {} nodes, {}/{} tokens, {} coalesced I/O read(s)",
@@ -2360,6 +2430,7 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let prune = cli.has_switch("--prune");
             let t0 = Instant::now();
             let db_path = Path::new(&cli.positionals[0]);
+            ensure_valid_cli_db_path(db_path)?;
             let gdb_opt = hooks::open_global_ldb_checked(cli.global_deref())?;
             let seal_guard =
                 security::PreMutationSealGuard::verify_before_write(gdb_opt.as_deref(), db_path)?;
@@ -2395,7 +2466,7 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 .path_value("--db")
                 .or_else(|| cli.positionals.first().map(PathBuf::from));
             let db: Arc<LibreDb> = if let Some(ref db_p) = explicit_db {
-                open_cli_verified_project_db(cli.global_deref(), db_p)?
+                open_cli_verified_readonly_db(cli.global_deref(), db_p)?
             } else {
                 let ws_dir_opt = cli.path_value("--project").or_else(|| env::current_dir().ok());
                 let glob_db = match cli.global_deref() {
@@ -3513,12 +3584,45 @@ pub(crate) fn modernize_global_db_with_options(
     Ok(())
 }
 
-/// Verifies workspace trust BEFORE read-only CLI commands (`pulse`, `skeleton`, `impact`, `fim`)
-/// open a project `.agents/memory.ldb`.
+fn ensure_valid_cli_db_path(db_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    if db_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with('-'))
+    {
+        return Err(format!(
+            "Refusing database path '{}': file name starts with '-' (looks like a CLI flag).",
+            db_path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Verifies workspace trust BEFORE CLI commands open a project `.agents/memory.ldb`.
 fn open_cli_verified_project_db(
     global_path_opt: Option<&Path>,
     db_path: &Path,
 ) -> Result<Arc<LibreDb>, Box<dyn std::error::Error>> {
+    open_cli_verified_project_db_inner(global_path_opt, db_path, false)
+}
+
+/// Verifies workspace trust and requires explicit database files to already exist on disk
+/// before read-only CLI commands (`pulse`, `skeleton`, `locate`, `impact`, `fim`, `grep`,
+/// `learning`, `get`, `get-key`, `trace`, `recall`, `status`/`stats`) open them.
+fn open_cli_verified_readonly_db(
+    global_path_opt: Option<&Path>,
+    db_path: &Path,
+) -> Result<Arc<LibreDb>, Box<dyn std::error::Error>> {
+    open_cli_verified_project_db_inner(global_path_opt, db_path, true)
+}
+
+fn open_cli_verified_project_db_inner(
+    global_path_opt: Option<&Path>,
+    db_path: &Path,
+    must_exist: bool,
+) -> Result<Arc<LibreDb>, Box<dyn std::error::Error>> {
+    ensure_valid_cli_db_path(db_path)?;
     let gdb_opt = hooks::open_global_ldb_checked(global_path_opt)?;
     let joined_db = if db_path.is_relative() {
         env::current_dir()
@@ -3562,9 +3666,15 @@ fn open_cli_verified_project_db(
                 if !security::is_workspace_memory_trusted(Some(gdb), ws_root) {
                     return Err(security::diagnose_untrusted_workspace_db(Some(gdb), ws_root).into());
                 }
+                if must_exist && !ldb_file.is_file() {
+                    return Err(format!("Database file '{}' does not exist.", db_path.display()).into());
+                }
                 return Ok(Arc::new(LibreDb::open(&ldb_file)?));
             }
         }
+    }
+    if must_exist && !resolved_db.is_file() {
+        return Err(format!("Database file '{}' does not exist.", db_path.display()).into());
     }
     Ok(Arc::new(LibreDb::open(&resolved_db)?))
 }
@@ -3739,7 +3849,7 @@ fn resolve_default_cli_code_graph_db(
     ws_dir_opt: Option<&Path>,
 ) -> Result<Arc<LibreDb>, Box<dyn std::error::Error>> {
     if let Some(ldb_cand) = find_existing_cli_project_db(ws_dir_opt) {
-        return open_cli_verified_project_db(global_path_opt, &ldb_cand);
+        return open_cli_verified_readonly_db(global_path_opt, &ldb_cand);
     }
     open_cli_ephemeral_code_db(ws_dir_opt)
 }
@@ -3750,7 +3860,7 @@ fn resolve_default_cli_project_db(
     ws_dir_opt: Option<&Path>,
 ) -> Result<Arc<LibreDb>, Box<dyn std::error::Error>> {
     if let Some(ldb_cand) = find_existing_cli_project_db(ws_dir_opt) {
-        return open_cli_verified_project_db(global_path_opt, &ldb_cand);
+        return open_cli_verified_readonly_db(global_path_opt, &ldb_cand);
     }
     if let Some(gdb) = glob_db_opt {
         return Ok(Arc::clone(gdb));
@@ -4142,6 +4252,10 @@ mod tests {
         for bad in [
             s(&["pulse", "db.ldb", "query", "--budget"]),
             s(&["pulse", "db.ldb", "query", "--typo"]),
+            s(&["pulse", "--bogus", "query"]),
+            s(&["pulse", "--query"]),
+            s(&["pulse", "--db", "nonexistent_missing_12345.ldb", "query"]),
+            s(&["status", "nonexistent_missing_12345.ldb"]),
             s(&["skeleton", "db.ldb", "src/lib.rs", "--filter"]),
             s(&["skeleton", "db.ldb", "src/lib.rs", "--bogus"]),
             s(&["compact", "db.ldb", "--prun"]),
@@ -4364,6 +4478,105 @@ mod tests {
         if let Some(p) = bare_eph_path {
             let _ = std::fs::remove_file(p);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cli_pulse_supports_query_and_db_flags_without_creating_flag_files() {
+        let dir = env::temp_dir().join(format!(
+            "libredb_cli_pulse_flags_{}_{}",
+            process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let ws = dir.join("ws_pulse");
+        let libre_home = dir.join("libre_home");
+        std::fs::create_dir_all(ws.join(".agents")).unwrap();
+        std::fs::create_dir_all(&libre_home).unwrap();
+        let gdb_path = libre_home.join("customizations.ldb");
+        let gdb = LibreDb::open(&gdb_path).unwrap();
+        let pdb_path = ws.join(".agents").join("memory.ldb");
+        let pdb = LibreDb::open(&pdb_path).unwrap();
+        pdb.put(
+            WriteRequest::new(NodeKind::Fact, b"seal_probe=verified_pulse_fact".to_vec())
+                .with_key("fact:seal_probe"),
+        )
+        .unwrap();
+        security::seal_workspace_memory(&gdb, &pdb, &ws).unwrap();
+        drop(pdb);
+        drop(gdb);
+
+        let ws_s = ws.to_string_lossy().into_owned();
+        let gdb_s = gdb_path.to_string_lossy().into_owned();
+        let pdb_s = pdb_path.to_string_lossy().into_owned();
+        let missing_db = dir.join("missing_db.ldb");
+        let missing_s = missing_db.to_string_lossy().into_owned();
+
+        // 1. `pulse --query "seal_probe" --cwd <ws> --global <gdb>` succeeds without creating `--query`.
+        run_with_args(&[
+            "pulse".to_owned(),
+            "--query".to_owned(),
+            "seal_probe".to_owned(),
+            "--cwd".to_owned(),
+            ws_s.clone(),
+            "--global".to_owned(),
+            gdb_s.clone(),
+        ])
+        .unwrap();
+        assert!(!Path::new("--query").exists());
+        assert!(!ws.join("--query").exists());
+
+        // 2. `pulse --db <ws>/.agents/memory.ldb --query "seal_probe" --global <gdb>` succeeds.
+        run_with_args(&[
+            "pulse".to_owned(),
+            "--db".to_owned(),
+            pdb_s,
+            "--query".to_owned(),
+            "seal_probe".to_owned(),
+            "--global".to_owned(),
+            gdb_s.clone(),
+        ])
+        .unwrap();
+
+        // 3. `pulse --bogus "seal_probe" --cwd <ws> --global <gdb>` fails without creating `--bogus`.
+        assert!(run_with_args(&[
+            "pulse".to_owned(),
+            "--bogus".to_owned(),
+            "seal_probe".to_owned(),
+            "--cwd".to_owned(),
+            ws_s.clone(),
+            "--global".to_owned(),
+            gdb_s.clone(),
+        ])
+        .is_err());
+        assert!(!Path::new("--bogus").exists());
+        assert!(!ws.join("--bogus").exists());
+
+        // 4. `pulse missing_db.ldb "seal_probe" --cwd <ws> --global <gdb>` fails without creating `missing_db.ldb`.
+        assert!(run_with_args(&[
+            "pulse".to_owned(),
+            missing_s,
+            "seal_probe".to_owned(),
+            "--cwd".to_owned(),
+            ws_s.clone(),
+            "--global".to_owned(),
+            gdb_s.clone(),
+        ])
+        .is_err());
+        assert!(!missing_db.exists());
+
+        // 5. Single-argument query starting with `-` stays supported.
+        run_with_args(&[
+            "pulse".to_owned(),
+            "-D warnings".to_owned(),
+            "--cwd".to_owned(),
+            ws_s,
+            "--global".to_owned(),
+            gdb_s,
+        ])
+        .unwrap();
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
