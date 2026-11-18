@@ -1056,8 +1056,13 @@ pub fn is_sensitive_staged_file(rel_path: &str, allowed_patterns: &[String]) -> 
         return Some("local agent memory directory (.agents/)");
     }
     let fname = low.rsplit('/').next().unwrap_or(&low);
-    if fname.ends_with(".tmp.ldb") || fname.ends_with(".bench.ldb") {
-        return Some("ephemeral LibreDB database artifact");
+    if fname.ends_with(".ldb")
+        || fname.ends_with(".ldbbak")
+        || fname.ends_with(".pre_restore.bak")
+        || fname == "backup_index.json"
+        || fname == "backup_project_info.json"
+    {
+        return Some("LibreDB database or unencrypted backup artifact");
     }
     if fname.ends_with(".credential.xml") {
         return Some("Windows DPAPI credential XML file");

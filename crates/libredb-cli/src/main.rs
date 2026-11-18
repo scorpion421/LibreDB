@@ -88,7 +88,13 @@ Core Storage & Graph Commands:
   libredb compact <db.ldb> [--prune]
   libredb stats | status [<db.ldb>] [--project <dir> | --cwd <dir>] [--json] [--global <customizations.ldb>]
   libredb verify <db.ldb>
-  libredb bench [--suite kernel|full|audit|learning] [--workspace <dir> | --project <dir> | --cwd <dir>] [--filter <p1,p2>] [--ext <e1,e2>] [--max-files <n>] [--nodes <n>] [--threads <t>] [--json]",
+  libredb bench [--suite kernel|full|audit|learning] [--workspace <dir> | --project <dir> | --cwd <dir>] [--filter <p1,p2>] [--ext <e1,e2>] [--max-files <n>] [--nodes <n>] [--threads <t>] [--json]
+
+Backup, restore, migration & read-only inspection commands:
+  libredb backup | backup-ldb [<dest_dir>] [--project <dir> | --cwd <dir>] [--cid <id>] [--instance] [--all] [--json] [--global <customizations.ldb>]
+  libredb restore | restore-ldb <source_path> [--project <dir> | --cwd <dir>] [--instance] [--all] [--json] [--global <customizations.ldb>]
+  libredb migrate | migrate-ldb [<source_path>] [--cid <id>] [--project <dir> | --cwd <dir>] [--from-path <old_dir>] [--include-artifacts] [--json] [--global <customizations.ldb>]
+  libredb read | read-ldb <path_or_dir> [--query <substr>] [--show-secrets] [--json] [--global <customizations.ldb>]",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -2381,6 +2387,170 @@ fn run_with_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        "backup" | "backup-ldb" => {
+            let cli = CliSpec::new(
+                "backup",
+                "libredb backup [<dest_dir>] [--project <dir> | --cwd <dir>] [--cid <id>] [--instance] [--all] [--json]",
+            )
+            .positionals(0, Some(1))
+            .switches(&["--instance", "--all", "--json"])
+            .values(&["--project", "--cwd", "--cid"])
+            .alias("--cwd", "--project")
+            .allow_global()
+            .parse(sub_args)?;
+            let as_json = cli.has_switch("--json");
+            let opts = security::BackupOptions {
+                destination: cli.positionals.first().map(PathBuf::from),
+                project_dir: cli.path_value("--project"),
+                cid: cli.value("--cid").map(str::to_owned),
+                instance: cli.has_switch("--instance"),
+                all: cli.has_switch("--all"),
+                global_path: cli.global_path.clone(),
+                allow_prompt: true,
+            };
+            let rep = security::execute_backup_command(&opts)?;
+            if as_json {
+                println!("{}", serde_json::to_string_pretty(&rep)?);
+            } else {
+                println!("[WARN] {}", rep.unencrypted_warning);
+                println!(
+                    "[OK] Portable {} backup written to '{}'",
+                    rep.scope, rep.destination
+                );
+                println!(
+                    "  instance={}, telemetry={}, chat={}, projects={}, decrypted_secrets={}, total_capsules={}",
+                    rep.instance_exported,
+                    rep.telemetry_exported,
+                    rep.chat_exported,
+                    rep.projects_exported.len(),
+                    rep.secrets_decrypted,
+                    rep.total_capsules
+                );
+                for proj in &rep.projects_exported {
+                    println!(
+                        "  * {} <- '{}' ({} capsules)",
+                        proj.relative_ldb_path, proj.original_path, proj.capsule_count
+                    );
+                }
+            }
+        }
+        "restore" | "restore-ldb" => {
+            let cli = CliSpec::new(
+                "restore",
+                "libredb restore <source_path> [--project <dir> | --cwd <dir>] [--instance] [--all] [--json]",
+            )
+            .positionals(1, Some(1))
+            .switches(&["--instance", "--all", "--json"])
+            .values(&["--project", "--cwd"])
+            .alias("--cwd", "--project")
+            .allow_global()
+            .parse(sub_args)?;
+            let as_json = cli.has_switch("--json");
+            let opts = security::RestoreOptions {
+                source: PathBuf::from(&cli.positionals[0]),
+                project_dir: cli.path_value("--project"),
+                instance: cli.has_switch("--instance"),
+                all: cli.has_switch("--all"),
+                global_path: cli.global_path.clone(),
+            };
+            let rep = security::execute_restore_command(&opts)?;
+            if as_json {
+                println!("{}", serde_json::to_string_pretty(&rep)?);
+            } else {
+                println!(
+                    "[OK] Restored {} backup from '{}'",
+                    rep.scope, rep.source
+                );
+                println!(
+                    "  instance={}, telemetry={}, projects_restored={}, skipped_missing={}, reencrypted_secrets={}",
+                    rep.instance_restored,
+                    rep.telemetry_restored,
+                    rep.projects_restored.len(),
+                    rep.projects_skipped_missing_dir.len(),
+                    rep.secrets_reencrypted
+                );
+                for p in &rep.projects_restored {
+                    println!("  * restored project: {p}");
+                }
+                for skipped in &rep.projects_skipped_missing_dir {
+                    println!(
+                        "  [WARN] skipped project '{}' (original dir '{}' does not exist locally; create folder and re-run 'libredb restore' or copy '{}' to '.agents/memory.ldb')",
+                        skipped.slug, skipped.original_path, skipped.relative_ldb_path
+                    );
+                }
+                for bak in &rep.backup_files_created {
+                    println!("  * rollback snapshot: {bak}");
+                }
+            }
+        }
+        "migrate" | "migrate-ldb" => {
+            let cli = CliSpec::new(
+                "migrate",
+                "libredb migrate [<source_path>] [--cid <id>] [--project <dir> | --cwd <dir>] [--from-path <old_dir>] [--include-artifacts] [--json]",
+            )
+            .positionals(0, Some(1))
+            .switches(&["--include-artifacts", "--json"])
+            .values(&["--cid", "--project", "--cwd", "--from-path"])
+            .alias("--cwd", "--project")
+            .allow_global()
+            .parse(sub_args)?;
+            let as_json = cli.has_switch("--json");
+            let opts = security::MigrateOptions {
+                source: cli.positionals.first().map(PathBuf::from),
+                cid: cli.value("--cid").map(str::to_owned),
+                target_project: cli.path_value("--project"),
+                from_path: cli.path_value("--from-path"),
+                include_artifacts: cli.has_switch("--include-artifacts"),
+                global_path: cli.global_path.clone(),
+            };
+            let rep = security::execute_migrate_command(&opts)?;
+            if as_json {
+                println!("{}", serde_json::to_string_pretty(&rep)?);
+            } else {
+                println!(
+                    "[OK] Migration ({}) completed for target '{}'",
+                    rep.mode, rep.target_project
+                );
+                println!(
+                    "  nodes_merged={}, synapses_merged={}, skipped_older={}, artifacts_copied={}, legacy_cleaned={}",
+                    rep.nodes_merged,
+                    rep.synapses_merged,
+                    rep.nodes_skipped_older,
+                    rep.artifacts_copied,
+                    rep.legacy_brain_db_cleaned
+                );
+                for src in &rep.sources_used {
+                    println!("  * source: {src}");
+                }
+                if let Some(ref prev) = rep.relocated_from {
+                    println!("  * relocated from prior host seal: {prev}");
+                }
+            }
+        }
+        "read" | "read-ldb" => {
+            let cli = CliSpec::new(
+                "read",
+                "libredb read <path_or_dir> [--query <substr>] [--show-secrets] [--json]",
+            )
+            .positionals(1, Some(1))
+            .switches(&["--show-secrets", "--json"])
+            .values(&["--query"])
+            .allow_global()
+            .parse(sub_args)?;
+            let as_json = cli.has_switch("--json");
+            let opts = security::ReadLdbOptions {
+                target: PathBuf::from(&cli.positionals[0]),
+                query: cli.value("--query").map(str::to_owned),
+                show_secrets: cli.has_switch("--show-secrets"),
+                global_path: cli.global_path.clone(),
+            };
+            let rep = security::execute_read_ldb_command(&opts)?;
+            if as_json {
+                println!("{}", serde_json::to_string_pretty(&rep)?);
+            } else {
+                print!("{}", security::format_read_ldb_report(&rep));
+            }
+        }
         other => {
             return Err(format!("Unknown subcommand '{other}'. Run 'libredb --help'.").into());
         }
@@ -3101,12 +3271,7 @@ fn open_cli_verified_project_db(
                 let _ws_lock = security::WorkspaceTrustLockGuard::acquire(gdb, ws_root)?;
                 let ldb_file = ws_root.join(".agents").join("memory.ldb");
                 if !security::is_workspace_memory_trusted(Some(gdb), ws_root) {
-                    return Err(format!(
-                        "Workspace memory at '{}' is untrusted, tampered, or rolled back; inspect the workspace and run 'libredb trust \"{}\"' before querying it.",
-                        db_path.display(),
-                        ws_root.display()
-                    )
-                    .into());
+                    return Err(security::diagnose_untrusted_workspace_db(Some(gdb), ws_root).into());
                 }
                 return Ok(Arc::new(LibreDb::open(&ldb_file)?));
             }

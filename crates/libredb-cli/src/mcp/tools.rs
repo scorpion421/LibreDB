@@ -288,6 +288,271 @@ pub(super) fn dispatch_tool(
                 .unwrap_or("skeleton");
             let raw_cwd_arg = args.get("cwd").and_then(Value::as_str);
             let target_opt = args.get("target").and_then(Value::as_str);
+            if matches!(action, "backup" | "restore" | "migrate" | "read") {
+                state.sync_global_db_or_purge()?;
+                let want_json = args
+                    .get("format")
+                    .and_then(Value::as_str)
+                    .is_some_and(|f| f.eq_ignore_ascii_case("json"));
+                let instance_flag = args.get("instance").and_then(Value::as_bool).unwrap_or(false);
+                let all_flag = args.get("all").and_then(Value::as_bool).unwrap_or(false);
+
+                if let Some(ref pin_root) = state.pinned_workspace_root {
+                    if instance_flag || all_flag {
+                        return Err(
+                            "LibreDB MCP access denied: 'instance' and 'all' backup/restore operations are disabled on workspace-pinned MCP servers; run the local 'libredb' CLI instead."
+                                .into(),
+                        );
+                    }
+                    if let Some(raw_c) = raw_cwd_arg.filter(|s| !s.trim().is_empty()) {
+                        let c_path = Path::new(raw_c);
+                        let abs_c = if c_path.is_relative() {
+                            pin_root.join(c_path)
+                        } else {
+                            c_path.to_path_buf()
+                        };
+                        let canon_c = crate::security::canonicalize_with_missing_tail(&abs_c)
+                            .unwrap_or(abs_c);
+                        if let Some(err) =
+                            crate::security::check_mcp_workspace_containment(&canon_c, pin_root)
+                        {
+                            return Err(err.into());
+                        }
+                    }
+                }
+
+                match action {
+                    "backup" => {
+                        let base_dir = raw_cwd_arg
+                            .filter(|s| !s.trim().is_empty())
+                            .map(PathBuf::from)
+                            .or_else(|| state.pinned_workspace_root.clone());
+                        let dest = args
+                            .get("destination")
+                            .and_then(Value::as_str)
+                            .or(target_opt)
+                            .filter(|s| !s.trim().is_empty())
+                            .map(|raw| {
+                                let p = Path::new(raw);
+                                if p.is_relative() {
+                                    base_dir
+                                        .as_deref()
+                                        .unwrap_or(&state.default_project_path)
+                                        .join(p)
+                                } else {
+                                    p.to_path_buf()
+                                }
+                            });
+                        if let Some(ref d) = dest {
+                            if let Some(err) = crate::security::check_mcp_read_path_policy(d, &[]) {
+                                return Err(err.into());
+                            }
+                        }
+                        let opts = crate::security::BackupOptions {
+                            destination: dest,
+                            project_dir: base_dir,
+                            cid: cid_arg.map(str::to_owned),
+                            instance: instance_flag,
+                            all: all_flag,
+                            global_path: state.global_path.clone(),
+                            allow_prompt: false,
+                        };
+                        let rep = crate::security::execute_backup_command(&opts)?;
+                        return if want_json {
+                            Ok(serde_json::to_string_pretty(&rep)?)
+                        } else {
+                            Ok(format!(
+                                "[WARN] {}\n[OK] Portable {} backup written to '{}' (instance={}, telemetry={}, chat={}, projects={}, decrypted_secrets={}, total_capsules={})",
+                                rep.unencrypted_warning,
+                                rep.scope,
+                                rep.destination,
+                                rep.instance_exported,
+                                rep.telemetry_exported,
+                                rep.chat_exported,
+                                rep.projects_exported.len(),
+                                rep.secrets_decrypted,
+                                rep.total_capsules
+                            ))
+                        };
+                    }
+                    "restore" => {
+                        let raw_src = args
+                            .get("source")
+                            .and_then(Value::as_str)
+                            .or(target_opt)
+                            .filter(|s| !s.trim().is_empty())
+                            .ok_or("Missing 'source' backup path for action='restore'")?;
+                        let base_dir = raw_cwd_arg
+                            .filter(|s| !s.trim().is_empty())
+                            .map(PathBuf::from)
+                            .or_else(|| state.pinned_workspace_root.clone());
+                        let src_path = {
+                            let p = Path::new(raw_src);
+                            if p.is_relative() {
+                                base_dir
+                                    .as_deref()
+                                    .unwrap_or(&state.default_project_path)
+                                    .join(p)
+                            } else {
+                                p.to_path_buf()
+                            }
+                        };
+                        if let Some(err) =
+                            crate::security::check_mcp_read_path_policy(&src_path, &[])
+                        {
+                            return Err(err.into());
+                        }
+                        let opts = crate::security::RestoreOptions {
+                            source: src_path,
+                            project_dir: base_dir,
+                            instance: instance_flag,
+                            all: all_flag,
+                            global_path: state.global_path.clone(),
+                        };
+                        let rep = crate::security::execute_restore_command(&opts)?;
+                        state.brains.clear();
+                        state.ram_session_fallback.clear();
+                        state.sync_global_db_or_purge()?;
+                        return if want_json {
+                            Ok(serde_json::to_string_pretty(&rep)?)
+                        } else {
+                            Ok(format!(
+                                "[OK] Restored {} backup from '{}' (instance={}, telemetry={}, projects_restored={}, skipped_missing={}, reencrypted_secrets={})",
+                                rep.scope,
+                                rep.source,
+                                rep.instance_restored,
+                                rep.telemetry_restored,
+                                rep.projects_restored.len(),
+                                rep.projects_skipped_missing_dir.len(),
+                                rep.secrets_reencrypted
+                            ))
+                        };
+                    }
+                    "migrate" => {
+                        let target_project = raw_cwd_arg
+                            .filter(|s| !s.trim().is_empty())
+                            .map(PathBuf::from)
+                            .or_else(|| state.pinned_workspace_root.clone());
+                        let base_dir = target_project
+                            .as_deref()
+                            .unwrap_or(&state.default_project_path);
+                        let source = args
+                            .get("source")
+                            .and_then(Value::as_str)
+                            .or(target_opt)
+                            .filter(|s| !s.trim().is_empty())
+                            .map(|raw| {
+                                let p = Path::new(raw);
+                                if p.is_relative() {
+                                    base_dir.join(p)
+                                } else {
+                                    p.to_path_buf()
+                                }
+                            });
+                        if let Some(ref sp) = source {
+                            if let Some(err) = crate::security::check_mcp_read_path_policy(sp, &[])
+                            {
+                                return Err(err.into());
+                            }
+                        }
+                        let from_path = args
+                            .get("from_path")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.trim().is_empty())
+                            .map(PathBuf::from);
+                        let include_artifacts = args
+                            .get("include_artifacts")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        let opts = crate::security::MigrateOptions {
+                            source,
+                            cid: cid_arg.map(str::to_owned),
+                            target_project,
+                            from_path,
+                            include_artifacts,
+                            global_path: state.global_path.clone(),
+                        };
+                        let rep = crate::security::execute_migrate_command(&opts)?;
+                        state.brains.clear();
+                        state.ram_session_fallback.clear();
+                        state.sync_global_db_or_purge()?;
+                        return if want_json {
+                            Ok(serde_json::to_string_pretty(&rep)?)
+                        } else {
+                            Ok(format!(
+                                "[OK] Migration ({}) completed for '{}' (nodes_merged={}, synapses_merged={}, skipped_older={}, artifacts_copied={}, legacy_cleaned={})",
+                                rep.mode,
+                                rep.target_project,
+                                rep.nodes_merged,
+                                rep.synapses_merged,
+                                rep.nodes_skipped_older,
+                                rep.artifacts_copied,
+                                rep.legacy_brain_db_cleaned
+                            ))
+                        };
+                    }
+                    "read" => {
+                        let raw_target = target_opt
+                            .or_else(|| args.get("source").and_then(Value::as_str))
+                            .filter(|s| !s.trim().is_empty())
+                            .ok_or("Missing 'target' path or directory for action='read'")?;
+                        let base_dir = state
+                            .pinned_workspace_root
+                            .as_deref()
+                            .unwrap_or(&state.default_project_path);
+                        let resolved_target = {
+                            let p = Path::new(raw_target);
+                            if p.is_relative() {
+                                base_dir.join(p)
+                            } else {
+                                p.to_path_buf()
+                            }
+                        };
+                        if let Some(err) =
+                            crate::security::check_mcp_read_path_policy(&resolved_target, &[])
+                        {
+                            return Err(err.into());
+                        }
+                        let show_secrets = args
+                            .get("show_secrets")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        if let Some(ref pin_root) = state.pinned_workspace_root {
+                            let canon_t = crate::security::canonicalize_with_missing_tail(
+                                &resolved_target,
+                            )
+                            .unwrap_or_else(|| resolved_target.clone());
+                            if let Some(err) =
+                                crate::security::check_mcp_workspace_containment(&canon_t, pin_root)
+                            {
+                                return Err(err.into());
+                            }
+                            if show_secrets {
+                                return Err(
+                                    "LibreDB MCP access denied: 'show_secrets' is disabled on workspace-pinned MCP servers."
+                                        .into(),
+                                );
+                            }
+                        }
+                        let opts = crate::security::ReadLdbOptions {
+                            target: resolved_target,
+                            query: args
+                                .get("query")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned),
+                            show_secrets,
+                            global_path: state.global_path.clone(),
+                        };
+                        let rep = crate::security::execute_read_ldb_command(&opts)?;
+                        return if want_json {
+                            Ok(serde_json::to_string_pretty(&rep)?)
+                        } else {
+                            Ok(crate::security::format_read_ldb_report(&rep))
+                        };
+                    }
+                    _ => {}
+                }
+            }
             if action == "savings" {
                 let days_opt: Option<u32> = match args.get("days") {
                     None | Some(Value::Null) => None,

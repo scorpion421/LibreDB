@@ -10,6 +10,7 @@
 //!   and `PreMutationSealGuard`.
 //! - `path_policy.rs`: Symlink/NTFS-ADS/Win32-dot path policy, `MCP` containment, and `CVE-2022-24765`.
 
+mod backup;
 mod ephemeral;
 mod path_policy;
 mod seals;
@@ -17,15 +18,25 @@ mod vault;
 #[cfg(test)]
 mod tests;
 
+pub use backup::{
+    diagnose_untrusted_workspace_db, execute_backup_command, execute_migrate_command,
+    execute_read_ldb_command, execute_restore_command, BackupOptions, MigrateOptions,
+    ReadLdbOptions, RestoreOptions,
+};
+#[cfg(test)]
+pub use backup::{
+    has_valid_portable_backup_manifest, BackupScope,
+};
+pub(crate) use backup::format_read_ldb_report;
 pub(crate) use ephemeral::{
     create_private_ephemeral_dir, ephemeral_workspace_ldb_filename, reap_abandoned_ephemeral_dirs,
 };
-pub(crate) use path_policy::canonicalize_with_missing_tail;
 pub use path_policy::{
     check_mcp_read_path_policy, check_mcp_workspace_containment,
     check_tool_write_path_policy_with_base, is_forbidden_mcp_workspace_root,
     sanitize_git_ref_for_prompt, strip_verbatim_prefix,
 };
+pub(crate) use path_policy::canonicalize_with_missing_tail;
 #[cfg(any(feature = "git-automation", test))]
 pub use path_policy::is_safe_auto_git_dir;
 
@@ -60,12 +71,14 @@ pub(super) type HmacSha256 = Hmac<Sha256>;
 pub(super) const DPAPI_PREFIX: &str = "dpapi:v1:";
 pub(super) const VAULT_V1_PREFIX: &str = "vault:v1:";
 pub(super) const VAULT_V2_PREFIX: &str = "vault:v2:";
+pub(super) const PORTABLE_SECRET_PREFIX: &str = "portable_plain:";
 pub(super) const VAULT_AEAD_AAD: &[u8] = b"LibreDB::CredentialVault::v2";
 pub(super) const CONTENT_DIGEST_DOMAIN: &[u8] = b"LibreDB::CognitiveContent::v4\0";
 pub(super) const SEAL_V4_DOMAIN_SEP: &[u8] = b"LibreDB::WorkspaceTrustSeal::v4\0";
 pub(super) const SEAL_V4_REV_DOMAIN_SEP: &[u8] = b"LibreDB::WorkspaceTrustSeal::v4r\0";
 pub(super) const TRUST_SECRET_KEY: &str = "sys::trust_anchor_secret";
 pub(super) const TRUST_SEALS_KEY: &str = "sys::trust_seals";
+pub(super) const BACKUP_MANIFEST_KEY: &str = "sys::backup_manifest";
 
 
 pub fn load_config_list(

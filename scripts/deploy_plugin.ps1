@@ -8,8 +8,8 @@ $ErrorActionPreference = "Stop"
 
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $VersionFile = Join-Path $ProjectRoot "VERSION"
-$LibreVersion = if (Test-Path $VersionFile) { (Get-Content -Raw $VersionFile).Trim() } else { "2.2.1" }
-if (-not $LibreVersion) { $LibreVersion = "2.2.1" }
+$LibreVersion = if (Test-Path $VersionFile) { (Get-Content -Raw $VersionFile).Trim() } else { "2.3.0" }
+if (-not $LibreVersion) { $LibreVersion = "2.3.0" }
 $UserHome = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
 $GeminiDir = Join-Path $UserHome ".gemini"
 $LibreHome = Join-Path $GeminiDir "libredb"
@@ -438,7 +438,7 @@ description: >-
 1. **`libredb_pulse`** (`query`, `cwd`, `cid`, `budget`, `error`):
    - Retrieves relevant rules, micro-skills, decisions, facts, tasks, snapshots, and symbols across global + workspace layers within `budget` tokens.
    - Always pass `cid` (Conversation ID) and `cwd` so RAM-first `Zero-Repeat Delta` suppresses already-delivered items (`0` disk I/O reads on Turn 2+) and automatically re-hydrates after `/compact`.
-2. **`libredb_code`** (`action`: `"index"` | `"skeleton"` | `"locate"` | `"impact"` | `"fim"` | `"grep"` | `"savings"`, `target`, `files`, `symbols`, `slices`, `cwd`, `subpath`, `cid`, `force`, `symbol`, `line`, `pad`, `ignore_case`, `fixed_strings`, `word_boundary`, `context`, `max_matches`, `extensions`, `format`, `days`):
+2. **`libredb_code`** (`action`: `"index"` | `"skeleton"` | `"locate"` | `"impact"` | `"fim"` | `"grep"` | `"savings"` | `"backup"` | `"restore"` | `"migrate"` | `"read"`, `target`, `destination`, `source`, `instance`, `all`, `from_path`, `include_artifacts`, `query`, `show_secrets`, `files`, `symbols`, `slices`, `cwd`, `subpath`, `cid`, `force`, `symbol`, `line`, `pad`, `ignore_case`, `fixed_strings`, `word_boundary`, `context`, `max_matches`, `extensions`, `format`, `days`):
    - `"index"`: Incrementally scans non-binary source files in `target` (`< 3 ms` warm stat+hash fast path), wiring `Calls` (including Dalvik/Smali descriptors & `1..2`-char R8 methods) and `Decision -> Governs -> Symbol` synapses.
    - `"skeleton"`: Returns a `92-99%` compressed `[Lstart-Lend]` contract map of a single `target` file or multi-file batch (`files: [...]`) across 25+ languages and `< 5 us` topology-inferred extensionless files with session-aware `[Zero-Repeat Skeleton]` deduplication (`cid`).
    - `"locate"`: Returns `< 0.5 ms` 1-line `[Lstart-Lend]` symbol locations for a single `target` or batched `symbols: [...]` (`<= 64`) without full caller/callee edge traversal.
@@ -446,6 +446,7 @@ description: >-
    - `"fim"`: Returns surgical `[Lstart-Lend]` edit slices with blast-radius callers, implementors, and governing decisions attached for a file `target` (including `<path>:<line>` syntax), file-less workspace `symbol`/`symbols` lookup, or batched `slices` (`<= 32`).
    - `"grep"`: Pure-Rust `.gitignore`-aware, credential/binary-safe workspace text and pattern search annotated with enclosing `[kind name Lstart-Lend]` contracts (optional `subpath`, `ignore_case`, `fixed_strings`, `word_boundary`, `context`, `max_matches`, `extensions`).
    - `"savings"`: Returns an authorized workspace 3-tier token-consumption and savings report (`days=0` for today, `days <= 3660`).
+   - `"backup"` / `"restore"` / `"migrate"` / `"read"`: Portable unencrypted export with `sys::backup_manifest` (`destination`, `instance`, `all`), integrity-verified local re-encryption and sealing (`source`, `instance`, `all`), standalone chat or moved-folder migration (`source`, `cid`, `from_path`, `include_artifacts`), and own-risk read-only inspection (`target`, `query`, `show_secrets`).
 3. **`libredb_memorize`** (`cwd`, `cid`, `facts`, `decisions`, `tasks`, `snapshot`, `learn_assoc`, `learn_reflex`, `learn_error`):
    - Atomically commits workspace/chat facts, architectural decisions (auto-linked to symbols), tasks, milestone snapshots, language-agnostic Hebbian concept bridges, situational pitfall reflexes, or error-recovery directives.
 
@@ -470,6 +471,17 @@ description: >-
 - **Workspace trust & universal config:**
   - `libredb trust [<dir>] [--revoke] [--list] [--accept-rollback] [--reinit-lost] [--if-clean]`
   - `libredb config <get|set|unset|list> [<key>] [<value>] [--project "<dir>" | --cwd "<dir>"]`
+- **Portable backup, restore, migration & own-risk inspection:**
+  - `libredb backup [<dest_dir>] [--project "<dir>" | --cwd "<dir>"] [--cid <id>] [--instance] [--all] [--json]` (alias: `backup-ldb`)
+  - `libredb restore <source_path> [--project "<dir>" | --cwd "<dir>"] [--instance] [--all] [--json]` (alias: `restore-ldb`)
+  - `libredb migrate [<source_path>] [--cid <id>] [--project "<dir>" | --cwd "<dir>"] [--from-path "<old_dir>"] [--include-artifacts] [--json]` (alias: `migrate-ldb`)
+  - `libredb read <path_or_dir> [--query "<substr>"] [--show-secrets] [--json]` (alias: `read-ldb`)
+
+## Portable backup & migration rules
+
+- **Mandatory backup prompt & warning:** When the user invokes `/libredb backup` without specifying a destination folder, ALWAYS warn them clearly that exported `.ldb` files contain unencrypted `portable_plain:` secrets and ask where to store the backup before executing it.
+- **Auto-adopt on new project start:** Dropping a backed-up project `memory.ldb` into a brand-new project's `.agents/memory.ldb` automatically verifies `sys::backup_manifest`, re-encrypts any secrets locally, deletes the manifest, and seals it with `hmac-sha256:v4` on first open.
+- **Fail-closed raw copies:** Copying raw `.ldb` files without `/libredb backup` fails closed on host/path mismatch; use `/libredb read <path_or_dir>` for strictly read-only own-risk inspection without sealing or trust changes.
 - **Compaction & GC:** `libredb compact <db.ldb> [--prune]`
 - **Rules, skills & reflexes:**
   - `libredb sync-skill <SKILL.md> [--name <skill_name>]`

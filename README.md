@@ -1,7 +1,7 @@
 # LibreDB
 
-[![Version](https://img.shields.io/badge/version-2.2.1-blue.svg)](CHANGELOG.md)
-[![Tests](https://img.shields.io/badge/tests-passing%20(153%20tests%20%2B%2012%20audits%20%2B%2015%20learning%20checks%20%2B%2010k%20crash%20sims)-brightgreen.svg)](crates/libredb-cli/tests/)
+[![Version](https://img.shields.io/badge/version-2.3.0-blue.svg)](CHANGELOG.md)
+[![Tests](https://img.shields.io/badge/tests-passing%20(157%20tests%20%2B%2012%20audits%20%2B%2015%20learning%20checks%20%2B%2010k%20crash%20sims)-brightgreen.svg)](crates/libredb-cli/tests/)
 [![Tech Stack](https://img.shields.io/badge/pure%20rust-1.89%2B%20%7C%20zero%20C%20%7C%20MCP-orange.svg)](Cargo.toml)
 [![License](https://img.shields.io/badge/license-Apache%202.0%20%2B%20Commons%20Clause-purple.svg)](LICENSE)
 
@@ -17,7 +17,7 @@
 
 ## Executive summary and impact
 
-| Dimension | Legacy Python + `SQLite` (`SkillsDB`) | `LibreDB v2.2.1` (100% Pure `Rust` + `MCP` + `PyO3`) |
+| Dimension | Legacy Python + `SQLite` (`SkillsDB`) | `LibreDB v2.3.0` (100% Pure `Rust` + `MCP` + `PyO3`) |
 | :--- | :--- | :--- |
 | **Hook response latency** | `350-500 ms` Python startup + `SQLite` WAL per edit or turn | **`< 0.5 ms` via the in-memory `MCP` `IPC` coordinator (`< 2 ms` direct fallback), loading matching rules and project memory without disk polling** |
 | **Multi-turn recall & I/O** | Repeated subprocess spawns and full-file re-reads | **RAM-cached session delta and `O(1)` incremental tail-sync (`2` reads total on external updates), keeping turn 2+ recall instant even over network shares** |
@@ -62,6 +62,7 @@ pwsh -ExecutionPolicy Bypass -File .\scripts\deploy_plugin.ps1 -Profile Personal
 | `libredb_memorize` / `learn-reflex`, `learn-error` | Saves project facts, architectural decisions, tasks, snapshots, and verified bug-fix rules atomically |
 | `libredb mcp-serve` / `guardrail check` | Starts the workspace-scoped MCP server with in-memory hook IPC coordinator or checks staged commits against formatting, style, and security rules |
 | `libredb trust` / `libredb config` / `status` | Seals and verifies workspace memory databases (`HMAC-SHA256`), manages global or per-project settings, and inspects database statistics |
+| `libredb backup` / `restore` / `migrate` / `read` | Exports portable unencrypted backups (`--instance`, `--all`, `--cid`), restores with local re-encryption and automatic project-start adoption, migrates standalone chats or moved folders, and inspects `.ldb` files read-only |
 | `libredb git-init` / `git-sync` / `git-release` | Optional `git-automation` feature (enabled by default): pushes commits cleanly with multi-remote preflight checks, creates Keep a Changelog releases on Gitea/GitHub, and attaches matching binary assets |
 
 ## Architecture and project structure
@@ -70,7 +71,7 @@ pwsh -ExecutionPolicy Bypass -File .\scripts\deploy_plugin.ps1 -Profile Personal
 LibreDB/
 |-- Cargo.toml                                     # Pure-Rust workspace (4 default CLI/MCP crates + optional PyO3 crate)
 |-- Makefile                                       # Zero-dependency POSIX/Linux/macOS source build & installer
-|-- VERSION                                        # Semantic Version (2.2.1)
+|-- VERSION                                        # Semantic Version (2.3.0)
 |-- CHANGELOG.md                                   # Keep a Changelog 1.1.0 release history
 |-- LICENSE                                        # Commons Clause v1.0 + full verbatim Apache License 2.0 text
 |-- README.md                                      # 9-block standardized documentation
@@ -95,7 +96,7 @@ LibreDB/
     |   |-- src/telemetry.rs                       # Cross-process-atomic telemetry.ldb ledger + streaming 8 MiB transcript analyzer
     |   |-- src/ipc.rs                             # Cross-platform in-memory MCP-to-hook IPC coordinator (Named Pipe / Unix Socket)
     |   |-- src/mcp/                               # Modular MCP server (mod, protocol, authz, tools, tests)
-    |   |-- src/security/                          # Modular security suite (mod, ephemeral, vault, seals, path_policy, tests)
+    |   |-- src/security/                          # Modular security suite (mod, ephemeral, vault, seals, path_policy, backup, tests)
     |   |-- src/hooks.rs                           # Sub-millisecond IPC-routed & direct-fallback PreInvocation & PreToolUse hooks
     |   |-- src/gitea.rs                           # Optional git-automation feature: Git, Gitea & GitHub release automation
     |   |-- tests/military_grade_mcp_security.rs   # Multi-process OS SIGKILL, root-refresh & boundary isolation E2E suite

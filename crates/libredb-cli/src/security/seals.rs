@@ -781,6 +781,19 @@ pub fn is_workspace_memory_trusted(global_db: Option<&LibreDb>, ws_root: &Path) 
         }
         Err(LibreDbError::KeyNotFound { .. }) => {
             secure_zero(&mut secret);
+            // Auto-adopt a fresh portable backup database (`sys::backup_manifest`) on first
+            // project start: decryptable `portable_plain:` secrets are encrypted locally, the
+            // one-time manifest is removed, and the database is immediately sealed for this host.
+            if !has_prior_seal
+                && global_rev == 0
+                && pdb.get_by_key(NodeKind::Config, BACKUP_MANIFEST_KEY).is_ok()
+            {
+                let arc_pdb = std::sync::Arc::new(pdb);
+                return super::backup::adopt_portable_backup_in_place_locked(
+                    gdb, &arc_pdb, ws_root,
+                )
+                .is_ok();
+            }
             // Allow cache-only `.agents/memory.ldb` (0 cognitive capsules, e.g. fresh `index-workspace` symbols only)
             // ONLY when the workspace has NEVER been sealed before on this host.
             !has_prior_seal && global_rev == 0 && capsule_count == 0 && path_authorized
@@ -1157,11 +1170,7 @@ impl PreMutationSealGuard {
                     ws_root.display()
                 ));
             }
-            return Err(format!(
-                "Workspace memory at '{}' failed workspace content-seal verification (offline modification or unverified seal detected). Inspect the database and run 'libredb trust \"{}\"' before writing to it.",
-                db_path.display(),
-                ws_root.display()
-            ));
+            return Err(diagnose_untrusted_workspace_db(Some(gdb), ws_root));
         }
         Ok(Self {
             authorized_ws: Some(ws_root.to_path_buf()),

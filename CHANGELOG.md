@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.0] - 2026-11-18
+
+### Added
+- **Portable unencrypted database backups (`libredb backup`, MCP `backup`, `/libredb`)**: Exports project, global instance (`--instance`), complete multi-project (`--all`), or standalone chat (`--cid`) databases outside workspace working trees after printing a clear unencrypted storage warning and asking interactively for a destination when omitted. Stored configuration credentials are unwrapped from OS-bound keystores into portable envelopes, host-specific trust anchors and rollback ratchets are stripped, a `.gitignore` is placed in the export folder, and a tamper-evident content manifest certifies every exported database.
+- **Integrity-verified restore and automatic new-project adoption (`libredb restore`, MCP `restore`)**: Restores individual projects, the global instance (`--instance`), or full multi-project archives (`--all`) in place so running MCP servers pick up changes cleanly without Windows file-lock errors, while creating `.pre_restore.bak` rollback snapshots and re-encrypting portable secrets under the local OS keystore. Dropping an exported project `memory.ldb` into a brand-new project's `.agents/memory.ldb` automatically verifies its backup manifest, re-encrypts any secrets, removes the portable manifest, and applies a fresh `hmac-sha256:v4` workspace trust seal on first project open.
+- **Single-chat and moved-folder migration (`libredb migrate`, MCP `migrate`)**: Merges standalone chat memory (ephemeral sessions or legacy chat databases via `--cid`, plus optional artifact copying via `--include-artifacts`) or another trusted backup into an existing workspace while preserving causal timestamps and remapping cross-node synapses. Also re-seals locally moved or renamed workspace folders (`--from-path`) on the same host without losing local trust continuity.
+- **Own-risk read-only database inspection (`libredb read`, MCP `read`)**: Opens any local backup directory or foreign `.ldb` file strictly read-only without sealing it or trusting its workspace, reports CRC32 integrity and provenance classification, and redacts sensitive credential values by default unless `--show-secrets` is requested explicitly.
+
+### Security
+- **Explicit fail-closed rejection and diagnosis for raw unbacked-up `.ldb` copies**: Workspaces populated by copying raw `.ldb` files without `libredb backup` continue to fail closed across hooks, CLI queries, MCP authorization, and `restore`/`migrate`, now surfacing actionable diagnostics pointing to `libredb backup`, `libredb migrate`, `libredb trust`, or own-risk inspection with `libredb read`.
+- **Backup file and manifest leak prevention in commit guardrails**: Added `.ldb`, `.ldbbak`, `.pre_restore.bak`, `backup_index.json`, and `backup_project_info.json` patterns to staged commit guardrails and rejected destinations located inside Git working trees or `.agents` folders.
+
 ## [2.2.1] - 2026-11-17
 
 ### Fixed

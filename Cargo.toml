@@ -15,7 +15,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "2.2.1"
+version = "2.3.0"
 edition = "2021"
 authors = ["Antigravity <antigravity@local.dev>"]
 license-file = "LICENSE"

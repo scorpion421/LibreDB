@@ -1801,3 +1801,420 @@ use libredb_core::EdgeKind;
             PathBuf::from(r"Q:\Antigravity\LibreDB")
         );
     }
+
+    fn temp_test_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join(format!("libredb_{tag}_{}_{}", std::process::id(), nanos))
+    }
+
+    #[test]
+    fn backup_restore_and_auto_adopt_on_project_start_across_hosts() {
+        let tmp = temp_test_dir("backup_auto_adopt");
+        let global_a_path = tmp.join("host_a_customizations.ldb");
+        let global_b_path = tmp.join("host_b_customizations.ldb");
+        let ws_a = tmp.join("project_alpha");
+        let ws_b = tmp.join("project_beta_fresh");
+        let ws_raw = tmp.join("project_raw_copy");
+        let ws_tampered = tmp.join("project_tampered");
+        let bak_dir = tmp.join("portable_backup");
+        fs::create_dir_all(ws_a.join(".agents")).unwrap();
+        fs::create_dir_all(ws_b.join(".agents")).unwrap();
+        fs::create_dir_all(ws_raw.join(".agents")).unwrap();
+        fs::create_dir_all(ws_tampered.join(".agents")).unwrap();
+
+        let gdb_a = LibreDb::open(&global_a_path).unwrap();
+        let gdb_b = LibreDb::open(&global_b_path).unwrap();
+        let _ = super::vault::ensure_trust_anchor_secret(&gdb_b).unwrap();
+
+        let pdb_a = LibreDb::open(&ws_a.join(".agents").join("memory.ldb")).unwrap();
+        let enc_secret = protect_secret("tok_hostA_secret_1234").unwrap();
+        assert!(is_ciphertext_envelope(&enc_secret));
+        pdb_a
+            .put(WriteRequest::new(NodeKind::Config, enc_secret.as_bytes()).with_key("gitea:token"))
+            .unwrap();
+        let fact_id = pdb_a
+            .put(
+                WriteRequest::new(NodeKind::Fact, b"Portable architecture fact")
+                    .with_key("fact_portable"),
+            )
+            .unwrap();
+        let dec_id = pdb_a
+            .put(
+                WriteRequest::new(NodeKind::Decision, b"Use single-file LIBREDB1 snapshots")
+                    .with_key("dec_portable"),
+            )
+            .unwrap();
+        pdb_a
+            .link_batch(&[(dec_id, EdgeKind::Governs, fact_id, 220)])
+            .unwrap();
+        seal_workspace_memory(&gdb_a, &pdb_a, &ws_a).unwrap();
+        drop(pdb_a);
+        drop(gdb_a);
+
+        let rep = execute_backup_command(&BackupOptions {
+            destination: Some(bak_dir.clone()),
+            project_dir: Some(ws_a.clone()),
+            cid: None,
+            instance: false,
+            all: false,
+            global_path: Some(global_a_path.clone()),
+            allow_prompt: false,
+        })
+        .unwrap();
+        assert_eq!(rep.scope, "project");
+        assert!(rep.secrets_decrypted >= 1);
+        assert_eq!(rep.projects_exported.len(), 1);
+        assert!(bak_dir.join(".gitignore").is_file());
+        assert!(bak_dir.join("backup_index.json").is_file());
+
+        let exported_ldb_path = bak_dir.join(&rep.projects_exported[0].relative_ldb_path);
+        let bak_db = LibreDb::open(&exported_ldb_path).unwrap();
+        assert!(has_valid_portable_backup_manifest(&bak_db, Some(BackupScope::Project))
+            .unwrap()
+            .is_some());
+        assert!(bak_db.get_by_key(NodeKind::Config, TRUST_SEALS_KEY).is_err());
+        let plain_cfg = bak_db.get_by_key(NodeKind::Config, "gitea:token").unwrap();
+        let plain_val = String::from_utf8(plain_cfg.payload).unwrap();
+        assert!(plain_val.starts_with(PORTABLE_SECRET_PREFIX));
+        drop(bak_db);
+
+        // Simulate user dropping portable backup `memory.ldb` into a brand-new project on Host B:
+        fs::copy(&exported_ldb_path, ws_b.join(".agents").join("memory.ldb")).unwrap();
+        assert!(is_workspace_memory_trusted(Some(&gdb_b), &ws_b));
+
+        let pdb_b = LibreDb::open(&ws_b.join(".agents").join("memory.ldb")).unwrap();
+        assert!(pdb_b.get_by_key(NodeKind::Config, BACKUP_MANIFEST_KEY).is_err());
+        let adopted_fact = pdb_b.get_by_key(NodeKind::Fact, "fact_portable").unwrap();
+        assert_eq!(adopted_fact.payload, b"Portable architecture fact");
+        let adopted_tok_rec = pdb_b.get_by_key(NodeKind::Config, "gitea:token").unwrap();
+        let adopted_tok_str = String::from_utf8(adopted_tok_rec.payload).unwrap();
+        assert!(is_ciphertext_envelope(&adopted_tok_str));
+        let (decrypted, _) = unprotect_secret(&adopted_tok_str).unwrap();
+        assert_eq!(decrypted, "tok_hostA_secret_1234");
+        drop(pdb_b);
+
+        // Tampered portable backup MUST fail auto-adoption and fail closed:
+        let tampered_path = ws_tampered.join(".agents").join("memory.ldb");
+        fs::copy(&exported_ldb_path, &tampered_path).unwrap();
+        let tdb = LibreDb::open(&tampered_path).unwrap();
+        tdb.put(WriteRequest::new(NodeKind::Fact, b"injected malicious payload").with_key("evil"))
+            .unwrap();
+        drop(tdb);
+        assert!(!is_workspace_memory_trusted(Some(&gdb_b), &ws_tampered));
+        let tampered_diag = diagnose_untrusted_workspace_db(Some(&gdb_b), &ws_tampered);
+        assert!(tampered_diag.contains("manifest"));
+
+        // Raw copy made WITHOUT `/libredb backup` MUST fail closed and mention `/libredb backup`:
+        fs::copy(
+            ws_a.join(".agents").join("memory.ldb"),
+            ws_raw.join(".agents").join("memory.ldb"),
+        )
+        .unwrap();
+        assert!(!is_workspace_memory_trusted(Some(&gdb_b), &ws_raw));
+        let raw_diag = diagnose_untrusted_workspace_db(Some(&gdb_b), &ws_raw);
+        assert!(raw_diag.contains("/libredb backup"));
+
+        drop(gdb_b);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn instance_and_all_restore_reencrypts_secrets_and_rejects_scope_mismatch() {
+        let tmp = temp_test_dir("backup_all_restore");
+        let global_a_path = tmp.join("host_a_custom.ldb");
+        let global_b_path = tmp.join("host_b_custom.ldb");
+        let ws_1 = tmp.join("repo_one");
+        let ws_2 = tmp.join("repo_two_missing_on_b");
+        let bak_all = tmp.join("backup_all");
+        let bak_proj_only = tmp.join("backup_proj_only");
+        fs::create_dir_all(ws_1.join(".agents")).unwrap();
+        fs::create_dir_all(ws_2.join(".agents")).unwrap();
+
+        let gdb_a = LibreDb::open(&global_a_path).unwrap();
+        let _ = super::vault::ensure_trust_anchor_secret(&gdb_a).unwrap();
+        let g_secret = protect_secret("pat_instance_global_999").unwrap();
+        gdb_a
+            .put(WriteRequest::new(NodeKind::Config, g_secret.as_bytes()).with_key("gitea:token"))
+            .unwrap();
+        gdb_a
+            .put(
+                WriteRequest::new(NodeKind::Rule, b"Always enforce sentence case.")
+                    .with_key("rule:sentence_case"),
+            )
+            .unwrap();
+
+        let pdb_1 = LibreDb::open(&ws_1.join(".agents").join("memory.ldb")).unwrap();
+        pdb_1
+            .put(WriteRequest::new(NodeKind::Fact, b"Repo one fact").with_key("f1"))
+            .unwrap();
+        seal_workspace_memory(&gdb_a, &pdb_1, &ws_1).unwrap();
+        drop(pdb_1);
+
+        let pdb_2 = LibreDb::open(&ws_2.join(".agents").join("memory.ldb")).unwrap();
+        pdb_2
+            .put(WriteRequest::new(NodeKind::Fact, b"Repo two fact").with_key("f2"))
+            .unwrap();
+        seal_workspace_memory(&gdb_a, &pdb_2, &ws_2).unwrap();
+        drop(pdb_2);
+        drop(gdb_a);
+
+        // Export project-only backup for mismatch assertion, then full --all backup:
+        execute_backup_command(&BackupOptions {
+            destination: Some(bak_proj_only.clone()),
+            project_dir: Some(ws_1.clone()),
+            cid: None,
+            instance: false,
+            all: false,
+            global_path: Some(global_a_path.clone()),
+            allow_prompt: false,
+        })
+        .unwrap();
+
+        let all_rep = execute_backup_command(&BackupOptions {
+            destination: Some(bak_all.clone()),
+            project_dir: Some(ws_1.clone()),
+            cid: None,
+            instance: false,
+            all: true,
+            global_path: Some(global_a_path.clone()),
+            allow_prompt: false,
+        })
+        .unwrap();
+        assert!(all_rep.instance_exported);
+        assert_eq!(all_rep.projects_exported.len(), 2);
+
+        // Pre-seed global_b so restore must create a rollback `.pre_restore.bak`:
+        let gdb_b = LibreDb::open(&global_b_path).unwrap();
+        let _ = super::vault::ensure_trust_anchor_secret(&gdb_b).unwrap();
+        drop(gdb_b);
+
+        // Scope mismatches MUST fail closed:
+        assert!(execute_restore_command(&RestoreOptions {
+            source: bak_proj_only.clone(),
+            project_dir: None,
+            instance: true,
+            all: false,
+            global_path: Some(global_b_path.clone()),
+        })
+        .is_err());
+        assert!(execute_restore_command(&RestoreOptions {
+            source: bak_proj_only.clone(),
+            project_dir: None,
+            instance: false,
+            all: true,
+            global_path: Some(global_b_path.clone()),
+        })
+        .is_err());
+
+        // Remove ws_2 from disk on Host B; ws_1 stays present -> restore skips ws_2 cleanly:
+        fs::remove_dir_all(&ws_2).unwrap();
+        fs::remove_file(ws_1.join(".agents").join("memory.ldb")).unwrap();
+
+        let res_rep = execute_restore_command(&RestoreOptions {
+            source: bak_all.clone(),
+            project_dir: None,
+            instance: false,
+            all: true,
+            global_path: Some(global_b_path.clone()),
+        })
+        .unwrap();
+        assert!(res_rep.instance_restored);
+        assert_eq!(res_rep.projects_restored.len(), 1);
+        assert_eq!(res_rep.projects_skipped_missing_dir.len(), 1);
+        assert!(!res_rep.backup_files_created.is_empty());
+
+        let gdb_b = LibreDb::open(&global_b_path).unwrap();
+        let rule = gdb_b.get_by_key(NodeKind::Rule, "rule:sentence_case").unwrap();
+        assert_eq!(rule.payload, b"Always enforce sentence case.");
+        let g_tok_rec = gdb_b.get_by_key(NodeKind::Config, "gitea:token").unwrap();
+        let g_tok_str = String::from_utf8(g_tok_rec.payload).unwrap();
+        assert!(is_ciphertext_envelope(&g_tok_str));
+        let (plain_g_tok, _) = unprotect_secret(&g_tok_str).unwrap();
+        assert_eq!(plain_g_tok, "pat_instance_global_999");
+        assert!(gdb_b.get_by_key(NodeKind::Config, BACKUP_MANIFEST_KEY).is_err());
+        assert!(is_workspace_memory_trusted(Some(&gdb_b), &ws_1));
+
+        drop(gdb_b);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn migrate_single_chat_ephemeral_to_project_and_relocate_moved_folder() {
+        let tmp = temp_test_dir("backup_migrate");
+        let global_path = tmp.join("customizations.ldb");
+        let ws_old = tmp.join("old_repo_name");
+        let ws_new = tmp.join("renamed_repo_name");
+        let chat_src_ws = tmp.join("standalone_chat_src");
+        let chat_bak = tmp.join("chat_backup_dir");
+        fs::create_dir_all(ws_old.join(".agents")).unwrap();
+        fs::create_dir_all(chat_src_ws.join(".agents")).unwrap();
+
+        let gdb = LibreDb::open(&global_path).unwrap();
+        let _ = super::vault::ensure_trust_anchor_secret(&gdb).unwrap();
+        let pdb_old = LibreDb::open(&ws_old.join(".agents").join("memory.ldb")).unwrap();
+        pdb_old
+            .put(WriteRequest::new(NodeKind::Fact, b"Original project memory").with_key("orig_k"))
+            .unwrap();
+        seal_workspace_memory(&gdb, &pdb_old, &ws_old).unwrap();
+        drop(pdb_old);
+
+        // Move folder on the same host (seal path mismatch -> untrusted until migrated):
+        fs::rename(&ws_old, &ws_new).unwrap();
+        assert!(!is_workspace_memory_trusted(Some(&gdb), &ws_new));
+        drop(gdb);
+
+        let reloc_rep = execute_migrate_command(&MigrateOptions {
+            source: None,
+            cid: None,
+            target_project: Some(ws_new.clone()),
+            from_path: Some(ws_old.clone()),
+            include_artifacts: false,
+            global_path: Some(global_path.clone()),
+        })
+        .unwrap();
+        assert!(reloc_rep.relocated_from.is_some());
+
+        let gdb = LibreDb::open(&global_path).unwrap();
+        assert!(is_workspace_memory_trusted(Some(&gdb), &ws_new));
+
+        // Create a chat database with linked nodes and export it as a chat backup, then merge:
+        let pdb_chat = LibreDb::open(&chat_src_ws.join(".agents").join("memory.ldb")).unwrap();
+        let c_fact = pdb_chat
+            .put(
+                WriteRequest::new(NodeKind::Fact, b"Standalone chat finding")
+                    .with_key("chat_fact_1"),
+            )
+            .unwrap();
+        let c_dec = pdb_chat
+            .put(
+                WriteRequest::new(NodeKind::Decision, b"Standalone chat decision")
+                    .with_key("chat_dec_1"),
+            )
+            .unwrap();
+        pdb_chat
+            .link_batch(&[(c_dec, EdgeKind::Governs, c_fact, 205)])
+            .unwrap();
+        seal_workspace_memory(&gdb, &pdb_chat, &chat_src_ws).unwrap();
+        drop(pdb_chat);
+        drop(gdb);
+
+        execute_backup_command(&BackupOptions {
+            destination: Some(chat_bak.clone()),
+            project_dir: Some(chat_src_ws.clone()),
+            cid: Some("chat-1234".to_owned()),
+            instance: false,
+            all: false,
+            global_path: Some(global_path.clone()),
+            allow_prompt: false,
+        })
+        .unwrap();
+
+        let chat_rep = execute_migrate_command(&MigrateOptions {
+            source: Some(chat_bak.clone()),
+            cid: None,
+            target_project: Some(ws_new.clone()),
+            from_path: None,
+            include_artifacts: false,
+            global_path: Some(global_path.clone()),
+        })
+        .unwrap();
+        assert!(chat_rep.nodes_merged >= 2);
+        assert!(chat_rep.synapses_merged >= 1);
+
+        let gdb = LibreDb::open(&global_path).unwrap();
+        assert!(is_workspace_memory_trusted(Some(&gdb), &ws_new));
+        let pdb_new = LibreDb::open(&ws_new.join(".agents").join("memory.ldb")).unwrap();
+        let migrated_dec = pdb_new.get_by_key(NodeKind::Decision, "chat_dec_1").unwrap();
+        let migrated_fact = pdb_new.get_by_key(NodeKind::Fact, "chat_fact_1").unwrap();
+        assert!(migrated_dec
+            .synapses
+            .iter()
+            .any(|s| s.target_id == migrated_fact.node_id && s.kind == EdgeKind::Governs));
+        assert!(pdb_new.get_by_key(NodeKind::Fact, "orig_k").is_ok());
+
+        drop(pdb_new);
+        drop(gdb);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn read_ldb_inspects_portable_and_raw_foreign_dbs_read_only() {
+        let tmp = temp_test_dir("read_ldb_readonly");
+        let global_path = tmp.join("customizations.ldb");
+        let ws = tmp.join("ws");
+        let bak_dir = tmp.join("bak");
+        let raw_foreign = tmp.join("foreign_raw.ldb");
+        fs::create_dir_all(ws.join(".agents")).unwrap();
+
+        let gdb = LibreDb::open(&global_path).unwrap();
+        let _ = super::vault::ensure_trust_anchor_secret(&gdb).unwrap();
+        let pdb = LibreDb::open(&ws.join(".agents").join("memory.ldb")).unwrap();
+        let enc_tok = protect_secret("secret_read_test_42").unwrap();
+        pdb.put(WriteRequest::new(NodeKind::Config, enc_tok.as_bytes()).with_key("gitea:token"))
+            .unwrap();
+        pdb.put(
+            WriteRequest::new(NodeKind::Decision, b"Alpha searchable decision")
+                .with_key("dec_alpha"),
+        )
+        .unwrap();
+        seal_workspace_memory(&gdb, &pdb, &ws).unwrap();
+        drop(pdb);
+        drop(gdb);
+
+        // 1. Inspect portable backup read-only with default secret redaction:
+        execute_backup_command(&BackupOptions {
+            destination: Some(bak_dir.clone()),
+            project_dir: Some(ws.clone()),
+            cid: None,
+            instance: false,
+            all: false,
+            global_path: Some(global_path.clone()),
+            allow_prompt: false,
+        })
+        .unwrap();
+
+        let bak_read = execute_read_ldb_command(&ReadLdbOptions {
+            target: bak_dir.clone(),
+            query: None,
+            show_secrets: false,
+            global_path: Some(global_path.clone()),
+        })
+        .unwrap();
+        assert_eq!(bak_read.files.len(), 1);
+        assert_eq!(bak_read.files[0].provenance_status, "PORTABLE_BACKUP");
+        assert!(bak_read.files[0]
+            .matched_entries
+            .iter()
+            .any(|e| e.key.as_deref() == Some("gitea:token")
+                && e.payload_preview.contains("REDACTED")));
+
+        // 2. Inspect foreign raw `.ldb` without trusting or modifying a single byte:
+        fs::copy(ws.join(".agents").join("memory.ldb"), &raw_foreign).unwrap();
+        let bytes_before = fs::read(&raw_foreign).unwrap();
+        let raw_read = execute_read_ldb_command(&ReadLdbOptions {
+            target: raw_foreign.clone(),
+            query: Some("Alpha".to_owned()),
+            show_secrets: false,
+            global_path: Some(global_path.clone()),
+        })
+        .unwrap();
+        let bytes_after = fs::read(&raw_foreign).unwrap();
+        assert_eq!(bytes_before, bytes_after, "read must be 100% read-only");
+        assert_eq!(
+            raw_read.files[0].provenance_status,
+            "UNVERIFIED_FOREIGN_OR_RAW_DB"
+        );
+        assert_eq!(raw_read.files[0].matched_entries.len(), 1);
+        assert_eq!(
+            raw_read.files[0].matched_entries[0].key.as_deref(),
+            Some("dec_alpha")
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }

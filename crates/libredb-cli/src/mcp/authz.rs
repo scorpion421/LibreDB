@@ -142,11 +142,11 @@ impl McpServerState {
                 return Err(err);
             }
             if !crate::security::is_workspace_memory_trusted(self.global_db.as_deref(), pin_root) {
-                return Err(format!(
-                    "LibreDB MCP access denied: workspace memory in '{}' is untrusted, tampered, or rolled back; run 'libredb trust \"{}\"' in a terminal.",
-                    pin_root.display(),
-                    pin_root.display()
-                ));
+                let diag = crate::security::diagnose_untrusted_workspace_db(
+                    self.global_db.as_deref(),
+                    pin_root,
+                );
+                return Err(format!("LibreDB MCP access denied: {diag}"));
             }
             candidates_by_specificity.push(pin_root.clone());
         }
@@ -211,11 +211,11 @@ impl McpServerState {
                 self.global_db.as_deref(),
                 &selected_root,
             ) {
-                return Err(format!(
-                    "LibreDB MCP access denied: workspace memory in '{}' is untrusted, tampered, or rolled back; run 'libredb trust \"{}\"' in a terminal.",
-                    selected_root.display(),
-                    selected_root.display()
-                ));
+                let diag = crate::security::diagnose_untrusted_workspace_db(
+                    self.global_db.as_deref(),
+                    &selected_root,
+                );
+                return Err(format!("LibreDB MCP access denied: {diag}"));
             }
             return Ok(selected_root);
         }
@@ -233,11 +233,11 @@ impl McpServerState {
                     ));
                 }
                 if !crate::security::is_workspace_memory_trusted(Some(gdb), &inferred_root) {
-                    return Err(format!(
-                        "LibreDB MCP access denied: workspace memory in '{}' is untrusted, tampered, or rolled back; run 'libredb trust \"{}\"' in a terminal.",
-                        inferred_root.display(),
-                        inferred_root.display()
-                    ));
+                    let diag = crate::security::diagnose_untrusted_workspace_db(
+                        Some(gdb),
+                        &inferred_root,
+                    );
+                    return Err(format!("LibreDB MCP access denied: {diag}"));
                 }
                 return Ok(inferred_root);
             }
@@ -691,10 +691,13 @@ impl McpServerState {
                                     self.clear_ram_sessions_for_cache_key(&candidate_cache_key);
                                     self.clear_ram_sessions_for_cache_key(&auth_cache_key);
                                     if is_explicit_memorize {
+                                        let diag = crate::security::diagnose_untrusted_workspace_db(
+                                            self.global_db.as_deref(),
+                                            &auth_root,
+                                        );
                                         return Err(format!(
-                                            "Workspace memory at '{}' is quarantined because a pre-existing unsealed, tampered, rolled-back, or Git-tracked .agents database was detected. Run 'libredb trust \"{}\"' (or '--reinit-lost' / '--accept-rollback' if recovering) in a terminal if you trust this repository.",
+                                            "Workspace memory at '{}' is quarantined: {diag}",
                                             auth_ldb.display(),
-                                            auth_root.display()
                                         ));
                                     }
                                     ws_write_lock = None;

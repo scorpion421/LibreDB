@@ -393,12 +393,20 @@ pub fn handle_rpc_method(
                 },
                 {
                     "name": "libredb_code",
-                    "description": "Zero-bloat source code graph: 'skeleton' (-95% file map, supports single 'target' or batch 'files'), 'locate' (<0.5ms 1-line [Lstart-Lend] symbol lookup, supports single 'target' or batch 'symbols'), 'impact' (compact caller/callee blast radius + governing decisions, supports single 'target' or batch 'symbols'), 'fim' (surgical edit slice + callers + decisions, supports file 'target', file-less 'symbol'/'symbols', or batch 'slices'), 'grep' (symbol-annotated pure-Rust .gitignore-aware search with enclosing [kind name Lstart-Lend] contracts), 'index' (scan workspace), or 'savings' (authorized workspace token-economy report).",
+                    "description": "Zero-bloat source code graph and database portability: 'skeleton' (-95% file map, supports single 'target' or batch 'files'), 'locate' (<0.5ms 1-line [Lstart-Lend] symbol lookup, supports single 'target' or batch 'symbols'), 'impact' (compact caller/callee blast radius + governing decisions, supports single 'target' or batch 'symbols'), 'fim' (surgical edit slice + callers + decisions, supports file 'target', file-less 'symbol'/'symbols', or batch 'slices'), 'grep' (symbol-annotated pure-Rust .gitignore-aware search with enclosing [kind name Lstart-Lend] contracts), 'index' (scan workspace), 'savings' (authorized workspace token-economy report), 'backup' (portable unencrypted export), 'restore' (integrity-verified local re-encryption and sealing), 'migrate' (chat/project merge or relocated folder recovery), or 'read' (own-risk read-only .ldb inspection).",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "action": { "type": "string", "enum": ["skeleton", "locate", "impact", "fim", "grep", "index", "savings"] },
-                            "target": { "type": "string", "description": "File path, workspace directory, symbol query, or pattern (for action='grep')" },
+                            "action": { "type": "string", "enum": ["skeleton", "locate", "impact", "fim", "grep", "index", "savings", "backup", "restore", "migrate", "read"] },
+                            "target": { "type": "string", "description": "File path, workspace directory, symbol query, pattern (for action='grep'), or target .ldb/folder (for action='read')" },
+                            "destination": { "type": "string", "description": "Destination folder for portable unencrypted export (for action='backup'; ask the user where to store it if omitted)" },
+                            "source": { "type": "string", "description": "Source backup folder or .ldb file (for action='restore' or action='migrate')" },
+                            "instance": { "type": "boolean", "description": "Export or restore global customizations and telemetry database (for action='backup' or action='restore')" },
+                            "all": { "type": "boolean", "description": "Export or restore all registered projects plus global instance database (for action='backup' or action='restore')" },
+                            "from_path": { "type": "string", "description": "Previous directory path when migrating a moved or renamed project on the same host (for action='migrate')" },
+                            "include_artifacts": { "type": "boolean", "description": "Copy chat brain artifacts into docs/migrated_<cid>/ during action='migrate'" },
+                            "query": { "type": "string", "description": "Optional substring filter for action='read'" },
+                            "show_secrets": { "type": "boolean", "description": "Reveal plaintext secret values during action='read' instead of [REDACTED]" },
                             "files": { "type": "array", "items": { "type": "string" }, "description": "Optional batch of file paths for action='skeleton' (single fsync), or subpath filter for action='grep'" },
                             "symbols": { "type": "array", "items": { "type": "string" }, "description": "Optional batch of symbol names/descriptors for action='locate', 'impact', or file/file-less action='fim' (max 64)" },
                             "slices": {
