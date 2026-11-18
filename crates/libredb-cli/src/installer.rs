@@ -158,16 +158,7 @@ pub(crate) fn install_binary_hot_safe(src: &Path, dst: &Path) -> Result<(), Stri
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("libredb");
-    let _ = fs::remove_file(format!("{}.old", dst.display()));
-    if let Ok(entries) = fs::read_dir(parent) {
-        for ent in entries.flatten() {
-            if let Some(name) = ent.file_name().to_str() {
-                if name.starts_with(dst_leaf) && name.ends_with(".old") {
-                    let _ = fs::remove_file(ent.path());
-                }
-            }
-        }
-    }
+    sweep_old_backup_files(parent, dst_leaf);
 
     #[cfg(unix)]
     {
@@ -217,6 +208,306 @@ pub(crate) fn install_binary_hot_safe(src: &Path, dst: &Path) -> Result<(), Stri
         strip_zone_identifier(dst);
         Ok(())
     }
+}
+
+fn sweep_old_backup_files(parent: &Path, leaf: &str) {
+    let _ = fs::remove_file(parent.join(format!("{leaf}.old")));
+    if let Ok(entries) = fs::read_dir(parent) {
+        for ent in entries.flatten() {
+            if let Some(name) = ent.file_name().to_str() {
+                if name.starts_with(leaf) && name.ends_with(".old") {
+                    let _ = fs::remove_file(ent.path());
+                }
+            }
+        }
+    }
+}
+
+/// Removes a legacy/duplicate binary copy (moving locked Windows executables aside via `.old` rename).
+fn remove_stale_binary_copy(path: &Path) {
+    if let (Some(parent), Some(leaf)) = (
+        path.parent().filter(|p| !p.as_os_str().is_empty()),
+        path.file_name().and_then(|s| s.to_str()),
+    ) {
+        if parent.is_dir() {
+            sweep_old_backup_files(parent, leaf);
+        }
+    }
+    if fs::symlink_metadata(path).is_err() {
+        return;
+    }
+    if fs::remove_file(path).is_err() {
+        #[cfg(windows)]
+        if let (Some(parent), Some(leaf)) = (
+            path.parent().filter(|p| !p.as_os_str().is_empty()),
+            path.file_name().and_then(|s| s.to_str()),
+        ) {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            let old_path = parent.join(format!("{leaf}.{}.{nanos}.old", std::process::id()));
+            if fs::rename(path, &old_path).is_ok() {
+                let _ = fs::remove_file(&old_path);
+            }
+        }
+    }
+}
+
+pub(crate) fn merge_windows_user_path_value(
+    existing_raw: &str,
+    user_profile_opt: Option<&str>,
+    bin_dir: &Path,
+) -> Option<String> {
+    let target_clean = bin_dir
+        .to_string_lossy()
+        .trim()
+        .trim_end_matches(['\\', '/'])
+        .to_owned();
+    if target_clean.is_empty() {
+        return None;
+    }
+    let target_cmp = target_clean.replace('/', "\\");
+    let up_clean = user_profile_opt
+        .map(|s| s.trim().trim_end_matches(['\\', '/']).replace('/', "\\"))
+        .filter(|s| !s.is_empty());
+
+    for raw_part in existing_raw.split(';') {
+        let clean_entry = raw_part
+            .trim()
+            .trim_matches('"')
+            .trim_end_matches(['\\', '/'])
+            .replace('/', "\\");
+        if clean_entry.is_empty() {
+            continue;
+        }
+        if clean_entry.eq_ignore_ascii_case(&target_cmp) {
+            return None;
+        }
+        if let Some(ref up) = up_clean {
+            if clean_entry
+                .get(..13)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("%USERPROFILE%"))
+            {
+                let expanded = format!("{up}{}", &clean_entry[13..]);
+                if expanded.eq_ignore_ascii_case(&target_cmp) {
+                    return None;
+                }
+            }
+        }
+    }
+
+    let base = existing_raw.trim().trim_end_matches(';');
+    if base.is_empty() {
+        Some(target_clean)
+    } else {
+        Some(format!("{base};{target_clean}"))
+    }
+}
+
+#[cfg(windows)]
+mod win_env_path {
+    use super::merge_windows_user_path_value;
+    use std::ffi::c_void;
+    use std::path::Path;
+    use std::ptr;
+
+    const HKEY_CURRENT_USER: *mut c_void = (-2147483647isize) as *mut c_void;
+    const HWND_BROADCAST: *mut c_void = 0xffffusize as *mut c_void;
+    const KEY_READ: u32 = 0x20019;
+    const KEY_WRITE: u32 = 0x20006;
+    const REG_SZ: u32 = 1;
+    const REG_EXPAND_SZ: u32 = 2;
+    const ERROR_FILE_NOT_FOUND: i32 = 2;
+    const WM_SETTINGCHANGE: u32 = 0x001A;
+    const SMTO_ABORTIFHUNG: u32 = 0x0002;
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegCreateKeyExW(
+            hkey: *mut c_void,
+            lp_sub_key: *const u16,
+            reserved: u32,
+            lp_class: *mut u16,
+            dw_options: u32,
+            sam_desired: u32,
+            lp_security_attributes: *const c_void,
+            phk_result: *mut *mut c_void,
+            lpdw_disposition: *mut u32,
+        ) -> i32;
+        fn RegQueryValueExW(
+            hkey: *mut c_void,
+            lp_value_name: *const u16,
+            lp_reserved: *const u32,
+            lp_type: *mut u32,
+            lp_data: *mut u8,
+            lpcb_data: *mut u32,
+        ) -> i32;
+        fn RegSetValueExW(
+            hkey: *mut c_void,
+            lp_value_name: *const u16,
+            reserved: u32,
+            dw_type: u32,
+            lp_data: *const u8,
+            cb_data: u32,
+        ) -> i32;
+        fn RegCloseKey(hkey: *mut c_void) -> i32;
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn SendMessageTimeoutW(
+            hwnd: *mut c_void,
+            msg: u32,
+            wparam: usize,
+            lparam: isize,
+            fu_flags: u32,
+            u_timeout: u32,
+            lpdw_result: *mut usize,
+        ) -> isize;
+    }
+
+    struct RegKeyGuard(*mut c_void);
+
+    impl Drop for RegKeyGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    let _ = RegCloseKey(self.0);
+                }
+            }
+        }
+    }
+
+    fn to_wide_z(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    pub(super) fn ensure_user_path_in_registry(bin_dir: &Path) -> Result<bool, String> {
+        let subkey = to_wide_z("Environment");
+        let val_name = to_wide_z("Path");
+        let mut hkey: *mut c_void = ptr::null_mut();
+        let rc = unsafe {
+            RegCreateKeyExW(
+                HKEY_CURRENT_USER,
+                subkey.as_ptr(),
+                0,
+                ptr::null_mut(),
+                0,
+                KEY_READ | KEY_WRITE,
+                ptr::null(),
+                &mut hkey,
+                ptr::null_mut(),
+            )
+        };
+        if rc != 0 || hkey.is_null() {
+            return Err(format!("Failed to open HKCU\\Environment (Win32 error {rc})"));
+        }
+        let _guard = RegKeyGuard(hkey);
+
+        let mut val_type: u32 = 0;
+        let mut cb_data: u32 = 0;
+        let q1 = unsafe {
+            RegQueryValueExW(
+                hkey,
+                val_name.as_ptr(),
+                ptr::null(),
+                &mut val_type,
+                ptr::null_mut(),
+                &mut cb_data,
+            )
+        };
+
+        let existing = if q1 == ERROR_FILE_NOT_FOUND {
+            val_type = REG_EXPAND_SZ;
+            String::new()
+        } else if q1 == 0 {
+            let mut raw = vec![0u8; cb_data as usize + 4];
+            let mut cb2 = raw.len() as u32;
+            let q2 = unsafe {
+                RegQueryValueExW(
+                    hkey,
+                    val_name.as_ptr(),
+                    ptr::null(),
+                    &mut val_type,
+                    raw.as_mut_ptr(),
+                    &mut cb2,
+                )
+            };
+            if q2 != 0 {
+                return Err(format!("Failed to read HKCU\\Environment\\Path (Win32 error {q2})"));
+            }
+            let used = (cb2 as usize).min(raw.len());
+            let mut units: Vec<u16> = raw[..used]
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            while units.last() == Some(&0) {
+                units.pop();
+            }
+            String::from_utf16_lossy(&units)
+        } else {
+            return Err(format!("Failed to query HKCU\\Environment\\Path (Win32 error {q1})"));
+        };
+
+        let user_profile = std::env::var("USERPROFILE").ok();
+        let Some(merged) =
+            merge_windows_user_path_value(&existing, user_profile.as_deref(), bin_dir)
+        else {
+            return Ok(false);
+        };
+
+        let out_type = if val_type == REG_SZ && !merged.contains('%') {
+            REG_SZ
+        } else {
+            REG_EXPAND_SZ
+        };
+        let wide_val = to_wide_z(&merged);
+        let byte_len = wide_val
+            .len()
+            .checked_mul(2)
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| "Windows user PATH exceeds registry size limits".to_owned())?;
+        let bytes: Vec<u8> = wide_val.iter().flat_map(|u| u.to_le_bytes()).collect();
+
+        let set_rc = unsafe {
+            RegSetValueExW(
+                hkey,
+                val_name.as_ptr(),
+                0,
+                out_type,
+                bytes.as_ptr(),
+                byte_len,
+            )
+        };
+        if set_rc != 0 {
+            return Err(format!("Failed to write HKCU\\Environment\\Path (Win32 error {set_rc})"));
+        }
+
+        let mut msg_result: usize = 0;
+        unsafe {
+            let _ = SendMessageTimeoutW(
+                HWND_BROADCAST,
+                WM_SETTINGCHANGE,
+                0,
+                subkey.as_ptr() as isize,
+                SMTO_ABORTIFHUNG,
+                1000,
+                &mut msg_result,
+            );
+        }
+        Ok(true)
+    }
+}
+
+#[cfg(windows)]
+fn ensure_windows_user_path_in_registry(bin_dir: &Path) -> Result<bool, String> {
+    win_env_path::ensure_user_path_in_registry(bin_dir)
+}
+
+#[cfg(not(windows))]
+fn ensure_windows_user_path_in_registry(bin_dir: &Path) -> Result<bool, String> {
+    let _ = merge_windows_user_path_value("", None, bin_dir);
+    Ok(false)
 }
 
 fn resolve_effective_home(home_override: Option<&Path>) -> Result<PathBuf, String> {
@@ -357,40 +648,49 @@ fn probe_hook_command(
     }
     let formatted = format_hook_exec_token(hook_display_path);
 
-    #[cfg(windows)]
-    let mut cmd = {
-        let comspec = env::var_os("ComSpec")
-            .map(PathBuf::from)
-            .filter(|p| p.is_file())
-            .unwrap_or_else(|| PathBuf::from(r"C:\Windows\System32\cmd.exe"));
-        let mut c = Command::new(comspec);
-        c.args(["/C", &format!("{formatted} hook-pre-invocation")]);
-        c
-    };
+    // Tolerate short AV/EDR hash scans (e.g. Panda Zero-Trust / Defender) on newly written executables.
+    for attempt in 0..3 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(350));
+        }
+        #[cfg(windows)]
+        let mut cmd = {
+            let comspec = env::var_os("ComSpec")
+                .map(PathBuf::from)
+                .filter(|p| p.is_file())
+                .unwrap_or_else(|| PathBuf::from(r"C:\Windows\System32\cmd.exe"));
+            let mut c = Command::new(comspec);
+            c.args(["/C", &format!("{formatted} hook-pre-invocation")]);
+            c
+        };
 
-    #[cfg(not(windows))]
-    let mut cmd = {
-        let mut c = Command::new("/bin/sh");
-        c.args(["-c", &format!("{formatted} hook-pre-invocation")]);
-        c
-    };
+        #[cfg(not(windows))]
+        let mut cmd = {
+            let mut c = Command::new("/bin/sh");
+            c.args(["-c", &format!("{formatted} hook-pre-invocation")]);
+            c
+        };
 
-    cmd.env("HOME", home_dir)
-        .env("USERPROFILE", home_dir)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        cmd.env("HOME", home_dir)
+            .env("USERPROFILE", home_dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
 
-    let mut child = cmd.spawn().ok()?;
-    if let Some(ref mut stdin) = child.stdin {
-        let _ = stdin.write_all(b"{}");
+        let Ok(mut child) = cmd.spawn() else {
+            continue;
+        };
+        if let Some(ref mut stdin) = child.stdin {
+            let _ = stdin.write_all(b"{}");
+        }
+        if let Ok(out) = child.wait_with_output() {
+            if out.status.success() && String::from_utf8_lossy(&out.stdout).contains("injectSteps")
+            {
+                return Some(formatted);
+            }
+        }
     }
-    let out = child.wait_with_output().ok()?;
-    if out.status.success() && String::from_utf8_lossy(&out.stdout).contains("injectSteps") {
-        Some(formatted)
-    } else {
-        None
-    }
+    None
 }
 
 fn verify_ripgrep_binary(exe: &Path) -> bool {
@@ -407,16 +707,20 @@ fn verify_ripgrep_binary(exe: &Path) -> bool {
             .is_some_and(|l| l.starts_with("ripgrep "))
 }
 
-fn locate_local_ripgrep(home_dir: &Path) -> Option<PathBuf> {
+fn locate_rg_on_path() -> Option<PathBuf> {
     let exe_name = if cfg!(windows) { "rg.exe" } else { "rg" };
-    if let Some(path_env) = env::var_os("PATH") {
-        for dir in env::split_paths(&path_env) {
-            let cand = dir.join(exe_name);
-            if verify_ripgrep_binary(&cand) {
-                return Some(cand);
-            }
+    let path_env = env::var_os("PATH")?;
+    for dir in env::split_paths(&path_env) {
+        let cand = dir.join(exe_name);
+        if verify_ripgrep_binary(&cand) {
+            return Some(cand);
         }
     }
+    None
+}
+
+fn locate_local_ripgrep(home_dir: &Path) -> Option<PathBuf> {
+    let exe_name = if cfg!(windows) { "rg.exe" } else { "rg" };
     let candidates = [
         home_dir.join(".cargo").join("bin").join(exe_name),
         home_dir.join(".local").join("bin").join(exe_name),
@@ -700,13 +1004,12 @@ pub fn execute_install_command(opts: &InstallOptions) -> Result<InstallReport, S
     let skill_dir = plugin_dir.join("skills").join("libredb");
     let assets_dir = plugin_dir.join("assets");
 
-    for dir in [&bin_dir, &agy_bin_dir, &rules_dir, &skill_dir, &assets_dir] {
+    for dir in [&bin_dir, &rules_dir, &skill_dir, &assets_dir] {
         fs::create_dir_all(dir)
             .map_err(|e| format!("Failed to create directory '{}': {e}", dir.display()))?;
     }
     set_unix_mode(&libre_home, 0o700)?;
     set_unix_mode(&bin_dir, 0o755)?;
-    set_unix_mode(&agy_bin_dir, 0o755)?;
 
     let global_ldb = opts.global_path.clone().unwrap_or_else(|| {
         if opts.home_override.is_some() {
@@ -727,19 +1030,22 @@ pub fn execute_install_command(opts: &InstallOptions) -> Result<InstallReport, S
     )?;
     drop(existing_gdb);
 
-    let custom_mcp_exe = detect_existing_custom_mcp_command(&plugin_dir, &home_dir);
     let bin_name = if cfg!(windows) { "libredb.exe" } else { "libredb" };
     let target_exe = bin_dir.join(bin_name);
-    let agy_exe = agy_bin_dir.join(bin_name);
 
+    // Single canonical binary installation at `~/.gemini/libredb/bin/libredb(.exe)`.
     let mut installed_binaries = Vec::new();
     install_binary_hot_safe(&src_exe, &target_exe)?;
     installed_binaries.push(target_exe.display().to_string());
 
-    if canonical_compare_key(&agy_exe) != canonical_compare_key(&target_exe) {
-        install_binary_hot_safe(&src_exe, &agy_exe)?;
-        installed_binaries.push(agy_exe.display().to_string());
+    // Remove legacy/redundant duplicate binary copies and batch shims under `~/.gemini/antigravity/bin`.
+    remove_stale_binary_copy(&agy_bin_dir.join(bin_name));
+    let _ = fs::remove_file(agy_bin_dir.join("libredb.cmd"));
+
+    if opts.home_override.is_none() {
+        let _ = ensure_windows_user_path_in_registry(&bin_dir);
     }
+
     #[cfg(unix)]
     {
         let local_bin_dir = home_dir.join(".local").join("bin");
@@ -750,43 +1056,62 @@ pub fn execute_install_command(opts: &InstallOptions) -> Result<InstallReport, S
             )
         })?;
         set_unix_mode(&local_bin_dir, 0o755)?;
-        let local_exe = local_bin_dir.join(bin_name);
-        let local_key = canonical_compare_key(&local_exe);
-        if local_key != canonical_compare_key(&target_exe)
-            && local_key != canonical_compare_key(&agy_exe)
-        {
-            install_binary_hot_safe(&src_exe, &local_exe)?;
-            installed_binaries.push(local_exe.display().to_string());
+        if canonical_compare_key(&local_bin_dir) != canonical_compare_key(&bin_dir) {
+            let local_link = local_bin_dir.join(bin_name);
+            let is_symlink = fs::symlink_metadata(&local_link)
+                .is_ok_and(|m| m.file_type().is_symlink());
+            let points_to_target = fs::read_link(&local_link).is_ok_and(|cur| {
+                cur == target_exe
+                    || canonical_compare_key(&local_link) == canonical_compare_key(&target_exe)
+            });
+            if !is_symlink || !points_to_target {
+                let tmp_link = local_bin_dir.join(format!(".{bin_name}.lnk.{}", std::process::id()));
+                let _ = fs::remove_file(&tmp_link);
+                std::os::unix::fs::symlink(&target_exe, &tmp_link).map_err(|e| {
+                    format!(
+                        "Failed to create symlink '{}' -> '{}': {e}",
+                        local_link.display(),
+                        target_exe.display()
+                    )
+                })?;
+                fs::rename(&tmp_link, &local_link).map_err(|e| {
+                    let _ = fs::remove_file(&tmp_link);
+                    format!("Failed to install symlink '{}': {e}", local_link.display())
+                })?;
+            }
         }
-    }
-    let legacy_cmd_shim = agy_bin_dir.join("libredb.cmd");
-    if legacy_cmd_shim.exists() {
-        let _ = fs::remove_file(&legacy_cmd_shim);
     }
 
     if let Some(ext_dst) = copy_sibling_python_ext_if_present(&src_exe, &bin_dir) {
         installed_binaries.push(ext_dst.display().to_string());
     }
 
-    if let Some(ref custom_path) = custom_mcp_exe {
-        if canonical_compare_key(custom_path) != canonical_compare_key(&target_exe)
-            && canonical_compare_key(custom_path) != canonical_compare_key(&agy_exe)
-        {
-            if install_binary_hot_safe(&src_exe, custom_path).is_ok() {
-                installed_binaries.push(custom_path.display().to_string());
-            }
-        }
-    }
-
-    // Provision local ripgrep (rg) if missing in antigravity/bin.
+    // Discover ripgrep (`rg`) or provision into canonical `bin_dir` when absent from PATH.
     let rg_name = if cfg!(windows) { "rg.exe" } else { "rg" };
-    let dst_rg = agy_bin_dir.join(rg_name);
-    let ripgrep_path = if verify_ripgrep_binary(&dst_rg) {
-        Some(dst_rg.display().to_string())
+    let canonical_rg = bin_dir.join(rg_name);
+    let legacy_agy_rg = agy_bin_dir.join(rg_name);
+    let ripgrep_path = if verify_ripgrep_binary(&canonical_rg) {
+        Some(canonical_rg.display().to_string())
+    } else if verify_ripgrep_binary(&legacy_agy_rg) {
+        Some(legacy_agy_rg.display().to_string())
+    } else if let Some(path_rg) = locate_rg_on_path() {
+        Some(path_rg.display().to_string())
     } else if let Some(found_rg) = locate_local_ripgrep(&home_dir) {
-        let _ = install_binary_hot_safe(&found_rg, &dst_rg);
-        if verify_ripgrep_binary(&dst_rg) {
-            Some(dst_rg.display().to_string())
+        let _ = install_binary_hot_safe(&found_rg, &canonical_rg);
+        if verify_ripgrep_binary(&canonical_rg) {
+            #[cfg(unix)]
+            {
+                let local_bin_dir = home_dir.join(".local").join("bin");
+                if local_bin_dir.is_dir()
+                    && canonical_compare_key(&local_bin_dir) != canonical_compare_key(&bin_dir)
+                {
+                    let rg_link = local_bin_dir.join(rg_name);
+                    if fs::symlink_metadata(&rg_link).is_err() {
+                        let _ = std::os::unix::fs::symlink(&canonical_rg, &rg_link);
+                    }
+                }
+            }
+            Some(canonical_rg.display().to_string())
         } else {
             Some(found_rg.display().to_string())
         }
@@ -794,100 +1119,78 @@ pub fn execute_install_command(opts: &InstallOptions) -> Result<InstallReport, S
         None
     };
 
-    // Build ordered hook probe candidates (preserving existing AppLocker custom path first if present).
+    // Always probe canonical local `~/.gemini/libredb/bin/libredb(.exe)` FIRST; fall back to an
+    // external directory ONLY when explicitly requested via `--fallback-drive` or as last resort.
     let mut verified_hook_cmd: Option<String> = None;
     let mut verified_exe_path: Option<PathBuf> = None;
 
-    if !opts.no_hooks {
-        let mut candidates: Vec<(String, PathBuf)> = Vec::new();
-        if let Some(ref custom_path) = custom_mcp_exe {
-            if custom_path.is_file() {
-                candidates.push((custom_path.display().to_string(), custom_path.clone()));
-            }
+    let stage_fallback_root = |fb: &Path, installed: &mut Vec<String>| -> Option<(PathBuf, String)> {
+        if !test_safe_binary_dir(fb) {
+            return None;
         }
-        if cfg!(windows) {
-            if opts.home_override.is_none() {
-                candidates.push((
-                    r"%USERPROFILE%\.gemini\libredb\bin\libredb.exe".to_owned(),
-                    target_exe.clone(),
-                ));
-                candidates.push((
-                    r"%USERPROFILE%\.gemini\antigravity\bin\libredb.exe".to_owned(),
-                    agy_exe.clone(),
-                ));
-            } else {
-                candidates.push((target_exe.display().to_string(), target_exe.clone()));
-                candidates.push((agy_exe.display().to_string(), agy_exe.clone()));
-            }
-        } else {
-            if test_safe_binary_dir(&bin_dir) {
-                candidates.push((target_exe.display().to_string(), target_exe.clone()));
-            }
-            if test_safe_binary_dir(&agy_bin_dir) {
-                candidates.push((agy_exe.display().to_string(), agy_exe.clone()));
-            }
+        let fb_libre = fb.join(".gemini").join("libredb");
+        let fb_dir = fb_libre.join("bin");
+        let fb_exe = fb_dir.join(bin_name);
+        install_binary_hot_safe(&src_exe, &fb_exe).ok()?;
+        let _ = set_unix_mode(&fb_libre, 0o700);
+        let _ = set_unix_mode(&fb_dir, 0o755);
+        if let Some(ref rg_src) = locate_rg_on_path().or_else(|| locate_local_ripgrep(&home_dir)) {
+            let _ = install_binary_hot_safe(rg_src, &fb_dir.join(rg_name));
         }
+        let disp = fb_exe.display().to_string();
+        installed.push(disp.clone());
+        Some((fb_exe, disp))
+    };
 
-        for (display_cmd, disk_exe) in candidates {
+    if !opts.no_hooks {
+        let local_cand = if cfg!(windows) && opts.home_override.is_none() {
+            Some((
+                r"%USERPROFILE%\.gemini\libredb\bin\libredb.exe".to_owned(),
+                target_exe.clone(),
+            ))
+        } else if cfg!(windows) || test_safe_binary_dir(&bin_dir) {
+            Some((target_exe.display().to_string(), target_exe.clone()))
+        } else {
+            None
+        };
+
+        if let Some((display_cmd, disk_exe)) = local_cand {
             if let Some(formatted) = probe_hook_command(&display_cmd, &disk_exe, &home_dir) {
                 verified_hook_cmd = Some(formatted);
                 verified_exe_path = Some(disk_exe);
-                break;
             }
         }
 
-        // Enterprise AppLocker / noexec fallback check when default home dirs cannot execute hooks:
-        let mut fallback_roots: Vec<PathBuf> = Vec::new();
-        if let Some(ref fb) = opts.fallback_drive {
-            fallback_roots.push(fb.clone());
-        }
         if verified_hook_cmd.is_none() {
-            #[cfg(windows)]
-            {
-                let home_root = home_dir.components().next().map(|c| PathBuf::from(c.as_os_str()));
-                for probe_p in [&src_exe, &env::current_dir().unwrap_or_default()] {
-                    if let Some(comp) = probe_p.components().next() {
-                        let root = PathBuf::from(format!("{}\\", comp.as_os_str().to_string_lossy()));
-                        if home_root.as_ref().is_none_or(|hr| {
-                            !root
-                                .to_string_lossy()
-                                .trim_end_matches('\\')
-                                .eq_ignore_ascii_case(hr.to_string_lossy().trim_end_matches('\\'))
-                        }) && !fallback_roots.contains(&root)
-                        {
-                            fallback_roots.push(root);
-                        }
-                    }
-                }
-            }
-            for drv in fallback_roots {
-                if !test_safe_binary_dir(&drv) {
-                    continue;
-                }
-                let fb_libre = drv.join(".gemini").join("libredb");
-                let fb_dir = fb_libre.join("bin");
-                let fb_exe = fb_dir.join(bin_name);
-                if install_binary_hot_safe(&src_exe, &fb_exe).is_ok() {
-                    let _ = set_unix_mode(&fb_libre, 0o700);
-                    let _ = set_unix_mode(&fb_dir, 0o755);
-                    if let Some(ref rg_src) = locate_local_ripgrep(&home_dir) {
-                        let _ = install_binary_hot_safe(rg_src, &fb_dir.join(rg_name));
-                    }
-                    let disp = fb_exe.display().to_string();
+            if let Some(ref fb) = opts.fallback_drive {
+                if let Some((fb_exe, disp)) = stage_fallback_root(fb, &mut installed_binaries) {
                     if let Some(formatted) = probe_hook_command(&disp, &fb_exe, &home_dir) {
-                        installed_binaries.push(disp);
                         verified_hook_cmd = Some(formatted);
                         verified_exe_path = Some(fb_exe);
-                        break;
+                    }
+                }
+            } else if let Some(custom_path) =
+                detect_existing_custom_mcp_command(&plugin_dir, &home_dir)
+            {
+                if install_binary_hot_safe(&src_exe, &custom_path).is_ok() {
+                    let disp = custom_path.display().to_string();
+                    if let Some(formatted) = probe_hook_command(&disp, &custom_path, &home_dir) {
+                        installed_binaries.push(disp);
+                        verified_hook_cmd = Some(formatted);
+                        verified_exe_path = Some(custom_path);
                     }
                 }
             }
         }
+    } else if let Some(ref fb) = opts.fallback_drive {
+        if let Some((fb_exe, _)) = stage_fallback_root(fb, &mut installed_binaries) {
+            verified_exe_path = Some(fb_exe);
+        }
+    } else {
+        verified_exe_path = Some(target_exe.clone());
     }
 
-    let mcp_exe = verified_exe_path
-        .or(custom_mcp_exe.filter(|p| p.is_file()))
-        .unwrap_or_else(|| target_exe.clone());
+    let mcp_exe = verified_exe_path.unwrap_or_else(|| target_exe.clone());
     let mcp_exe_fwd = mcp_exe.to_string_lossy().replace('\\', "/");
     let global_fwd = global_ldb.to_string_lossy().replace('\\', "/");
 
@@ -1555,27 +1858,35 @@ mod tests {
     }
 
     #[test]
-    fn standalone_install_creates_plugin_preserves_profile_and_preserves_custom_applocker_mcp_path() {
+    fn standalone_install_creates_plugin_preserves_profile_and_resets_stale_foreign_mcp_path() {
         let tmp = temp_installer_dir("standalone_install");
         let fake_home = tmp.join("user_home");
-        let custom_dir = tmp.join("corp_applocker_share").join("bin");
-        let custom_exe = custom_dir.join(if cfg!(windows) { "libredb.exe" } else { "libredb" });
+        let stale_foreign_dir = tmp.join("stale_q_drive").join(".gemini").join("libredb").join("bin");
+        let bin_name = if cfg!(windows) { "libredb.exe" } else { "libredb" };
+        let stale_foreign_exe = stale_foreign_dir.join(bin_name);
         let plugin_dir = fake_home
             .join(".gemini")
             .join("config")
             .join("plugins")
             .join("libredb");
-        fs::create_dir_all(&custom_dir).unwrap();
+        let agy_bin_dir = fake_home.join(".gemini").join("antigravity").join("bin");
+        fs::create_dir_all(&stale_foreign_dir).unwrap();
         fs::create_dir_all(&plugin_dir).unwrap();
+        fs::create_dir_all(&agy_bin_dir).unwrap();
 
-        // Pre-seed custom AppLocker-permitted binary path in mcp_config.json:
-        let custom_fwd = custom_exe.to_string_lossy().replace('\\', "/");
+        // Pre-seed stale duplicate in `~/.gemini/antigravity/bin` and stale foreign path in `mcp_config.json`:
+        let stale_agy_exe = agy_bin_dir.join(bin_name);
+        let stale_agy_cmd = agy_bin_dir.join("libredb.cmd");
+        fs::write(&stale_agy_exe, b"stale_duplicate").unwrap();
+        fs::write(&stale_agy_cmd, b"@echo off\r\n").unwrap();
+
+        let stale_foreign_fwd = stale_foreign_exe.to_string_lossy().replace('\\', "/");
         fs::write(
             plugin_dir.join("mcp_config.json"),
             serde_json::to_string_pretty(&json!({
                 "mcpServers": {
                     "libredb-mcp": {
-                        "command": custom_fwd,
+                        "command": stale_foreign_fwd,
                         "args": ["mcp-serve", "--global", "old.ldb"]
                     }
                 }
@@ -1584,7 +1895,11 @@ mod tests {
         )
         .unwrap();
 
-        // 1. Install with Personal profile using no external skills dir -> must hydrate embedded design skills
+        let canonical_exe = fake_home.join(".gemini").join("libredb").join("bin").join(bin_name);
+        let canonical_fwd = canonical_exe.to_string_lossy().replace('\\', "/");
+
+        // 1. Install with Personal profile & no fallback drive -> must use canonical local binary,
+        // never write to stale_q_drive, and remove duplicate binaries from antigravity/bin.
         let rep1 = execute_install_command(&InstallOptions {
             binary_path: None,
             profile: Some("personal".to_owned()),
@@ -1595,9 +1910,50 @@ mod tests {
             quiet_stdout: true,
         })
         .unwrap();
+        let canonical_bin_dir = canonical_exe
+            .parent()
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        let assert_single_canonical = |installed: &[String]| {
+            let exe_entries: Vec<&String> = installed
+                .iter()
+                .filter(|p| Path::new(p).file_name().and_then(|s| s.to_str()) == Some(bin_name))
+                .collect();
+            assert_eq!(
+                exe_entries,
+                vec![&canonical_exe.display().to_string()],
+                "Expected exactly one canonical CLI executable, got: {installed:?}"
+            );
+            assert!(
+                installed
+                    .iter()
+                    .all(|p| p.replace('\\', "/").starts_with(&canonical_bin_dir)),
+                "All installed binaries must stay inside canonical bin dir: {installed:?}"
+            );
+        };
         assert_eq!(rep1.profile, InstallProfile::Personal);
-        assert_eq!(rep1.mcp_command, custom_fwd);
-        assert!(custom_exe.is_file(), "Custom AppLocker binary path must be updated");
+        assert_eq!(rep1.mcp_command, canonical_fwd);
+        assert_single_canonical(&rep1.installed_binaries);
+        assert!(canonical_exe.is_file(), "Canonical binary must exist at ~/.gemini/libredb/bin");
+        assert!(
+            !stale_foreign_exe.exists(),
+            "Stale foreign drive binary must never be recreated or preferred"
+        );
+        assert!(
+            !stale_agy_exe.exists() && !stale_agy_cmd.exists(),
+            "Stale duplicate binaries under ~/.gemini/antigravity/bin must be removed"
+        );
+        #[cfg(unix)]
+        {
+            let local_link = fake_home.join(".local").join("bin").join(bin_name);
+            let meta = fs::symlink_metadata(&local_link).expect("~/.local/bin/libredb symlink");
+            assert!(
+                meta.file_type().is_symlink(),
+                "~/.local/bin/libredb must be a symlink to canonical binary, not a physical copy"
+            );
+            assert_eq!(fs::read_link(&local_link).unwrap(), canonical_exe);
+        }
         assert!(plugin_dir.join("plugin.json").is_file());
         assert!(plugin_dir.join("hooks.json").is_file());
         assert!(plugin_dir.join("rules").join("AGENTS.md").is_file());
@@ -1624,7 +1980,39 @@ mod tests {
         })
         .unwrap();
         assert_eq!(rep2.profile, InstallProfile::Personal);
-        assert_eq!(rep2.mcp_command, custom_fwd);
+        assert_eq!(rep2.mcp_command, canonical_fwd);
+        assert_single_canonical(&rep2.installed_binaries);
+
+        // 3. Verify pure Windows HKCU\Environment\Path merging & deduplication logic.
+        let win_bin = Path::new(r"C:\Users\alice\.gemini\libredb\bin");
+        assert_eq!(
+            merge_windows_user_path_value("", Some(r"C:\Users\alice"), win_bin),
+            Some(r"C:\Users\alice\.gemini\libredb\bin".to_owned())
+        );
+        assert_eq!(
+            merge_windows_user_path_value(
+                r"%SystemRoot%\system32;%USERPROFILE%\.gemini\libredb\bin\",
+                Some(r"C:\Users\alice"),
+                win_bin
+            ),
+            None
+        );
+        assert_eq!(
+            merge_windows_user_path_value(
+                r"C:\Users\Alice\.gemini\libredb\bin;C:\Tools",
+                Some(r"C:\Users\alice"),
+                win_bin
+            ),
+            None
+        );
+        assert_eq!(
+            merge_windows_user_path_value(
+                r"%SystemRoot%\system32;%USERPROFILE%\AppData\Local\Programs;",
+                Some(r"C:\Users\alice"),
+                win_bin
+            ),
+            Some(r"%SystemRoot%\system32;%USERPROFILE%\AppData\Local\Programs;C:\Users\alice\.gemini\libredb\bin".to_owned())
+        );
 
         let _ = fs::remove_dir_all(&tmp);
     }

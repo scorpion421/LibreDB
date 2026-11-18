@@ -56,7 +56,7 @@ guardrail: build
 ## Remove installed Antigravity plugin and PATH binary while preserving ~/.gemini/libredb/*.ldb data
 uninstall:
 	rm -rf "$$HOME/.gemini/config/plugins/libredb"
-	rm -f "$$HOME/.gemini/antigravity/bin/libredb" "$$HOME/.local/bin/libredb"
+	rm -f "$$HOME/.gemini/libredb/bin/libredb" "$$HOME/.gemini/libredb/bin/libredb.so" "$$HOME/.gemini/antigravity/bin/libredb" "$$HOME/.local/bin/libredb"
 	@echo "[OK] Removed LibreDB plugin and PATH shims (preserved user databases in $$HOME/.gemini/libredb)."
 
 ## Clean Cargo build artifacts

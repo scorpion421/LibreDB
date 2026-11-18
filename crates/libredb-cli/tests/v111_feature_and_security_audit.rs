@@ -796,7 +796,30 @@ fn standalone_cli_install_verifies_live_hooks_and_posix_local_bin() {
     let sbx = fresh_sandbox("standalone_cli_install");
     let bin = env!("CARGO_BIN_EXE_libredb");
     let fake_home = sbx.0.join("fake_home");
-    fs::create_dir_all(&fake_home).unwrap();
+    let plugin_dir = fake_home
+        .join(".gemini")
+        .join("config")
+        .join("plugins")
+        .join("libredb");
+    let stale_agy_dir = fake_home.join(".gemini").join("antigravity").join("bin");
+    let bin_name = if cfg!(windows) { "libredb.exe" } else { "libredb" };
+    let stale_agy_exe = stale_agy_dir.join(bin_name);
+    fs::create_dir_all(&plugin_dir).unwrap();
+    fs::create_dir_all(&stale_agy_dir).unwrap();
+    fs::write(&stale_agy_exe, b"stale_duplicate_binary").unwrap();
+    fs::write(
+        plugin_dir.join("mcp_config.json"),
+        serde_json::to_string_pretty(&json!({
+            "mcpServers": {
+                "libredb-mcp": {
+                    "command": format!("Q:/stale/{bin_name}"),
+                    "args": ["mcp-serve", "--global", "old.ldb"]
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
 
     let out = Command::new(bin)
         .args(["install", "--home", &fake_home.to_string_lossy(), "--json"])
@@ -815,12 +838,18 @@ fn standalone_cli_install_verifies_live_hooks_and_posix_local_bin() {
     let rep: Value = serde_json::from_slice(&out.stdout).expect("valid install JSON");
     assert_eq!(rep.get("hooks_enabled").and_then(Value::as_bool), Some(true));
     assert_eq!(rep.get("profile").and_then(Value::as_str), Some("neutral"));
+    let canonical_exe = fake_home.join(".gemini").join("libredb").join("bin").join(bin_name);
+    let canonical_fwd = canonical_exe.to_string_lossy().replace('\\', "/");
+    assert_eq!(
+        rep.get("mcp_command").and_then(Value::as_str),
+        Some(canonical_fwd.as_str()),
+        "Installer must reset stale foreign mcp_command back to local canonical binary"
+    );
+    assert!(
+        !stale_agy_exe.exists(),
+        "Stale duplicate binary in ~/.gemini/antigravity/bin must be removed"
+    );
 
-    let plugin_dir = fake_home
-        .join(".gemini")
-        .join("config")
-        .join("plugins")
-        .join("libredb");
     let hooks_raw = fs::read_to_string(plugin_dir.join("hooks.json")).unwrap();
     assert!(
         hooks_raw.contains("hook-pre-invocation"),
@@ -838,9 +867,11 @@ fn standalone_cli_install_verifies_live_hooks_and_posix_local_bin() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        let local_link = fake_home.join(".local").join("bin").join("libredb");
+        let meta = fs::symlink_metadata(&local_link).expect("~/.local/bin/libredb symlink");
         assert!(
-            fake_home.join(".local").join("bin").join("libredb").is_file(),
-            "Expected ~/.local/bin/libredb to be installed on Unix"
+            meta.file_type().is_symlink(),
+            "Expected ~/.local/bin/libredb to be a symlink on Unix"
         );
         let dir_mode = fs::metadata(&libre_home).unwrap().permissions().mode();
         let db_mode = fs::metadata(&global_ldb).unwrap().permissions().mode();

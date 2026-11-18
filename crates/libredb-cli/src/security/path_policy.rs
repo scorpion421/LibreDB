@@ -50,6 +50,7 @@ pub fn check_tool_write_path_policy_with_base(
             || slash_low.ends_with("/.gemini/config/plugins/libredb")
             || slash_low.ends_with("/.gemini/antigravity/bin/libredb")
             || slash_low.ends_with("/.gemini/antigravity/bin/libredb.exe")
+            || slash_low.ends_with("/.local/bin/libredb")
         {
             return Some(
                 "Direct agent modification of active LibreDB control-plane files, binaries, or trust stores under ~/.gemini is blocked."

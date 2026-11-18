@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.2] - 2026-11-18
+
+### Changed
+- **Single canonical binary installation and automatic user `PATH` registration (`libredb install`, `libredb update`, `deploy_plugin.ps1`, `deploy_plugin.sh`)**: Consolidated local installations to a single canonical binary under `~/.gemini/libredb/bin`, automatically appending `~/.gemini/libredb/bin` to the Windows user `PATH` registry entry (`HKCU\Environment\Path`), exposing `~/.local/bin/libredb` as a symbolic link on Linux and macOS, and removing legacy duplicate binaries or batch wrappers from `~/.gemini/antigravity/bin`. This keeps only one binary hash on disk so endpoint security tools trust updates cleanly across versions.
+
+### Fixed
+- **Eliminated unintended network-drive failovers and updated `PreInvocation` prompt parsing**: Always probes the canonical local `~/.gemini/libredb/bin` executable first (with a short three-attempt tolerance for initial AV/EDR hash scans), resets previously stranded external paths back to the local binary once it passes, and restricts external staging strictly to explicit `--fallback-drive` / `-FallbackDrive` requests instead of inferring working-directory drives. Also prioritizes `"lastUserInput"` / `"last_user_input"` on `PreInvocation` `stdin` payloads so Antigravity `v2.28+` prompts resolve directly in memory without reading `transcript.jsonl` from disk.
+
 ## [2.4.1] - 2026-11-18
 
 ### Fixed

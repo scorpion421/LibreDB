@@ -2,15 +2,16 @@ param(
     [ValidateSet("Neutral", "Personal")]
     [string]$Profile = "Neutral",
     [switch]$NoHooks,
-    [string]$BinaryPath = ""
+    [string]$BinaryPath = "",
+    [string]$FallbackDrive = ""
 )
 
 $ErrorActionPreference = "Stop"
 
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $VersionFile = Join-Path $ProjectRoot "VERSION"
-$LibreVersion = if (Test-Path $VersionFile) { (Get-Content -Raw $VersionFile).Trim() } else { "2.4.1" }
-if (-not $LibreVersion) { $LibreVersion = "2.4.1" }
+$LibreVersion = if (Test-Path $VersionFile) { (Get-Content -Raw $VersionFile).Trim() } else { "2.4.2" }
+if (-not $LibreVersion) { $LibreVersion = "2.4.2" }
 $UserHome = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
 $GeminiDir = Join-Path $UserHome ".gemini"
 $LibreHome = Join-Path $GeminiDir "libredb"
@@ -62,35 +63,116 @@ function Install-BinaryHotSafe {
     Unblock-File -Path $Dst -ErrorAction SilentlyContinue
 }
 
+function Remove-StaleBinaryCopy {
+    param([string]$TargetPath)
+    $TargetDir = Split-Path -Parent $TargetPath
+    $TargetLeaf = Split-Path -Leaf $TargetPath
+    if (Test-Path -LiteralPath $TargetDir) {
+        Remove-Item "$TargetPath.old" -Force -ErrorAction SilentlyContinue
+        Get-ChildItem -LiteralPath $TargetDir -Filter "$TargetLeaf.*.old" -ErrorAction SilentlyContinue |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+    }
+    if (-not (Test-Path -LiteralPath $TargetPath)) {
+        return
+    }
+    try {
+        Remove-Item -LiteralPath $TargetPath -Force -ErrorAction Stop
+    } catch {
+        try {
+            $OldPath = "$TargetPath.$PID.$([Environment]::TickCount64).old"
+            Move-Item -LiteralPath $TargetPath -Destination $OldPath -Force -ErrorAction Stop
+            Remove-Item -LiteralPath $OldPath -Force -ErrorAction SilentlyContinue
+        } catch {
+        }
+    }
+}
+
+function Ensure-UserPathContains {
+    param([string]$DirToAdd)
+    $CleanTarget = $DirToAdd.Trim().TrimEnd('\', '/')
+    if (-not $CleanTarget) { return }
+    $CurrentSessionHas = ($env:PATH -split ';') | Where-Object {
+        $_.Trim().Trim('"').TrimEnd('\', '/').Equals($CleanTarget, [System.StringComparison]::OrdinalIgnoreCase)
+    }
+    if (-not $CurrentSessionHas) {
+        $env:PATH = "$CleanTarget;$env:PATH"
+    }
+    try {
+        $EnvKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("Environment")
+        try {
+            $ExistingRaw = [string]$EnvKey.GetValue("Path", "", [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            $ValKind = [Microsoft.Win32.RegistryValueKind]::ExpandString
+            try {
+                if ($EnvKey.GetValueNames() -contains "Path") {
+                    $ExistingKind = $EnvKey.GetValueKind("Path")
+                    if ($ExistingKind -eq [Microsoft.Win32.RegistryValueKind]::String -and -not $ExistingRaw.Contains('%')) {
+                        $ValKind = [Microsoft.Win32.RegistryValueKind]::String
+                    }
+                }
+            } catch {
+            }
+            $AlreadyPresent = $false
+            foreach ($Part in ($ExistingRaw -split ';')) {
+                $CleanPart = $Part.Trim().Trim('"').TrimEnd('\', '/')
+                if (-not $CleanPart) { continue }
+                $ExpandedPart = if ($UserHome -and $CleanPart -match '^(?i)%USERPROFILE%(.*)$') {
+                    $UserHome.TrimEnd('\', '/') + $Matches[1]
+                } else {
+                    $CleanPart
+                }
+                if ($CleanPart.Equals($CleanTarget, [System.StringComparison]::OrdinalIgnoreCase) -or
+                    $ExpandedPart.Equals($CleanTarget, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    $AlreadyPresent = $true
+                    break
+                }
+            }
+            if (-not $AlreadyPresent) {
+                $TrimmedBase = $ExistingRaw.Trim().TrimEnd(';')
+                $NewVal = if ($TrimmedBase) { "$TrimmedBase;$CleanTarget" } else { $CleanTarget }
+                $EnvKey.SetValue("Path", $NewVal, $ValKind)
+                if (-not ("LibreDbNativeWin32.UserEnv" -as [type])) {
+                    Add-Type -Namespace LibreDbNativeWin32 -Name UserEnv -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("user32.dll", SetLastError=true, CharSet=System.Runtime.InteropServices.CharSet.Unicode)]
+public static extern System.IntPtr SendMessageTimeout(System.IntPtr hWnd, uint Msg, System.UIntPtr wParam, string lParam, uint fuFlags, uint uTimeout, out System.UIntPtr lpdwResult);
+'@
+                }
+                $MsgRes = [System.UIntPtr]::Zero
+                [void][LibreDbNativeWin32.UserEnv]::SendMessageTimeout([IntPtr]0xffff, 0x001A, [UIntPtr]::Zero, "Environment", 0x0002, 1000, [ref]$MsgRes)
+                Write-Output "[OK] Added canonical binary directory to user PATH: $CleanTarget"
+            }
+        } finally {
+            $EnvKey.Close()
+        }
+    } catch {
+        Write-Output "[WARN] Could not update HKCU\Environment\Path: $_"
+    }
+}
+
 $TargetExe = Join-Path $BinDir "libredb.exe"
 Install-BinaryHotSafe -Src $ReleaseExe -Dst $TargetExe
 if (Test-Path $ReleaseDll) {
     Install-BinaryHotSafe -Src $ReleaseDll -Dst (Join-Path $BinDir "libredb.pyd")
 }
 
-# Install native `libredb.exe` PE binary directly into `~/.gemini/antigravity/bin` (and any user PATH shim dir)
-# instead of a `.cmd` batch wrapper, avoiding Enterprise AppLocker/SRP script blocks and `cmd.exe` spawn overhead.
-$TargetPathDirs = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+Ensure-UserPathContains -DirToAdd $BinDir
+
+# Remove legacy duplicate binary copies and batch shims so only `~/.gemini/libredb/bin/libredb.exe` exists locally.
+$LegacyPathDirs = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 $DefaultAgyBin = Join-Path $GeminiDir "antigravity\bin"
-[void]$TargetPathDirs.Add($DefaultAgyBin)
+[void]$LegacyPathDirs.Add($DefaultAgyBin)
 $SkillsDbCmd = Get-Command skillsdb -ErrorAction SilentlyContinue
 if ($SkillsDbCmd -and $SkillsDbCmd.Source) {
     $ShimDir = Split-Path -Parent $SkillsDbCmd.Source
     if ($ShimDir.StartsWith($UserHome, [System.StringComparison]::OrdinalIgnoreCase)) {
-        [void]$TargetPathDirs.Add($ShimDir)
+        [void]$LegacyPathDirs.Add($ShimDir)
     }
 }
-foreach ($PathDir in $TargetPathDirs) {
-    New-Item -ItemType Directory -Force -Path $PathDir | Out-Null
-    $LegacyCmdShim = Join-Path $PathDir "libredb.cmd"
-    if (Test-Path $LegacyCmdShim) {
-        Remove-Item $LegacyCmdShim -Force -ErrorAction SilentlyContinue
+foreach ($PathDir in $LegacyPathDirs) {
+    if ($PathDir.TrimEnd('\', '/').Equals($BinDir.TrimEnd('\', '/'), [System.StringComparison]::OrdinalIgnoreCase)) {
+        continue
     }
-    $DirectExePath = Join-Path $PathDir "libredb.exe"
-    if (-not $DirectExePath.Equals($TargetExe, [System.StringComparison]::OrdinalIgnoreCase)) {
-        Install-BinaryHotSafe -Src $ReleaseExe -Dst $DirectExePath
-        Write-Output "[OK] Installed native PATH CLI binary at: $DirectExePath"
-    }
+    Remove-StaleBinaryCopy -TargetPath (Join-Path $PathDir "libredb.cmd")
+    Remove-StaleBinaryCopy -TargetPath (Join-Path $PathDir "libredb.exe")
 }
 
 function Test-RipgrepBinary {
@@ -149,9 +231,15 @@ $script:ProvisionedRg = $null
 function Ensure-RipgrepOnPath {
     param([string]$DefaultBinDir)
     $DstRg = Join-Path $DefaultBinDir "rg.exe"
+    $LegacyAgyRg = Join-Path $GeminiDir "antigravity\bin\rg.exe"
     if (Test-RipgrepBinary -ExePath $DstRg) {
         $script:ProvisionedRg = $DstRg
         Write-Output "[OK] Native ripgrep (rg.exe) verified at: $DstRg"
+        return
+    }
+    if (Test-RipgrepBinary -ExePath $LegacyAgyRg) {
+        $script:ProvisionedRg = $LegacyAgyRg
+        Write-Output "[OK] Native ripgrep (rg.exe) verified at: $LegacyAgyRg"
         return
     }
     $ExistingRg = Get-Command rg -ErrorAction SilentlyContinue
@@ -182,7 +270,7 @@ function Ensure-RipgrepOnPath {
     Write-Output "[INFO] ripgrep (rg.exe) not found locally and winget install unavailable."
 }
 
-Ensure-RipgrepOnPath -DefaultBinDir $DefaultAgyBin
+Ensure-RipgrepOnPath -DefaultBinDir $BinDir
 
 # Seed ~/.gemini/libredb/customizations.ldb cleanly when absent.
 $GlobalLdb = Join-Path $LibreHome "customizations.ldb"
@@ -250,54 +338,49 @@ function Test-SafeBinaryAcl {
     }
 }
 
-$PrimaryHookCandidates = @(
-    @{ Hook = "%USERPROFILE%\.gemini\libredb\bin\libredb.exe"; Path = $TargetExe },
-    @{ Hook = "%USERPROFILE%\.gemini\antigravity\bin\libredb.exe"; Path = (Join-Path $DefaultAgyBin "libredb.exe") }
-)
 $VerifiedHookCmd = $null
 $VerifiedExePath = $null
-foreach ($Cand in $PrimaryHookCandidates) {
-    $CandCmd = $Cand.Hook
-    $FormattedCmd = if ($CandCmd.Contains(' ')) { '"' + $CandCmd + '"' } else { $CandCmd }
+$CanonicalHookToken = "%USERPROFILE%\.gemini\libredb\bin\libredb.exe"
+$FormattedCanonicalCmd = if ($CanonicalHookToken.Contains(' ')) { '"' + $CanonicalHookToken + '"' } else { $CanonicalHookToken }
+for ($attempt = 0; $attempt -lt 3; $attempt++) {
+    if ($attempt -gt 0) {
+        Start-Sleep -Milliseconds 350
+    }
     try {
-        $ProbeOut = "{}" | & $env:ComSpec /c "$FormattedCmd hook-pre-invocation" 2>$null
+        $ProbeOut = "{}" | & $env:ComSpec /c "$FormattedCanonicalCmd hook-pre-invocation" 2>$null
         if ($LASTEXITCODE -eq 0 -and ($ProbeOut -join "") -match "injectSteps") {
-            $VerifiedHookCmd = $FormattedCmd
-            $VerifiedExePath = $Cand.Path
+            $VerifiedHookCmd = $FormattedCanonicalCmd
+            $VerifiedExePath = $TargetExe
             break
         }
     } catch {
     }
 }
 
-# Fallback for Enterprise AD workstations where `%USERPROFILE%` is SRP-blocked and `$ProjectRoot`
-# resides on an ACL-restricted personal network home share (e.g. `Q:\`): stage outside `target\`!
-if ($null -eq $VerifiedHookCmd) {
-    $HomeRoot = [System.IO.Path]::GetPathRoot($UserHome)
-    $ProjDriveRoot = [System.IO.Path]::GetPathRoot($ProjectRoot)
-    if ($ProjDriveRoot -and (-not $ProjDriveRoot.Equals($HomeRoot, [System.StringComparison]::OrdinalIgnoreCase))) {
-        if (Test-SafeBinaryAcl -CheckPath $ProjDriveRoot) {
-            $DriveHookDir = Join-Path $ProjDriveRoot ".gemini\libredb\bin"
-            try {
-                New-Item -ItemType Directory -Force -Path $DriveHookDir -ErrorAction Stop | Out-Null
-                if (Test-SafeBinaryAcl -CheckPath $DriveHookDir) {
-                    $DriveHookExe = Join-Path $DriveHookDir "libredb.exe"
-                    Install-BinaryHotSafe -Src $ReleaseExe -Dst $DriveHookExe
-                    if ($ProvisionedRg -and (Test-Path $ProvisionedRg)) {
-                        Install-BinaryHotSafe -Src $ProvisionedRg -Dst (Join-Path $DriveHookDir "rg.exe")
-                    }
-                    $FormattedCmd = if ($DriveHookExe.Contains(' ')) { '"' + $DriveHookExe + '"' } else { $DriveHookExe }
-                    $ProbeOut = "{}" | & $env:ComSpec /c "$FormattedCmd hook-pre-invocation" 2>$null
-                    if ($LASTEXITCODE -eq 0 -and ($ProbeOut -join "") -match "injectSteps") {
-                        $VerifiedHookCmd = $FormattedCmd
-                        $VerifiedExePath = $DriveHookExe
-                    }
+# Explicit opt-in fallback ONLY via -FallbackDrive <dir> (never auto-derived from workspace or current_dir):
+if (($null -eq $VerifiedHookCmd) -and $FallbackDrive -and $FallbackDrive.Trim()) {
+    $FbRoot = $FallbackDrive.Trim()
+    if (Test-SafeBinaryAcl -CheckPath $FbRoot) {
+        $DriveHookDir = Join-Path $FbRoot ".gemini\libredb\bin"
+        try {
+            New-Item -ItemType Directory -Force -Path $DriveHookDir -ErrorAction Stop | Out-Null
+            if (Test-SafeBinaryAcl -CheckPath $DriveHookDir) {
+                $DriveHookExe = Join-Path $DriveHookDir "libredb.exe"
+                Install-BinaryHotSafe -Src $ReleaseExe -Dst $DriveHookExe
+                if ($ProvisionedRg -and (Test-Path $ProvisionedRg)) {
+                    Install-BinaryHotSafe -Src $ProvisionedRg -Dst (Join-Path $DriveHookDir "rg.exe")
                 }
-            } catch {
+                $FormattedCmd = if ($DriveHookExe.Contains(' ')) { '"' + $DriveHookExe + '"' } else { $DriveHookExe }
+                $ProbeOut = "{}" | & $env:ComSpec /c "$FormattedCmd hook-pre-invocation" 2>$null
+                if ($LASTEXITCODE -eq 0 -and ($ProbeOut -join "") -match "injectSteps") {
+                    $VerifiedHookCmd = $FormattedCmd
+                    $VerifiedExePath = $DriveHookExe
+                }
             }
-        } else {
-            Write-Output "[WARN] Skipping fallback drive hook root $ProjDriveRoot due to broad multi-user write ACL."
+        } catch {
         }
+    } else {
+        Write-Output "[WARN] Skipping -FallbackDrive root $FbRoot due to broad multi-user write ACL."
     }
 }
 

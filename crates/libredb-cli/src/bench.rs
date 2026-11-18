@@ -1888,7 +1888,7 @@ pub fn run_feature_and_security_audit(
                 return Err(format!("slice_skill_sections mismatch: {skill_slices:?}"));
             }
 
-            // 3. Subagent-aware `extract_prompt_hint` (nested `toolArgs.Prompt` + `<SYSTEM_MESSAGE>` stripping)
+            // 3. Subagent-aware `extract_prompt_hint` (`lastUserInput`, nested `toolArgs.Prompt` + `<SYSTEM_MESSAGE>` stripping)
             let subagent_payload = json!({
                 "toolArgs": {
                     "Prompt": "<SYSTEM_MESSAGE>Boilerplate system header</SYSTEM_MESSAGE>\nVerify Dalvik R8 overload disambiguation"
@@ -1898,6 +1898,14 @@ pub fn run_feature_and_security_audit(
                 .ok_or_else(|| "extract_prompt_hint returned None for subagent payload".to_owned())?;
             if hint.contains("SYSTEM_MESSAGE") || !hint.contains("Dalvik R8 overload") {
                 return Err(format!("subagent prompt hint sanitization failed: {hint}"));
+            }
+            let last_input_payload = json!({
+                "lastUserInput": "<USER_REQUEST>Verify lastUserInput fast path</USER_REQUEST>"
+            });
+            let fast_hint = crate::hooks::extract_prompt_hint(&last_input_payload, None)
+                .ok_or_else(|| "extract_prompt_hint returned None for lastUserInput".to_owned())?;
+            if fast_hint != "Verify lastUserInput fast path" {
+                return Err(format!("lastUserInput prompt hint mismatch: {fast_hint}"));
             }
 
             // 4. Auto-compaction trigger after repeated batch mutations + `hmac-sha256:v4` seal preservation

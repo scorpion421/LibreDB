@@ -37,9 +37,9 @@ done
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PROJECT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
-LIBRE_VERSION=$(tr -d ' \t\r\n' < "$PROJECT_ROOT/VERSION" 2>/dev/null || echo "2.4.1")
+LIBRE_VERSION=$(tr -d ' \t\r\n' < "$PROJECT_ROOT/VERSION" 2>/dev/null || echo "2.4.2")
 case "$LIBRE_VERSION" in
-    ""|*[!0-9A-Za-z._+-]*) LIBRE_VERSION="2.4.1" ;;
+    ""|*[!0-9A-Za-z._+-]*) LIBRE_VERSION="2.4.2" ;;
 esac
 USER_HOME="${HOME:-$(pwd)}"
 GEMINI_DIR="$USER_HOME/.gemini"
@@ -127,31 +127,41 @@ for py_lib in "$PROJECT_ROOT/target/release/liblibredb_py.so" "$PROJECT_ROOT/tar
     fi
 done
 
-# Install native CLI binary into ~/.gemini/antigravity/bin and ~/.local/bin for immediate PATH access
-for path_dir in "$GEMINI_DIR/antigravity/bin" "$USER_HOME/.local/bin"; do
-    mkdir -p "$path_dir"
-    direct_bin="$path_dir/libredb"
-    if [ "$direct_bin" != "$TARGET_EXE" ]; then
-        install_binary_hot_safe "$RELEASE_BIN" "$direct_bin"
-        echo "[OK] Installed native PATH CLI binary at: $direct_bin"
-    fi
-done
+# Remove legacy duplicate physical copies and expose canonical binary via atomic ~/.local/bin symlink
+rm -f "$GEMINI_DIR/antigravity/bin/libredb" "$GEMINI_DIR/antigravity/bin/libredb.cmd"
+LOCAL_BIN_DIR="$USER_HOME/.local/bin"
+mkdir -p "$LOCAL_BIN_DIR"
+chmod 755 "$LOCAL_BIN_DIR" 2>/dev/null || true
+if [ "$LOCAL_BIN_DIR/libredb" != "$TARGET_EXE" ]; then
+    ln -sf "$TARGET_EXE" "$LOCAL_BIN_DIR/.libredb.lnk.$$"
+    mv -f "$LOCAL_BIN_DIR/.libredb.lnk.$$" "$LOCAL_BIN_DIR/libredb"
+    echo "[OK] Linked canonical CLI binary into PATH at: $LOCAL_BIN_DIR/libredb -> $TARGET_EXE"
+fi
 
-# Bridge ripgrep (rg) into Antigravity's GUI PATH dir if absent from standard /usr/bin:/bin (e.g. macOS launchd GUI sessions)
-RG_AGY_BIN="$GEMINI_DIR/antigravity/bin/rg"
-if [ -x "$RG_AGY_BIN" ]; then
-    rg_agy_ver=$("$RG_AGY_BIN" --version 2>/dev/null || true)
-    case "$rg_agy_ver" in
-        "ripgrep "*) echo "[OK] Native ripgrep (rg) verified at: $RG_AGY_BIN" ;;
+# Provision ripgrep (rg) into canonical ~/.gemini/libredb/bin (+ ~/.local/bin symlink) if absent from standard PATH
+RG_CANON_BIN="$BIN_DIR/rg"
+RG_LEGACY_BIN="$GEMINI_DIR/antigravity/bin/rg"
+if [ -x "$RG_CANON_BIN" ]; then
+    rg_canon_ver=$("$RG_CANON_BIN" --version 2>/dev/null || true)
+    case "$rg_canon_ver" in
+        "ripgrep "*) echo "[OK] Native ripgrep (rg) verified at: $RG_CANON_BIN" ;;
     esac
-elif ! PATH="/usr/bin:/bin:$GEMINI_DIR/antigravity/bin:$USER_HOME/.local/bin" command -v rg >/dev/null 2>&1; then
+elif [ -x "$RG_LEGACY_BIN" ]; then
+    rg_agy_ver=$("$RG_LEGACY_BIN" --version 2>/dev/null || true)
+    case "$rg_agy_ver" in
+        "ripgrep "*) echo "[OK] Native ripgrep (rg) verified at: $RG_LEGACY_BIN" ;;
+    esac
+elif ! PATH="/usr/bin:/bin:$BIN_DIR:$LOCAL_BIN_DIR:$GEMINI_DIR/antigravity/bin" command -v rg >/dev/null 2>&1; then
     for rg_cand in /opt/homebrew/bin/rg /usr/local/bin/rg "$USER_HOME/.cargo/bin/rg" /usr/bin/rg; do
         if [ -x "$rg_cand" ]; then
             rg_ver=$("$rg_cand" --version 2>/dev/null || true)
             case "$rg_ver" in
                 "ripgrep "*)
-                    install_binary_hot_safe "$rg_cand" "$RG_AGY_BIN"
-                    echo "[OK] Provisioned native ripgrep (rg) into Antigravity PATH at: $RG_AGY_BIN"
+                    install_binary_hot_safe "$rg_cand" "$RG_CANON_BIN"
+                    if [ "$LOCAL_BIN_DIR/rg" != "$RG_CANON_BIN" ] && [ ! -e "$LOCAL_BIN_DIR/rg" ]; then
+                        ln -sf "$RG_CANON_BIN" "$LOCAL_BIN_DIR/rg"
+                    fi
+                    echo "[OK] Provisioned native ripgrep (rg) into canonical bin at: $RG_CANON_BIN"
                     break
                     ;;
             esac
@@ -204,14 +214,12 @@ cat > "$PLUGIN_DIR/mcp_config.json" <<EOF
 }
 EOF
 
-# 3. Probe hook execution via /bin/sh -c and write hooks.json (unless --no-hooks was passed)
+# 3. Probe canonical binary hook execution via /bin/sh -c and write hooks.json (unless --no-hooks was passed)
 VERIFIED_HOOK_CMD=""
 if [ "$NO_HOOKS" -eq 0 ]; then
-    for cand_bin in "$BIN_DIR/libredb" "$GEMINI_DIR/antigravity/bin/libredb"; do
-        cand_dir=$(dirname "$cand_bin")
-        if ! test_safe_binary_dir "$cand_dir"; then
-            continue
-        fi
+    cand_bin="$BIN_DIR/libredb"
+    cand_dir=$(dirname "$cand_bin")
+    if test_safe_binary_dir "$cand_dir"; then
         case "$cand_bin" in
             *" "*) formatted_cmd="\"$cand_bin\"" ;;
             *) formatted_cmd="$cand_bin" ;;
@@ -220,10 +228,9 @@ if [ "$NO_HOOKS" -eq 0 ]; then
         case "$probe_out" in
             *injectSteps*)
                 VERIFIED_HOOK_CMD="$formatted_cmd"
-                break
                 ;;
         esac
-    done
+    fi
 fi
 
 if [ -n "$VERIFIED_HOOK_CMD" ]; then

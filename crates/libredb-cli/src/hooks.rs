@@ -850,6 +850,8 @@ fn sanitize_prompt_hint_text(raw: &str) -> Option<String> {
 
 pub fn extract_prompt_hint(payload: &Value, transcript_opt: Option<&Path>) -> Option<String> {
     const HINT_KEYS: &[&str] = &[
+        "lastUserInput",
+        "last_user_input",
         "prompt",
         "Prompt",
         "userPrompt",
@@ -3964,6 +3966,43 @@ fn unique_end() {
             Some(&global_path),
         );
         assert_eq!(unique_allow["decision"], "allow", "Unique anchor test append must be allowed: {unique_allow}");
+
+        let _ = fs::remove_dir_all(&base_dir);
+    }
+
+    #[test]
+    fn extract_prompt_hint_prefers_last_user_input_without_touching_transcript() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let base_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join(format!("libredb_prompt_hint_{}_{}", std::process::id(), nanos));
+        fs::create_dir_all(&base_dir).unwrap();
+        let transcript = base_dir.join("transcript.jsonl");
+        fs::write(
+            &transcript,
+            "{\"type\":\"USER_INPUT\",\"content\":\"stale transcript prompt\"}\n",
+        )
+        .unwrap();
+
+        let camel_payload = json!({
+            "lastUserInput": "<SYSTEM_MESSAGE>hidden</SYSTEM_MESSAGE>\n<USER_REQUEST>Fix canonical installer path</USER_REQUEST>"
+        });
+        assert_eq!(
+            super::extract_prompt_hint(&camel_payload, Some(&transcript)),
+            Some("Fix canonical installer path".to_owned())
+        );
+
+        let snake_payload = json!({
+            "last_user_input": "Check snake case last_user_input field"
+        });
+        assert_eq!(
+            super::extract_prompt_hint(&snake_payload, Some(&transcript)),
+            Some("Check snake case last_user_input field".to_owned())
+        );
 
         let _ = fs::remove_dir_all(&base_dir);
     }
