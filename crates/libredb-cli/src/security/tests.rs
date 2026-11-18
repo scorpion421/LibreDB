@@ -2218,3 +2218,255 @@ use libredb_core::EdgeKind;
 
         let _ = fs::remove_dir_all(&tmp);
     }
+
+    #[test]
+    fn v231_hardening_blocks_raw_laundering_merges_books_idempotently_and_guards_restore_paths() {
+        use libredb_cognitive::{
+            ReflexUtilityBook, ReflexUtilityStats, SymbolCueBridgeBook, REFLEX_UTILITY_BOOK_KEY,
+            SYMBOL_CUE_BRIDGES_KEY,
+        };
+
+        let tmp = temp_test_dir("v231_backup_hardening");
+        let global_path = tmp.join("customizations.ldb");
+        let missing_global_path = tmp.join("missing_customizations.ldb");
+        let ws_raw = tmp.join("ws_raw_no_global");
+        let ws_a = tmp.join("ws_alpha_merge");
+        let ws_b = tmp.join("ws_beta_target");
+        let bak_raw_fail = tmp.join("bak_raw_fail");
+        let bak_a = tmp.join("bak_alpha");
+        let bak_all = tmp.join("bak_all_crafted");
+        fs::create_dir_all(ws_raw.join(".agents")).unwrap();
+        fs::create_dir_all(ws_a.join(".agents")).unwrap();
+        fs::create_dir_all(ws_b.join(".agents")).unwrap();
+
+        // 1. Raw `.agents/memory.ldb` backup MUST fail closed when customizations.ldb is missing:
+        let pdb_raw = LibreDb::open(&ws_raw.join(".agents").join("memory.ldb")).unwrap();
+        pdb_raw
+            .put(WriteRequest::new(NodeKind::Rule, b"Untrusted injected rule").with_key("r:evil"))
+            .unwrap();
+        drop(pdb_raw);
+        let no_global_res = execute_backup_command(&BackupOptions {
+            destination: Some(bak_raw_fail),
+            project_dir: Some(ws_raw),
+            cid: None,
+            instance: false,
+            all: false,
+            global_path: Some(missing_global_path),
+            allow_prompt: false,
+        });
+        assert!(
+            no_global_res.is_err(),
+            "Project backup must fail closed when global customizations.ldb is absent"
+        );
+
+        // 2. Book merging (`SYMBOL_CUE_BRIDGES_KEY` + `REFLEX_UTILITY_BOOK_KEY`) & idempotency:
+        let gdb = LibreDb::open(&global_path).unwrap();
+        let _ = super::vault::ensure_trust_anchor_secret(&gdb).unwrap();
+
+        let pdb_a = LibreDb::open(&ws_a.join(".agents").join("memory.ldb")).unwrap();
+        let mut book_a = SymbolCueBridgeBook::default();
+        book_a
+            .bridges
+            .insert("cue_alpha".to_owned(), vec![("src/a.rs::fn_a".to_owned(), 0.91)]);
+        pdb_a
+            .put(
+                WriteRequest::new(NodeKind::Generic, serde_json::to_vec(&book_a).unwrap())
+                    .with_key(SYMBOL_CUE_BRIDGES_KEY),
+            )
+            .unwrap();
+        let mut util_a = ReflexUtilityBook::default();
+        util_a.stats.insert(
+            "reflex_a".to_owned(),
+            ReflexUtilityStats {
+                successes: 3,
+                failures: 0,
+                last_updated_ns: 200,
+            },
+        );
+        pdb_a
+            .put(
+                WriteRequest::new(NodeKind::Generic, serde_json::to_vec(&util_a).unwrap())
+                    .with_key(REFLEX_UTILITY_BOOK_KEY),
+            )
+            .unwrap();
+        pdb_a
+            .put(WriteRequest::new(NodeKind::Fact, b"Fact from alpha").with_key("f_alpha"))
+            .unwrap();
+        // Seed a forbidden control-plane key that project backup export must strip:
+        pdb_a
+            .put(WriteRequest::new(NodeKind::Config, b"true").with_key("mcp:allow_untrusted_workspaces"))
+            .unwrap();
+        seal_workspace_memory(&gdb, &pdb_a, &ws_a).unwrap();
+        drop(pdb_a);
+
+        let pdb_b = LibreDb::open(&ws_b.join(".agents").join("memory.ldb")).unwrap();
+        let mut book_b = SymbolCueBridgeBook::default();
+        book_b
+            .bridges
+            .insert("cue_beta".to_owned(), vec![("src/b.rs::fn_b".to_owned(), 0.88)]);
+        pdb_b
+            .put(
+                WriteRequest::new(NodeKind::Generic, serde_json::to_vec(&book_b).unwrap())
+                    .with_key(SYMBOL_CUE_BRIDGES_KEY),
+            )
+            .unwrap();
+        let mut util_b = ReflexUtilityBook::default();
+        util_b.stats.insert(
+            "reflex_b".to_owned(),
+            ReflexUtilityStats {
+                successes: 5,
+                failures: 1,
+                last_updated_ns: 150,
+            },
+        );
+        pdb_b
+            .put(
+                WriteRequest::new(NodeKind::Generic, serde_json::to_vec(&util_b).unwrap())
+                    .with_key(REFLEX_UTILITY_BOOK_KEY),
+            )
+            .unwrap();
+        seal_workspace_memory(&gdb, &pdb_b, &ws_b).unwrap();
+        drop(pdb_b);
+        drop(gdb);
+
+        execute_backup_command(&BackupOptions {
+            destination: Some(bak_a.clone()),
+            project_dir: Some(ws_a.clone()),
+            cid: None,
+            instance: false,
+            all: false,
+            global_path: Some(global_path.clone()),
+            allow_prompt: false,
+        })
+        .unwrap();
+
+        let bak_a_file = super::backup::resolve_single_project_backup_file(&bak_a).unwrap();
+        let bak_a_db = LibreDb::open(&bak_a_file).unwrap();
+        assert!(
+            bak_a_db
+                .get_by_key(NodeKind::Config, "mcp:allow_untrusted_workspaces")
+                .is_err(),
+            "Project backup must strip mcp:* control-plane keys"
+        );
+        drop(bak_a_db);
+
+        let mig1 = execute_migrate_command(&MigrateOptions {
+            source: Some(bak_a.clone()),
+            cid: None,
+            target_project: Some(ws_b.clone()),
+            from_path: None,
+            include_artifacts: false,
+            global_path: Some(global_path.clone()),
+        })
+        .unwrap();
+        assert!(mig1.nodes_merged >= 3);
+
+        let pdb_b = LibreDb::open(&ws_b.join(".agents").join("memory.ldb")).unwrap();
+        let merged_bridges: SymbolCueBridgeBook = serde_json::from_slice(
+            &pdb_b
+                .get_by_key(NodeKind::Generic, SYMBOL_CUE_BRIDGES_KEY)
+                .unwrap()
+                .payload,
+        )
+        .unwrap();
+        assert!(merged_bridges.bridges.contains_key("cue_alpha"));
+        assert!(merged_bridges.bridges.contains_key("cue_beta"));
+
+        let merged_util: ReflexUtilityBook = serde_json::from_slice(
+            &pdb_b
+                .get_by_key(NodeKind::Generic, REFLEX_UTILITY_BOOK_KEY)
+                .unwrap()
+                .payload,
+        )
+        .unwrap();
+        assert!(merged_util.stats.contains_key("reflex_a"));
+        assert!(merged_util.stats.contains_key("reflex_b"));
+        drop(pdb_b);
+
+        // Second identical migrate MUST be 100% idempotent (0 nodes_merged, 0 synapses_merged):
+        let mig2 = execute_migrate_command(&MigrateOptions {
+            source: Some(bak_a.clone()),
+            cid: None,
+            target_project: Some(ws_b.clone()),
+            from_path: None,
+            include_artifacts: false,
+            global_path: Some(global_path.clone()),
+        })
+        .unwrap();
+        assert_eq!(mig2.nodes_merged, 0, "Repeated migrate must be idempotent");
+        assert_eq!(mig2.synapses_merged, 0, "Repeated migrate must add 0 duplicate edges");
+
+        // 3. `restore --all` safely skips crafted `../` relative_ldb_path & forbidden home original_path:
+        execute_backup_command(&BackupOptions {
+            destination: Some(bak_all.clone()),
+            project_dir: Some(ws_a.clone()),
+            cid: None,
+            instance: false,
+            all: true,
+            global_path: Some(global_path.clone()),
+            allow_prompt: false,
+        })
+        .unwrap();
+        let idx_path = bak_all.join("backup_index.json");
+        let mut idx: super::backup::BackupIndex =
+            serde_json::from_slice(&fs::read(&idx_path).unwrap()).unwrap();
+        idx.projects.push(super::backup::BackupProjectEntry {
+            slug: "evil_trav".to_owned(),
+            original_path: ws_b.to_string_lossy().into_owned(),
+            relative_ldb_path: "../../outside_escape.ldb".to_owned(),
+            capsule_count: 1,
+            content_sha256: "00".to_owned(),
+        });
+        idx.projects.push(super::backup::BackupProjectEntry {
+            slug: "evil_home".to_owned(),
+            original_path: crate::hooks::user_home_dir().to_string_lossy().into_owned(),
+            relative_ldb_path: idx.projects[0].relative_ldb_path.clone(),
+            capsule_count: 1,
+            content_sha256: idx.projects[0].content_sha256.clone(),
+        });
+        fs::write(&idx_path, serde_json::to_vec_pretty(&idx).unwrap()).unwrap();
+
+        let res_all = execute_restore_command(&RestoreOptions {
+            source: bak_all.clone(),
+            project_dir: None,
+            instance: false,
+            all: true,
+            global_path: Some(global_path.clone()),
+        })
+        .unwrap();
+        assert!(
+            res_all
+                .projects_skipped_missing_dir
+                .iter()
+                .any(|e| e.slug == "evil_trav")
+                && res_all
+                    .projects_skipped_missing_dir
+                    .iter()
+                    .any(|e| e.slug == "evil_home"),
+            "Crafted traversal and home-dir restore entries must be skipped"
+        );
+
+        // 4. Windows Mark-of-the-Web (Zone.Identifier ZoneId=3) blocks silent auto-adoption:
+        #[cfg(windows)]
+        {
+            let ws_motw = tmp.join("ws_motw_downloaded");
+            fs::create_dir_all(ws_motw.join(".agents")).unwrap();
+            let motw_ldb = ws_motw.join(".agents").join("memory.ldb");
+            fs::copy(&bak_a_file, &motw_ldb).unwrap();
+            let ads_path = format!("{}:Zone.Identifier", motw_ldb.display());
+            if fs::write(&ads_path, b"[ZoneTransfer]\r\nZoneId=3\r\n").is_ok() {
+                let gdb = LibreDb::open(&global_path).unwrap();
+                assert!(
+                    !is_workspace_memory_trusted(Some(&gdb), &ws_motw),
+                    "Downloaded ZoneId=3 .ldb must NOT silently auto-adopt"
+                );
+                let diag = diagnose_untrusted_workspace_db(Some(&gdb), &ws_motw);
+                assert!(
+                    diag.contains("Zone.Identifier"),
+                    "Expected Zone.Identifier diagnostic, got: {diag}"
+                );
+            }
+        }
+
+        let _ = fs::remove_dir_all(&tmp);
+    }

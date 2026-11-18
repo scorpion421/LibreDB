@@ -108,6 +108,15 @@ impl McpServerState {
         candidate_dir: &Path,
         allow_private_brain: bool,
     ) -> Result<PathBuf, String> {
+        self.authorize_mcp_workspace_path_ext(candidate_dir, allow_private_brain, true)
+    }
+
+    pub(super) fn authorize_mcp_workspace_path_ext(
+        &mut self,
+        candidate_dir: &Path,
+        allow_private_brain: bool,
+        require_trusted_memory: bool,
+    ) -> Result<PathBuf, String> {
         self.sync_global_db_or_purge()?;
         let abs = if candidate_dir.is_relative() {
             std::env::current_dir()
@@ -141,7 +150,9 @@ impl McpServerState {
             if let Some(err) = crate::security::check_mcp_workspace_containment(&canon, pin_root) {
                 return Err(err);
             }
-            if !crate::security::is_workspace_memory_trusted(self.global_db.as_deref(), pin_root) {
+            if require_trusted_memory
+                && !crate::security::is_workspace_memory_trusted(self.global_db.as_deref(), pin_root)
+            {
                 let diag = crate::security::diagnose_untrusted_workspace_db(
                     self.global_db.as_deref(),
                     pin_root,
@@ -207,10 +218,12 @@ impl McpServerState {
                 probe_anc = d.parent();
             }
 
-            if !crate::security::is_workspace_memory_trusted(
-                self.global_db.as_deref(),
-                &selected_root,
-            ) {
+            if require_trusted_memory
+                && !crate::security::is_workspace_memory_trusted(
+                    self.global_db.as_deref(),
+                    &selected_root,
+                )
+            {
                 let diag = crate::security::diagnose_untrusted_workspace_db(
                     self.global_db.as_deref(),
                     &selected_root,
@@ -232,7 +245,9 @@ impl McpServerState {
                         candidate_dir.display()
                     ));
                 }
-                if !crate::security::is_workspace_memory_trusted(Some(gdb), &inferred_root) {
+                if require_trusted_memory
+                    && !crate::security::is_workspace_memory_trusted(Some(gdb), &inferred_root)
+                {
                     let diag = crate::security::diagnose_untrusted_workspace_db(
                         Some(gdb),
                         &inferred_root,

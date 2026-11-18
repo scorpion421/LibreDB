@@ -2027,3 +2027,135 @@ use super::{canonical_brain_cache_key, handle_rpc_method, process_mcp_stream, Mc
         drop(gdb);
         let _ = fs::remove_dir_all(&tmp);
     }
+
+    #[test]
+    fn mcp_portability_actions_block_unpinned_instance_exfil_show_secrets_and_unauthorized_workspaces() {
+        use serde_json::json;
+        let tmp = std::env::temp_dir().join(format!(
+            "libredb_mcp_portability_sec_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+
+        let ws_auth = tmp.join("ws_authorized");
+        let ws_evil = tmp.join("ws_unauthorized");
+        let bak_out = tmp.join("mcp_bak_out");
+        let global_path = tmp.join("customizations.ldb");
+        fs::create_dir_all(ws_auth.join(".agents")).unwrap();
+        fs::create_dir_all(ws_evil.join(".agents")).unwrap();
+
+        let gdb = LibreDb::open(&global_path).unwrap();
+        let _ = crate::security::protect_secret("host_pat_super_secret").unwrap();
+        let tok_enc = crate::security::protect_secret("host_pat_super_secret").unwrap();
+        gdb.put(WriteRequest::new(NodeKind::Config, tok_enc.as_bytes()).with_key("gitea:token"))
+            .unwrap();
+
+        let pdb_auth = LibreDb::open(&ws_auth.join(".agents").join("memory.ldb")).unwrap();
+        pdb_auth
+            .put(WriteRequest::new(NodeKind::Fact, b"Authorized MCP project fact").with_key("f_auth"))
+            .unwrap();
+        crate::security::seal_workspace_memory(&gdb, &pdb_auth, &ws_auth).unwrap();
+        drop(pdb_auth);
+
+        // Unauthorized workspace on disk (not sealed or authorized for ws_evil):
+        let pdb_evil = LibreDb::open(&ws_evil.join(".agents").join("memory.ldb")).unwrap();
+        pdb_evil
+            .put(WriteRequest::new(NodeKind::Fact, b"Unauthorized fact").with_key("f_evil"))
+            .unwrap();
+        drop(pdb_evil);
+        drop(gdb);
+
+        // Unpinned MCP server (`pinned_workspace_root == None`, standard plugin mode):
+        let mut state = McpServerState::new(Some(&ws_auth.join(".agents").join("memory.ldb")), Some(&global_path)).unwrap();
+
+        // 1. `instance=true` and `all=true` MUST be denied over MCP even when unpinned:
+        for flag_key in ["instance", "all"] {
+            let err = handle_rpc_method(
+                "tools/call",
+                &json!({
+                    "name": "libredb_code",
+                    "arguments": {
+                        "action": "backup",
+                        "destination": bak_out.to_string_lossy().to_string(),
+                        flag_key: true
+                    }
+                }),
+                &mut state,
+            )
+            .expect_err("MCP must reject --instance/--all even on unpinned server");
+            assert!(err.to_string().contains("access denied"), "got: {err}");
+        }
+
+        // 2. `show_secrets=true` MUST be denied over MCP even when unpinned:
+        let show_err = handle_rpc_method(
+            "tools/call",
+            &json!({
+                "name": "libredb_code",
+                "arguments": {
+                    "action": "read",
+                    "target": ws_auth.join(".agents").join("memory.ldb").to_string_lossy().to_string(),
+                    "show_secrets": true
+                }
+            }),
+            &mut state,
+        )
+        .expect_err("MCP read with show_secrets=true must be denied");
+        assert!(show_err.to_string().contains("show_secrets"), "got: {show_err}");
+
+        // 3. Unauthorized workspace backup/restore MUST be denied over MCP:
+        assert!(
+            handle_rpc_method(
+                "tools/call",
+                &json!({
+                    "name": "libredb_code",
+                    "arguments": {
+                        "action": "backup",
+                        "cwd": ws_evil.to_string_lossy().to_string(),
+                        "destination": bak_out.to_string_lossy().to_string()
+                    }
+                }),
+                &mut state,
+            )
+            .is_err(),
+            "MCP backup on unauthorized workspace must fail closed"
+        );
+        assert!(
+            handle_rpc_method(
+                "tools/call",
+                &json!({
+                    "name": "libredb_code",
+                    "arguments": {
+                        "action": "restore",
+                        "cwd": ws_evil.to_string_lossy().to_string(),
+                        "source": ws_auth.to_string_lossy().to_string()
+                    }
+                }),
+                &mut state,
+            )
+            .is_err(),
+            "MCP restore into unauthorized workspace must fail closed"
+        );
+
+        // 4. `lookup_or_cache_trusted_workspace_db` must re-verify trust after external on-disk overwrite:
+        let cached_first = state.lookup_or_cache_trusted_workspace_db(&ws_auth);
+        assert!(cached_first.is_some());
+        drop(cached_first);
+
+        // Tamper ws_auth `.agents/memory.ldb` directly on disk and advance commit_seq:
+        let pdb_tamper = LibreDb::open(&ws_auth.join(".agents").join("memory.ldb")).unwrap();
+        pdb_tamper
+            .put(WriteRequest::new(NodeKind::Rule, b"Injected post-cache evil rule").with_key("evil_rule"))
+            .unwrap();
+        drop(pdb_tamper);
+
+        assert!(
+            state.lookup_or_cache_trusted_workspace_db(&ws_auth).is_none(),
+            "Cached DB handle must be evicted immediately when disk reload fails v4 trust seal verification"
+        );
+
+        drop(state);
+        let _ = fs::remove_dir_all(&tmp);
+    }

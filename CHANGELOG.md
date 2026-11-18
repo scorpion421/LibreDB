@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.1] - 2026-11-18
+
+### Security
+- **MCP portability containment and secret-exfiltration boundaries**: Disabled `--instance`, `--all`, and `--show-secrets` over `MCP` (`libredb_code`) even when running unpinned in standard plugin mode so credentials remain out of model context and global configuration requires explicit terminal invocation. Enforced server-side workspace authorization on `MCP` `backup`, `restore`, and `migrate`, and required cached project database handles to re-verify their `hmac-sha256:v4` seal whenever a disk change is reloaded.
+- **Strict trust-anchor, Mark-of-the-Web, control-plane, and restore path hardening**: Project and chat fallbacks during `libredb backup` now fail closed if the global `customizations.ldb` trust anchor is absent or untrusted. Portable project exports and silent new-project auto-adoption strip global control-plane settings (`mcp:*`, `hook:*`, `guardrail:style_rules`), block Windows Internet Mark-of-the-Web (`Zone.Identifier` ZoneId `3`/`4`) downloads from silent auto-adoption, enforce `0700`/`0600` permissions on POSIX exports and rollback snapshots, and validate `restore --all` index entries against path traversal, symlinks, and forbidden OS/home directories.
+
+### Fixed
+- **Cognitive book merging, idempotent `migrate`, and atomic multi-DB chat export**: `libredb migrate` now merges symbol cue bridge and reflex utility books alongside error pitfall books without overwriting target knowledge, omits transient pending queues from backup digests, avoids duplicate writes and duplicate synapses on repeated migrations of identical capsules, and stages multi-database chat backups atomically with automatic cleanup on failure.
+
 ## [2.3.0] - 2026-11-18
 
 ### Added

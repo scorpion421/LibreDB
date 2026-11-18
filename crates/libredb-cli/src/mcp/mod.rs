@@ -343,12 +343,25 @@ impl McpServerState {
                 return None;
             }
             let pdb = Arc::clone(brain.project_db());
-            if pdb.sync_from_disk_if_changed().is_err() {
-                self.brains.remove(&cache_key);
-                self.clear_ram_sessions_for_cache_key(&cache_key);
-                return None;
+            match pdb.sync_from_disk_if_changed() {
+                Ok(false) => return Some(pdb),
+                Ok(true) => {
+                    if !crate::security::is_workspace_memory_trusted(
+                        self.global_db.as_deref(),
+                        ws_root,
+                    ) {
+                        self.brains.remove(&cache_key);
+                        self.clear_ram_sessions_for_cache_key(&cache_key);
+                        return None;
+                    }
+                    return Some(pdb);
+                }
+                Err(_) => {
+                    self.brains.remove(&cache_key);
+                    self.clear_ram_sessions_for_cache_key(&cache_key);
+                    return None;
+                }
             }
-            return Some(pdb);
         }
 
         if !ldb_path.is_file() {

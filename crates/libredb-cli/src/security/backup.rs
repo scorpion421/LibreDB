@@ -20,11 +20,15 @@ use super::seals::{
 };
 use super::vault::{ensure_trust_anchor_secret, is_ciphertext_envelope, protect_secret, unprotect_secret};
 use super::{
-    constant_time_eq, hex_encode, is_git_index_tracking_agents_db, is_private_brain_workspace,
-    normalize_workspace_key, secure_zero, strip_verbatim_prefix, BACKUP_MANIFEST_KEY,
-    PORTABLE_SECRET_PREFIX, TRUST_SEALS_KEY, TRUST_SECRET_KEY,
+    constant_time_eq, hex_encode, is_forbidden_mcp_workspace_root, is_git_index_tracking_agents_db,
+    is_private_brain_workspace, normalize_workspace_key, secure_zero, strip_verbatim_prefix,
+    BACKUP_MANIFEST_KEY, PORTABLE_SECRET_PREFIX, TRUST_SEALS_KEY, TRUST_SECRET_KEY,
 };
-use libredb_cognitive::{CognitiveEngine, ErrorPitfallBook, ERROR_PITFALL_BOOK_KEY};
+use libredb_cognitive::{
+    CognitiveEngine, ErrorPitfallBook, ReflexUtilityBook, SymbolCueBridgeBook,
+    ERROR_PITFALL_BOOK_KEY, PENDING_ERROR_CUES_KEY, PENDING_MISS_CUES_KEY,
+    PENDING_SERVED_BRIDGES_KEY, REFLEX_UTILITY_BOOK_KEY, SYMBOL_CUE_BRIDGES_KEY,
+};
 use libredb_core::{EdgeKind, LibreDb, LibreDbError, NodeFlags, NodeKind, Synapse, WriteRequest};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -260,6 +264,14 @@ fn is_instance_host_ratchet_key(key: &str) -> bool {
         || low.starts_with("workspace_id::")
 }
 
+fn is_project_forbidden_control_config_key(key: &str) -> bool {
+    let low = key.trim().to_ascii_lowercase();
+    is_instance_host_ratchet_key(&low)
+        || low.starts_with("mcp:")
+        || low.starts_with("hook:")
+        || low == "guardrail:style_rules"
+}
+
 fn should_include_in_backup_digest(kind: NodeKind, key_opt: Option<&str>) -> bool {
     match kind {
         NodeKind::Rule
@@ -281,7 +293,13 @@ fn should_include_in_backup_digest(kind: NodeKind, key_opt: Option<&str>) -> boo
                 | Some(BACKUP_MANIFEST_KEY)
                 | Some(TELEMETRY_MARKER_KEY)
         ),
-        NodeKind::Generic => key_opt != Some("sys::index_snapshot"),
+        NodeKind::Generic => !matches!(
+            key_opt,
+            Some("sys::index_snapshot")
+                | Some(PENDING_MISS_CUES_KEY)
+                | Some(PENDING_SERVED_BRIDGES_KEY)
+                | Some(PENDING_ERROR_CUES_KEY)
+        ),
         NodeKind::Symbol | NodeKind::WorkingSet | NodeKind::QuotaEvent | NodeKind::TranscriptCursor => false,
     }
 }
@@ -290,9 +308,14 @@ fn should_export_node(scope: BackupScope, kind: NodeKind, key_opt: Option<&str>)
     if !should_include_in_backup_digest(kind, key_opt) {
         return false;
     }
-    if scope == BackupScope::Instance && kind == NodeKind::Config {
+    if kind == NodeKind::Config {
         if let Some(k) = key_opt {
-            if is_instance_host_ratchet_key(k) {
+            if scope == BackupScope::Instance && is_instance_host_ratchet_key(k) {
+                return false;
+            }
+            if matches!(scope, BackupScope::Project | BackupScope::Chat)
+                && is_project_forbidden_control_config_key(k)
+            {
                 return false;
             }
         }
@@ -710,26 +733,141 @@ fn merge_pitfall_books(existing_payload: &[u8], incoming_payload: &[u8]) -> Opti
     serde_json::to_vec(&dst_book).ok()
 }
 
+fn merge_symbol_bridge_books(existing_payload: &[u8], incoming_payload: &[u8]) -> Option<Vec<u8>> {
+    let mut dst_book: SymbolCueBridgeBook = serde_json::from_slice(existing_payload).ok()?;
+    let src_book: SymbolCueBridgeBook = serde_json::from_slice(incoming_payload).ok()?;
+    for (cue, targets) in src_book.bridges {
+        let entry = dst_book.bridges.entry(cue).or_default();
+        for (sym, weight) in targets {
+            if let Some(existing) = entry.iter_mut().find(|(s, _)| s == &sym) {
+                if weight > existing.1 {
+                    existing.1 = weight;
+                }
+            } else {
+                entry.push((sym, weight));
+            }
+        }
+        entry.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        entry.truncate(8);
+    }
+    while dst_book.bridges.len() > 512 {
+        if let Some(victim) = dst_book
+            .bridges
+            .iter()
+            .min_by(|(ka, va), (kb, vb)| {
+                let wa = va.first().map_or(0.0, |x| x.1);
+                let wb = vb.first().map_or(0.0, |x| x.1);
+                wa.total_cmp(&wb).then_with(|| ka.cmp(kb))
+            })
+            .map(|(k, _)| k.clone())
+        {
+            dst_book.bridges.remove(&victim);
+        } else {
+            break;
+        }
+    }
+    serde_json::to_vec(&dst_book).ok()
+}
+
+fn merge_reflex_utility_books(existing_payload: &[u8], incoming_payload: &[u8]) -> Option<Vec<u8>> {
+    let mut dst_book: ReflexUtilityBook = serde_json::from_slice(existing_payload).ok()?;
+    let src_book: ReflexUtilityBook = serde_json::from_slice(incoming_payload).ok()?;
+    for (id, st) in src_book.stats {
+        match dst_book.stats.get_mut(&id) {
+            Some(cur) => {
+                if st.last_updated_ns > cur.last_updated_ns {
+                    *cur = st;
+                } else if st.last_updated_ns == cur.last_updated_ns {
+                    cur.successes = cur.successes.max(st.successes);
+                    cur.failures = cur.failures.max(st.failures);
+                }
+            }
+            None => {
+                dst_book.stats.insert(id, st);
+            }
+        }
+    }
+    serde_json::to_vec(&dst_book).ok()
+}
+
 fn merge_nodes_additive(
     dst_db: &Arc<LibreDb>,
     nodes: Vec<ExportedNode>,
     preserve_instance_security: bool,
 ) -> Result<(usize, usize, usize), String> {
-    let mut existing_keyed: HashMap<(NodeKind, String), (u64, u64)> = HashMap::new();
-    for (ino, key_opt, _) in dst_db.list_inodes(None, false) {
+    struct ExistingDstNode {
+        node_id: u64,
+        kind: NodeKind,
+        importance: u8,
+        pinned: bool,
+        updated_ns: u64,
+        key: Option<String>,
+    }
+
+    let mut active_inodes = Vec::new();
+    let mut existing_edges: HashSet<(u64, u8, u64)> = HashSet::new();
+    for (ino, key_opt, syns) in dst_db.list_inodes(None, false) {
         if !ino.flags.is_live_active() {
             continue;
         }
-        if let Some(k) = key_opt {
-            existing_keyed.insert((ino.kind, k), (ino.node_id, ino.updated_ns));
+        for s in &syns {
+            existing_edges.insert((ino.node_id, s.kind as u8, s.target_id));
+        }
+        active_inodes.push(ExistingDstNode {
+            node_id: ino.node_id,
+            kind: ino.kind,
+            importance: ino.importance,
+            pinned: ino.flags.contains(NodeFlags::PINNED),
+            updated_ns: ino.updated_ns,
+            key: key_opt,
+        });
+    }
+
+    let existing_ids: Vec<u64> = active_inodes.iter().map(|n| n.node_id).collect();
+    let mut existing_payloads: HashMap<u64, Vec<u8>> = HashMap::with_capacity(existing_ids.len());
+    if !existing_ids.is_empty() {
+        let (recs, _) = dst_db
+            .get_many_coalesced(&existing_ids)
+            .map_err(|e| e.to_string())?;
+        for r in recs {
+            existing_payloads.insert(r.node_id, r.payload);
+        }
+    }
+
+    struct ExistingKeyedMeta {
+        node_id: u64,
+        updated_ns: u64,
+        importance: u8,
+        pinned: bool,
+        payload: Vec<u8>,
+    }
+    let mut existing_keyed: HashMap<(NodeKind, String), ExistingKeyedMeta> = HashMap::new();
+    let mut existing_unkeyed: HashMap<(NodeKind, Vec<u8>), u64> = HashMap::new();
+    for n in active_inodes {
+        let payload = existing_payloads.remove(&n.node_id).unwrap_or_default();
+        if let Some(k) = n.key {
+            existing_keyed.insert(
+                (n.kind, k),
+                ExistingKeyedMeta {
+                    node_id: n.node_id,
+                    updated_ns: n.updated_ns,
+                    importance: n.importance,
+                    pinned: n.pinned,
+                    payload,
+                },
+            );
+        } else {
+            existing_unkeyed.insert((n.kind, payload), n.node_id);
         }
     }
 
     let mut to_write: Vec<(usize, ExportedNode)> = Vec::new();
+    let mut skipped_edge_sources: Vec<(u64, Vec<Synapse>)> = Vec::new();
     let mut id_map: HashMap<u64, u64> = HashMap::new();
     let mut skipped_older = 0usize;
+    let mut batch_unkeyed: HashSet<(NodeKind, Vec<u8>)> = HashSet::new();
 
-    for item in nodes {
+    for mut item in nodes {
         if item.kind == NodeKind::Config {
             if let Some(ref k) = item.key {
                 if k == BACKUP_MANIFEST_KEY || k == TRUST_SEALS_KEY || k == TRUST_SECRET_KEY {
@@ -738,57 +876,97 @@ fn merge_nodes_additive(
                 if preserve_instance_security && is_instance_host_ratchet_key(k) {
                     continue;
                 }
-            }
-        }
-        if item.kind == NodeKind::Generic && item.key.as_deref() == Some(ERROR_PITFALL_BOOK_KEY) {
-            if let Some(&(dst_id, _)) =
-                existing_keyed.get(&(NodeKind::Generic, ERROR_PITFALL_BOOK_KEY.to_owned()))
-            {
-                if let Ok(cur_rec) = dst_db.get(dst_id) {
-                    if let Some(merged_bytes) = merge_pitfall_books(&cur_rec.payload, &item.payload)
-                    {
-                        let mut updated = item;
-                        updated.payload = merged_bytes;
-                        let idx = to_write.len();
-                        to_write.push((idx, updated));
-                        continue;
-                    }
-                }
-            }
-        }
-
-        if let Some(ref k) = item.key {
-            if let Some(&(existing_id, existing_updated)) = existing_keyed.get(&(item.kind, k.clone()))
-            {
-                if existing_updated > item.updated_ns {
-                    id_map.insert(item.old_id, existing_id);
-                    skipped_older += 1;
+                if !preserve_instance_security && is_project_forbidden_control_config_key(k) {
                     continue;
                 }
             }
         }
+        if item.kind == NodeKind::Generic {
+            let merged_opt = match item.key.as_deref() {
+                Some(ERROR_PITFALL_BOOK_KEY) => existing_keyed
+                    .get(&(NodeKind::Generic, ERROR_PITFALL_BOOK_KEY.to_owned()))
+                    .and_then(|cur| {
+                        merge_pitfall_books(&cur.payload, &item.payload)
+                            .map(|bytes| (cur.node_id, &cur.payload, bytes))
+                    }),
+                Some(SYMBOL_CUE_BRIDGES_KEY) => existing_keyed
+                    .get(&(NodeKind::Generic, SYMBOL_CUE_BRIDGES_KEY.to_owned()))
+                    .and_then(|cur| {
+                        merge_symbol_bridge_books(&cur.payload, &item.payload)
+                            .map(|bytes| (cur.node_id, &cur.payload, bytes))
+                    }),
+                Some(REFLEX_UTILITY_BOOK_KEY) => existing_keyed
+                    .get(&(NodeKind::Generic, REFLEX_UTILITY_BOOK_KEY.to_owned()))
+                    .and_then(|cur| {
+                        merge_reflex_utility_books(&cur.payload, &item.payload)
+                            .map(|bytes| (cur.node_id, &cur.payload, bytes))
+                    }),
+                _ => None,
+            };
+            if let Some((cur_id, cur_payload, merged_bytes)) = merged_opt {
+                if cur_payload == &merged_bytes {
+                    id_map.insert(item.old_id, cur_id);
+                    skipped_older += 1;
+                    continue;
+                }
+                item.payload = merged_bytes;
+                let idx = to_write.len();
+                to_write.push((idx, item));
+                continue;
+            }
+        }
+
+        if let Some(ref k) = item.key {
+            if let Some(existing) = existing_keyed.get(&(item.kind, k.clone())) {
+                if existing.updated_ns > item.updated_ns
+                    || (existing.payload == item.payload
+                        && existing.importance == item.importance
+                        && existing.pinned == item.pinned)
+                {
+                    id_map.insert(item.old_id, existing.node_id);
+                    skipped_edge_sources.push((item.old_id, item.synapses));
+                    skipped_older += 1;
+                    continue;
+                }
+            }
+        } else {
+            let unkeyed_sig = (item.kind, item.payload.clone());
+            if let Some(&existing_id) = existing_unkeyed.get(&unkeyed_sig) {
+                id_map.insert(item.old_id, existing_id);
+                skipped_edge_sources.push((item.old_id, item.synapses));
+                skipped_older += 1;
+                continue;
+            }
+            if !batch_unkeyed.insert(unkeyed_sig) {
+                skipped_older += 1;
+                continue;
+            }
+        }
+
         let idx = to_write.len();
         to_write.push((idx, item));
     }
 
-    let mut prepared = Vec::with_capacity(to_write.len());
-    for (lane_idx, item) in &to_write {
-        let mut req = WriteRequest::new(item.kind, item.payload.clone())
-            .with_importance(item.importance)
-            .with_pinned(item.pinned);
-        if let Some(ref k) = item.key {
-            req = req.with_key(k.clone());
+    if !to_write.is_empty() {
+        let mut prepared = Vec::with_capacity(to_write.len());
+        for (lane_idx, item) in &to_write {
+            let mut req = WriteRequest::new(item.kind, item.payload.clone())
+                .with_importance(item.importance)
+                .with_pinned(item.pinned);
+            if let Some(ref k) = item.key {
+                req = req.with_key(k.clone());
+            }
+            prepared.push(
+                dst_db
+                    .prepare(req, lane_idx % libredb_core::SHARD_WRITE_LANES)
+                    .map_err(|e| e.to_string())?,
+            );
         }
-        prepared.push(
-            dst_db
-                .prepare(req, lane_idx % libredb_core::SHARD_WRITE_LANES)
-                .map_err(|e| e.to_string())?,
-        );
-    }
 
-    let assigned_ids = dst_db.commit_batch(&prepared).map_err(|e| e.to_string())?;
-    for ((_, item), &new_id) in to_write.iter().zip(assigned_ids.iter()) {
-        id_map.insert(item.old_id, new_id);
+        let assigned_ids = dst_db.commit_batch(&prepared).map_err(|e| e.to_string())?;
+        for ((_, item), &new_id) in to_write.iter().zip(assigned_ids.iter()) {
+            id_map.insert(item.old_id, new_id);
+        }
     }
 
     let mut edges: Vec<(u64, EdgeKind, u64, u8)> = Vec::new();
@@ -801,26 +979,113 @@ fn merge_nodes_additive(
                 continue;
             }
             if let Some(&dst_new) = id_map.get(&syn.target_id) {
-                edges.push((src_new, syn.kind, dst_new, syn.weight));
+                if existing_edges.insert((src_new, syn.kind as u8, dst_new)) {
+                    edges.push((src_new, syn.kind, dst_new, syn.weight));
+                }
             }
         }
     }
+    for (old_id, syns) in &skipped_edge_sources {
+        let Some(&src_new) = id_map.get(old_id) else {
+            continue;
+        };
+        for syn in syns {
+            if syn.kind == EdgeKind::Supersedes {
+                continue;
+            }
+            if let Some(&dst_new) = id_map.get(&syn.target_id) {
+                if existing_edges.insert((src_new, syn.kind as u8, dst_new)) {
+                    edges.push((src_new, syn.kind, dst_new, syn.weight));
+                }
+            }
+        }
+    }
+
     let edge_cnt = edges.len();
     if !edges.is_empty() {
         dst_db.link_batch(&edges).map_err(|e| e.to_string())?;
     }
 
-    let mut cog = CognitiveEngine::open_db(Arc::clone(dst_db)).map_err(|e| e.to_string())?;
-    cog.save_index_snapshot().map_err(|e| e.to_string())?;
-    let _ = dst_db
-        .compact_with_options(false)
-        .map_err(|e| e.to_string())?;
+    if !to_write.is_empty() || edge_cnt > 0 {
+        let mut cog = CognitiveEngine::open_db(Arc::clone(dst_db)).map_err(|e| e.to_string())?;
+        cog.save_index_snapshot().map_err(|e| e.to_string())?;
+        let _ = dst_db
+            .compact_with_options(false)
+            .map_err(|e| e.to_string())?;
+    }
 
     Ok((to_write.len(), edge_cnt, skipped_older))
 }
 
-/// Re-encrypts any `portable_plain:` secret payloads on `proj_db`, strips `sys::backup_manifest`,
-/// refreshes snapshots/compaction, and seals `ws_root` on this host (`v4` HMAC).
+#[cfg(unix)]
+fn set_private_dir_permissions(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+}
+
+#[cfg(not(unix))]
+fn set_private_dir_permissions(_dir: &Path) {}
+
+#[cfg(unix)]
+fn set_private_file_permissions(file: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = fs::set_permissions(file, fs::Permissions::from_mode(0o600));
+}
+
+#[cfg(not(unix))]
+fn set_private_file_permissions(_file: &Path) {}
+
+struct StagingFileGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl StagingFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StagingFileGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn has_internet_mark_of_the_web(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        let ads_path = format!("{}:Zone.Identifier", path.display());
+        if let Ok(content) = fs::read_to_string(&ads_path) {
+            for line in content.lines() {
+                let cleaned: String = line
+                    .chars()
+                    .filter(|c| !c.is_ascii_whitespace())
+                    .collect::<String>()
+                    .to_ascii_lowercase();
+                if cleaned.starts_with("zoneid=3") || cleaned.starts_with("zoneid=4") {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+/// Re-encrypts any `portable_plain:` secret payloads on `proj_db`, strips `sys::backup_manifest`
+/// and disallowed control-plane `Config` keys, refreshes snapshots/compaction, and seals `ws_root`
+/// on this host (`v4` HMAC).
 /// Caller MUST hold `WorkspaceTrustLockGuard` on `(global_db, ws_root)` when calling this `_locked` path.
 pub(super) fn adopt_portable_backup_in_place_locked(
     global_db: &LibreDb,
@@ -833,6 +1098,13 @@ pub(super) fn adopt_portable_backup_in_place_locked(
             ws_root.display()
         ));
     }
+    let ldb_path = ws_root.join(".agents").join("memory.ldb");
+    if has_internet_mark_of_the_web(&ldb_path) {
+        return Err(format!(
+            "Refusing to auto-adopt '.agents/memory.ldb' in '{}' because it carries an Internet Mark-of-the-Web (Zone.Identifier).",
+            ws_root.display()
+        ));
+    }
     let Some(manifest) = has_valid_portable_backup_manifest(proj_db, Some(BackupScope::Project))?
     else {
         return Err(format!(
@@ -842,6 +1114,20 @@ pub(super) fn adopt_portable_backup_in_place_locked(
     };
 
     reencrypt_portable_secrets_in_place(proj_db)?;
+    let config_inodes = proj_db.list_inodes(Some(NodeKind::Config), false);
+    for (ino, key_opt, _) in config_inodes {
+        if !ino.flags.is_live_active() {
+            continue;
+        }
+        if let Some(k) = key_opt {
+            if k != TRUST_SEALS_KEY
+                && k != BACKUP_MANIFEST_KEY
+                && is_project_forbidden_control_config_key(&k)
+            {
+                deprecate_config_if_present(proj_db, &k)?;
+            }
+        }
+    }
     deprecate_config_if_present(proj_db, BACKUP_MANIFEST_KEY)?;
     let mut cog = CognitiveEngine::open_db(Arc::clone(proj_db)).map_err(|e| e.to_string())?;
     cog.save_index_snapshot().map_err(|e| e.to_string())?;
@@ -944,10 +1230,12 @@ fn validate_safe_backup_destination(dest: &Path, ws_roots: &[&Path]) -> Result<(
 fn ensure_backup_gitignore(dir: &Path) -> Result<(), String> {
     fs::create_dir_all(dir)
         .map_err(|e| format!("Failed to create backup directory '{}': {e}", dir.display()))?;
+    set_private_dir_permissions(dir);
     let gi = dir.join(".gitignore");
     if !gi.exists() {
         fs::write(&gi, "*\n")
             .map_err(|e| format!("Failed to write '{}': {e}", gi.display()))?;
+        set_private_file_permissions(&gi);
     }
     Ok(())
 }
@@ -968,6 +1256,7 @@ fn export_single_db_to_file(
         .ok_or_else(|| format!("Invalid backup file target '{}'", dst_file.display()))?;
     fs::create_dir_all(parent)
         .map_err(|e| format!("Failed to create directory '{}': {e}", parent.display()))?;
+    set_private_dir_permissions(parent);
 
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -978,6 +1267,7 @@ fn export_single_db_to_file(
         nonce
     ));
     let _ = fs::remove_file(&staging);
+    let mut staging_guard = StagingFileGuard::new(staging.clone());
 
     let (nodes, decrypted) = collect_exported_nodes(
         src_db,
@@ -991,6 +1281,7 @@ fn export_single_db_to_file(
             LibreDb::open(&staging)
                 .map_err(|e| format!("Failed to create staging backup DB: {e}"))?,
         );
+        set_private_file_permissions(&staging);
         replace_db_from_nodes_in_place(&dst_db, nodes, false, !telemetry_only)?;
         let m = stamp_backup_manifest(&dst_db, scope, source_label)?;
         let verified = has_valid_portable_backup_manifest(&dst_db, Some(scope))?;
@@ -1004,12 +1295,13 @@ fn export_single_db_to_file(
         let _ = fs::remove_file(dst_file);
     }
     fs::rename(&staging, dst_file).map_err(|e| {
-        let _ = fs::remove_file(&staging);
         format!(
             "Failed to finalize backup database '{}': {e}",
             dst_file.display()
         )
     })?;
+    staging_guard.disarm();
+    set_private_file_permissions(dst_file);
     Ok((manifest, decrypted))
 }
 
@@ -1090,12 +1382,26 @@ pub fn execute_backup_command(opts: &BackupOptions) -> Result<BackupReport, Stri
         let mut dbs = locate_chat_source_dbs(trimmed_cid);
         if dbs.is_empty() {
             if let Some(ref proj_dir) = opts.project_dir {
-                let candidate = if proj_dir.is_file() {
-                    proj_dir.clone()
+                let (candidate, ws_opt) = if proj_dir.is_file() {
+                    (proj_dir.clone(), workspace_root_from_ldb_path(proj_dir))
                 } else {
-                    proj_dir.join(".agents").join("memory.ldb")
+                    let ws_root = crate::hooks::find_workspace_root(proj_dir)
+                        .unwrap_or_else(|| proj_dir.clone());
+                    (ws_root.join(".agents").join("memory.ldb"), Some(ws_root))
                 };
                 if candidate.is_file() {
+                    if let Some(ref ws_root) = ws_opt {
+                        let Some(ref gdb) = gdb_opt else {
+                            return Err(format!(
+                                "Refusing to back up project database '{}' without an initialized customizations.ldb trust anchor at '{}'.",
+                                candidate.display(),
+                                global_path.display()
+                            ));
+                        };
+                        if !is_workspace_memory_trusted(Some(gdb), ws_root) {
+                            return Err(diagnose_untrusted_workspace_db(Some(gdb), ws_root));
+                        }
+                    }
                     dbs.push(candidate);
                 }
             }
@@ -1112,6 +1418,7 @@ pub fn execute_backup_command(opts: &BackupOptions) -> Result<BackupReport, Stri
             dest.join(format!("chat_{}", sanitize_slug(trimmed_cid)))
         };
         fs::create_dir_all(&target_dir).map_err(|e| e.to_string())?;
+        set_private_dir_permissions(&target_dir);
         let out_ldb = target_dir.join("memory.ldb");
         if dbs.len() == 1 {
             let src = LibreDb::open(&dbs[0]).map_err(|e| e.to_string())?;
@@ -1125,28 +1432,62 @@ pub fn execute_backup_command(opts: &BackupOptions) -> Result<BackupReport, Stri
             total_secrets += dec;
             total_capsules += m.capsule_count;
         } else {
-            let temp_merged = Arc::new(LibreDb::open(&out_ldb).map_err(|e| e.to_string())?);
-            for p in &dbs {
-                let sdb = LibreDb::open(p).map_err(|e| e.to_string())?;
-                sdb.verify_integrity().map_err(|e| e.to_string())?;
-                let (nodes, dec) = collect_exported_nodes(
-                    &sdb,
-                    Some(BackupScope::Chat),
-                    SecretTransform::DecryptToPortablePlain,
-                    false,
-                )?;
-                total_secrets += dec;
-                merge_nodes_additive(&temp_merged, nodes, false)?;
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            let staging = target_dir.join(format!(
+                ".staging_backup_{}_{}.ldb",
+                std::process::id(),
+                nonce
+            ));
+            let _ = fs::remove_file(&staging);
+            let mut staging_guard = StagingFileGuard::new(staging.clone());
+            let m_count = {
+                let temp_merged = Arc::new(LibreDb::open(&staging).map_err(|e| e.to_string())?);
+                set_private_file_permissions(&staging);
+                for p in &dbs {
+                    let sdb = LibreDb::open(p).map_err(|e| e.to_string())?;
+                    sdb.verify_integrity().map_err(|e| e.to_string())?;
+                    let (nodes, dec) = collect_exported_nodes(
+                        &sdb,
+                        Some(BackupScope::Chat),
+                        SecretTransform::DecryptToPortablePlain,
+                        false,
+                    )?;
+                    total_secrets += dec;
+                    merge_nodes_additive(&temp_merged, nodes, false)?;
+                }
+                let m = stamp_backup_manifest(&temp_merged, BackupScope::Chat, trimmed_cid)?;
+                if has_valid_portable_backup_manifest(&temp_merged, Some(BackupScope::Chat))?
+                    .is_none()
+                {
+                    return Err(
+                        "Multi-DB chat backup manifest self-check failed after staging".to_owned(),
+                    );
+                }
+                m.capsule_count
+            };
+            if out_ldb.exists() {
+                let _ = fs::remove_file(&out_ldb);
             }
-            let m = stamp_backup_manifest(&temp_merged, BackupScope::Chat, trimmed_cid)?;
-            total_capsules += m.capsule_count;
+            fs::rename(&staging, &out_ldb).map_err(|e| {
+                format!(
+                    "Failed to finalize chat backup '{}': {e}",
+                    out_ldb.display()
+                )
+            })?;
+            staging_guard.disarm();
+            set_private_file_permissions(&out_ldb);
+            total_capsules += m_count;
         }
         index.chat_db = Some(format!("chat_{}/memory.ldb", sanitize_slug(trimmed_cid)));
+        let idx_file = dest.join("backup_index.json");
         fs::write(
-            dest.join("backup_index.json"),
+            &idx_file,
             serde_json::to_vec_pretty(&index).map_err(|e| e.to_string())?,
         )
         .map_err(|e| e.to_string())?;
+        set_private_file_permissions(&idx_file);
         return Ok(BackupReport {
             destination: dest.display().to_string(),
             scope: "chat".to_owned(),
@@ -1213,6 +1554,7 @@ pub fn execute_backup_command(opts: &BackupOptions) -> Result<BackupReport, Stri
         if opts.all {
             let projects_dir = dest.join("projects");
             fs::create_dir_all(&projects_dir).map_err(|e| e.to_string())?;
+            set_private_dir_permissions(&projects_dir);
             let mut seen_slugs = HashSet::new();
             for (_, raw_ws) in list_trusted_workspaces(gdb)? {
                 let ws_root = PathBuf::from(raw_ws.trim());
@@ -1253,11 +1595,13 @@ pub fn execute_backup_command(opts: &BackupOptions) -> Result<BackupReport, Stri
             }
         }
 
+        let idx_file = dest.join("backup_index.json");
         fs::write(
-            dest.join("backup_index.json"),
+            &idx_file,
             serde_json::to_vec_pretty(&index).map_err(|e| e.to_string())?,
         )
         .map_err(|e| format!("Failed to write backup_index.json: {e}"))?;
+        set_private_file_permissions(&idx_file);
 
         return Ok(BackupReport {
             destination: dest.display().to_string(),
@@ -1292,13 +1636,17 @@ pub fn execute_backup_command(opts: &BackupOptions) -> Result<BackupReport, Stri
             ws_ldb.display()
         ));
     }
-    if let Some(ref gdb) = gdb_opt {
-        if !is_workspace_memory_trusted(Some(gdb), &ws_root) {
-            return Err(format!(
-                "Refusing to back up untrusted workspace '{}'. Verify or inspect it first.",
-                ws_root.display()
-            ));
-        }
+    let Some(ref gdb) = gdb_opt else {
+        return Err(format!(
+            "Refusing to back up workspace '{}' without an initialized customizations.ldb trust anchor at '{}'. Run 'libredb trust \"{}\"' first or inspect read-only via '/libredb read \"{}\"'",
+            ws_root.display(),
+            global_path.display(),
+            ws_root.display(),
+            ws_ldb.display()
+        ));
+    };
+    if !is_workspace_memory_trusted(Some(gdb), &ws_root) {
+        return Err(diagnose_untrusted_workspace_db(Some(gdb), &ws_root));
     }
     validate_safe_backup_destination(&dest, &[&ws_root])?;
 
@@ -1336,15 +1684,17 @@ pub fn execute_backup_command(opts: &BackupOptions) -> Result<BackupReport, Stri
         content_sha256: pm.content_sha256,
     };
     index.projects.push(entry.clone());
+    let info_file = index_dir.join(if is_explicit_file {
+        "backup_project_info.json"
+    } else {
+        "backup_index.json"
+    });
     fs::write(
-        index_dir.join(if is_explicit_file {
-            "backup_project_info.json"
-        } else {
-            "backup_index.json"
-        }),
+        &info_file,
         serde_json::to_vec_pretty(&index).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
+    set_private_file_permissions(&info_file);
 
     Ok(BackupReport {
         destination: dest.display().to_string(),
@@ -1396,6 +1746,7 @@ fn pre_restore_backup_file(target: &Path) -> Result<Option<String>, String> {
             bak.display()
         )
     })?;
+    set_private_file_permissions(&bak);
     Ok(Some(bak.display().to_string()))
 }
 
@@ -1404,8 +1755,20 @@ fn restore_project_ldb_from_backup_file(
     src_file: &Path,
     ws_root: &Path,
 ) -> Result<(usize, Option<String>), String> {
+    if fs::symlink_metadata(ws_root).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(format!(
+            "Refusing to restore into symlinked workspace directory '{}'.",
+            ws_root.display()
+        ));
+    }
     if is_private_brain_workspace(ws_root) {
         return Err("Refusing to restore a project database inside Antigravity's private brain folder.".to_owned());
+    }
+    if is_forbidden_mcp_workspace_root(ws_root) {
+        return Err(format!(
+            "Refusing to restore project database into forbidden root '{}'.",
+            ws_root.display()
+        ));
     }
     let (src_db, _) = require_valid_backup_file(src_file, BackupScope::Project)?;
     let _ws_lock = super::WorkspaceTrustLockGuard::acquire(global_db, ws_root)?;
@@ -1431,7 +1794,7 @@ fn restore_project_ldb_from_backup_file(
     Ok((reencrypted, pre_bak))
 }
 
-fn resolve_single_project_backup_file(source: &Path) -> Result<PathBuf, String> {
+pub(super) fn resolve_single_project_backup_file(source: &Path) -> Result<PathBuf, String> {
     if source.is_file() {
         return Ok(source.to_path_buf());
     }
@@ -1586,8 +1949,29 @@ pub fn execute_restore_command(opts: &RestoreOptions) -> Result<RestoreReport, S
                 let index: BackupIndex = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
                 let base_dir = idx_path.parent().unwrap_or_else(|| Path::new("."));
                 for entry in index.projects {
-                    let src_file = base_dir.join(&entry.relative_ldb_path);
+                    let rel_p = Path::new(&entry.relative_ldb_path);
+                    let safe_rel = !rel_p.is_absolute()
+                        && rel_p.components().all(|c| {
+                            matches!(
+                                c,
+                                std::path::Component::Normal(_) | std::path::Component::CurDir
+                            )
+                        });
+                    let src_file = base_dir.join(rel_p);
                     let target_dir = PathBuf::from(&entry.original_path);
+                    let src_symlink = fs::symlink_metadata(&src_file)
+                        .is_ok_and(|m| m.file_type().is_symlink());
+                    let target_symlink = fs::symlink_metadata(&target_dir)
+                        .is_ok_and(|m| m.file_type().is_symlink());
+                    if !safe_rel
+                        || src_symlink
+                        || target_symlink
+                        || is_private_brain_workspace(&target_dir)
+                        || is_forbidden_mcp_workspace_root(&target_dir)
+                    {
+                        projects_skipped.push(entry);
+                        continue;
+                    }
                     if target_dir.is_dir() && src_file.is_file() {
                         let (dec, bak_opt) =
                             restore_project_ldb_from_backup_file(&gdb, &src_file, &target_dir)?;
@@ -2249,6 +2633,15 @@ pub fn diagnose_untrusted_workspace_db(global_db: Option<&LibreDb>, ws_root: &Pa
     if is_git_index_tracking_agents_db(ws_root) {
         return format!(
             "Workspace memory at '{}' is tracked inside '.git/index' and quarantined against repository poisoning. Run 'libredb trust \"{}\"' only if you explicitly created and trust this database.",
+            ldb_path.display(),
+            ws_root.display()
+        );
+    }
+    if has_internet_mark_of_the_web(&ldb_path) {
+        return format!(
+            "Workspace memory at '{}' carries a Windows Internet Mark-of-the-Web (Zone.Identifier ZoneId=3/4) and was quarantined instead of auto-adopted. Inspect read-only at your own risk via '/libredb read \"{}\"' or restore explicitly with '/libredb restore \"{}\" --project \"{}\"' if you downloaded and trust this archive.",
+            ldb_path.display(),
+            ldb_path.display(),
             ldb_path.display(),
             ws_root.display()
         );

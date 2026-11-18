@@ -296,14 +296,16 @@ pub(super) fn dispatch_tool(
                     .is_some_and(|f| f.eq_ignore_ascii_case("json"));
                 let instance_flag = args.get("instance").and_then(Value::as_bool).unwrap_or(false);
                 let all_flag = args.get("all").and_then(Value::as_bool).unwrap_or(false);
+                let protected = state.custom_protected_paths(None);
+
+                if instance_flag || all_flag {
+                    return Err(
+                        "LibreDB MCP access denied: '--instance' and '--all' backup/restore operations decrypt or replace global credentials and system rules; run 'libredb backup' or 'libredb restore' via the CLI instead."
+                            .into(),
+                    );
+                }
 
                 if let Some(ref pin_root) = state.pinned_workspace_root {
-                    if instance_flag || all_flag {
-                        return Err(
-                            "LibreDB MCP access denied: 'instance' and 'all' backup/restore operations are disabled on workspace-pinned MCP servers; run the local 'libredb' CLI instead."
-                                .into(),
-                        );
-                    }
                     if let Some(raw_c) = raw_cwd_arg.filter(|s| !s.trim().is_empty()) {
                         let c_path = Path::new(raw_c);
                         let abs_c = if c_path.is_relative() {
@@ -323,10 +325,21 @@ pub(super) fn dispatch_tool(
 
                 match action {
                     "backup" => {
-                        let base_dir = raw_cwd_arg
-                            .filter(|s| !s.trim().is_empty())
-                            .map(PathBuf::from)
-                            .or_else(|| state.pinned_workspace_root.clone());
+                        let project_dir = if cid_arg.is_none() {
+                            let cand_ws = raw_cwd_arg
+                                .filter(|s| !s.trim().is_empty())
+                                .map(PathBuf::from)
+                                .or_else(|| state.pinned_workspace_root.clone())
+                                .unwrap_or_else(|| state.default_project_path.clone());
+                            let ws_root = state.authorize_mcp_workspace_path(&cand_ws, false)?;
+                            Some(ws_root)
+                        } else {
+                            None
+                        };
+                        let base_for_rel = project_dir
+                            .as_deref()
+                            .or(state.pinned_workspace_root.as_deref())
+                            .unwrap_or(&state.default_project_path);
                         let dest = args
                             .get("destination")
                             .and_then(Value::as_str)
@@ -335,25 +348,33 @@ pub(super) fn dispatch_tool(
                             .map(|raw| {
                                 let p = Path::new(raw);
                                 if p.is_relative() {
-                                    base_dir
-                                        .as_deref()
-                                        .unwrap_or(&state.default_project_path)
-                                        .join(p)
+                                    base_for_rel.join(p)
                                 } else {
                                     p.to_path_buf()
                                 }
                             });
                         if let Some(ref d) = dest {
-                            if let Some(err) = crate::security::check_mcp_read_path_policy(d, &[]) {
+                            if let Some(err) =
+                                crate::security::check_mcp_read_path_policy(d, &protected)
+                            {
+                                return Err(err.into());
+                            }
+                            if let Some(err) =
+                                crate::security::check_tool_write_path_policy_with_base(
+                                    &d.to_string_lossy(),
+                                    None,
+                                    &protected,
+                                )
+                            {
                                 return Err(err.into());
                             }
                         }
                         let opts = crate::security::BackupOptions {
                             destination: dest,
-                            project_dir: base_dir,
+                            project_dir,
                             cid: cid_arg.map(str::to_owned),
-                            instance: instance_flag,
-                            all: all_flag,
+                            instance: false,
+                            all: false,
                             global_path: state.global_path.clone(),
                             allow_prompt: false,
                         };
@@ -382,31 +403,31 @@ pub(super) fn dispatch_tool(
                             .or(target_opt)
                             .filter(|s| !s.trim().is_empty())
                             .ok_or("Missing 'source' backup path for action='restore'")?;
-                        let base_dir = raw_cwd_arg
+                        let cand_ws = raw_cwd_arg
                             .filter(|s| !s.trim().is_empty())
                             .map(PathBuf::from)
-                            .or_else(|| state.pinned_workspace_root.clone());
+                            .or_else(|| state.pinned_workspace_root.clone())
+                            .unwrap_or_else(|| state.default_project_path.clone());
+                        let ws_root =
+                            state.authorize_mcp_workspace_path_ext(&cand_ws, false, false)?;
                         let src_path = {
                             let p = Path::new(raw_src);
                             if p.is_relative() {
-                                base_dir
-                                    .as_deref()
-                                    .unwrap_or(&state.default_project_path)
-                                    .join(p)
+                                ws_root.join(p)
                             } else {
                                 p.to_path_buf()
                             }
                         };
                         if let Some(err) =
-                            crate::security::check_mcp_read_path_policy(&src_path, &[])
+                            crate::security::check_mcp_read_path_policy(&src_path, &protected)
                         {
                             return Err(err.into());
                         }
                         let opts = crate::security::RestoreOptions {
                             source: src_path,
-                            project_dir: base_dir,
-                            instance: instance_flag,
-                            all: all_flag,
+                            project_dir: Some(ws_root),
+                            instance: false,
+                            all: false,
                             global_path: state.global_path.clone(),
                         };
                         let rep = crate::security::execute_restore_command(&opts)?;
@@ -429,13 +450,13 @@ pub(super) fn dispatch_tool(
                         };
                     }
                     "migrate" => {
-                        let target_project = raw_cwd_arg
+                        let cand_ws = raw_cwd_arg
                             .filter(|s| !s.trim().is_empty())
                             .map(PathBuf::from)
-                            .or_else(|| state.pinned_workspace_root.clone());
-                        let base_dir = target_project
-                            .as_deref()
-                            .unwrap_or(&state.default_project_path);
+                            .or_else(|| state.pinned_workspace_root.clone())
+                            .unwrap_or_else(|| state.default_project_path.clone());
+                        let ws_root =
+                            state.authorize_mcp_workspace_path_ext(&cand_ws, false, false)?;
                         let source = args
                             .get("source")
                             .and_then(Value::as_str)
@@ -444,13 +465,14 @@ pub(super) fn dispatch_tool(
                             .map(|raw| {
                                 let p = Path::new(raw);
                                 if p.is_relative() {
-                                    base_dir.join(p)
+                                    ws_root.join(p)
                                 } else {
                                     p.to_path_buf()
                                 }
                             });
                         if let Some(ref sp) = source {
-                            if let Some(err) = crate::security::check_mcp_read_path_policy(sp, &[])
+                            if let Some(err) =
+                                crate::security::check_mcp_read_path_policy(sp, &protected)
                             {
                                 return Err(err.into());
                             }
@@ -460,6 +482,13 @@ pub(super) fn dispatch_tool(
                             .and_then(Value::as_str)
                             .filter(|s| !s.trim().is_empty())
                             .map(PathBuf::from);
+                        if let Some(ref fp) = from_path {
+                            if let Some(err) =
+                                crate::security::check_mcp_read_path_policy(fp, &protected)
+                            {
+                                return Err(err.into());
+                            }
+                        }
                         let include_artifacts = args
                             .get("include_artifacts")
                             .and_then(Value::as_bool)
@@ -467,7 +496,7 @@ pub(super) fn dispatch_tool(
                         let opts = crate::security::MigrateOptions {
                             source,
                             cid: cid_arg.map(str::to_owned),
-                            target_project,
+                            target_project: Some(ws_root),
                             from_path,
                             include_artifacts,
                             global_path: state.global_path.clone(),
@@ -492,6 +521,16 @@ pub(super) fn dispatch_tool(
                         };
                     }
                     "read" => {
+                        let show_secrets = args
+                            .get("show_secrets")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        if show_secrets {
+                            return Err(
+                                "LibreDB MCP access denied: 'show_secrets' is disabled over MCP to keep credentials out of model context; run 'libredb read --show-secrets' in a local terminal instead."
+                                    .into(),
+                            );
+                        }
                         let raw_target = target_opt
                             .or_else(|| args.get("source").and_then(Value::as_str))
                             .filter(|s| !s.trim().is_empty())
@@ -508,15 +547,19 @@ pub(super) fn dispatch_tool(
                                 p.to_path_buf()
                             }
                         };
-                        if let Some(err) =
-                            crate::security::check_mcp_read_path_policy(&resolved_target, &[])
-                        {
+                        if let Some(err) = crate::security::check_mcp_read_path_policy(
+                            &resolved_target,
+                            &protected,
+                        ) {
                             return Err(err.into());
                         }
-                        let show_secrets = args
-                            .get("show_secrets")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false);
+                        if crate::security::is_forbidden_mcp_workspace_root(&resolved_target) {
+                            return Err(format!(
+                                "LibreDB MCP access denied: reading control-plane or broad root '{}' is forbidden.",
+                                resolved_target.display()
+                            )
+                            .into());
+                        }
                         if let Some(ref pin_root) = state.pinned_workspace_root {
                             let canon_t = crate::security::canonicalize_with_missing_tail(
                                 &resolved_target,
@@ -527,12 +570,6 @@ pub(super) fn dispatch_tool(
                             {
                                 return Err(err.into());
                             }
-                            if show_secrets {
-                                return Err(
-                                    "LibreDB MCP access denied: 'show_secrets' is disabled on workspace-pinned MCP servers."
-                                        .into(),
-                                );
-                            }
                         }
                         let opts = crate::security::ReadLdbOptions {
                             target: resolved_target,
@@ -540,7 +577,7 @@ pub(super) fn dispatch_tool(
                                 .get("query")
                                 .and_then(Value::as_str)
                                 .map(str::to_owned),
-                            show_secrets,
+                            show_secrets: false,
                             global_path: state.global_path.clone(),
                         };
                         let rep = crate::security::execute_read_ldb_command(&opts)?;

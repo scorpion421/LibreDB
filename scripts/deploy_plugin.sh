@@ -32,9 +32,9 @@ done
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PROJECT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
-LIBRE_VERSION=$(tr -d ' \t\r\n' < "$PROJECT_ROOT/VERSION" 2>/dev/null || echo "2.3.0")
+LIBRE_VERSION=$(tr -d ' \t\r\n' < "$PROJECT_ROOT/VERSION" 2>/dev/null || echo "2.3.1")
 case "$LIBRE_VERSION" in
-    ""|*[!0-9A-Za-z._+-]*) LIBRE_VERSION="2.3.0" ;;
+    ""|*[!0-9A-Za-z._+-]*) LIBRE_VERSION="2.3.1" ;;
 esac
 USER_HOME="${HOME:-$(pwd)}"
 GEMINI_DIR="$USER_HOME/.gemini"
